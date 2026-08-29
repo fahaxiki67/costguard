@@ -101,6 +101,11 @@ def ensure_period(
         return int(cur.lastrowid)
 
 
+def guess_period_no_from_text(text: str) -> int | None:
+    m = _PERIOD_RE.search(text or "")
+    return _cn_to_int(m.group(1)) if m else None
+
+
 def import_settlement_file(
     conn: sqlite3.Connection,
     project_id: int,
@@ -110,23 +115,28 @@ def import_settlement_file(
     direction: str = "unknown",
     contract_party: str = "",
 ) -> ImportReport:
-    """导入并解析一个结算文件。期次缺省按文件名猜测，猜不出按递增编号。"""
+    """导入并解析一个结算文件。
+
+    期次归属（v2 模型）：一个工作簿可含多期。逐 Sheet 判定期号——
+    Sheet 名或表前标题含"第N期"则用之；否则用文件名期号；再否则按递增编号。
+    """
     src = Path(src)
     sf = import_file(conn, project_id, project_dir, src)
-    if period_no is None:
-        period_no = guess_period_no(src) or next_period_no(conn, project_id)
+    file_period = period_no if period_no is not None else guess_period_no(src)
+    used_increment = file_period is None
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
     if result.status != "ok":
-        return ImportReport(sf.file_id, None, period_no, -1, "failed", message=result.error)
+        fallback = file_period or next_period_no(conn, project_id)
+        return ImportReport(sf.file_id, None, fallback, -1, "failed", message=result.error)
 
     from costguard.core.parsing.excel_parser import persist_parse_result
 
     batch_id = persist_parse_result(conn, sf.file_id, result)
-    period_id = ensure_period(conn, project_id, period_no, src.stem, sf.file_id, direction, contract_party)
 
-    report = ImportReport(sf.file_id, batch_id, period_no, period_id, "partial")
+    report = ImportReport(sf.file_id, batch_id, file_period or 0, -1, "partial")
     parsed_any = False
+    period_ids: set[int] = set()
     for sheet in result.sheets:
         sheet_id = conn.execute(
             "SELECT id FROM raw_sheets WHERE batch_id=? AND sheet_index=?", (batch_id, sheet.sheet_index)
@@ -140,6 +150,28 @@ def import_settlement_file(
         if not items:
             report.sheets.append(SheetReport(sheet.sheet_name, "no_header", notes=["header-like but 0 data rows"]))
             continue
+
+        # ---- 逐 Sheet 期次判定 ----
+        # 优先级：用户显式指定 > 文件名期号 > Sheet 名期号 > 递增。
+        # 文件名与 Sheet 名期号冲突时按文件名（导入语境更明确）并提示复核。
+        sheet_pno = guess_period_no_from_text(sheet.sheet_name) or guess_period_no_from_text(
+            " ".join(t for (r, _c), t in sorted(cells.items()) if r <= 5)
+        )
+        notes: list[str] = []
+        if used_increment:
+            pno = next_period_no(conn, project_id) if parsed_any else (file_period or sheet_pno or next_period_no(conn, project_id))
+        elif file_period is not None:
+            pno = file_period
+            if sheet_pno is not None and sheet_pno != file_period:
+                notes.append(f"Sheet 名期号({sheet_pno})与文件名期号({file_period})不一致，按文件名处理，请复核")
+        else:
+            pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id)
+        title = f"{src.stem}/{sheet.sheet_name}"
+        period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
+        with conn:
+            conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
+        period_ids.add(period_id)
+
         extract_items.persist_line_items(conn, period_id, sheet_id, items)
         parsed_any = True
         status = "needs_review" if det.needs_review else "parsed"
@@ -148,11 +180,15 @@ def import_settlement_file(
                 sheet.sheet_name, status,
                 n_items=len([i for i in items if not i.flags.get("subtotal")]),
                 n_subtotal=len([i for i in items if i.flags.get("subtotal")]),
-                confidence=det.confidence, notes=det.notes,
+                confidence=det.confidence, notes=det.notes + notes,
             )
         )
-    report.status = "ok" if parsed_any else "partial" if any(s.status == "needs_review" for s in report.sheets) else "partial"
-    if not parsed_any and not report.sheets:
-        report.status = "failed"
+    report.period_id = next(iter(period_ids), -1)
+    report.period_no = min(
+        (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
+         for pid in period_ids), default=0,
+    )
+    report.status = "ok" if parsed_any else "failed"
+    if not parsed_any:
         report.message = "no sheets parsed"
     return report

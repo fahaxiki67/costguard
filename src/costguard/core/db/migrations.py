@@ -205,6 +205,13 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
         ],
     ),
+    (
+        # v2: 一个工作簿可含多期（每 Sheet 一期），raw_sheets 需要关联期次
+        2,
+        [
+            "ALTER TABLE raw_sheets ADD COLUMN period_id INTEGER REFERENCES settlement_periods(id)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

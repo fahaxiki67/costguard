@@ -100,21 +100,19 @@ class TestMessyPipeline:
 
 class TestMultiPeriodPipeline:
     def test_three_periods_imported(self, project):
+        """一个工作簿 3 个期次 Sheet → 应生成 3 个期次（v2 模型）。"""
         pdir, info, conn = project
         src = pdir.parent / "multi.xlsx"
         make_multi_period(src, periods=3)
         report = settlement_io.import_settlement_file(conn, info.project_id, pdir, src)
-        assert report.period_no == 1
+        assert report.status == "ok"
         periods = conn.execute(
             "SELECT period_no FROM settlement_periods WHERE project_id=? ORDER BY period_no",
             (info.project_id,),
         ).fetchall()
-        # 同一文件 3 个 sheet → 同一期次（一期一文件模型下，多 sheet 合一期）
-        assert len(periods) == 1
-        counts = conn.execute(
-            "SELECT COUNT(*) AS c FROM line_items WHERE period_id=?", (report.period_id,)
-        ).fetchall()
-        assert counts[0]["c"] > 15
+        assert [p["period_no"] for p in periods] == [1, 2, 3]
+        counts = conn.execute("SELECT COUNT(*) AS c FROM line_items").fetchone()
+        assert counts["c"] > 15
 
     def test_filename_guesses_period(self, project):
         pdir, info, conn = project
