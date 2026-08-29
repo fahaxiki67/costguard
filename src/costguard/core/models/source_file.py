@@ -19,6 +19,7 @@ FILE_TYPE_BY_SUFFIX = {
     ".xlsm": "xlsx",
     ".xls": "xls",
     ".csv": "csv",
+    ".txt": "txt",
     ".pdf": "pdf",
     ".docx": "docx",
     ".doc": "doc",
