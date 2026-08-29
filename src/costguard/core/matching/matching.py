@@ -130,7 +130,7 @@ def match_items(conn: sqlite3.Connection, project_id: int) -> list[MatchGroup]:
             if g not in bucket:  # 同组多个名称变体只登记一次
                 bucket.append(g)
     merged_keys: set[str] = set()
-    for nm, gs in by_name.items():
+    for gs in by_name.values():
         if len(gs) > 1:
             base = gs[0]
             for other in gs[1:]:

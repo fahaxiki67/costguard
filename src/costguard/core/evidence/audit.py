@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 
-class AuditReasonRequired(Exception):
+class AuditReasonRequiredError(Exception):
     """人工修改必须给出原因（原则 14）。"""
 
 
@@ -33,7 +33,7 @@ def record_audit(
 ) -> int:
     """记录一次人工修改。reason 为空直接拒绝。"""
     if not reason or not reason.strip():
-        raise AuditReasonRequired("人工修改必须记录原因（原则 14）")
+        raise AuditReasonRequiredError("人工修改必须记录原因（原则 14）")
     now = datetime.now().isoformat(timespec="seconds")
     with conn:
         cur = conn.execute(

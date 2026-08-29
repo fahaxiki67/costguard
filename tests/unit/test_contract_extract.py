@@ -131,7 +131,7 @@ class TestImportAndRisk:
         d.add_paragraph("发包人：甲公司")
         d.add_paragraph("承包人：乙公司")
         d.save(str(src))
-        doc_id = extract.import_contract(conn, pid, pdir, src)
+        extract.import_contract(conn, pid, pdir, src)
         risks = extract.contract_risks(conn, pid)
         keys = {r["fact_key"] for r in risks}
         assert {"payment_clause", "settlement_clause", "duration", "contract_amount"} <= keys
