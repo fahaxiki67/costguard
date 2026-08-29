@@ -110,10 +110,25 @@ class TestExcelExport:
         info, conn, exports = full_project
         path = excel_export.export_workbook(conn, info.project_id, exports)
         out = tmp_path / "recalc"
-        subprocess.run([soffice, "--headless", "--convert-to", "xlsx", "--outdir", str(out), str(path)],
-                       check=True, capture_output=True, timeout=240)
+        out.mkdir(parents=True, exist_ok=True)  # 显式创建输出目录（合法前置条件）
+        # 隔离 UserInstallation：独立 profile，避免与用户日常 soffice/其他实例的
+        # profile 锁冲突（间歇性 SIGABRT/退出码 134 的根因），不影响任何其他应用
+        profile = tmp_path / "lo_profile_isolated"
+        profile.mkdir(parents=True, exist_ok=True)
+        cmd = [soffice,
+               "-env:UserInstallation=" + Path(profile).as_uri(),
+               "--headless", "--convert-to", "xlsx", "--outdir", str(out), str(path)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        if proc.returncode != 0:
+            # 失败证据完整保留在断言消息中，不隐藏
+            pytest.fail(
+                f"soffice rc={proc.returncode}\n"
+                f"cmd={cmd}\n"
+                f"stdout(尾2000)={proc.stdout[-2000:]}\n"
+                f"stderr(尾2000)={proc.stderr[-2000:]}"
+            )
         recalc_path = out / path.name
-        assert recalc_path.exists()
+        assert recalc_path.exists(), f"转换未产出文件: stdout={proc.stdout[-500:]}"
 
         from decimal import Decimal
 
