@@ -286,63 +286,125 @@ def _backup(db_path: Path, backups_dir: Path) -> Path:
     finally:
         ver_probe.close()
     dest = backups_dir / f"project_pre_migration_v{src_ver}_{stamp}.db"
-    # WAL 可能有未 checkpoint 数据，先关闭句柄再拷贝由调用方保证；这里用备份 API。
+    # WAL 可能有未 checkpoint 数据；使用 backup API 获取一致快照，并确保句柄可关闭。
     src = sqlite3.connect(db_path)
-    dst = sqlite3.connect(dest)
-    with dst:
-        src.backup(dst)
-    dst.close()
-    src.close()
+    try:
+        dst = sqlite3.connect(dest)
+        try:
+            with dst:
+                src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     return dest
+
+
+def _sync_project_schema_versions(conn: sqlite3.Connection, version: int) -> None:
+    """将所有项目行的冗余结构版本标记同步到实际迁移版本。"""
+    has_projects = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'"
+    ).fetchone()
+    if has_projects:
+        conn.execute("UPDATE projects SET schema_version = ?", (version,))
 
 
 def migrate(db_path: Path, backups_dir: Path | None = None, log: Callable[[str], None] | None = None) -> int:
     """将库迁移到最新版本。返回最终版本号。
 
     - 迁移前自动备份；
-    - 任一脚本失败则整体回滚，抛 MigrationError。
+    - 所有待执行版本在一个事务中提交；
+    - 任一脚本失败则从迁移前备份恢复，抛 MigrationError。
     """
     db_path = Path(db_path)
     conn = connect(db_path)
+    backup_path: Path | None = None
     try:
         ver = current_version(conn)
         target = LATEST_SCHEMA_VERSION
         if ver >= target:
+            # 版本已是最新时仍修正项目表中的冗余版本标记。
+            conn.execute("BEGIN")
+            try:
+                _sync_project_schema_versions(conn, target)
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
             return ver
         backups_dir = backups_dir or db_path.parent / "backups"
         backup_path = _backup(db_path, backups_dir)
         if log:
             log(f"migration backup -> {backup_path}")
-        # 表重建型迁移（v3）需要全程关闭外键（事务内 PRAGMA foreign_keys 无效），
-        # 这是 SQLite 官方 ALTER 流程；迁移结束（无论成败）必须恢复开启。
-        conn.execute("PRAGMA foreign_keys=OFF")
+
+        applied_versions: list[int] = []
         try:
-            try:
-                for version, scripts in MIGRATIONS:
-                    if version <= ver:
-                        continue
-                    conn.execute("BEGIN")
-                    try:
-                        for sql in scripts:
-                            conn.execute(sql)
-                        conn.execute(
-                            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                            (version, datetime.now().isoformat(timespec="seconds")),
-                        )
-                        conn.execute("COMMIT")
-                    except sqlite3.Error:
-                        conn.execute("ROLLBACK")
-                        raise
-                    if log:
-                        log(f"applied migration v{version}")
-                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-                if violations:
-                    raise MigrationError(f"foreign key violations after migration: {violations[:5]}")
-            except sqlite3.Error as exc:
-                raise MigrationError(f"migration failed: {exc}; backup kept at {backup_path}") from exc
-            return current_version(conn)
-        finally:
+            # 表重建型迁移（v3）需要在事务外关闭外键；事务内 PRAGMA
+            # foreign_keys 无效。整个迁移仍在一个事务中，避免留下 v2/v3 的部分提交。
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("BEGIN")
+            for version, scripts in MIGRATIONS:
+                if version <= ver:
+                    continue
+                for sql in scripts:
+                    conn.execute(sql)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (version, datetime.now().isoformat(timespec="seconds")),
+                )
+                applied_versions.append(version)
+
+            _sync_project_schema_versions(conn, target)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise MigrationError(f"foreign key violations after migration: {violations[:5]}")
+            conn.execute("COMMIT")
+
+            # COMMIT 后才能重新开启外键；开启后再确认连接没有遗留在错误状态。
             conn.execute("PRAGMA foreign_keys=ON")
+            if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                raise MigrationError("foreign keys could not be re-enabled after migration")
+        except Exception as exc:
+            cleanup_errors: list[str] = []
+            if conn.in_transaction:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error as rollback_exc:
+                    cleanup_errors.append(f"transaction rollback failed: {rollback_exc}")
+            try:
+                conn.execute("PRAGMA foreign_keys=ON")
+            except sqlite3.Error as foreign_key_exc:
+                cleanup_errors.append(f"foreign keys restore failed: {foreign_key_exc}")
+
+            # 备份恢复前必须关闭迁移连接，避免自身持有 WAL/读写句柄阻塞恢复。
+            try:
+                conn.close()
+            except sqlite3.Error as close_exc:
+                cleanup_errors.append(f"migration connection close failed: {close_exc}")
+
+            try:
+                rollback_to_backup(db_path, backup_path)
+            except Exception as restore_exc:
+                details = [
+                    f"migration failed: {exc}",
+                    f"backup restore failed: {restore_exc}",
+                    f"backup kept at {backup_path}",
+                    *cleanup_errors,
+                ]
+                raise MigrationError("; ".join(details)) from exc
+
+            details = [
+                f"migration failed: {exc}",
+                f"database restored from backup {backup_path}",
+                *cleanup_errors,
+            ]
+            raise MigrationError("; ".join(details)) from exc
+
+        for version in applied_versions:
+            if log:
+                log(f"applied migration v{version}")
+        return current_version(conn)
     finally:
         try:
             conn.close()
@@ -358,9 +420,11 @@ def rollback_to_backup(db_path: Path, backup_path: Path) -> None:
     要求目标库无活动连接（单机单实例）。
     """
     src = sqlite3.connect(backup_path)
-    dst = connect(db_path)
     try:
-        src.backup(dst)
+        dst = connect(db_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
     finally:
-        dst.close()
         src.close()

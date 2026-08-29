@@ -94,6 +94,78 @@ class TestFkAndWal:
         conn.close()
 
 class TestLegacyUpgrade:
+    def test_late_failure_restores_v1_database_completely(self, tmp_path, monkeypatch):
+        """v1→v4 后续迁移失败时，不得留下 v2/v3 的部分提交。"""
+        db = tmp_path / "legacy.db"
+        conn = migrations.connect(db)
+        try:
+            for sql in migrations.MIGRATIONS[0][1]:
+                conn.execute(sql)
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01')"
+            )
+            with conn:
+                project_id = conn.execute(
+                    "INSERT INTO projects(name, schema_version, workspace_path, created_at)"
+                    " VALUES ('旧项目', 1, '/legacy', '2026')"
+                ).lastrowid
+                period_id = conn.execute(
+                    "INSERT INTO settlement_periods(project_id, period_no, title, direction)"
+                    " VALUES (?, 1, '旧第1期', 'upward')",
+                    (project_id,),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO line_items(period_id, name, quantity, amount)"
+                    " VALUES (?, '旧清单', '10', '1000')",
+                    (period_id,),
+                )
+        finally:
+            conn.close()
+
+        broken = [*migrations.MIGRATIONS]
+        broken[-1] = (4, [*broken[-1][1], "THIS IS NOT SQL"])
+        monkeypatch.setattr(migrations, "MIGRATIONS", broken)
+        monkeypatch.setattr(migrations, "LATEST_SCHEMA_VERSION", 4)
+
+        with pytest.raises(migrations.MigrationError):
+            migrations.migrate(db, tmp_path / "backups")
+
+        conn = migrations.connect(db)
+        try:
+            assert [tuple(row) for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )] == [(1,)]
+            assert tuple(conn.execute(
+                "SELECT name, schema_version FROM projects WHERE id=?", (project_id,)
+            ).fetchone()) == ("旧项目", 1)
+            assert tuple(conn.execute(
+                "SELECT name, amount FROM line_items WHERE period_id=?", (period_id,)
+            ).fetchone()) == ("旧清单", "1000")
+
+            raw_sheet_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(raw_sheets)")
+            }
+            assert "period_id" not in raw_sheet_columns
+            header_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(table_headers)")
+            }
+            assert {"data_row_start", "data_row_end"}.isdisjoint(header_columns)
+
+            settlement_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='settlement_periods'"
+            ).fetchone()[0]
+            assert "UNIQUE(project_id, period_no)" in settlement_sql
+            assert "UNIQUE(project_id, period_no, direction)" not in settlement_sql
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO settlement_periods(project_id, period_no, title, direction)"
+                    " VALUES (?, 1, '重复期次', 'downward')",
+                    (project_id,),
+                )
+        finally:
+            conn.close()
+
     def test_v1_database_upgrades_to_latest_with_data(self, tmp_path):
         """旧库兼容：v1 结构 + 已有数据 → migrate 到 v3，数据完整保留。"""
         from costguard.core.db import migrations as m
