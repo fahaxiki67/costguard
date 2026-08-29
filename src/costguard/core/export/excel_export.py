@@ -112,36 +112,144 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     return ws.title
 
 
+def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[dict]:
+    """差异表数据序列：按 (direction, period_id, item_key) 取可追溯原始值。
+
+    - 数量/金额：同期同组多行求和（Decimal）；单位不一致时该期标记不可比；
+    - 单价：同期同组若存在多个不同价 → 标记"多价待复核"，绝不平均；
+    - 缺失值不补 0：整期无有效值 → None（待补资料）。
+    """
+    rows = conn.execute(
+        """SELECT li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
+                  li.flags_json, sp.period_no AS pno, sp.direction AS dir
+           FROM line_items li JOIN settlement_periods sp ON sp.id = li.period_id
+           WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
+        (project_id,),
+    ).fetchall()
+    series: dict[tuple[str, str, str], dict[int, dict]] = {}
+    for r in rows:
+        flags = json.loads(r["flags_json"] or "{}")
+        if flags.get("subtotal"):
+            continue
+        key = (r["dir"] or "unknown", "code:" + r["code"] if r["code"] else "name:" + (r["name"] or ""),
+               r["name"] or "")
+        by_period = series.setdefault(key, {})
+        pp = by_period.setdefault(int(r["pno"]), {
+            "qty": None, "amount": None, "prices": set(), "units": set(), "qty_missing": False,
+            "period_no": int(r["pno"]),
+        })
+        if r["quantity"] is not None:
+            try:
+                q = D(r["quantity"])
+            except Exception:
+                q = None
+            if q is not None:
+                pp["qty"] = q if pp["qty"] is None else pp["qty"] + q
+        else:
+            pp["qty_missing"] = True
+        if r["amount"] is not None:
+            try:
+                a = D(r["amount"])
+            except Exception:
+                a = None
+            if a is not None:
+                pp["amount"] = a if pp["amount"] is None else pp["amount"] + a
+        if r["unit_price"]:
+            try:
+                pp["prices"].add(D(r["unit_price"]))
+            except Exception:
+                pass
+        if r["unit"]:
+            pp["units"].add(_norm_unit_local(r["unit"]))
+    out = []
+    for (direction, _key, name), by_period in series.items():
+        code = _key[5:] if _key.startswith("code:") else ""
+        out.append({"direction": direction, "code": code, "name": name, "by_period": by_period})
+    return sorted(out, key=lambda x: (x["direction"], x["code"], x["name"]))
+
+
+def _norm_unit_local(u: str | None) -> str:
+    if not u:
+        return ""
+    u = u.strip()
+    for canonical, aliases in UNIT_ALIAS_EXPORT.items():
+        if u == canonical or u in aliases:
+            return canonical
+    return u
+
+
+UNIT_ALIAS_EXPORT = {
+    "m3": {"m³", "立方米", "立米", "M3", "m^3"},
+    "m2": {"m²", "平方米", "平米", "M2", "m^2"},
+}
+
+
 def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
-    """单价/工程量/金额 差异表（同组跨期对比，差异由公式计算）。"""
-    aggs = aggregate_project(conn, project_id)
-    periods = _fetch_periods(conn, project_id)
-    for title, field in (("单价差异表", "unit_price"), ("工程量差异表", "quantity"), ("金额差异表", "amount")):
+    """单价/工程量/金额 差异表：方向隔离的跨期比较。
+
+    - 按 direction 分组，同方向内按 period_no 比较；对上与对下绝不互比；
+    - 每行输出方向列；
+    - 单价来自可追溯原始 unit_price；同期同组多价 → 标"多价待复核"，不得平均；
+    - 差异列保留公式；一侧缺失 → 标待补资料，不补 0。
+    """
+    titles = (("单价差异表", "unit_price"), ("工程量差异表", "quantity"), ("金额差异表", "amount"))
+    dir_zh = {"upward": "对上", "downward": "对下", "unknown": "未标记"}
+    all_series = {f: _diff_series(conn, project_id, f) for _t, f in titles}
+
+    for title, field in titles:
         ws = wb.create_sheet(title)
-        ws.append(["清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
-        _style_header(ws, 1, 7)
-        for agg in aggs:
-            # per_period 键是 period_id；显示与排序必须用 period_no
-            ordered = sorted(agg.per_period.items(), key=lambda kv: kv[1]["period_no"])
+        ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
+        _style_header(ws, 1, 8)
+        series = all_series[field]
+        r = 1
+        for item in series:
+            # 键为 period_id，按 period_no 排序比较
+            ordered = sorted(item["by_period"].items(), key=lambda kv: kv[1]["period_no"])
             prev = None
             for _pid, pp in ordered:
-                cur = pp.get(field)
-                pno_title = f"第{pp['period_no']}期"
-                if prev is not None and cur is not None and prev["value"] is not None:
-                    r = ws.max_row + 1
-                    ws.append([agg.code, agg.name, pno_title,
-                               _num(cur, money=True), _num(prev["value"], money=True), None, None])
-                    # 差异公式（保留公式：WPS/Excel 均可复核）
-                    ws.cell(row=r, column=6, value=f"=D{r}-E{r}")
-                    ws.cell(row=r, column=7, value=f'=IF(E{r}=0,"不可比",(D{r}-E{r})/E{r})')
-                    for c in (4, 5, 6):
-                        ws.cell(row=r, column=c).number_format = MONEY_FMT
-                    ws.cell(row=r, column=7).number_format = "0.00%"
-                if cur is not None:
-                    prev = {"value": cur}
-                _ = pno_title
+                r += 1
+                pno = pp["period_no"]
+                if field == "unit_price":
+                    if len(pp["prices"]) > 1:
+                        cur_val = "多价待复核（不可比，不平均）"
+                    else:
+                        cur_val = _num(next(iter(pp["prices"])), money=True) if pp["prices"] else None
+                elif field == "quantity":
+                    cur_val = _num(pp["qty"]) if pp["qty"] is not None else None
+                    if len(pp["units"]) > 1:
+                        cur_val = "单位不一致（不可比）"
+                else:
+                    cur_val = _num(pp["amount"], money=True) if pp["amount"] is not None else None
+                ws.cell(row=r, column=1, value=dir_zh.get(item["direction"], item["direction"]))
+                ws.cell(row=r, column=2, value=item["code"])
+                ws.cell(row=r, column=3, value=item["name"])
+                ws.cell(row=r, column=4, value=f"第{pno}期")
+                ws.cell(row=r, column=5, value=cur_val)
+                if prev is None:
+                    ws.cell(row=r, column=8, value="首期（无上期可比）")
+                else:
+                    if isinstance(cur_val, (int, float, Decimal)) and isinstance(prev, (int, float, Decimal)):
+                        ws.cell(row=r, column=6, value=prev)
+                        ws.cell(row=r, column=7, value=f"=E{r}-F{r}")
+                        if prev != 0:
+                            ws.cell(row=r, column=8, value=f'=IF(F{r}=0,"不可比",(E{r}-F{r})/F{r})')
+                            ws.cell(row=r, column=8).number_format = "0.00%"
+                        else:
+                            ws.cell(row=r, column=8, value="不可比（上期为 0）")
+                    else:
+                        ws.cell(row=r, column=6, value=prev if isinstance(prev, str) else None)
+                        ws.cell(row=r, column=7, value="待补资料")
+                        ws.cell(row=r, column=8, value="不可比")
+                if isinstance(cur_val, (int, float, Decimal)):
+                    ws.cell(row=r, column=5).number_format = MONEY_FMT
+                for c in (6, 7):
+                    ws.cell(row=r, column=c).number_format = MONEY_FMT
+                if isinstance(cur_val, (int, float, Decimal)):
+                    prev = cur_val
+                # 不可比/缺失期不作为比较基准（防污染下一期差异）
+                elif isinstance(cur_val, str) and "多价" not in cur_val and "不可比" not in cur_val:
+                    prev = None
         _autowidth(ws)
-    _ = periods
 
 
 def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction: str) -> dict[str, dict]:

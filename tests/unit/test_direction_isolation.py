@@ -10,7 +10,7 @@ import pytest
 
 from costguard.core.db import migrations
 from costguard.core.engine import crosscheck
-from costguard.core.engine.settlement_io import ensure_period, next_period_no
+from costguard.core.engine.settlement_io import ensure_period
 
 
 @pytest.fixture()
@@ -66,15 +66,14 @@ class TestEnsurePeriodDirectionIsolation:
         b = ensure_period(conn, pid, 1, "对上第1期（重复）", None, direction="upward")
         assert a == b
 
-    def test_next_period_no_independent_per_direction(self, db):
-        """期号递增语义确认：对上已有第1期时，对下第1期仍允许创建（编号序列按方向独立）。"""
+    def test_period_creation_after_up_period_one(self, db):
+        """对上已有第1期时，对下第1期仍允许创建（方向隔离的期次创建）。"""
         conn, pid = db
         ensure_period(conn, pid, 1, "对上第1期", None, direction="upward")
-        # 全项目口径的 next 仍是 2（用于未标记导入的兜底）
-        assert next_period_no(conn, pid) == 2
-        # 但对下方向创建第1期必须成功，不得被对上的期号挡住
         down_id = ensure_period(conn, pid, 1, "对下第1期", None, direction="downward")
         assert down_id
+        # 期号递增语义见 test_direction_residual.py::TestBlock3NextPeriodNo：
+        # next(up)=2、next(down)=1（按方向独立递增）
 
 
 class TestCrosscheckPeriodLocking:

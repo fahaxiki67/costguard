@@ -145,7 +145,7 @@ class WorkbenchPage(QWidget):
 
     def refresh_periods(self):
         rows = self.conn.execute(
-            """SELECT sp.period_no, sp.title, sp.direction, sp.contract_party,
+            """SELECT sp.id, sp.period_no, sp.title, sp.direction, sp.contract_party,
                SUM(CASE WHEN li.flags_json NOT LIKE '%"subtotal": true%' THEN 1 ELSE 0 END) AS items,
                SUM(CASE WHEN li.flags_json LIKE '%"subtotal": true%' THEN 1 ELSE 0 END) AS subs
                FROM settlement_periods sp LEFT JOIN line_items li ON li.period_id = sp.id
@@ -159,6 +159,8 @@ class WorkbenchPage(QWidget):
             vals = [r["period_no"], r["title"], direction, r["items"], r["subs"], r["contract_party"]]
             for c, v in enumerate(vals):
                 t.setItem(i, c, QTableWidgetItem(str(v if v is not None else "—")))
+            # 行必须绑定明确 period_id：对上/对下可同期号，按期号更新会双向覆盖
+            t.item(i, 0).setData(Qt.UserRole, int(r["id"]))
 
     def _import_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -238,21 +240,40 @@ class WorkbenchPage(QWidget):
         if row < 0:
             QMessageBox.information(self, "标记方向", "请先在表中选择期次")
             return
+        period_id = self.period_table.item(row, 0).data(Qt.UserRole)
+        if period_id is None:
+            QMessageBox.warning(self, "标记方向", "行缺少期次标识，请刷新后重试")
+            return
         pno = int(self.period_table.item(row, 0).text())
         direction = self.dir_combo.currentText()
-        direction = None if direction.startswith("（") else direction
-        dlg = ReasonDialog("标记期次方向", f"将第 {pno} 期方向标记为 {direction or '未标记'}", self)
+        # 未标记方向使用 schema 允许的明确值，不写 NULL
+        direction = "unknown" if direction.startswith("（") else direction
+        dir_zh = {"upward": "对上", "downward": "对下", "unknown": "未标记"}[direction]
+        dlg = ReasonDialog("标记期次方向", f"将第 {pno} 期方向标记为「{dir_zh}」", self)
         if dlg.exec() != QDialog.Accepted:
             return
+        import sqlite3 as _sq
+
         from costguard.core.evidence import audit as audit_log
 
         with self.conn:
-            self.conn.execute(
-                "UPDATE settlement_periods SET direction=? WHERE project_id=? AND period_no=?",
-                (direction, self.project.project_id, pno))
+            # 按 period_id 精确更新：同 period_no 的另一方向不受影响
+            try:
+                cur = self.conn.execute(
+                    "UPDATE settlement_periods SET direction=? WHERE id=?",
+                    (direction, period_id))
+            except _sq.IntegrityError:
+                # 目标方向同期号已有期次（v3 唯一约束）：友好拒绝，不做部分更新
+                QMessageBox.warning(
+                    self, "标记方向",
+                    f"第 {pno} 期在「{dir_zh}」方向已存在期次，无法重复标记。\n"
+                    "如需合并，请先人工核清两期数据。")
+                return
+            if cur.rowcount != 1:
+                raise RuntimeError(f"direction update affected {cur.rowcount} rows for period_id={period_id}")
         audit_log.record_audit(
-            self.conn, self.project.project_id, "user", "set_direction", f"period:{pno}",
-            None, {"direction": direction}, dlg.reason())
+            self.conn, self.project.project_id, "user", "set_direction", f"period:{period_id}",
+            None, {"direction": direction, "period_no": pno}, dlg.reason())
         self.refresh_periods()
 
     # ---------- 清单明细 ----------

@@ -62,7 +62,6 @@ def inspect_file(conn: sqlite3.Connection, project_id: int, pdir: Path,
                  copy: Path, test_id: str, purpose: str) -> dict:
     """单文件全流程，返回结构化记录。任何一步失败都记录而非中断。"""
     rec: dict = {"test_id": test_id, "copy": copy.name, "purpose": purpose}
-    suffix = copy.suffix.lower()
 
     # ---- 导入 ----
     from costguard.core.models.source_file import SourceFileError, import_file
@@ -93,12 +92,8 @@ def inspect_file(conn: sqlite3.Connection, project_id: int, pdir: Path,
                     for s in report.sheets
                 ],
             }
-            period_ids = [int(r["id"]) for r in conn.execute(
-                "SELECT DISTINCT sp.id FROM settlement_periods sp JOIN raw_sheets rs ON rs.period_id=sp.id"
-                " WHERE sp.project_id=?", (project_id,))]
         except Exception as exc:  # noqa: BLE001
             rec["settlement_parse"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            period_ids = []
 
         # ---- Decimal 复算 + 双路径 ----
         from costguard.core.engine import aggregate, crosscheck
@@ -116,8 +111,6 @@ def inspect_file(conn: sqlite3.Connection, project_id: int, pdir: Path,
         except Exception as exc:  # noqa: BLE001
             rec["decimal_recompute"] = {"error": f"{type(exc).__name__}: {exc}"}
         try:
-            pnos = [int(r["period_no"]) for r in conn.execute(
-                "SELECT DISTINCT period_no FROM settlement_periods WHERE project_id=?", (project_id,))]
             by_dir: dict[str, list[int]] = {}
             for r in conn.execute(
                 "SELECT period_no, direction FROM settlement_periods WHERE project_id=?", (project_id,)):
@@ -178,7 +171,6 @@ def main() -> None:
     # 全新测试项目
     if WORK.exists():
         shutil.rmtree(WORK)
-    project_dir = WORK / "真实资料验收项目"
     from costguard.core.models import project as pm
     info = pm.create_project("真实资料验收-私有副本", WORK)
     info, conn = pm.open_project(Path(info.workspace_path))

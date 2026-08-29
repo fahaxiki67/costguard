@@ -69,10 +69,13 @@ def load_sheet_grid(conn: sqlite3.Connection, sheet_id: int) -> tuple[dict, list
     return cells, merged, meta["n_rows"], meta["n_cols"]
 
 
-def next_period_no(conn: sqlite3.Connection, project_id: int) -> int:
+def next_period_no(conn: sqlite3.Connection, project_id: int,
+                   direction: str = "unknown") -> int:
+    """下一个可用期号——按方向独立递增（对上/对下各自有序）。"""
     row = conn.execute(
-        "SELECT COALESCE(MAX(period_no), 0) AS m FROM settlement_periods WHERE project_id=?",
-        (project_id,),
+        "SELECT COALESCE(MAX(period_no), 0) AS m FROM settlement_periods"
+        " WHERE project_id=? AND direction=?",
+        (project_id, direction),
     ).fetchone()
     return int(row["m"]) + 1
 
@@ -132,7 +135,7 @@ def import_settlement_file(
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
     if result.status != "ok":
-        fallback = file_period or next_period_no(conn, project_id)
+        fallback = file_period or next_period_no(conn, project_id, direction)
         return ImportReport(sf.file_id, None, fallback, -1, "failed", message=result.error)
 
     from costguard.core.parsing.excel_parser import persist_parse_result
@@ -158,19 +161,21 @@ def import_settlement_file(
 
         # ---- 逐 Sheet 期次判定 ----
         # 优先级：用户显式指定 > 文件名期号 > Sheet 名期号 > 递增。
-        # 文件名与 Sheet 名期号冲突时按文件名（导入语境更明确）并提示复核。
+        # 递增按导入 direction 独立（对上/对下各自有序）；文件名与 Sheet 名期号
+        # 冲突时按文件名（导入语境更明确）并提示复核。
         sheet_pno = guess_period_no_from_text(sheet.sheet_name) or guess_period_no_from_text(
             " ".join(t for (r, _c), t in sorted(cells.items()) if r <= 5)
         )
         notes: list[str] = []
         if used_increment:
-            pno = next_period_no(conn, project_id) if parsed_any else (file_period or sheet_pno or next_period_no(conn, project_id))
+            pno = (next_period_no(conn, project_id, direction) if parsed_any
+                   else (file_period or sheet_pno or next_period_no(conn, project_id, direction)))
         elif file_period is not None:
             pno = file_period
             if sheet_pno is not None and sheet_pno != file_period:
                 notes.append(f"Sheet 名期号({sheet_pno})与文件名期号({file_period})不一致，按文件名处理，请复核")
         else:
-            pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id)
+            pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id, direction)
         title = f"{src.stem}/{sheet.sheet_name}"
         period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
         with conn:

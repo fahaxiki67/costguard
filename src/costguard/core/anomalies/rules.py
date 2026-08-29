@@ -218,19 +218,23 @@ def rule_subtotal_vs_details(conn, project_id) -> list[Finding]:
 
 
 def rule_duplicates(conn, project_id) -> list[Finding]:
-    """重复清单（同期同编码同名多行）。"""
+    """重复清单（同一期次内同编码同名多行）。
+
+    键使用 period_id：对上/对下可存在相同期号，按期号会跨方向误报。
+    """
     out = []
     seen: dict[tuple, list] = {}
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]):
             continue
-        key = (r["pno"], r["code"] or "", (r["name"] or "").strip())
+        key = (r["period_id"], r["code"] or "", (r["name"] or "").strip())
         seen.setdefault(key, []).append(r)
-    for (pno, code, name), rows in seen.items():
+    for (period_id, code, name), rows in seen.items():
         if len(rows) > 1:
             out.append(Finding(
-                "duplicate_item", "medium", "period", rows[0]["period_id"],
-                f"第{pno}期「{name}」（编码 {code or '无'}）出现 {len(rows)} 行，请确认是否重复结算或分期计量",
+                "duplicate_item", "medium", "period", period_id,
+                f"{_dir_label(rows[0]['dir'])}第{rows[0]['pno']}期「{name}」"
+                f"（编码 {code or '无'}）出现 {len(rows)} 行，请确认是否重复结算或分期计量",
                 {"item_ids": [r["id"] for r in rows]},
             ))
     return out
