@@ -46,3 +46,8 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Qt 覆写方法使用 Qt 约定的驼峰命名
+"src/costguard/ui/*" = ["N802", "N803", "N806"]
+"tests/*" = ["N802"]

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv pip install -e ".[dev]" --system
+      - name: Lint
+        run: ruff check src tests
+      - name: Tests
+        run: python -m pytest tests/ -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Sensitive-data scan
+        run: |
+          # 真实工程资料/密钥不得进入仓库（AGENTS.md 第三节）
+          set -e
+          echo "== scanning tracked files =="
+          patterns='(\.pem|\.p12|\.pfx|\.key|\.mobileprovision|API_KEY|SECRET|PASSWORD|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)'
+          hits=$(git ls-files | grep -viE 'local_private_data' | xargs grep -lEI "$patterns" 2>/dev/null || true)
+          if [ -n "$hits" ]; then
+            echo "SENSITIVE PATTERNS FOUND:"; echo "$hits"; exit 1
+          fi
+          if git ls-files | grep -qE '^local_private_data/'; then
+            echo "local_private_data/ must never be tracked"; exit 1
+          fi
+          echo "clean"
