@@ -288,3 +288,101 @@ class TestBlock4Duplicates:
         add_item(conn, up1, "K1", "清单K", "5", "10", "50")
         f = rule_duplicates(conn, pid)
         assert len(f) == 1 and "重复" in f[0].message
+
+class TestRound3CodeFirstGrouping:
+    """二阶边界一：同码跨期改名必须仍是同一序列（code 优先口径）。"""
+
+    def test_renamed_code_still_compared(self, db):
+        conn, pid = db
+        up1 = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+        up2 = ensure_period(conn, pid, 2, "up2", None, direction="upward")
+        add_item(conn, up1, "K1", "旧名称", "10", "10", "100")
+        add_item(conn, up2, "K1", "新名称", "10", "12", "120")
+        wb = pytest.importorskip("openpyxl").Workbook()
+        wb.remove(wb.active)
+        export_diff_sheets(conn, pid, wb)
+        rows = _grid_rows(wb["单价差异表"])
+        # 第2期必须与第1期比较：上期 10、本期 12、差异公式存在
+        comp = [r for r in rows if str(r["期间"]) == "第2期"]
+        assert comp, f"第2期行缺失: {rows}"
+        r2 = comp[0]
+        assert r2["上期值"] == Decimal("10"), f"跨期改名被拆序列，第2期上期值={r2['上期值']}"
+        assert r2["本期值"] == Decimal("12")
+        assert isinstance(r2["差异"], str) and r2["差异"].startswith("="), "缺少差异公式"
+        # 名称变化可追溯：第1期展示旧名称，第2期行包含新名称
+        r1 = next(r for r in rows if str(r["期间"]) == "第1期")
+        assert r1["清单名称"] == "旧名称"
+        assert "新名称" in str(r2["清单名称"])
+        # 明确变更提示
+        assert "变更" in str(r2["清单名称"]), f"缺少名称变更提示: {r2['清单名称']}"
+
+
+class TestRound3BreakOnNoncomparable:
+    """二阶边界二：不可比/缺失期是断点，后续期不得跨越它强行比较。"""
+
+    def test_multi_price_period_breaks_chain(self, db):
+        """期1单价10、期2同组多价15/16、期3单价20：期3 不得与期1 比较。"""
+        conn, pid = db
+        up1 = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+        up2 = ensure_period(conn, pid, 2, "up2", None, direction="upward")
+        up3 = ensure_period(conn, pid, 3, "up3", None, direction="upward")
+        add_item(conn, up1, "K1", "清单K", "10", "10", "100")
+        add_item(conn, up2, "K1", "清单K", "5", "15", "75")
+        add_item(conn, up2, "K1", "清单K", "5", "16", "80")
+        add_item(conn, up3, "K1", "清单K", "10", "20", "200")
+        wb = pytest.importorskip("openpyxl").Workbook()
+        wb.remove(wb.active)
+        export_diff_sheets(conn, pid, wb)
+        rows = _grid_rows(wb["单价差异表"])
+        r3 = next(r for r in rows if str(r["期间"]) == "第3期")
+        # 第3期不得拿第1期当上期：无上期值、无差异公式
+        assert r3["上期值"] is None, f"第3期跨越多价期取到上期 {r3['上期值']}"
+        assert not (isinstance(r3["差异"], str) and r3["差异"].startswith("=")), \
+            f"第3期跨越不可比期产生差异公式: {r3['差异']}"
+        assert "首期" in str(r3.get("差异率", "")) or "待复核" in str(r3.get("差异率", "")), \
+            f"第3期应标注新首期/待复核: {r3}"
+        # 第2期明确标记不可比
+        r2 = next(r for r in rows if str(r["期间"]) == "第2期")
+        assert "不可比" in str(r2["差异"]) or "不可比" in str(r2["差异率"]) or "多价" in str(r2["本期值"])
+
+    def test_unit_inconsistent_period_breaks_chain(self, db):
+        """数量表：单位不一致期为断点。"""
+        conn, pid = db
+        up1 = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+        up2 = ensure_period(conn, pid, 2, "up2", None, direction="upward")
+        up3 = ensure_period(conn, pid, 3, "up3", None, direction="upward")
+        add_item(conn, up1, "K1", "清单K", "10", "10", "100", unit="m3")
+        add_item(conn, up2, "K1", "清单K", "10", "10", "100", unit="m2")
+        add_item(conn, up3, "K1", "清单K", "30", "10", "300", unit="m3")
+        wb = pytest.importorskip("openpyxl").Workbook()
+        wb.remove(wb.active)
+        export_diff_sheets(conn, pid, wb)
+        rows = _grid_rows(wb["工程量差异表"])
+        r3 = next(r for r in rows if str(r["期间"]) == "第3期")
+        assert r3["上期值"] is None, f"第3期跨越单位不一致期取到上期 {r3['上期值']}"
+        assert not (isinstance(r3["差异"], str) and r3["差异"].startswith("="))
+        r2 = next(r for r in rows if str(r["期间"]) == "第2期")
+        assert "不可比" in str(r2["本期值"]) or "不可比" in str(r2["差异"])
+
+    def test_missing_amount_period_breaks_chain(self, db):
+        """金额表：缺失金额期为断点（不补 0，不跨越）。"""
+        conn, pid = db
+        up1 = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+        up2 = ensure_period(conn, pid, 2, "up2", None, direction="upward")
+        up3 = ensure_period(conn, pid, 3, "up3", None, direction="upward")
+        add_item(conn, up1, "K1", "清单K", "10", "10", "100")
+        with conn:
+            conn.execute(
+                "INSERT INTO line_items(period_id, code, name, unit, quantity, amount, flags_json)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (up2, "K1", "清单K", "m3", "10", None, "{}"))  # 金额缺失
+        add_item(conn, up3, "K1", "清单K", "10", "10", "150")
+        wb = pytest.importorskip("openpyxl").Workbook()
+        wb.remove(wb.active)
+        export_diff_sheets(conn, pid, wb)
+        rows = _grid_rows(wb["金额差异表"])
+        r3 = next(r for r in rows if str(r["期间"]) == "第3期")
+        assert r3["上期值"] is None, f"第3期跨越缺失期取到上期 {r3['上期值']}"
+        assert not (isinstance(r3["差异"], str) and r3["差异"].startswith("="))
+        r2 = next(r for r in rows if str(r["期间"]) == "第2期")
+        assert r2["本期值"] is None, "缺失金额不得补 0"
