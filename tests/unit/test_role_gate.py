@@ -338,3 +338,14 @@ class TestRound9DocumentSemantics:
                                 "non_settlement_form") for s in report.sheets), \
             f"文档级语义门控应挡整文件: {[x.status for x in report.sheets]}"
         assert _counts(conn)["line_items"] == 0
+
+
+class TestRound9EnglishNames:
+    def test_english_summary_filename_gated(self, db):
+        """英文文件名语义（resource_summary 等）同样触发文档级门控。"""
+        conn, pid, tmp = db
+        src = tmp / "R99_resource_summary.xlsx"
+        make_mixed_named_summary(src)
+        report = settlement_io.import_settlement_file(conn, pid, tmp, src)
+        assert report.needs_manual_review
+        assert _counts(conn)["line_items"] == 0

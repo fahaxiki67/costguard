@@ -43,7 +43,7 @@ _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
 # - det.needs_review 一律不写 canonical（歧义/低置信未经人工确认不得进入结算模型）；
 # - sheet 名/document 语义门控：汇总/核销/台账类 sheet 即使强表头也需角色确认；
 # - 无行数护栏（600 行合法大结算必须解析，判断不按大小）。
-SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账")
+SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账|summary|reconciliation|ledger", re.IGNORECASE)
 
 
 def _cn_to_int(s: str) -> int:
