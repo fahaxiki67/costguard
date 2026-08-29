@@ -246,14 +246,6 @@ class TestPureFormProjectHandling:
             w.writeheader()
             w.writerows(rows)
 
-        # 拦截：表单项目不得调用 aggregate/anomaly/matching/export
-        import scripts.real_acceptance_run as runner_mod
-        calls = []
-        from costguard.core.engine import aggregate as agg_mod
-        monkeypatch.setattr(agg_mod.aggregate_project,
-                            "__wrapped__", agg_mod.aggregate_project, raising=False)
-        orig = runner_mod.inspect_file
-
         runner.main()
         runs = sorted((base / "work").glob("run_*"))
         t01 = json.loads((runs[-1] / "done" / "T01.json").read_text(encoding="utf-8"))
