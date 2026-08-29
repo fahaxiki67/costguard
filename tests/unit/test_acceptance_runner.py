@@ -148,6 +148,11 @@ class TestFormRouting:
                 f"表单 sheet 应路由为 non_settlement_form，得到 {form_sheet.status}"
             assert any("人工" in n or "表单" in n for n in form_sheet.notes), \
                 f"必须给出可恢复的人工复核提示: {form_sheet.notes}"
+            joined = "".join(form_sheet.notes)
+            assert "通用 evidence 人工复核入口" in joined, \
+                f"notes 必须指向通用 evidence 人工复核入口: {joined}"
+            assert "合同" not in joined and "contract" not in joined.lower(), \
+                f"notes 不得暗示写入合同模型: {joined}"
 
             # 结算与合同模型全部零污染（contract_docs/facts 是合同模块专用，
             # 表单路由不得写入，否则 contract_risks 会产生虚假合同风险）
@@ -255,6 +260,11 @@ class TestPureFormProjectHandling:
         assert steps.get("full_pipeline") is False
         for k in ("compute", "anomalies", "matches", "excel", "word"):
             assert steps.get(k) is False, f"纯表单 steps.{k} 必须为 False: {steps}"
+        # 口径：settlement parse 仅在 report.status=='ok' 时算成功；
+        # 纯表单 partial 不得计入 parse
+        assert steps.get("parse") is False, f"纯表单 partial 不得计入 parse: {steps}"
+        assert (t01.get("settlement_parse") or {}).get("ok") is False, \
+            "settlement_parse.ok 必须仅在 status=='ok' 时为 True"
 
         # ImportReport 状态：纯表单 = partial 且 needs_manual_review（非 ok 非普通 failed）
         rec = t01

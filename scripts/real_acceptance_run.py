@@ -84,7 +84,9 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
                 report = settlement_io.import_settlement_file(
                     conn, info.project_id, pdir, copy)
                 rec["settlement_parse"] = {
-                    "ok": report.status != "failed",
+                    # 口径：仅 status=='ok'（真实清单解析成功）算 parse 成功；
+                    # partial（纯表单待人工）/failed 均不算（监督第七轮）
+                    "ok": report.status == "ok",
                     "status": report.status,
                     "needs_manual_review": bool(getattr(report, "needs_manual_review", False)),
                     "sheets": [

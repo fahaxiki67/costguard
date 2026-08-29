@@ -217,8 +217,8 @@ def import_settlement_file(
                 _route_form_sheet(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name, cells)
                 report.sheets.append(SheetReport(
                     sheet.sheet_name, "non_settlement_form",
-                    notes=["检测为键值对表单（非结算清单）：已按待人工复核的表单事实候选记录，"
-                           "保留原 Sheet 与单元格；请人工确认后使用合同/文本事实复核入口"]))
+                    notes=["检测为键值对表单（非结算清单）：已按待人工复核的表单字段候选记录，"
+                           "保留原 Sheet 与单元格；请人工确认后使用通用 evidence 人工复核入口"]))
                 form_routed = True
             else:
                 report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
