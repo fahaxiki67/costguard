@@ -251,7 +251,7 @@ def detect_form_like(cells: dict[tuple[int, int], str], merged_ranges: list[str]
             w in joined for w in ("清单编码", "清单名称", "合价", "综合单价")
         ):
             kv_rows += 1
-    if kv_rows >= 3:
+    if kv_rows >= 3 and kv_rows * 2 >= data_rows:  # 键值行占多数（结算表标题键值行占比低）
         return True
     if len(merged_ranges) >= 3 and data_rows <= 20:
         return True

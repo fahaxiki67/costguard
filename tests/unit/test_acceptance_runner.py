@@ -1,10 +1,14 @@
-"""验收执行器非破坏性 + 人工映射入口 + 表单类检测（监督第五轮，先红后绿）。
+"""验收执行器非破坏性 + 表单路由（监督第五/六/七轮，先红后绿）。
 
-1) runner 必须使用时间戳 run 目录：重复运行不得覆盖/删除既有 run 结果（基线保留）；
-2) 人工列映射入口：表头识别失败（如键值对表单）时，允许人工指定 col_map 抽取，
-   并写审计留痕（可恢复，不是死路）；
-3) 表单类结构（键值对 + 合并单元格）必须给出可恢复的诊断提示。
+1) runner 必须使用时间戳 run 目录（微秒唯一，同秒碰撞安全）：重复运行不得
+   覆盖/删除既有 run 结果（基线保留）；支持可恢复续跑且不破坏未完成现场；
+2) 键值对表单（支付审批单类）路由为 non_settlement_form 待人工状态：
+   绝不写入 settlement/contract 模型；候选仅存通用 evidence 表；
+   纯表单导入归类为 partial/needs_manual_review，不进入结算计算与导出；
+3) steps.compute 必须反映真实计算（有 groups/checks/复算结果），不得用
+   解析成功代替。
 """
+import json
 from pathlib import Path
 
 import pytest
@@ -25,7 +29,7 @@ def _make_form_workbook(path: Path) -> None:
         ("申请单位名称：", None, "甲单位（脱敏）"),  # 键带冒号 + 值在右侧第2列（间隔布局）
         ("合同名称", "某工程（脱敏）"),
         ("合同编号", "HZ-001"),
-        ("收款单位信息", "名称", "乙单位（脱敏）"),
+        ("收款方信息", "户名", "乙单位（脱敏）"),
         ("", "开户行", "某银行"),
         ("本次申请支付金额", None, "1,000,000.00"),  # 金额在 C 列（col3）
     ]
@@ -218,3 +222,103 @@ class TestFormRouting:
         plain = next(s for s in result.sheets if s.sheet_name == "VYSMSZ")
         plain_cells = {(c.row, c.col): (c.raw_value or "") for c in plain.cells}
         assert detect_form_like(plain_cells, plain.merged_ranges) is False
+
+class TestPureFormProjectHandling:
+    def test_pure_form_project_partial_and_skips_settlement_pipeline(self, runner_env, monkeypatch):
+        """纯表单项目：status=partial（非 ok/failed），不进计算/异常/匹配/导出，
+        steps 单列 non_settlement_form_needs_manual_review，full_pipeline=False。"""
+        runner, base = runner_env
+        # T01 换成纯表单，其余 simple 清单
+        manifest_t01 = base / "corpus" / "T01_sample.xlsx"
+        _make_form_workbook(manifest_t01)
+        import csv
+
+        rows = []
+        for i in range(1, 14):
+            src = base / "corpus" / f"T{i:02d}_sample.xlsx"
+            rows.append({
+                "test_id": f"T{i:02d}", "source_path": f"orig/T{i:02d}",
+                "copy_path": f"corpus/T{i:02d}_sample.xlsx",
+                "sha256": runner.sha256_of(src), "purpose": "脱敏回归",
+            })
+        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
+            w.writeheader()
+            w.writerows(rows)
+
+        # 拦截：表单项目不得调用 aggregate/anomaly/matching/export
+        import scripts.real_acceptance_run as runner_mod
+        calls = []
+        from costguard.core.engine import aggregate as agg_mod
+        monkeypatch.setattr(agg_mod.aggregate_project,
+                            "__wrapped__", agg_mod.aggregate_project, raising=False)
+        orig = runner_mod.inspect_file
+
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        t01 = json.loads((runs[-1] / "done" / "T01.json").read_text(encoding="utf-8"))
+        steps = t01.get("steps", {})
+        assert steps.get("non_settlement_form_needs_manual_review") is True, \
+            f"纯表单必须单列 needs_manual_review: {steps}"
+        assert steps.get("full_pipeline") is False
+        for k in ("compute", "anomalies", "matches", "excel", "word"):
+            assert steps.get(k) is False, f"纯表单 steps.{k} 必须为 False: {steps}"
+
+        # ImportReport 状态：纯表单 = partial 且 needs_manual_review（非 ok 非普通 failed）
+        rec = t01
+        sp = rec.get("settlement_parse") or {}
+        assert sp.get("status") == "partial", f"纯表单导入状态应为 partial: {sp}"
+        assert sp.get("needs_manual_review") is True
+
+
+class TestInterruptSafety:
+    def test_interrupted_site_preserved_on_rerun(self, runner_env):
+        """中断续跑不得删除未完成现场：旧项目目录保留，新目录带序号生成。"""
+        runner, base = runner_env
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        first = runs[-1]
+        # 模拟中断：T13 无 done marker，且项目目录留有现场标记
+        (first / "done" / "T13.json").unlink(missing_ok=True)
+        site = first / "验收-T13"
+        site.mkdir(exist_ok=True)
+        (site / "interrupted.marker").write_text("现场")
+        # 删除另一个 test 的 marker 模拟两个未完成
+        (first / "done" / "T12.json").unlink(missing_ok=True)
+
+        runner.main(run_dir=first)  # 续跑
+        # T13 旧现场必须保留（不得 rmtree）
+        assert (site / "interrupted.marker").exists(), "中断现场被删除"
+        # 重跑生成新目录（带序号），不覆盖旧目录
+        new_dirs = sorted(first.glob("验收-T13*"))
+        assert len(new_dirs) >= 2 and new_dirs[-1].name != "验收-T13"
+
+
+class TestRunDirUniqueness:
+    def test_same_second_runs_both_kept(self, runner_env):
+        """同一秒连续两次运行：两个 run 目录都必须保留（微秒/唯一后缀）。"""
+        runner, base = runner_env
+        runner.main()
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        assert len(runs) == 2, f"同秒两次运行应产生 2 个 run 目录: {runs}"
+
+
+class TestComputeTruthfulness:
+    def test_compute_false_when_all_computation_fails(self, runner_env, monkeypatch):
+        """steps.compute 必须反映真实计算：groups 与 checks 全部失败时 compute=False
+        （不得用解析成功代替）。"""
+        runner, base = runner_env
+        from costguard.core.engine import aggregate as agg_mod
+        from costguard.core.engine import crosscheck as cc_mod
+
+        def boom(*a, **k):
+            raise RuntimeError("computation broken")
+        monkeypatch.setattr(agg_mod, "aggregate_project", boom)
+        monkeypatch.setattr(cc_mod, "run_crosscheck", boom)
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        t02 = json.loads((runs[-1] / "done" / "T02.json").read_text(encoding="utf-8"))
+        steps = t02.get("steps", {})
+        assert steps.get("compute") is False, \
+            f"复算失败时 compute 必须为 False: {steps}（不得用解析成功代替）"

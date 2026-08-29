@@ -52,10 +52,14 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
     from costguard.core.models import project as pm
     from costguard.core.models.source_file import SourceFileError, import_file
 
+    # 中断安全：旧现场一律保留，重试目录带序号（验收-<tid>、_r2、_r3…）
     target = project_parent / f"验收-{test_id}"
     if target.exists():
-        shutil.rmtree(target)
-    info = pm.create_project(f"验收-{test_id}", project_parent)
+        n = 2
+        while (project_parent / f"验收-{test_id}_r{n}").exists():
+            n += 1
+        target = project_parent / f"验收-{test_id}_r{n}"
+    info = pm.create_project(target.name, project_parent)
     info, conn = pm.open_project(Path(info.workspace_path))
     pdir = Path(info.workspace_path)
     rec["project"] = pdir.name
@@ -82,6 +86,7 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
                 rec["settlement_parse"] = {
                     "ok": report.status != "failed",
                     "status": report.status,
+                    "needs_manual_review": bool(getattr(report, "needs_manual_review", False)),
                     "sheets": [
                         {"name": s.sheet_name, "status": s.status, "n_items": s.n_items,
                          "n_subtotal": s.n_subtotal, "confidence": s.confidence,
@@ -91,6 +96,13 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
                 }
             except Exception as exc:  # noqa: BLE001
                 rec["settlement_parse"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                return rec
+
+            if getattr(report, "needs_manual_review", False):
+                # 纯表单文件：不进入结算计算/异常/匹配/导出（监督 A）
+                rec["form_route"] = {"needs_manual_review": True,
+                                     "sheets": [x.sheet_name for x in report.sheets
+                                                if x.status == "non_settlement_form"]}
                 return rec
 
             # ---- Decimal 复算（独立路径 1：清洗后明细累计）----
@@ -222,7 +234,7 @@ def main(run_dir: Path | None = None) -> None:
             shutil.move(str(d), str(baseline / d.name))
 
     if run_dir is None:
-        run_dir = WORK / f"run_{now.strftime('%Y%m%d_%H%M%S')}"
+        run_dir = WORK / f"run_{now.strftime('%Y%m%d_%H%M%S_%f')}"  # 微秒防同秒碰撞
     run_dir = Path(run_dir)
     (run_dir / "done").mkdir(parents=True, exist_ok=True)
 
@@ -241,13 +253,18 @@ def main(run_dir: Path | None = None) -> None:
         result["steps"] = {
             "import": bool(imp.get("ok")),
             "parse": bool((sp or {}).get("ok") or (tp or {}).get("ok")),
-            "compute": bool(result.get("decimal_recompute", {}).get("n_groups")
-                            or (sp or {}).get("ok")),
+            "compute": bool(
+                (result.get("decimal_recompute") or {}).get("n_groups")
+                and result["decimal_recompute"]["n_groups"] > 0
+            ) or bool(isinstance(result.get("dual_path_check"), list)
+                      and result["dual_path_check"]),
             "anomalies": "total" in (result.get("anomalies") or {}),
             "matches": "total" in (result.get("matches") or {}),
             "excel": "xlsx" in (result.get("export") or {}),
             "word": "docx" in (result.get("export") or {}),
             "wps": "pending_manual",  # WPS 实际打开为人工门槛
+            "non_settlement_form_needs_manual_review": bool(
+                (result.get("form_route") or {}).get("needs_manual_review")),
             "full_pipeline": bool(
                 imp.get("ok") and (sp or {}).get("ok")
                 and result.get("export", {}).get("xlsx")

@@ -34,6 +34,7 @@ class ImportReport:
     status: str  # 'ok' | 'partial' | 'failed'
     sheets: list[SheetReport] = field(default_factory=list)
     message: str = ""
+    needs_manual_review: bool = False
 
 
 _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
@@ -208,10 +209,10 @@ def import_settlement_file(
         det = detect_header(sheet.sheet_index, cells, merged, n_rows, sheet.n_cols)
         from costguard.core.parsing.header_detect import detect_form_like
 
-        # 保守路由：无表头、或表头低置信(needs_review)且呈键值对表单结构时，
-        # 一律按非结算表单处理（宁可待人工，不误入结算模型）。
-        form_like = detect_form_like(cells, merged)
-        if det is None or (det.needs_review and form_like):
+        # 保守路由：仅当完全没有列式表头时才做表单检测。
+        # needs_review 的清单表保留原抽取路径（进人工复核队列），防止误吞真实低置信清单。
+        form_like = det is None and detect_form_like(cells, merged)
+        if det is None:
             if form_like:
                 _route_form_sheet(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name, cells)
                 report.sheets.append(SheetReport(
@@ -219,8 +220,8 @@ def import_settlement_file(
                     notes=["检测为键值对表单（非结算清单）：已按待人工复核的表单事实候选记录，"
                            "保留原 Sheet 与单元格；请人工确认后使用合同/文本事实复核入口"]))
                 form_routed = True
-                continue
-            report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
+            else:
+                report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
             continue
         items = extract_items.extract_items(cells, merged, det, n_rows)
         if not items:
@@ -267,14 +268,19 @@ def import_settlement_file(
                 confidence=det.confidence, notes=det.notes + notes,
             )
         )
-    if form_routed:
-        report.status = "ok"
     report.period_id = next(iter(period_ids), -1)
     report.period_no = min(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
          for pid in period_ids), default=0,
     )
-    report.status = "ok" if parsed_any else "failed"
-    if not parsed_any:
+    if parsed_any:
+        report.status = "ok"
+    elif form_routed:
+        # 纯表单：不是结算解析成功，也不是普通失败——待人工复核
+        report.status = "partial"
+        report.needs_manual_review = True
+        report.message = "non_settlement_form_needs_manual_review"
+    else:
+        report.status = "failed"
         report.message = "no sheets parsed"
     return report
