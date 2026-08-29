@@ -136,7 +136,7 @@ class TestExcelExport:
             if attempt > 1:
                 import time
 
-                time.sleep((attempt - 1))  # 退避 1s / 2s，穿过竞态窗口
+                time.sleep(attempt - 1)  # 退避 1s / 2s，穿过竞态窗口
             env = dict(os.environ)
             env["__CFBundleIdentifier"] = f"org.costguard.headless.{os.getpid()}.{attempt}"
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240,
