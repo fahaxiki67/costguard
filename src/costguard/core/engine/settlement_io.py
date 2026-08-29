@@ -109,6 +109,60 @@ def ensure_period(
         return int(cur.lastrowid)
 
 
+def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
+                      sheet_id: int, sheet_name: str,
+                      cells: dict[tuple[int, int], str]) -> None:
+    """键值对表单 → 待人工确认的证据候选（仅通用 evidence 表 + 审计）。
+
+    纪律（监督第六轮）：
+    - 不写 settlement_period / line_items / period_totals（防污染结算模型）；
+    - 不写 contract_docs / contract_facts（合同模块专用，避免虚假合同风险）；
+    - 每条候选 = 一条 evidence（kind='form_field_candidate'，sources 含
+      file_id/sheet_id/行列/原文，summary 明确待人工确认）+ audit 留痕；
+    - 不新建数据库迁移。
+    """
+    import re
+
+    from costguard.core.evidence import audit as audit_log
+    from costguard.core.evidence import evidence as evidence_api
+
+    kv_pairs = []
+    max_col = max(c for _r, c in cells) if cells else 0
+    for (row, col), text in sorted(cells.items()):
+        t = (text or "").strip()
+        m = re.match(r"^(.{2,24}?)[：:]\s*(.+)$", t)
+        if m and not any(w in t for w in ("清单编码", "清单名称", "合价")):
+            kv_pairs.append((m.group(1).strip(), m.group(2).strip(), row, col, t))
+            continue
+        # 键列 + 同行右侧第一个非空格作为值（间隔布局）。
+        # 标签先去掉尾部冒号再匹配后缀——"申请单位名称："不能因冒号而漏掉。
+        label = t.rstrip("：:")
+        if t and len(label) <= 24 and not any(
+            w in t for w in ("清单编码", "清单名称", "合价")
+        ) and (label.endswith("名称") or label.endswith("行") or label.endswith("编号")
+               or label.endswith("信息") or label.endswith("金额")):
+            value_col, nxt = next(
+                ((c2, cells.get((row, c2), "").strip())
+                 for c2 in range(col + 1, max_col + 1)
+                 if cells.get((row, c2), "").strip()),
+                (None, ""))
+            if value_col is not None and nxt:
+                # 位置记真实值列（可反向定位到原格），不是 col+1
+                kv_pairs.append((label, nxt, row, value_col, f"{t} {nxt}"))
+    for key, value, row, col, quote in kv_pairs[:40]:
+        evidence_api.add_evidence(
+            conn, project_id, "form_field_candidate",
+            f"表单字段候选（待人工确认）：{key} = {value[:60]}",
+            steps=[{"step": "表单路由", "sheet": sheet_name, "status": "待人工确认"}],
+            sources=[{"file_id": file_id, "sheet_id": sheet_id,
+                      "location": f"行{row}列{col}", "quote": quote[:120]}],
+        )
+    audit_log.record_audit(
+        conn, project_id, "system", "route_non_settlement_form", f"sheet:{sheet_id}",
+        None, {"sheet": sheet_name, "n_candidates": len(kv_pairs[:40])},
+        "键值对表单路由：保留原 Sheet，字段候选存证据表待人工复核，未进入结算与合同模型")
+
+
 def guess_period_no_from_text(text: str) -> int | None:
     m = _PERIOD_RE.search(text or "")
     return _cn_to_int(m.group(1)) if m else None
@@ -144,6 +198,7 @@ def import_settlement_file(
 
     report = ImportReport(sf.file_id, batch_id, file_period or 0, -1, "partial")
     parsed_any = False
+    form_routed = False
     period_ids: set[int] = set()
     for sheet in result.sheets:
         sheet_id = conn.execute(
@@ -151,7 +206,20 @@ def import_settlement_file(
         ).fetchone()["id"]
         cells, merged, n_rows, _ = load_sheet_grid(conn, sheet_id)
         det = detect_header(sheet.sheet_index, cells, merged, n_rows, sheet.n_cols)
-        if det is None:
+        from costguard.core.parsing.header_detect import detect_form_like
+
+        # 保守路由：无表头、或表头低置信(needs_review)且呈键值对表单结构时，
+        # 一律按非结算表单处理（宁可待人工，不误入结算模型）。
+        form_like = detect_form_like(cells, merged)
+        if det is None or (det.needs_review and form_like):
+            if form_like:
+                _route_form_sheet(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name, cells)
+                report.sheets.append(SheetReport(
+                    sheet.sheet_name, "non_settlement_form",
+                    notes=["检测为键值对表单（非结算清单）：已按待人工复核的表单事实候选记录，"
+                           "保留原 Sheet 与单元格；请人工确认后使用合同/文本事实复核入口"]))
+                form_routed = True
+                continue
             report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
             continue
         items = extract_items.extract_items(cells, merged, det, n_rows)
@@ -199,6 +267,8 @@ def import_settlement_file(
                 confidence=det.confidence, notes=det.notes + notes,
             )
         )
+    if form_routed:
+        report.status = "ok"
     report.period_id = next(iter(period_ids), -1)
     report.period_no = min(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]

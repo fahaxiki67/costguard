@@ -221,3 +221,38 @@ def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
             if text.endswith(w) and not _SUBTOTAL_TRIM.sub("", text[: -len(w)]):
                 return True
     return False
+
+
+def detect_form_like(cells: dict[tuple[int, int], str], merged_ranges: list[str]) -> bool:
+    """检测键值对表单结构（如支付审批单：'申请单位名称：X'、'开户行' '某银行'）。
+
+    启发式（保守，避免误伤普通结算表）：
+    - 网格中"键：值"形态（单元格含冒号）的行 ≥ 3；或
+    - 合并单元格密集（≥3）且无词典命中的短表（≤30 行）。
+    普通结算表标题行虽含冒号，但占比低、行数多，不会命中。
+    """
+    if not cells:
+        return False
+    max_row = max(r for r, _c in cells)
+    if max_row > 30:
+        return False
+    kv_rows = 0
+    data_rows = 0
+    row_texts: dict[int, list[str]] = {}
+    for (r, _c), text in cells.items():
+        t = (text or "").strip()
+        if not t:
+            continue
+        row_texts.setdefault(r, []).append(t)
+    for texts in row_texts.values():
+        data_rows += 1
+        joined = "".join(texts)
+        if ("：" in joined or ":" in joined) and not any(
+            w in joined for w in ("清单编码", "清单名称", "合价", "综合单价")
+        ):
+            kv_rows += 1
+    if kv_rows >= 3:
+        return True
+    if len(merged_ranges) >= 3 and data_rows <= 20:
+        return True
+    return False

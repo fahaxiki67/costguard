@@ -15,9 +15,7 @@ import csv
 import hashlib
 import json
 import shutil
-import sqlite3
 from datetime import datetime
-from decimal import Decimal
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parents[1] / "local_private_data" / "real_acceptance"
@@ -47,17 +45,17 @@ def verify_corpus(records: list[dict]) -> list[dict]:
     return out
 
 
-def inspect_file(test_id: str, purpose: str, copy: Path) -> dict:
-    """单文件独立项目全流程。任何一步失败都记录而非中断。"""
+def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -> dict:
+    """单文件独立项目全流程（项目建在 run 目录内）。任何一步失败都记录而非中断。"""
     rec: dict = {"test_id": test_id, "copy": copy.name, "purpose": purpose}
 
     from costguard.core.models import project as pm
     from costguard.core.models.source_file import SourceFileError, import_file
 
-    target = WORK / test_id
+    target = project_parent / f"验收-{test_id}"
     if target.exists():
         shutil.rmtree(target)
-    info = pm.create_project(f"验收-{test_id}", WORK)
+    info = pm.create_project(f"验收-{test_id}", project_parent)
     info, conn = pm.open_project(Path(info.workspace_path))
     pdir = Path(info.workspace_path)
     rec["project"] = pdir.name
@@ -150,18 +148,26 @@ def inspect_file(test_id: str, purpose: str, copy: Path) -> dict:
                 levels[g.level] = levels.get(g.level, 0) + 1
             rec["matches"] = {"total": len(groups), **levels}
 
-            # ---- 导出 ----
+            # ---- 导出（Excel 审核底稿 + Word 管理层摘要）----
             from costguard.core.export import excel_export
             try:
                 xlsx = excel_export.export_workbook(conn, info.project_id, pdir / "exports")
                 rec["export"] = {"xlsx": xlsx.name}
             except Exception as exc:  # noqa: BLE001
                 rec["export"] = {"error": f"{type(exc).__name__}: {exc}"}
+                return rec
+            try:
+                docx = excel_export.export_management_summary_docx(
+                    conn, info.project_id, pdir / "exports")
+                rec["export"]["docx"] = docx.name
+            except Exception as exc:  # noqa: BLE001
+                rec["export"]["docx_error"] = f"{type(exc).__name__}: {exc}"
             return rec
 
         # ---- 合同/文本解析（docx/pdf/txt）----
         if sf.file_type in ("docx", "pdf", "txt"):
-            from costguard.core.contracts import docx_parser, extract as contract_extract
+            from costguard.core.contracts import docx_parser
+            from costguard.core.contracts import extract as contract_extract
             try:
                 paras = docx_parser.parse_contract(stored, sf.file_type)
                 facts = contract_extract.extract_facts(paras)
@@ -188,7 +194,14 @@ def inspect_file(test_id: str, purpose: str, copy: Path) -> dict:
         conn.close()
 
 
-def main() -> None:
+def main(run_dir: Path | None = None) -> None:
+    """非破坏性验收执行：时间戳 run 目录 + 可恢复重跑。
+
+    - 每次运行写入 work/run_<时间戳>/，既有 run 与基线绝不覆盖/删除；
+    - 传入 run_dir（或目录已存在）时为续跑：已完成 test_id 跳过；
+    - 旧版平铺 work/ 结构首次自动归档为 work/baseline_<stamp>/（mv，非删除）。
+    """
+
     now = datetime.now()
     with open(MANIFEST, encoding="utf-8") as f:
         records_raw = list(csv.DictReader(f))
@@ -198,13 +211,50 @@ def main() -> None:
     bad = [r for r in pre if not r["hash_match"] or not r["exists"]]
     assert not bad, f"哈希不符或缺失: {[r['test_id'] for r in bad]}"
 
-    if WORK.exists():
-        shutil.rmtree(WORK)
+    WORK.mkdir(parents=True, exist_ok=True)
+    # 旧版平铺结构一次性归档（mv 保留，不删除）
+    legacy = [d for d in WORK.iterdir()
+              if d.is_dir() and not d.name.startswith(("run_", "baseline_"))]
+    if legacy and not run_dir:
+        baseline = WORK / f"baseline_{now.strftime('%Y%m%d_%H%M%S')}"
+        baseline.mkdir()
+        for d in legacy:
+            shutil.move(str(d), str(baseline / d.name))
+
+    if run_dir is None:
+        run_dir = WORK / f"run_{now.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = Path(run_dir)
+    (run_dir / "done").mkdir(parents=True, exist_ok=True)
 
     results = []
     for rec in pre:
+        done_marker = run_dir / "done" / f"{rec['test_id']}.json"
+        if done_marker.exists():  # 可恢复重跑：跳过已完成
+            results.append(json.loads(done_marker.read_text(encoding="utf-8")))
+            continue
         copy = BASE / rec["copy_path"]
-        result = inspect_file(rec["test_id"], rec["purpose"], copy)
+        result = inspect_file(rec["test_id"], rec["purpose"], copy, run_dir)
+        # 分步状态（监督要求分列，文本只解析不算完整流程成功）
+        imp = result.get("import", {})
+        sp = result.get("settlement_parse")
+        tp = result.get("text_parse")
+        result["steps"] = {
+            "import": bool(imp.get("ok")),
+            "parse": bool((sp or {}).get("ok") or (tp or {}).get("ok")),
+            "compute": bool(result.get("decimal_recompute", {}).get("n_groups")
+                            or (sp or {}).get("ok")),
+            "anomalies": "total" in (result.get("anomalies") or {}),
+            "matches": "total" in (result.get("matches") or {}),
+            "excel": "xlsx" in (result.get("export") or {}),
+            "word": "docx" in (result.get("export") or {}),
+            "wps": "pending_manual",  # WPS 实际打开为人工门槛
+            "full_pipeline": bool(
+                imp.get("ok") and (sp or {}).get("ok")
+                and result.get("export", {}).get("xlsx")
+                and result.get("export", {}).get("docx")),
+        }
+        done_marker.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                               encoding="utf-8")
         results.append(result)
 
     post = verify_corpus(records_raw)
@@ -212,20 +262,20 @@ def main() -> None:
 
     report = {
         "generated_at": now.isoformat(timespec="seconds"),
+        "run_dir": str(run_dir),
         "hash_check": {"before_all_match": all(r["hash_match"] for r in pre),
                        "after_all_match": all(r["hash_match"] for r in post),
                        "modified_copies": modified},
         "per_file": results,
     }
-    (BASE / "acceptance_results.json").write_text(
+    (run_dir / "acceptance_results.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    ok_files = sum(1 for r in results
-                   if (r.get("import") or {}).get("ok")
-                   and (r.get("settlement_parse", r.get("text_parse")) or {}).get("ok", False))
+    full = sum(1 for r in results if (r.get("steps") or {}).get("full_pipeline"))
     print(json.dumps({
+        "run_dir": str(run_dir),
         "hash_ok": report["hash_check"],
         "files_import_ok": sum(1 for r in results if (r.get("import") or {}).get("ok")),
-        "files_fully_ok": ok_files,
+        "files_full_pipeline": full,
         "files_total": len(results),
     }, ensure_ascii=False, indent=2))
 
