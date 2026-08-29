@@ -128,7 +128,7 @@ def _import(db, name_maker):
     conn, pid, tmp = db
     src = tmp / "in.xlsx"
     name_maker(src)
-    info = pm.ProjectInfo(pid, "g", str(tmp), 1, "2026")
+    _info = pm.ProjectInfo(pid, "g", str(tmp), 1, "2026")
     report = settlement_io.import_settlement_file(conn, pid, tmp, src)
     return conn, pid, report
 
