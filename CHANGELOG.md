@@ -44,6 +44,14 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
   longer claims full traceability without an evidence entry (points to the
   Excel evidence index instead); synthetic-data disclaimer added
 
+### Fixed (environment)
+- LibreOffice.app on the dev machine had a broken installation (codesign
+  "sealed resource invalid": main bundle + soffice binary + Python framework;
+  LO python SIGKILL/segfault) — root cause of the intermittent headless
+  SIGABRT (rc -6/134) in the recalc test. Reinstalled via
+  `brew reinstall --cask libreoffice` (26.2.5.2 -> 26.8.0.3): codesign clean,
+  conversion smoke OK, recalc test 5/5, full suite 2x152+1skip green.
+
 ### Testing
 - 129 tests + 1 explicit skip: WPS has no headless xlsx recalc CLI (wpscli is
   PDF-conversion only) — real-engine recalculation is verified via LibreOffice
