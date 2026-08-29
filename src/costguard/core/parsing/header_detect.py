@@ -255,23 +255,6 @@ def detect_form_like(cells: dict[tuple[int, int], str],
         return "weak"
     return None
 
-def data_rows_range(cells: dict[tuple[int, int], str], det: HeaderDetection,
-                    max_row: int) -> tuple[int, int]:
-    """数据行区间：表头下一行 → 最后一个非空行。"""
-    anchors = build_anchor_map([])  # 数据行不需要锚点回填
-    start = det.header_row_hi + 1
-    end = start - 1
-    for r in range(start, max_row + 1):
-        row_has_data = any(_cell_text(cells, r, c, anchors) for c in range(1, max_col_of(cells) + 1))
-        if row_has_data:
-            end = r
-    return (start, end) if end >= start else (start, start - 1)
-
-
-def max_col_of(cells: dict[tuple[int, int], str]) -> int:
-    return max((c for (_, c) in cells), default=0)
-
-
 _SUBTOTAL_TRIM = re.compile(
     r"[\s0-9一二三四五六七八九十\.、（）()\-—:：,，ⅠⅡⅢ]+|部分|章|节|类|段"
 )
