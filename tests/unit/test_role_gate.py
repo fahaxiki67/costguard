@@ -179,7 +179,11 @@ class TestGate:
             "汇总语义 sheet 必须挡下"
         assert by_name["小清单"].status == "parsed", \
             "无歧义强表头小清单照常解析（判断不按行数）"
-        assert report.status == "ok"  # 存在 canonical sheet → overall ok
+        # 只要仍有被挡 sheet：overall=partial + needs_manual_review（不得 ok/full_pipeline 掩盖 pending）
+        assert report.status == "partial", \
+            f"存在 pending sheet 时 overall 必须为 partial: {report.status}"
+        assert report.needs_manual_review is True
+        assert "pending" in report.message or "needs_manual_review" in report.message
         # pending role review 必须可见（report/audit 双通道）
         assert any(x.status == "needs_role_review" for x in report.sheets)
         assert conn.execute(
@@ -349,3 +353,65 @@ class TestRound9EnglishNames:
         report = settlement_io.import_settlement_file(conn, pid, tmp, src)
         assert report.needs_manual_review
         assert _counts(conn)["line_items"] == 0
+
+
+class TestExplicitColMapConfirmation:
+    def test_ambiguous_requires_explicit_map(self, db):
+        """歧义 sheet（两列金额）人工确认必须显式传 confirmed_col_map。"""
+        conn, pid, report = _import(db, make_ambiguous_header)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='第1期'").fetchone()["id"]
+        # 未传映射 → 拒绝（人工并未真正选择列）
+        with pytest.raises(ValueError, match="显式"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="确认")
+
+    def test_explicit_map_selects_correct_amount_column(self, db):
+        """人工明确选择正确金额列（col6 含税合价）后写入，审计记录 old/new mapping。"""
+        conn, pid, report = _import(db, make_ambiguous_header)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='第1期'").fetchone()["id"]
+        n = settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人",
+            reason="歧义列经人工核对：金额取含税合价列",
+            confirmed_col_map={"code": 1, "name": 2, "unit": 3, "quantity": 4,
+                               "unit_price": 5, "amount": 6, "tax_rate": 8})
+        assert n == 2
+        rows = conn.execute(
+            "SELECT code, amount FROM line_items WHERE sheet_id=? ORDER BY id",
+            (sheet_id,)).fetchall()
+        assert [r["amount"] for r in rows] == ["4650", "24250"], \
+            f"金额必须取人工选择的列6: {[tuple(r) for r in rows]}"
+        # 审计 old/new mapping
+        from costguard.core.evidence import audit as audit_log
+
+        entries = [e for e in audit_log.history_for(conn, pid)
+                   if e.action == "confirm_sheet_role"]
+        assert entries, "缺少 confirm_sheet_role 审计"
+        detail = conn.execute(
+            "SELECT before_json, after_json FROM audit_log WHERE action='confirm_sheet_role'").fetchone()
+        before = json.loads(detail["before_json"])
+        after = json.loads(detail["after_json"])
+        # 审计完整记录 old(程序检测) 与 new(人工确认) 两套映射；
+        # 人工选对时两者可相等，但 confirmed 必须是人工明确选择的列
+        assert after["mapping"]["detected"] and after["mapping"]["confirmed"]
+        assert after["mapping"]["confirmed"]["amount"] == 6
+        assert before["needs_review"] is True  # 歧义来源留痕（before）
+
+    def test_explicit_map_rejects_invalid(self, db):
+        """列映射校验：列号越界/冲突/缺必需字段 → 拒绝。"""
+        conn, pid, report = _import(db, make_ambiguous_header)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='第1期'").fetchone()["id"]
+        with pytest.raises(ValueError, match="冲突|越界|必需"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="同列两字段",
+                confirmed_col_map={"code": 1, "name": 1})  # 冲突
+        with pytest.raises(ValueError, match="冲突|越界|必需"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="缺名称",
+                confirmed_col_map={"code": 1, "unit": 3})  # 缺必需 name
+        with pytest.raises(ValueError, match="冲突|越界|必需"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="越界",
+                confirmed_col_map={"name": 99})  # 越界

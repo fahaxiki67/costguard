@@ -270,7 +270,8 @@ def main(run_dir: Path | None = None) -> None:
             "full_pipeline": bool(
                 imp.get("ok") and (sp or {}).get("ok")
                 and result.get("export", {}).get("xlsx")
-                and result.get("export", {}).get("docx")),
+                and result.get("export", {}).get("docx")
+                and not (sp or {}).get("needs_manual_review")),
         }
         done_marker.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str),
                                encoding="utf-8")

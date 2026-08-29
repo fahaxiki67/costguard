@@ -139,14 +139,31 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
         f"角色审阅路由：{reason}；保留 raw 网格，未进入结算模型")
 
 
+def _validate_confirmed_col_map(col_map: dict, max_col: int) -> None:
+    """校验人工确认列映射：必需字段、列号存在且不冲突。"""
+    if "name" not in col_map:
+        raise ValueError("确认列映射缺少必需字段: name（清单名称）")
+    cols = list(col_map.values())
+    if len(cols) != len(set(cols)):
+        raise ValueError("确认列映射存在冲突：同一列被映射到多个字段")
+    if any(not isinstance(c, int) or c < 1 or c > max_col for c in cols):
+        raise ValueError(f"确认列映射列号越界（有效范围 1..{max_col}）")
+
+
 def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                                    sheet_id: int, actor: str, reason: str,
-                                   direction: str = "unknown") -> int:
+                                   direction: str = "unknown",
+                                   confirmed_col_map: dict | None = None) -> int:
     """人工确认被门控 sheet 的角色为结算清单后，重放语义层抽取（ADR-008）。
 
-    reason 必填（原则 14）；确认与抽取均留审计/证据；期次按方向递增兜底。
-    返回写入行数。若 sheet 无表头识别结果，要求人工列映射（另行提供），此处拒绝。
+    - reason 必填（原则 14）；
+    - det.needs_review（歧义/低置信）时必须显式传 confirmed_col_map（人工真正
+      选择列），未传即拒绝；无歧义 sheet（仅角色语义被挡）可仅确认角色；
+    - 审计记录 old（检测到的映射）/new（人工确认的映射）；
+    - 校验：必需字段、列号存在且不冲突。
     """
+    from dataclasses import replace
+
     from costguard.core.evidence import audit as audit_log
     from costguard.core.evidence import evidence as evidence_api
 
@@ -159,19 +176,35 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     det = detect_header(0, cells, merged, n_rows, n_cols)
     if det is None:
         raise ValueError("该 sheet 无可识别表头，需人工列映射后才能按清单抽取")
+
+    if det.needs_review and confirmed_col_map is None:
+        raise ValueError(
+            "该 sheet 表头存在歧义（needs_review），必须显式传入人工确认的列映射 "
+            "confirmed_col_map 后才能写入结算模型")
+
+    used_map = dict(det.col_map)
+    if confirmed_col_map is not None:
+        _validate_confirmed_col_map(confirmed_col_map, n_cols)
+        used_map = dict(confirmed_col_map)
+
     audit_log.record_audit(
         conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
-        {"role": "gated"}, {"role": "settlement", "confidence": det.confidence}, reason)
+        {"role": "gated", "needs_review": det.needs_review,
+         "mapping": {"detected": det.col_map}},
+        {"role": "settlement", "confidence": det.confidence,
+         "mapping": {"detected": det.col_map, "confirmed": used_map}}, reason)
     pno = next_period_no(conn, project_id, direction)
     period_id = ensure_period(conn, project_id, pno, f"sheet:{sheet_id}", None,
                               direction=direction)
-    items = extract_items.extract_items(cells, merged, det, n_rows)
+    det_used = replace(det, col_map=used_map, needs_review=False)
+    items = extract_items.extract_items(cells, merged, det_used, n_rows)
     n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_confirmed",
-        f"Sheet「{sheet_name if sheet_name else sheet_id}」经人工确认为结算清单，重放抽取 {n} 行",
+        f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
         steps=[{"step": "人工确认", "actor": actor, "reason": reason,
-                "col_map": det.col_map, "confidence": det.confidence}],
+                "mapping": {"detected": det.col_map, "confirmed": used_map},
+                "confidence": det.confidence}],
         sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
     )
     return n
@@ -365,15 +398,19 @@ def import_settlement_file(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
          for pid in period_ids), default=0,
     )
-    if parsed_any:
+    has_pending = role_gated or form_routed
+    if parsed_any and not has_pending:
         report.status = "ok"
+    elif parsed_any:
+        # 有 canonical 但仍有被挡 sheet：overall=partial，pending 不得被 full_pipeline 掩盖
+        report.status = "partial"
+        report.needs_manual_review = True
+        report.message = "settlement_parsed_with_pending_role_review"
     elif form_routed and not role_gated:
-        # 纯表单：不是结算解析成功，也不是普通失败——待人工复核
         report.status = "partial"
         report.needs_manual_review = True
         report.message = "non_settlement_form_needs_manual_review"
     elif role_gated or form_routed:
-        # 存在需角色审阅/表单路由 sheet 且无 canonical：partial + 待人工
         report.status = "partial"
         report.needs_manual_review = True
         report.message = ("non_settlement_spreadsheet_needs_role_review" if role_gated
