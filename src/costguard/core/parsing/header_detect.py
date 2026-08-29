@@ -135,8 +135,6 @@ def _try_header(lo: int, hi: int, cells, anchors, max_col: int, sheet_index: int
             if hits2:
                 col_hits[c] = hits2
                 hi_hit_cols.add(c)
-            elif text2 and not text:
-                col_hits[c] = []
     total_score = 0.0
     for hits in sorted(col_hits.values()):
         if not hits:
@@ -151,6 +149,8 @@ def _try_header(lo: int, hi: int, cells, anchors, max_col: int, sheet_index: int
     notes: list[str] = []
     ambiguous = 0
     for c, hits in sorted(col_hits.items()):
+        if not hits:
+            continue
         fld, score = hits[0]
         if fld in col_map:
             ambiguous += 1

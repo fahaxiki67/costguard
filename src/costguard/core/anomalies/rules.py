@@ -566,19 +566,61 @@ def rule_merged_cells_in_data(conn, project_id) -> list[Finding]:
 
 
 def rule_missing_key_fields(conn, project_id) -> list[Finding]:
-    out = []
+    """缺失关键字段检查（降噪版）：
+
+    - 整列未识别（表头列映射缺该字段）→ 表级一条异常；
+    - 列存在但个别行为空 → 行级异常（待补资料）。
+    避免在“本来就没有编码列”的台账/汇总表上刷出海量行级误报。
+    """
+    out: list[Finding] = []
+    sheet_colmaps: dict[int, dict] = {}
+    for s in _sheets(conn, project_id):
+        h = conn.execute(
+            "SELECT col_map_json FROM table_headers WHERE sheet_id=?", (s["id"],)
+        ).fetchone()
+        if h:
+            sheet_colmaps[s["id"]] = json.loads(h["col_map_json"])
+
+    # ---- 表级：整列缺失 ----
+    field_labels = {"code": "清单编码", "name": "清单名称", "quantity": "工程量",
+                    "unit_price": "单价", "amount": "合价"}
+    for sid, col_map in sheet_colmaps.items():
+        meta = conn.execute(
+            "SELECT sheet_name, period_id FROM raw_sheets WHERE id=?", (sid,)
+        ).fetchone()
+        if not meta:
+            continue
+        n_rows = conn.execute(
+            "SELECT COUNT(*) c FROM line_items WHERE sheet_id=?", (sid,)
+        ).fetchone()["c"]
+        if not n_rows:
+            continue
+        missing_cols = [label for f, label in field_labels.items() if f not in col_map]
+        if missing_cols:
+            out.append(Finding(
+                "missing_key_column", "medium", "sheet", sid,
+                f"Sheet「{meta['sheet_name']}」未识别到{'、'.join(missing_cols)}列"
+                f"（{n_rows} 行均缺失，按列缺失处理，进入人工确认）",
+                {"missing_columns": missing_cols, "n_rows": n_rows},
+            ))
+
+    # ---- 行级：列存在但该行为空 ----
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]):
             continue
+        col_map = sheet_colmaps.get(r["sheet_id"])
+        # 有表头记录时：整列缺失已按表级报告，行级只查存在的列；
+        # 无表头记录（如手工数据/旧流程行）：退回逐字段行级判断。
         missing = []
-        if not (r["code"] or "").strip():
-            missing.append("清单编码")
-        if not (r["name"] or "").strip():
-            missing.append("清单名称")
-        if not r["quantity"]:
-            missing.append("工程量")
-        if not r["amount"]:
-            missing.append("合价")
+        for f, label in field_labels.items():
+            if col_map is not None and f not in col_map:
+                continue
+            if f == "code" and not (r["code"] or "").strip():
+                missing.append(label)
+            elif f == "name" and not (r["name"] or "").strip():
+                missing.append(label)
+            elif f in ("quantity", "unit_price", "amount") and not r[f]:
+                missing.append(label)
         if missing:
             out.append(Finding(
                 "missing_key_fields", "medium", "line_item", r["id"],

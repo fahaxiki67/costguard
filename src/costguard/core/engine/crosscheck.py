@@ -106,7 +106,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         for it in items:
             if it.flags.get("subtotal"):
                 continue
-            rows_b.append({"amount": it.amount.value})
+            # 表头未识别出合价列时 it.amount 为 None（字段级缺失，不可比）
+            rows_b.append({"amount": it.amount.value if it is not None and it.amount else None})
         sub, sub_missing = _sum_amounts(rows_b)
         b_missing += sub_missing
         if sub is not None:
