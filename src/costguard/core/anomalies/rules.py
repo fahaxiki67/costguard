@@ -8,12 +8,13 @@ severity: high(金额正确性受威胁) / medium(需人工复核) / low(提示)
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-D = Decimal
-
 from costguard.core.engine.money import round2
+
+D = Decimal
 
 ROUND_TOL = D("0.02")
 PRICE_CHANGE_PCT = D("0.20")   # 单价变化阈值 20%
@@ -395,7 +396,7 @@ def rule_qty_spike(conn, project_id) -> list[Finding]:
                     except Exception:
                         continue
         pnos = sorted(qtys)
-        for prev, cur in zip(pnos, pnos[1:]):
+        for prev, cur in zip(pnos, pnos[1:], strict=False):
             base = qtys[prev]
             if base == 0:
                 continue
@@ -533,7 +534,6 @@ def rule_merged_cells_in_data(conn, project_id) -> list[Finding]:
             continue
         merged = json.loads(s["merged_ranges_json"] or "[]")
         data_merged = []
-        import re
 
         for rng in merged:
             m = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.replace("$", ""))
