@@ -100,6 +100,7 @@ class TestExcelExport:
 
         重算后 G列=数量×单价、I列=ROUND(底稿合价-原表合价,2) 必须与 DB 值一致。
         """
+        import os
         import shutil
         import subprocess
 
@@ -121,15 +122,25 @@ class TestExcelExport:
                "-env:UserInstallation=" + Path(profile).as_uri(),
                "--headless", "--convert-to", "xlsx", "--outdir", str(out), str(path)]
 
-        # LibreOffice 启动器在 macOS 存在偶发 SIGABRT（上游缺陷，证据：abort 发生在
-        # 包装脚本 exec 真二进制瞬间、stdout 为空、同一输入文件矩阵 9/9 成功）。
-        # 仅对启动器 SIGABRT（rc 134/-6）做有界重试并逐次留证；其余 rc 立即失败；
-        # 转换成功后的全部重算断言不重试、不放宽。
+        # 根因（崩溃报告 soffice-*.ips，4 份同栈）：headless 启动器早期初始化 AppKit，
+        # RegisterApplication（HIServices）与驻留 LibreOffice GUI 实例的菜单栏状态
+        # 竞态 → SIGABRT。防御组合：
+        # 1) 每次尝试以唯一 __CFBundleIdentifier 注册，避免与 GUI 实例身份冲突（针对根因）；
+        # 2) 指数退避 0/1/2s（崩溃报告显示零退避的连续重试全撞同一竞态窗口）；
+        # 3) 仅 SIGABRT（rc 134/-6）重试，其余 rc 立即失败；逐次留 rc/stdout/stderr 证据；
+        # 4) 转换成功后的全部重算断言不重试、不放宽。
         max_attempts = 3
         attempt_log: list[str] = []
         proc = None
         for attempt in range(1, max_attempts + 1):
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            if attempt > 1:
+                import time
+
+                time.sleep((attempt - 1))  # 退避 1s / 2s，穿过竞态窗口
+            env = dict(os.environ)
+            env["__CFBundleIdentifier"] = f"org.costguard.headless.{os.getpid()}.{attempt}"
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240,
+                                  env=env)
             if proc.returncode == 0:
                 break
             attempt_log.append(
@@ -142,8 +153,8 @@ class TestExcelExport:
                 )
         else:
             pytest.fail(
-                f"soffice 启动器连续 {max_attempts} 次 SIGABRT（环境阻断证据）：\n"
-                + "\n".join(attempt_log)
+                f"soffice 启动器连续 {max_attempts} 次 SIGABRT（环境阻断证据，含退避与唯一"
+                f"__CFBundleIdentifier）：\n" + "\n".join(attempt_log)
             )
         recalc_path = out / path.name
         assert recalc_path.exists(), (
