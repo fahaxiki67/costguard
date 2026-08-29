@@ -53,9 +53,12 @@ def _norm_unit(u: str | None) -> str:
     return u
 
 
+DIR_ZH = {"upward": "对上", "downward": "对下", "unknown": ""}
+
+
 def _rows(conn, project_id: int):
     return conn.execute(
-        """SELECT li.*, sp.period_no AS pno FROM line_items li
+        """SELECT li.*, sp.period_no AS pno, sp.direction AS dir FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
            WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
         (project_id,),
@@ -270,35 +273,44 @@ def rule_same_name_diff_code(conn, project_id) -> list[Finding]:
 
 # ---------- 跨期规则 ----------
 
-def _item_series(conn, project_id: int) -> dict[str, dict[int, list]]:
-    """item_key -> period_no -> [rows]"""
-    series: dict[str, dict[int, list]] = {}
+def _item_series(conn, project_id: int) -> dict[tuple[str, str], dict[int, list]]:
+    """(item_key, direction) -> period_no -> [rows]
+
+    跨期比较（单价/税率/数量/单位变化、疑似重复结算）只在同一方向的期次
+    之间进行——对上与对下的同清单不是同一口径，混比会制造误报。
+    """
+    series: dict[tuple[str, str], dict[int, list]] = {}
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]):
             continue
         key = r["code"] if r["code"] else f"name:{r['name']}"
-        series.setdefault(key, {}).setdefault(r["pno"], []).append(r)
+        series.setdefault((key, r["dir"]), {}).setdefault(r["pno"], []).append(r)
     return series
+
+
+def _dir_label(direction: str) -> str:
+    zh = DIR_ZH.get(direction, direction)
+    return f"[{zh}]" if zh else ""
 
 
 def rule_unit_changed(conn, project_id) -> list[Finding]:
     out = []
-    for key, by_period in _item_series(conn, project_id).items():
+    for (key, direction), by_period in _item_series(conn, project_id).items():
         units = {pno: {_norm_unit(r["unit"]) for r in rows if r["unit"]} for pno, rows in by_period.items()}
         flat = {u for s in units.values() for u in s}
         if len(flat) > 1:
             out.append(Finding(
                 "unit_changed", "high", "project", project_id,
-                f"清单 {key} 单位不一致：{units}，数量不可直接累计（不可比），请核实",
+                f"{_dir_label(direction)}清单 {key} 单位不一致：{units}，数量不可直接累计（不可比），请核实",
                 {"units": {str(k): sorted(v) for k, v in units.items()}},
             ))
     return out
 
 
 def rule_price_changed(conn, project_id) -> list[Finding]:
-    """同一清单跨期单价变化：任何变化记录；超阈值升级为单价异常。"""
+    """同一清单同方向跨期单价变化：任何变化记录；超阈值升级为单价异常。"""
     any_changes, abnormal = [], []
-    for key, by_period in _item_series(conn, project_id).items():
+    for (key, direction), by_period in _item_series(conn, project_id).items():
         prices: dict[int, Decimal] = {}
         for pno, rows in sorted(by_period.items()):
             for r in rows:
@@ -315,13 +327,13 @@ def rule_price_changed(conn, project_id) -> list[Finding]:
             detail = {str(p): str(v) for p, v in prices.items()}
             any_changes.append(Finding(
                 "price_changed", "low", "project", project_id,
-                f"清单 {key} 跨期单价不一致：{detail}", {"prices": detail},
+                f"{_dir_label(direction)}清单 {key} 跨期单价不一致：{detail}", {"prices": detail},
             ))
             for pno, v in prices.items():
                 if base != 0 and abs((v - base) / base) > PRICE_CHANGE_PCT:
                     abnormal.append(Finding(
                         "price_abnormal_change", "high", "project", project_id,
-                        f"清单 {key} 第{pno}期单价 {v} 较第{first_pno}期 {base} 变化超过 "
+                        f"{_dir_label(direction)}清单 {key} 第{pno}期单价 {v} 较第{first_pno}期 {base} 变化超过 "
                         f"{PRICE_CHANGE_PCT * 100}%，请核实调价依据",
                         {"prices": detail},
                     ))
@@ -331,7 +343,7 @@ def rule_price_changed(conn, project_id) -> list[Finding]:
 
 def rule_tax_changed(conn, project_id) -> list[Finding]:
     out = []
-    for key, by_period in _item_series(conn, project_id).items():
+    for (key, direction), by_period in _item_series(conn, project_id).items():
         rates: dict[int, str] = {}
         for pno, rows in sorted(by_period.items()):
             for r in rows:
@@ -342,7 +354,7 @@ def rule_tax_changed(conn, project_id) -> list[Finding]:
         if len(vals) > 1:
             out.append(Finding(
                 "tax_rate_changed", "medium", "project", project_id,
-                f"清单 {key} 跨期税率变化：{rates}，影响含税/不含税口径，请核实",
+                f"{_dir_label(direction)}清单 {key} 跨期税率变化：{rates}，影响含税/不含税口径，请核实",
                 {"rates": {str(k): v for k, v in rates.items()}},
             ))
     return out
@@ -383,9 +395,9 @@ def rule_tax_mode_mixed(conn, project_id) -> list[Finding]:
 
 
 def rule_qty_spike(conn, project_id) -> list[Finding]:
-    """相邻期工程量突增/突减。"""
+    """同方向相邻期工程量突增/突减。"""
     out = []
-    for key, by_period in _item_series(conn, project_id).items():
+    for (key, direction), by_period in _item_series(conn, project_id).items():
         qtys: dict[int, Decimal] = {}
         for pno, rows in sorted(by_period.items()):
             for r in rows:
@@ -404,7 +416,7 @@ def rule_qty_spike(conn, project_id) -> list[Finding]:
             if ratio >= QTY_SPIKE_RATIO or ratio <= D(1) / QTY_SPIKE_RATIO:
                 out.append(Finding(
                     "qty_sudden_change", "medium", "project", project_id,
-                    f"清单 {key} 工程量第{prev}期 {base} → 第{cur}期 {qtys[cur]}"
+                    f"{_dir_label(direction)}清单 {key} 工程量第{prev}期 {base} → 第{cur}期 {qtys[cur]}"
                     f"（{ratio:.2f} 倍），请核实计量依据",
                     {"prev": str(base), "cur": str(qtys[cur]), "ratio": str(ratio)},
                 ))
@@ -412,21 +424,21 @@ def rule_qty_spike(conn, project_id) -> list[Finding]:
 
 
 def rule_suspected_duplicate_settlement(conn, project_id) -> list[Finding]:
-    """跨期出现数量+单价+金额完全一致的行（疑似重复结算）。"""
+    """同方向跨期出现数量+单价+金额完全一致的行（疑似重复结算）。"""
     out = []
     seen: dict[tuple, list] = {}
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]):
             continue
         if r["quantity"] and r["unit_price"] and r["amount"]:
-            key = (r["code"] or r["name"], r["quantity"], r["unit_price"], r["amount"])
+            key = (r["code"] or r["name"], r["quantity"], r["unit_price"], r["amount"], r["dir"])
             seen.setdefault(key, []).append(r)
     for key, rows in seen.items():
         pnos = {r["pno"] for r in rows}
         if len(pnos) > 1:
             out.append(Finding(
                 "suspected_duplicate_settlement", "medium", "project", project_id,
-                f"「{key[0]}」在第 {sorted(pnos)} 期出现完全相同的数量/单价/金额，疑似重复结算",
+                f"{_dir_label(key[4])}「{key[0]}」在第 {sorted(pnos)} 期出现完全相同的数量/单价/金额，疑似重复结算",
                 {"item_ids": [r["id"] for r in rows]},
             ))
     return out

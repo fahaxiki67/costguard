@@ -206,15 +206,30 @@ class WorkbenchPage(QWidget):
         self.refresh_anomalies()
 
     def _run_crosscheck(self):
-        pnos = [r["period_no"] for r in self.conn.execute(
-            "SELECT period_no FROM settlement_periods WHERE project_id=?", (self.project.project_id,))]
-        results = crosscheck.run_crosscheck(self.conn, self.project.project_id, pnos)
-        diff = [r for r in results if r.status == "diff"]
+        # 方向隔离：按方向分组逐期校核；同方向内期号唯一，无歧义
+        from costguard.core.engine.crosscheck import AmbiguousPeriodError
+
+        rows = self.conn.execute(
+            "SELECT period_no, direction FROM settlement_periods WHERE project_id=?",
+            (self.project.project_id,),
+        ).fetchall()
+        results = []
+        errors = []
+        for direction in sorted({r["direction"] for r in rows}):
+            pnos = sorted(r["period_no"] for r in rows if r["direction"] == direction)
+            try:
+                results.extend(crosscheck.run_crosscheck(self.conn, self.project.project_id, pnos, direction=direction))
+            except AmbiguousPeriodError as exc:
+                errors.append(str(exc))
+        status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
+        dir_zh = {"upward": "对上", "downward": "对下", "unknown": ""}
         msg = "\n".join(
-            f"第{r.period_no}期：{ {'match': '一致', 'diff': '存在差异', 'incomplete': '数据不完整'}[r.status] }"
+            f"第{r.period_no}期{dir_zh.get(r.direction, '')}：{status_zh[r.status]}"
             f"（A={r.path_a_total}，B={r.path_b_total}）" for r in results)
+        if errors:
+            msg += "\n\n以下期号存在方向歧义，已跳过（请先标记方向）：\n" + "\n".join(errors)
         QMessageBox.information(self, "双向校核", msg or "无期次可校核")
-        if diff:
+        if any(r.status == "diff" for r in results):
             self.tabs.setCurrentIndex(2)
         self.refresh_anomalies()
 

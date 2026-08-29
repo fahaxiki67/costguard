@@ -86,9 +86,14 @@ def ensure_period(
     direction: str = "unknown",
     contract_party: str = "",
 ) -> int:
+    """按 (project_id, period_no, direction) 定位或创建期次。
+
+    对上/对下各自拥有独立的期号序列：同一 period_no 的不同方向是两个期次，
+    不得复用（方向隔离）。同方向同期号重复调用幂等复用（重复导入安全）。
+    """
     row = conn.execute(
-        "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
-        (project_id, period_no),
+        "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=? AND direction=?",
+        (project_id, period_no, direction),
     ).fetchone()
     if row:
         return int(row["id"])

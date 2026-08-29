@@ -92,3 +92,56 @@ class TestFkAndWal:
                 " VALUES (999,'a','b','c','d'*1||'x',1,'xlsx','2026-01-01')"
             )
         conn.close()
+
+class TestLegacyUpgrade:
+    def test_v1_database_upgrades_to_latest_with_data(self, tmp_path):
+        """旧库兼容：v1 结构 + 已有数据 → migrate 到 v3，数据完整保留。"""
+        from costguard.core.db import migrations as m
+
+        db = tmp_path / "legacy.db"
+        # 手工只应用 v1
+        conn = m.connect(db)
+        for sql in m.MIGRATIONS[0][1]:
+            conn.execute(sql)
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01')"
+        )
+        with conn:
+            pid = conn.execute(
+                "INSERT INTO projects(name, schema_version, workspace_path, created_at)"
+                " VALUES ('旧项目', 1, '/legacy', '2026')"
+            ).lastrowid
+            cur = conn.execute(
+                "INSERT INTO settlement_periods(project_id, period_no, title, source_file_id,"
+                " direction, contract_party) VALUES (?, 1, '旧第1期', NULL, 'upward', '甲')",
+                (pid,),
+            )
+            old_period_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO line_items(period_id, code, name, unit, quantity, amount)"
+                " VALUES (?, 'C1', '旧清单', 'm3', '10', '1000')", (old_period_id,))
+        conn.close()
+
+        # migrate 到最新（v3 表重建）
+        assert m.migrate(db, tmp_path / "backups") == m.LATEST_SCHEMA_VERSION
+
+        conn = m.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT title, direction FROM settlement_periods WHERE id=?", (old_period_id,)
+            ).fetchone()
+            assert row and row["title"] == "旧第1期" and row["direction"] == "upward"
+            li = conn.execute("SELECT name, amount FROM line_items WHERE period_id=?", (old_period_id,)).fetchone()
+            assert li and li["name"] == "旧清单"
+            # v3 允许对上/对下同期号共存
+            with conn:
+                conn.execute(
+                    "INSERT INTO settlement_periods(project_id, period_no, title, direction)"
+                    " VALUES (?, 1, '旧第1期对下', 'downward')", (pid,))
+            n1 = conn.execute(
+                "SELECT COUNT(*) c FROM settlement_periods WHERE project_id=? AND period_no=1",
+                (pid,),
+            ).fetchone()["c"]
+            assert n1 == 2
+        finally:
+            conn.close()

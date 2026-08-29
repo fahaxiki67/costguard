@@ -121,12 +121,12 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
         ws.append(["清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
         _style_header(ws, 1, 7)
         for agg in aggs:
-            pnos = sorted(agg.per_period)
+            # per_period 键是 period_id；显示与排序必须用 period_no
+            ordered = sorted(agg.per_period.items(), key=lambda kv: kv[1]["period_no"])
             prev = None
-            for pno in pnos:
-                pp = agg.per_period[pno]
+            for _pid, pp in ordered:
                 cur = pp.get(field)
-                pno_title = f"第{pno}期"
+                pno_title = f"第{pp['period_no']}期"
                 if prev is not None and cur is not None and prev["value"] is not None:
                     r = ws.max_row + 1
                     ws.append([agg.code, agg.name, pno_title,

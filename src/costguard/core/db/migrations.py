@@ -217,7 +217,6 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         # SQLite 无法修改约束，按官方流程重建表（外键引用的表名与行 id 保持不变）。
         3,
         [
-            "PRAGMA foreign_keys=OFF",
             """CREATE TABLE settlement_periods_new (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL REFERENCES projects(id),
@@ -236,8 +235,6 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                FROM settlement_periods""",
             "DROP TABLE settlement_periods",
             "ALTER TABLE settlement_periods_new RENAME TO settlement_periods",
-            "PRAGMA foreign_key_check",
-            "PRAGMA foreign_keys=ON",
         ],
     ),
 ]
@@ -273,7 +270,12 @@ def current_version(conn: sqlite3.Connection) -> int:
 def _backup(db_path: Path, backups_dir: Path) -> Path:
     backups_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = backups_dir / f"project_pre_migration_v{current_version(sqlite3.connect(db_path))}_{stamp}.db"
+    ver_probe = connect(db_path)  # 必须用带 Row factory 的连接读版本
+    try:
+        src_ver = current_version(ver_probe)
+    finally:
+        ver_probe.close()
+    dest = backups_dir / f"project_pre_migration_v{src_ver}_{stamp}.db"
     # WAL 可能有未 checkpoint 数据，先关闭句柄再拷贝由调用方保证；这里用备份 API。
     src = sqlite3.connect(db_path)
     dst = sqlite3.connect(dest)
@@ -301,28 +303,36 @@ def migrate(db_path: Path, backups_dir: Path | None = None, log: Callable[[str],
         backup_path = _backup(db_path, backups_dir)
         if log:
             log(f"migration backup -> {backup_path}")
+        # 表重建型迁移（v3）需要全程关闭外键（事务内 PRAGMA foreign_keys 无效），
+        # 这是 SQLite 官方 ALTER 流程；迁移结束（无论成败）必须恢复开启。
+        conn.execute("PRAGMA foreign_keys=OFF")
         try:
-            for version, scripts in MIGRATIONS:
-                if version <= ver:
-                    continue
-                conn.execute("BEGIN")
-                try:
-                    for sql in scripts:
-                        conn.execute(sql)
-                    conn.execute(
-                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                        (version, datetime.now().isoformat(timespec="seconds")),
-                    )
-                    conn.execute("COMMIT")
-                except sqlite3.Error:
-                    conn.execute("ROLLBACK")
-                    raise
-                if log:
-                    log(f"applied migration v{version}")
-        except sqlite3.Error as exc:
-            conn.close()
-            raise MigrationError(f"migration failed: {exc}; backup kept at {backup_path}") from exc
-        return current_version(conn)
+            try:
+                for version, scripts in MIGRATIONS:
+                    if version <= ver:
+                        continue
+                    conn.execute("BEGIN")
+                    try:
+                        for sql in scripts:
+                            conn.execute(sql)
+                        conn.execute(
+                            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                            (version, datetime.now().isoformat(timespec="seconds")),
+                        )
+                        conn.execute("COMMIT")
+                    except sqlite3.Error:
+                        conn.execute("ROLLBACK")
+                        raise
+                    if log:
+                        log(f"applied migration v{version}")
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise MigrationError(f"foreign key violations after migration: {violations[:5]}")
+            except sqlite3.Error as exc:
+                raise MigrationError(f"migration failed: {exc}; backup kept at {backup_path}") from exc
+            return current_version(conn)
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
     finally:
         try:
             conn.close()
