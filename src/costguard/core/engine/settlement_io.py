@@ -170,6 +170,12 @@ def import_settlement_file(
         period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
         with conn:
             conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
+            conn.execute(
+                """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
+                   confidence, needs_review) VALUES (?,?,?,?,?,?)""",
+                (sheet_id, det.header_row_lo, det.header_row_hi,
+                 json.dumps(det.col_map), det.confidence, int(det.needs_review)),
+            )
         period_ids.add(period_id)
 
         extract_items.persist_line_items(conn, period_id, sheet_id, items)

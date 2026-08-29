@@ -65,10 +65,8 @@ def _write_sheet(wb, sheet_name: str, items: list[Item], gt: GroundTruth,
                  hidden_col_note: bool = False, currency_fmt: bool = False) -> None:
     ws = wb.create_sheet(sheet_name)
     r = 1
-    for _ in range(title_rows):
-        ws.cell(row=r, column=1, value="××工程结算书（合成测试数据）").font = Font(bold=True, size=14)
-        r += 1
-        ws.cell(row=r, column=1, value="编制单位：合成数据生成器        第1期")
+    for i in range(title_rows):
+        ws.cell(row=r, column=1, value="××工程结算书（合成测试数据）" if i == 0 else f"编制单位：合成数据生成器  第1期 说明行{i}").font = Font(bold=True, size=14)
         r += 1
     header_row = header_start
 
@@ -83,6 +81,7 @@ def _write_sheet(wb, sheet_name: str, items: list[Item], gt: GroundTruth,
         ws.cell(row=r, column=7, value="金额")
         ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=8)
         ws.cell(row=r + 1, column=7, value="合价")
+        ws.cell(row=r + 1, column=8, value="税率")
         gt.notes.append("two-row header with merged group cell")
         header_row = r + 1
         r += 2
@@ -91,7 +90,9 @@ def _write_sheet(wb, sheet_name: str, items: list[Item], gt: GroundTruth,
         for c, v in enumerate(cols, start=1):
             ws.cell(row=header_row, column=c, value=v)
         if merge_header:
-            ws.merge_cells(start_row=header_row, start_column=7, end_row=header_row, end_column=8)
+            # 表头区上方的组表头合并（不覆盖有效字段表头）
+            ws.cell(row=header_row - 1, column=1, value="清单信息")
+            ws.merge_cells(start_row=header_row - 1, start_column=1, end_row=header_row - 1, end_column=4)
         r = header_row + 1
 
     text_numbers = text_numbers or set()
