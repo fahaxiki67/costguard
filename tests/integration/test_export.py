@@ -152,9 +152,22 @@ class TestExcelExport:
                     f"stderr(尾2000)={proc.stderr[-2000:]}"
                 )
         else:
+            # 环境自检：SIGABRT 耗尽时附带安装完整性证据（LibreOffice 安装损坏时
+            # 密封校验会失败，这是启动器偶发 SIGABRT 的常见根源）
+            try:
+                cs = subprocess.run(
+                    ["codesign", "--verify", "--deep", "--strict",
+                     "/Applications/LibreOffice.app"],
+                    capture_output=True, text=True, timeout=120)
+                cs_status = "安装完整性 OK" if cs.returncode == 0 else (
+                    f"安装损坏（codesign rc={cs.returncode}: {cs.stdout.strip()[:200]}"
+                    f"{cs.stderr.strip()[:200]}）—— 请重装 LibreOffice 或改用专用验证机")
+            except Exception as exc:  # noqa: BLE001
+                cs_status = f"codesign 自检失败: {exc}"
             pytest.fail(
-                f"soffice 启动器连续 {max_attempts} 次 SIGABRT（环境阻断证据，含退避与唯一"
-                f"__CFBundleIdentifier）：\n" + "\n".join(attempt_log)
+                f"soffice 启动器连续 {max_attempts} 次 SIGABRT（环境阻断证据）\n"
+                + "\n".join(attempt_log)
+                + f"\n环境自检: {cs_status}"
             )
         recalc_path = out / path.name
         assert recalc_path.exists(), (
