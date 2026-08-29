@@ -269,6 +269,9 @@ def import_settlement_file(
     form_routed = False
     role_gated = False
     period_ids: set[int] = set()
+    # 文档级语义门控：文件名含汇总/核销/台账语义 → 整文件需角色审阅
+    # （copy 文件名是用户/验收语境的真实命名，非 test_id 硬编码）
+    doc_summary_like = bool(SUMMARY_LIKE_PATTERN.search(src.stem))
     for sheet in result.sheets:
         sheet_id = conn.execute(
             "SELECT id FROM raw_sheets WHERE batch_id=? AND sheet_index=?", (batch_id, sheet.sheet_index)
@@ -295,8 +298,9 @@ def import_settlement_file(
         # needs_review 一律挡（监督第九轮）：歧义/低置信未经人工确认不得写 canonical
         needs_review_gate = det is not None and det.needs_review
         no_quantity_column = det is not None and "quantity" not in det.col_map
-        if summary_like or needs_review_gate or no_quantity_column:
-            reason = ("sheet 名含汇总/核销/台账语义" if summary_like else
+        if doc_summary_like or summary_like or needs_review_gate or no_quantity_column:
+            reason = ("文档文件名含汇总/核销/台账语义，整文件需角色确认" if doc_summary_like else
+                      "sheet 名含汇总/核销/台账语义" if summary_like else
                       "表头存在歧义或识别不可靠（needs_review）" if needs_review_gate else
                       "未识别到数量（计量）列，结算清单结构不完整")
             _route_role_review(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name,

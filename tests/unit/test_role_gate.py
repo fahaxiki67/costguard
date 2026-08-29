@@ -308,3 +308,33 @@ class TestRound9Semantics:
         with pytest.raises(audit_log.AuditReasonRequiredError):
             settlement_io.confirm_sheet_role_and_extract(
                 conn, pid, sheet_id, actor="复核人", reason="")
+
+
+def make_mixed_named_summary(path: Path) -> None:
+    """文件名含汇总语义 + 混合 sheet（大 gated 表 + 小 canonical 表）
+    → 文档级语义门控：整文件需角色审阅。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "资源汇总"
+    rows = [(f"R{i:04d}", f"项{i}", "kg", 1, 2, 2) for i in range(1, 520)]
+    _wb_sheet(ws1, 1, rows, ["编号", "名称规格", "单位", "数量", "单价", "合价"])
+    ws2 = wb.create_sheet("钢筋")
+    _wb_sheet(ws2, 1, [("K1", "钢筋制作", "t", 3, 4850, 14550)],
+              ["清单编码", "清单名称", "单位", "工程量", "综合单价", "合价"])
+    wb.save(path)
+
+
+class TestRound9DocumentSemantics:
+    def test_document_level_semantic_gate(self, db):
+        """文件名含汇总/核销语义 → 文档级角色审阅，即使存在小 canonical sheet。"""
+        conn, pid, tmp = db
+        src = tmp / "人材机汇总.xlsx"  # 文件名语义（真实用户文件同样命中）
+        make_mixed_named_summary(src)
+        report = settlement_io.import_settlement_file(conn, pid, tmp, src)
+        assert report.needs_manual_review
+        assert all(s.status in ("needs_role_review", "no_header",
+                                "non_settlement_form") for s in report.sheets), \
+            f"文档级语义门控应挡整文件: {[x.status for x in report.sheets]}"
+        assert _counts(conn)["line_items"] == 0
