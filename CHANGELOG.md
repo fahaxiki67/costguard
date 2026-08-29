@@ -29,7 +29,26 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 - **Phase 8** Mac UI: project page + 5-tab workbench (periods, items with cell
   provenance, anomalies, match review with reason dialogs, export)
 
+### Changed (supervision gates for Phase 7)
+- Migration v3: settlement period uniqueness relaxed to
+  `(project_id, period_no, direction)` — upward/downward keep independent period
+  number sequences (table rebuild per SQLite ALTER limitations)
+- Export serialization boundary `_num`: Decimal is written natively (exact
+  decimal XML string, zero binary error); float conversion only via explicit
+  constant branch (money pre-rounded with round2 if ever required); missing
+  values strictly `is None` — Decimal("0") preserved
+- Up/down cumulative reports aggregate per direction and key by period_id
+  (prevents cross-direction merging at equal period numbers)
+- Management summary (xlsx + docx) declares scope: source-file count, period
+  count with direction split, tax mode status, evidence record count; docx no
+  longer claims full traceability without an evidence entry (points to the
+  Excel evidence index instead); synthetic-data disclaimer added
+
 ### Testing
-- 121 tests: unit + integration + UI (offscreen); hypothesis property tests for
-  money paths; synthetic defect corpus end-to-end
+- 129 tests + 1 explicit skip: WPS has no headless xlsx recalc CLI (wpscli is
+  PDF-conversion only) — real-engine recalculation is verified via LibreOffice
+  (same OOXML formula spec); WPS manual-open verification remains a human step
+- Second-path reconciliation: exported workbook re-read and recomputed with
+  Decimal (detail sums vs cumulative sheet), independent of LibreOffice
+
 

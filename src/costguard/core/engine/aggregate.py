@@ -24,7 +24,8 @@ class ItemAggregate:
     item_key: str  # 归组键：code 优先；无 code 用 'name:<名称>'
     code: str
     name: str
-    per_period: dict[int, dict] = field(default_factory=dict)  # period_no -> {qty, amount, rows}
+    # period_id -> {qty, amount, rows, period_no}；键用 period_id 防止对上/对下同期号串表
+    per_period: dict[int, dict] = field(default_factory=dict)
     cum_qty: Decimal | None = None
     cum_amount: Decimal | None = None
     wavg_price: Decimal | None = None
@@ -48,29 +49,40 @@ def group_key_of(code: str | None, name: str) -> str:
     return f"name:{name}"
 
 
-def load_line_items(conn: sqlite3.Connection, project_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        """SELECT li.*, sp.period_no FROM line_items li
-           JOIN settlement_periods sp ON sp.id = li.period_id
-           WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
-        (project_id,),
-    ).fetchall()
+def load_line_items(conn: sqlite3.Connection, project_id: int,
+                    direction: str | None = None) -> list[sqlite3.Row]:
+    sql = """SELECT li.*, sp.period_no FROM line_items li
+       JOIN settlement_periods sp ON sp.id = li.period_id
+       WHERE sp.project_id=?"""
+    params: list = [project_id]
+    if direction is not None:
+        sql += " AND sp.direction=?"
+        params.append(direction)
+    sql += " ORDER BY sp.period_no, li.id"
+    return conn.execute(sql, params).fetchall()
 
 
-def aggregate_project(conn: sqlite3.Connection, project_id: int) -> list[ItemAggregate]:
+def aggregate_project(conn: sqlite3.Connection, project_id: int,
+                      direction: str | None = None) -> list[ItemAggregate]:
     """按 item_key 累计项目全部期次。跳过小计行；缺失值不补 0。
 
-    漏项检测：某清单未覆盖项目全部期号 → status='incomplete' 并警示，
+    direction 给定时（'upward'/'downward'）只聚合该方向期次——对上/对下
+    报表必须各自独立累计，禁止混入另一方向数据。
+    per_period 以 period_id 为键：对上/对下可存在相同期号，按期号取值会串表。
+
+    漏项检测：某清单未覆盖（同方向）全部期次 → status='incomplete' 并警示，
     绝不静默当作 0 处理。
     """
-    all_periods = {
-        int(r["period_no"])
+    period_meta = {
+        int(r["id"]): int(r["period_no"])
         for r in conn.execute(
-            "SELECT period_no FROM settlement_periods WHERE project_id=?", (project_id,)
+            "SELECT id, period_no FROM settlement_periods WHERE project_id=?"
+            + (" AND direction=?" if direction is not None else ""),
+            (project_id, direction) if direction is not None else (project_id,),
         ).fetchall()
     }
     aggs: dict[str, ItemAggregate] = {}
-    for row in load_line_items(conn, project_id):
+    for row in load_line_items(conn, project_id, direction=direction):
         flags = json.loads(row["flags_json"] or "{}")
         if flags.get("subtotal"):
             continue
@@ -80,7 +92,10 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int) -> list[ItemAgg
 
         qty, qty_missing = _dec_or_none(row["quantity"])
         amount, amount_missing = _dec_or_none(row["amount"])
-        pp = agg.per_period.setdefault(int(row["period_no"]), {"qty": None, "amount": None, "rows": 0})
+        pp = agg.per_period.setdefault(
+            int(row["period_id"]),
+            {"qty": None, "amount": None, "rows": 0, "period_no": int(row["period_no"])},
+        )
         pp["rows"] += 1
         if qty is not None:
             pp["qty"] = qty if pp["qty"] is None else pp["qty"] + qty
@@ -95,10 +110,10 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int) -> list[ItemAgg
                 agg.warnings.append(f"第{row['period_no']}期 金额缺失/不可解析（行{row['id']}），未参与累计")
 
     for agg in aggs.values():
-        missing_periods = sorted(all_periods - set(agg.per_period))
-        for p in missing_periods:
+        missing_ids = sorted(set(period_meta) - set(agg.per_period))
+        for pid in missing_ids:
             agg.status = "incomplete"
-            agg.warnings.append(f"第{p}期无此清单（疑似漏项），未计入累计，待核实")
+            agg.warnings.append(f"第{period_meta[pid]}期无此清单（疑似漏项），未计入累计，待核实")
         periods = sorted(agg.per_period)
         qty_total: Decimal | None = None
         amt_total: Decimal | None = None
@@ -125,18 +140,9 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int) -> list[ItemAgg
 def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[ItemAggregate],
                           evidence_id: int | None = None) -> int:
     n = 0
-    pmap = {
-        int(r["period_no"]): int(r["id"])
-        for r in conn.execute(
-            "SELECT id, period_no FROM settlement_periods WHERE project_id=?", (project_id,)
-        ).fetchall()
-    }
     with conn:
         for agg in aggs:
-            for pno, pp in agg.per_period.items():
-                pid = pmap.get(pno)
-                if pid is None:
-                    continue
+            for pid, pp in agg.per_period.items():  # 键即 period_id
                 conn.execute(
                     """INSERT INTO period_totals(project_id, period_id, item_key, qty_sum, amount_sum,
                        wavg_price, cross_check_diff, cross_check_status, evidence_id)

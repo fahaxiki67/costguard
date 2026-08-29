@@ -212,6 +212,34 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE raw_sheets ADD COLUMN period_id INTEGER REFERENCES settlement_periods(id)",
         ],
     ),
+    (
+        # v3: 对上/对下各自拥有期号序列——唯一约束放宽为 (project_id, period_no, direction)。
+        # SQLite 无法修改约束，按官方流程重建表（外键引用的表名与行 id 保持不变）。
+        3,
+        [
+            "PRAGMA foreign_keys=OFF",
+            """CREATE TABLE settlement_periods_new (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                period_no INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_file_id INTEGER REFERENCES source_files(id),
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                contract_party TEXT DEFAULT '',
+                tax_mode TEXT DEFAULT 'unknown',
+                note TEXT DEFAULT '',
+                UNIQUE(project_id, period_no, direction)
+            )""",
+            """INSERT INTO settlement_periods_new
+               (id, project_id, period_no, title, source_file_id, direction, contract_party, tax_mode, note)
+               SELECT id, project_id, period_no, title, source_file_id, direction, contract_party, tax_mode, note
+               FROM settlement_periods""",
+            "DROP TABLE settlement_periods",
+            "ALTER TABLE settlement_periods_new RENAME TO settlement_periods",
+            "PRAGMA foreign_key_check",
+            "PRAGMA foreign_keys=ON",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

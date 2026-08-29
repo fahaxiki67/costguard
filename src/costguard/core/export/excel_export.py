@@ -18,7 +18,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from costguard.core.engine.aggregate import aggregate_project, group_key_of
-from costguard.core.engine.money import round2
+from costguard.core.engine.money import NotANumberError, round2, to_decimal
 
 D = Decimal
 
@@ -41,6 +41,38 @@ def _autowidth(ws):
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(width + 2, 8), 60)
 
 
+# openpyxl 原生支持 Decimal（XML 层写精确十进制字符串），当前序列化无需 float。
+# 若未来更换写入引擎导致必须经 float，本常量置 True：金额先 round2 再转 float，
+# 且转换只允许发生在 _num 这一个边界（监督门槛 4）。
+_SERIALIZE_NEEDS_FLOAT = False
+
+
+def _num(value, money: bool = False):
+    """序列化边界：业务值 → xlsx 数值。全模块唯一的"值 → 单元格"转换点。
+
+    - Decimal 直写，XML 层为精确十进制字符串，无二进制误差，业务值保真
+      （原表合价等证据值不得因序列化改变）；
+    - money=True 仅为金额列语义标记：若 _SERIALIZE_NEEDS_FLOAT（必须转 float 的
+      写入引擎），则先 round2 再转 float；
+    - 缺失/不可解析一律 None（待补资料），绝不补 0；
+    - 禁止在业务计算层做任何 float 转换。
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        d = value
+    elif isinstance(value, str):
+        try:
+            d = to_decimal(value)
+        except NotANumberError:
+            return None
+    else:
+        d = Decimal(repr(value))
+    if _SERIALIZE_NEEDS_FLOAT:
+        return float(round2(d)) if money else float(d)
+    return d
+
+
 def _fetch_periods(conn, project_id):
     return conn.execute(
         "SELECT id, period_no, title, direction, contract_party, tax_mode FROM settlement_periods"
@@ -51,9 +83,9 @@ def _fetch_periods(conn, project_id):
 
 def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook,
                               direction: str | None = None) -> str:
-    """结算累计表（可按对上/对下过滤）。"""
+    """结算累计表（对上/对下各自独立累计，绝不混入另一方向数据）。"""
     periods = [p for p in _fetch_periods(conn, project_id) if direction in (None, p["direction"])]
-    aggs = aggregate_project(conn, project_id)
+    aggs = aggregate_project(conn, project_id, direction=direction)
     ws = wb.create_sheet("对上结算累计表" if direction == "upward" else
                          "对下结算累计表" if direction == "downward" else "结算累计表")
     header = ["清单编码", "清单名称", "单位"] + [f"第{p['period_no']}期金额" for p in periods] + \
@@ -63,11 +95,11 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     for agg in aggs:
         row = [agg.code, agg.name, ""]
         for p in periods:
-            pp = agg.per_period.get(p["period_no"])
-            row.append(float(pp["amount"]) if pp and pp["amount"] is not None else None)
-        row.append(float(agg.cum_qty) if agg.cum_qty is not None else None)
-        row.append(float(agg.cum_amount) if agg.cum_amount is not None else None)
-        row.append(float(round2(agg.wavg_price)) if agg.wavg_price is not None else None)
+            pp = agg.per_period.get(p["id"])  # period_id 键：防对上/对下同期号串表
+            row.append(_num(pp["amount"], money=True) if pp else None)
+        row.append(_num(agg.cum_qty))
+        row.append(_num(agg.cum_amount, money=True))
+        row.append(_num(agg.wavg_price, money=True))
         status = {"ok": "正常", "incomplete": "待补资料", "incomparable": "不可比"}[agg.status]
         row.append(status + ("；".join(agg.warnings[:2]) if agg.warnings else ""))
         ws.append(row)
@@ -98,7 +130,7 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                 if prev is not None and cur is not None and prev["value"] is not None:
                     r = ws.max_row + 1
                     ws.append([agg.code, agg.name, pno_title,
-                               float(cur), float(prev["value"]), None, None])
+                               _num(cur, money=True), _num(prev["value"], money=True), None, None])
                     # 差异公式（保留公式：WPS/Excel 均可复核）
                     ws.cell(row=r, column=6, value=f"=D{r}-E{r}")
                     ws.cell(row=r, column=7, value=f'=IF(E{r}=0,"不可比",(D{r}-E{r})/E{r})')
@@ -129,7 +161,7 @@ def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction
         agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
         agg["names"].add(r["name"] or "")
         for field, val in (("qty", r["quantity"]), ("amount", r["amount"])):
-            if val:
+            if val is not None:  # "0" 是有效值参与累计；缺失(None)不参与也不补 0
                 try:
                     d = D(val)
                 except Exception:
@@ -159,13 +191,13 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
         ws.cell(row=r, column=1, value=code)
         ws.cell(row=r, column=2, value=names[0])
         if u and u["qty"] is not None:
-            ws.cell(row=r, column=3, value=float(u["qty"]))
+            ws.cell(row=r, column=3, value=_num(u["qty"]))
         if d and d["qty"] is not None:
-            ws.cell(row=r, column=4, value=float(d["qty"]))
+            ws.cell(row=r, column=4, value=_num(d["qty"]))
         if u and u["amount"] is not None:
-            ws.cell(row=r, column=5, value=float(u["amount"]))
+            ws.cell(row=r, column=5, value=_num(u["amount"], money=True))
         if d and d["amount"] is not None:
-            ws.cell(row=r, column=6, value=float(d["amount"]))
+            ws.cell(row=r, column=6, value=_num(d["amount"], money=True))
         # 差异公式：两侧都有值才算（一侧缺失标记待补资料，不补 0）
         if u and d and u["amount"] is not None and d["amount"] is not None:
             ws.cell(row=r, column=7, value=f"=E{r}-F{r}")
@@ -260,9 +292,10 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
         if flags.get("subtotal"):
             continue
         r += 1
-        qty = float(row["quantity"]) if row["quantity"] else None
-        price = float(row["unit_price"]) if row["unit_price"] else None
-        amount = float(row["amount"]) if row["amount"] else None
+        # 缺失仅按 is None 判断：Decimal("0") 是有效值必须保留（监督门槛 1）
+        qty = _num(row["quantity"]) if row["quantity"] is not None else None
+        price = _num(row["unit_price"], money=True) if row["unit_price"] is not None else None
+        amount = _num(row["amount"], money=True) if row["amount"] is not None else None
         ws.cell(row=r, column=1, value=row["pno"])
         ws.cell(row=r, column=2, value=row["code"])
         ws.cell(row=r, column=3, value=row["name"])
@@ -289,8 +322,36 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
     _autowidth(ws)
 
 
+def _tax_mode_status(conn: sqlite3.Connection, project_id: int) -> str:
+    """各期单价含税口径状态（供摘要声明范围）。"""
+    modes: dict[str, set] = {}
+    for h in conn.execute(
+        """SELECT th.col_map_json, th.header_row_lo, th.header_row_hi, rs.id AS sid
+           FROM table_headers th JOIN raw_sheets rs ON rs.id = th.sheet_id
+           JOIN settlement_periods sp ON sp.id = rs.period_id WHERE sp.project_id=?""",
+        (project_id,),
+    ):
+        col_map = json.loads(h["col_map_json"])
+        if "unit_price" not in col_map:
+            continue
+        texts = [r["raw_value"] or "" for r in conn.execute(
+            "SELECT raw_value FROM raw_cells WHERE sheet_id=? AND row BETWEEN ? AND ?",
+            (h["sid"], h["header_row_lo"], h["header_row_hi"]),
+        )]
+        joined = "".join(texts)
+        if "不含税" in joined:
+            modes.setdefault("excl_tax", set()).add(h["sid"])
+        elif "含税" in joined:
+            modes.setdefault("incl_tax", set()).add(h["sid"])
+    if not modes:
+        return "未识别（表头未标注含税/不含税，请人工确认）"
+    if len(modes) > 1:
+        return "混用（存在含税与不含税口径，详见异常清单 tax_mode_mixed）"
+    return "含税单价" if "incl_tax" in modes else "不含税单价"
+
+
 def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
-    """管理层摘要 sheet。"""
+    """管理层摘要 sheet：范围、期次与方向、税口径、异常与证据计数。"""
     ws = wb.create_sheet("管理层摘要")
     ws.append(["CostGuard 管理层摘要"])
     ws.cell(row=1, column=1).font = Font(bold=True, size=14)
@@ -303,22 +364,40 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     for r in conn.execute("SELECT severity, COUNT(*) c FROM anomalies WHERE project_id=? GROUP BY severity", (project_id,)):
         sev[r["severity"]] = r["c"]
     periods = _fetch_periods(conn, project_id)
+    n_up = sum(1 for p in periods if p["direction"] == "upward")
+    n_down = sum(1 for p in periods if p["direction"] == "downward")
+    n_none = len(periods) - n_up - n_down
+    n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
+    n_src = conn.execute("SELECT COUNT(*) c FROM source_files WHERE project_id=?", (project_id,)).fetchone()["c"]
     data = [
         ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ("—— 统计范围 ——", ""),
+        ("已导入原始文件数", n_src),
         ("期次数", len(periods)),
+        ("其中：对上", n_up),
+        ("其中：对下", n_down),
+        ("其中：未标记方向", n_none),
         ("清单组数", len(aggs)),
-        ("累计金额合计（可用部分）", float(round2(total))),
+        ("—— 金额与状态 ——", ""),
+        ("累计金额合计（可用部分）", _num(round2(total))),
         ("正常清单组", n_ok),
         ("待补资料清单组", n_inc),
         ("不可比清单组", n_inc2),
+        ("—— 口径与风险 ——", ""),
+        ("单价税口径", _tax_mode_status(conn, project_id)),
         ("高风险异常数", sev["high"]),
         ("中风险异常数", sev["medium"]),
         ("低风险异常数", sev["low"]),
+        ("—— 追溯 ——", ""),
+        ("证据记录数", n_ev),
+        ("证据索引位置", "本工作簿《证据索引》工作表（evidence ID）"),
     ]
     for k, v in data:
         ws.append([k, v])
     ws.append([])
-    ws.append(["说明：缺失数据未补 0；金额为可用部分累计；不可比/待补资料项详见待核实事项清单。"])
+    ws.append(["说明：本摘要由 CostGuard 自动生成，仅反映已导入数据。缺失数据未补 0；"
+               "不可比数据未强行比较；方向未标记的期次仅计入未分离汇总，请先标记对上/对下。"])
+    ws.append(["合成测试数据仅用于软件测试验证，不构成任何真实业务结论。"])
     _autowidth(ws)
 
 
@@ -351,13 +430,31 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     high = conn.execute(
         "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND severity='high'", (project_id,)
     ).fetchone()["c"]
+    periods = _fetch_periods(conn, project_id)
+    n_up = sum(1 for p in periods if p["direction"] == "upward")
+    n_down = sum(1 for p in periods if p["direction"] == "downward")
+    n_none = len(periods) - n_up - n_down
+    n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
     doc = docx_lib.Document()
     doc.add_heading("CostGuard 管理层摘要", level=0)
     doc.add_paragraph(
         f"截至 {datetime.now().strftime('%Y-%m-%d %H:%M')}，共识别清单组 {len(aggs)} 组，"
         f"累计金额（可用部分）{round2(total)} 元，高风险异常 {high} 项。"
     )
-    doc.add_paragraph("数据纪律：缺失数据未自动补 0；不可比数据未强行比较；所有结论可在证据索引中追溯。")
+    doc.add_paragraph(
+        f"统计范围：期次 {len(periods)} 期（对上 {n_up} 期、对下 {n_down} 期、未标记方向 {n_none} 期）；"
+        f"金额为可用部分累计，缺失与不可比项未计入且未补值。"
+    )
+    doc.add_paragraph("数据纪律：缺失数据未自动补 0；不可比数据未强行比较。")
+    doc.add_paragraph(
+        "追溯说明：本 Word 摘要不包含证据入口。逐单元格证据链与证据索引"
+        f"（当前共 {n_ev} 条证据记录）请查阅 CostGuard 导出的 Excel 审核底稿工作簿"
+        "《证据索引》工作表，按证据 ID 查询。"
+    )
+    doc.add_paragraph(
+        "本摘要由软件自动生成，仅反映已导入数据；导入的合成测试数据仅用于软件测试验证，"
+        "不构成任何真实业务结论。"
+    )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"CostGuard管理层摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
