@@ -223,10 +223,10 @@ class TestFormRouting:
         result = parse_file(src, "xlsx")
         ws2 = next(s for s in result.sheets if s.sheet_name == "支付审批单")
         cells = {(c.row, c.col): (c.raw_value or "") for c in ws2.cells}
-        assert detect_form_like(cells, ws2.merged_ranges) is True
+        assert detect_form_like(cells, ws2.merged_ranges) in ("strong", "weak")
         plain = next(s for s in result.sheets if s.sheet_name == "VYSMSZ")
         plain_cells = {(c.row, c.col): (c.raw_value or "") for c in plain.cells}
-        assert detect_form_like(plain_cells, plain.merged_ranges) is False
+        assert detect_form_like(plain_cells, plain.merged_ranges) is None
 
 class TestPureFormProjectHandling:
     def test_pure_form_project_partial_and_skips_settlement_pipeline(self, runner_env, monkeypatch):

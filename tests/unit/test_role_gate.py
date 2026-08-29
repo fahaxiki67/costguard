@@ -184,6 +184,7 @@ class TestGate:
 
     def test_gated_sheets_leave_evidence_and_audit(self, db):
         conn, pid, report = _import(db, make_weak_ledger)
+        _ = report
         ev = conn.execute(
             "SELECT summary, sources_json FROM evidence WHERE kind='sheet_role_candidate'"
         ).fetchall()
