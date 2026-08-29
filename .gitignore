@@ -1,0 +1,52 @@
+# ============ 敏感数据隔离（最高等级安全要求） ============
+# 真实工程资料、合同、结算数据、企业经营数据严禁进入 Git 仓库
+local_private_data/
+**/local_private_data/
+
+# 密钥 / 证书 / 签名材料 / 环境变量秘密
+*.key
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt
+*.mobileprovision
+.env
+.env.*
+secrets/
+credentials*
+entitlements.plist
+
+# 匿名化之前的真实样本
+*_real_*.xlsx
+*_real_*.pdf
+*_real_*.docx
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+dist/
+build/
+*.dmg
+*.exe
+*.msi
+
+# ============ macOS ============
+.DS_Store
+*.app
+
+# ============ IDE ============
+.idea/
+.vscode/
+*.swp
+
+# 本机私有笔记
+*.local.md
+TODO.private.md
