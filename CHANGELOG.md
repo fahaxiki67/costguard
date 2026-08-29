@@ -52,6 +52,15 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
   `brew reinstall --cask libreoffice` (26.2.5.2 -> 26.8.0.3): codesign clean,
   conversion smoke OK, recalc test 5/5, full suite 2x152+1skip green.
 
+### Real-data acceptance (formal round)
+- 13/13 private copies imported, hashes verified before/after (zero modification);
+  10/13 full pipeline success, 3 expected boundaries with explicit messages
+  (.doc/image unsupported, non-standard-header workbook rejected without guessing)
+- Per-file isolated projects (period semantics no longer cross-file);
+  dual/triple-path Decimal reconciliation per file; R05 chapter-summary table
+  keeps true zeros and marks 19/22 missing amounts as pending (never zero-filled)
+- WPS manual acceptance PASSED (2026-08-29, dynamic formula recalc verified by user)
+
 ### Testing
 - 129 tests + 1 explicit skip: WPS has no headless xlsx recalc CLI (wpscli is
   PDF-conversion only) — real-engine recalculation is verified via LibreOffice
