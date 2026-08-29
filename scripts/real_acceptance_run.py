@@ -101,10 +101,18 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
                 return rec
 
             if getattr(report, "needs_manual_review", False):
-                # 纯表单文件：不进入结算计算/异常/匹配/导出（监督 A）
-                rec["form_route"] = {"needs_manual_review": True,
-                                     "sheets": [x.sheet_name for x in report.sheets
-                                                if x.status == "non_settlement_form"]}
+                # 待人工文件：不进入结算计算/异常/匹配/导出（监督 A）
+                # 分列：表单路由 / 角色审阅，互不误标（监督第十轮 A）
+                form_sheets = [x.sheet_name for x in report.sheets
+                               if x.status == "non_settlement_form"]
+                gated_sheets = [x.sheet_name for x in report.sheets
+                                if x.status == "needs_role_review"]
+                if form_sheets:
+                    rec["form_route"] = {"needs_manual_review": True,
+                                         "sheets": form_sheets}
+                if gated_sheets:
+                    rec["role_review"] = {"needs_manual_review": True,
+                                          "sheets": gated_sheets}
                 return rec
 
             # ---- Decimal 复算（独立路径 1：清洗后明细累计）----
@@ -267,6 +275,8 @@ def main(run_dir: Path | None = None) -> None:
             "wps": "pending_manual",  # WPS 实际打开为人工门槛
             "non_settlement_form_needs_manual_review": bool(
                 (result.get("form_route") or {}).get("needs_manual_review")),
+            "non_settlement_spreadsheet_needs_role_review": bool(
+                (result.get("role_review") or {}).get("needs_manual_review")),
             "full_pipeline": bool(
                 imp.get("ok") and (sp or {}).get("ok")
                 and result.get("export", {}).get("xlsx")

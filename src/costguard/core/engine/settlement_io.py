@@ -140,9 +140,14 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
 
 
 def _validate_confirmed_col_map(col_map: dict, max_col: int) -> None:
-    """校验人工确认列映射：必需字段、列号存在且不冲突。"""
-    if "name" not in col_map:
-        raise ValueError("确认列映射缺少必需字段: name（清单名称）")
+    """校验人工确认列映射：name+quantity 必需，amount/unit_price 至少一个，
+    列号存在且不冲突（监督第十轮 B）。"""
+    missing = [f for f in ("name", "quantity") if f not in col_map]
+    if missing:
+        raise ValueError(f"确认列映射缺少必需字段: {'、'.join(missing)}"
+                         "（结算清单至少需要名称与数量）")
+    if "amount" not in col_map and "unit_price" not in col_map:
+        raise ValueError("确认列映射缺少必需字段: amount 或 unit_price 至少一个（金额口径）")
     cols = list(col_map.values())
     if len(cols) != len(set(cols)):
         raise ValueError("确认列映射存在冲突：同一列被映射到多个字段")
@@ -187,6 +192,19 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         _validate_confirmed_col_map(confirmed_col_map, n_cols)
         used_map = dict(confirmed_col_map)
 
+    # 幂等/重复确认拒绝：已回写 period_id 的 sheet 视为已完成
+    already = conn.execute(
+        "SELECT period_id FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
+    if already and already["period_id"] is not None:
+        raise ValueError(
+            f"该 sheet 已完成确认抽取（period_id={already['period_id']}），不得重复确认")
+
+    # 先抽取（items 非空才建 period，避免失败留空期次）
+    det_used = replace(det, col_map=used_map, needs_review=False)
+    items = extract_items.extract_items(cells, merged, det_used, n_rows)
+    if not items:
+        raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
+
     audit_log.record_audit(
         conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
         {"role": "gated", "needs_review": det.needs_review,
@@ -196,9 +214,17 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     pno = next_period_no(conn, project_id, direction)
     period_id = ensure_period(conn, project_id, pno, f"sheet:{sheet_id}", None,
                               direction=direction)
-    det_used = replace(det, col_map=used_map, needs_review=False)
-    items = extract_items.extract_items(cells, merged, det_used, n_rows)
     n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
+    # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
+    with conn:
+        conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?",
+                     (period_id, sheet_id))
+        conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
+        conn.execute(
+            """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
+               col_map_json, confidence, needs_review) VALUES (?,?,?,?,?,0)""",
+            (sheet_id, det.header_row_lo, det.header_row_hi,
+             json.dumps(used_map), det.confidence))
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_confirmed",
         f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",

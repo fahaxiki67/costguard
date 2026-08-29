@@ -415,3 +415,85 @@ class TestExplicitColMapConfirmation:
             settlement_io.confirm_sheet_role_and_extract(
                 conn, pid, sheet_id, actor="复核人", reason="越界",
                 confirmed_col_map={"name": 99})  # 越界
+
+
+class TestRound11ConfirmationGates:
+    def _gated(self, db):
+        conn, pid, report = _import(db, make_ambiguous_header)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='第1期'").fetchone()["id"]
+        return conn, pid, sheet_id
+
+    def test_colmap_requires_quantity_and_amount_or_price(self, db):
+        """列映射校验收严：name+quantity 必需，amount/unit_price 至少一个。"""
+        conn, pid, sheet_id = self._gated(db)
+        with pytest.raises(ValueError, match="必需"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="只有名称",
+                confirmed_col_map={"name": 2, "quantity": 4})
+        with pytest.raises(ValueError, match="必需"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="有名称有数量无金额单价",
+                confirmed_col_map={"name": 2, "quantity": 4, "code": 1})
+        # 合法：name+quantity+unit_price（无 amount 也接受）
+        n = settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人", reason="取单价路径",
+            confirmed_col_map={"code": 1, "name": 2, "unit": 3,
+                               "quantity": 4, "unit_price": 5, "tax_rate": 8})
+        assert n == 2
+
+    def test_no_empty_period_on_zero_extraction(self, db):
+        """抽取 0 行时不得留下空期次。"""
+        import openpyxl
+
+        conn, pid, tmp = db
+        src = tmp / "header_only.xlsx"
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "第1期"
+        for c, v in enumerate(["清单编码", "清单名称", "单位", "工程量", "综合单价", "合价"], start=1):
+            ws.cell(row=1, column=c, value=v)
+        wb.save(src)  # 只有表头无数据行
+        settlement_io.import_settlement_file(conn, pid, tmp, src)
+        sheet_id = conn.execute("SELECT id FROM raw_sheets LIMIT 1").fetchone()["id"]
+        with pytest.raises(ValueError, match="0 行|未抽取到"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="确认",
+                confirmed_col_map={"code": 1, "name": 2, "quantity": 4, "amount": 6})
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM settlement_periods").fetchone()["c"] == 0, \
+            "抽取失败不得留下空期次"
+
+    def test_success_writes_period_link_and_headers(self, db):
+        """成功确认后：raw_sheets.period_id 回写、table_headers 记录已确认映射且 needs_review=0。"""
+        conn, pid, sheet_id = self._gated(db)
+        confirmed = {"code": 1, "name": 2, "unit": 3, "quantity": 4,
+                     "unit_price": 5, "amount": 6, "tax_rate": 8}
+        settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人", reason="人工核对列",
+            confirmed_col_map=confirmed)
+        rs = conn.execute("SELECT period_id FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
+        assert rs["period_id"] is not None, "raw_sheets.period_id 未回写"
+        th = conn.execute(
+            "SELECT col_map_json, needs_review FROM table_headers WHERE sheet_id=?",
+            (sheet_id,)).fetchone()
+        assert json.loads(th["col_map_json"]) == confirmed
+        assert th["needs_review"] == 0
+
+    def test_duplicate_confirm_rejected(self, db):
+        """同一 sheet 重复确认 → 明确拒绝，不得重复插入 line_items。"""
+        conn, pid, sheet_id = self._gated(db)
+        confirmed = {"code": 1, "name": 2, "unit": 3, "quantity": 4,
+                     "unit_price": 5, "amount": 6, "tax_rate": 8}
+        settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人", reason="首次确认",
+            confirmed_col_map=confirmed)
+        before = conn.execute("SELECT COUNT(*) c FROM line_items WHERE sheet_id=?",
+                              (sheet_id,)).fetchone()["c"]
+        with pytest.raises(ValueError, match="已确认|重复"):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="再次确认",
+                confirmed_col_map=confirmed)
+        after = conn.execute("SELECT COUNT(*) c FROM line_items WHERE sheet_id=?",
+                             (sheet_id,)).fetchone()["c"]
+        assert before == after == 2

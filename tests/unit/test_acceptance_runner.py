@@ -324,3 +324,51 @@ class TestComputeTruthfulness:
         steps = t02.get("steps", {})
         assert steps.get("compute") is False, \
             f"复算失败时 compute 必须为 False: {steps}（不得用解析成功代替）"
+
+
+class TestStepsRoleFormSeparation:
+    def test_role_review_not_mislabeled_as_form(self, runner_env, monkeypatch):
+        """角色审阅文件不得被误标为表单路由；steps 两列互斥分列。"""
+        runner, base = runner_env
+        # T01 换成弱表头台账（→ needs_role_review），其余 simple 清单
+        import csv
+
+        from test_acceptance_runner import _make_form_workbook  # noqa: F401
+
+        # 弱台账样例
+        src = base / "corpus" / "T01_sample.xlsx"
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "台账明细"
+        for c, v in enumerate(["合同编号", "合同名称", "承包人", "合同金额"], start=1):
+            ws.cell(row=1, column=c, value=v)
+        for i in range(2, 6):
+            ws.cell(row=i, column=1, value=f"HT-{i}")
+            ws.cell(row=i, column=2, value=f"某合同{i}")
+            ws.cell(row=i, column=3, value=f"对方{i}")
+            ws.cell(row=i, column=4, value=1000 + i)
+        wb.save(src)
+        rows = []
+        for i in range(1, 14):
+            p = base / "corpus" / f"T{i:02d}_sample.xlsx"
+            rows.append({"test_id": f"T{i:02d}", "source_path": f"orig/T{i:02d}",
+                         "copy_path": f"corpus/T{i:02d}_sample.xlsx",
+                         "sha256": runner.sha256_of(p), "purpose": "脱敏回归"})
+        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
+            w.writeheader()
+            w.writerows(rows)
+
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        t01 = json.loads((runs[-1] / "done" / "T01.json").read_text(encoding="utf-8"))
+        steps = t01.get("steps", {})
+        assert steps.get("non_settlement_spreadsheet_needs_role_review") is True, \
+            f"角色审阅必须单列: {steps}"
+        assert steps.get("non_settlement_form_needs_manual_review") is False, \
+            f"角色审阅不得误标为表单路由: {steps}"
+        rec = t01
+        assert (rec.get("role_review") or {}).get("needs_manual_review") is True
+        assert rec.get("form_route") in (None, {})
