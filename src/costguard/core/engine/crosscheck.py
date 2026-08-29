@@ -17,7 +17,7 @@ from decimal import Decimal
 from costguard.core.engine.money import round2  # noqa: F401  (money 入口纪律：保留显式依赖)
 from costguard.core.engine.settlement_io import load_sheet_grid
 from costguard.core.parsing import extract_items
-from costguard.core.parsing.header_detect import detect_header
+from costguard.core.parsing.header_detect import HeaderDetection, detect_header
 
 D = Decimal
 
@@ -98,10 +98,30 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     b_missing = 0
     for (sheet_id,) in [(r["id"],) for r in sheet_ids]:
         cells, merged, n_rows, _n_cols = load_sheet_grid(conn, sheet_id)
-        det = detect_header(0, cells, merged, n_rows, max((c for _, c in cells), default=0))
+        confirmed = conn.execute(
+            """SELECT header_row_lo, header_row_hi, col_map_json, confidence,
+                      needs_review, data_row_start, data_row_end
+               FROM table_headers WHERE sheet_id=?""",
+            (sheet_id,),
+        ).fetchone()
+        data_range = None
+        if confirmed is not None:
+            det = HeaderDetection(
+                sheet_index=0,
+                header_row_lo=int(confirmed["header_row_lo"]),
+                header_row_hi=int(confirmed["header_row_hi"]),
+                col_map=json.loads(confirmed["col_map_json"]),
+                confidence=float(confirmed["confidence"]),
+                needs_review=bool(confirmed["needs_review"]),
+            )
+            if confirmed["data_row_start"] is not None and confirmed["data_row_end"] is not None:
+                data_range = (int(confirmed["data_row_start"]), int(confirmed["data_row_end"]))
+        else:
+            det = detect_header(
+                0, cells, merged, n_rows, max((c for _, c in cells), default=0))
         if det is None:
             continue
-        items = extract_items.extract_items(cells, merged, det, n_rows)
+        items = extract_items.extract_items(cells, merged, det, n_rows, data_range=data_range)
         rows_b = []
         for it in items:
             if it.flags.get("subtotal"):

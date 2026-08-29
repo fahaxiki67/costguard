@@ -8,15 +8,15 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from costguard import ui
+from costguard.ui.main_window import MainWindow
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("CostGuard")
     app.setApplicationDisplayName("CostGuard")
     app.setOrganizationName("CostGuard")
-    win = ui.main_window.MainWindow()
+    win = MainWindow()
     win.show()
     return app.exec()
 

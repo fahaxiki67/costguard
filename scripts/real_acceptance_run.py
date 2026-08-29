@@ -22,6 +22,7 @@ BASE = Path(__file__).resolve().parents[1] / "local_private_data" / "real_accept
 CORPUS = BASE / "corpus"
 WORK = BASE / "work"
 MANIFEST = BASE / "manifest.csv"
+DECISIONS = BASE / "manual_sheet_decisions.json"
 
 
 def sha256_of(path: Path) -> str:
@@ -45,7 +46,18 @@ def verify_corpus(records: list[dict]) -> list[dict]:
     return out
 
 
-def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -> dict:
+def load_manual_decisions() -> dict[str, list[dict]]:
+    """读取仅存于 local_private_data 的人工 sheet 角色/映射决定。"""
+    if not DECISIONS.exists():
+        return {}
+    data = json.loads(DECISIONS.read_text(encoding="utf-8"))
+    if data.get("version") != 1 or not isinstance(data.get("files"), dict):
+        raise ValueError("manual_sheet_decisions.json 格式无效：需要 version=1 与 files 对象")
+    return data["files"]
+
+
+def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
+                 manual_decisions: list[dict] | None = None) -> dict:
     """单文件独立项目全流程（项目建在 run 目录内）。任何一步失败都记录而非中断。"""
     rec: dict = {"test_id": test_id, "copy": copy.name, "purpose": purpose}
 
@@ -101,19 +113,115 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path) -
                 return rec
 
             if getattr(report, "needs_manual_review", False):
-                # 待人工文件：不进入结算计算/异常/匹配/导出（监督 A）
                 # 分列：表单路由 / 角色审阅，互不误标（监督第十轮 A）
                 form_sheets = [x.sheet_name for x in report.sheets
                                if x.status == "non_settlement_form"]
                 gated_sheets = [x.sheet_name for x in report.sheets
                                 if x.status == "needs_role_review"]
-                if form_sheets:
+                unresolved_form = set(form_sheets)
+                unresolved_gated = set(gated_sheets)
+                status_by_sheet = {x.sheet_name: x.status for x in report.sheets}
+                # 无自动表头的 sheet 仅在私有决定显式给出列/表头/数据范围时，
+                # 才加入人工抽取候选；其他 no_header 仍保持原样，不扩大任务范围。
+                for decision in manual_decisions or []:
+                    if (decision.get("action") == "extract"
+                            and status_by_sheet.get(decision.get("sheet")) == "no_header"):
+                        unresolved_gated.add(decision["sheet"])
+                decision_results: list[dict] = []
+                decision_errors: list[dict] = []
+                pending = unresolved_form | unresolved_gated
+                seen: set[str] = set()
+                for decision in manual_decisions or []:
+                    sheet_name = decision.get("sheet")
+                    action = decision.get("action")
+                    if not sheet_name or sheet_name in seen:
+                        decision_errors.append({
+                            "sheet": sheet_name, "error": "sheet 名缺失或决定重复"})
+                        continue
+                    seen.add(sheet_name)
+                    if sheet_name not in pending:
+                        decision_errors.append({
+                            "sheet": sheet_name, "error": "该 sheet 不在本轮待人工列表中"})
+                        continue
+                    row = conn.execute(
+                        "SELECT id FROM raw_sheets WHERE batch_id=? AND sheet_name=?",
+                        (report.batch_id, sheet_name),
+                    ).fetchone()
+                    if not row:
+                        decision_errors.append({"sheet": sheet_name, "error": "未找到 raw sheet"})
+                        continue
+                    sheet_id = int(row["id"])
+                    try:
+                        if action == "extract":
+                            if sheet_name not in unresolved_gated:
+                                raise ValueError("表单类 sheet 不允许直接作为结算明细抽取")
+                            n = settlement_io.confirm_sheet_role_and_extract(
+                                conn, info.project_id, sheet_id,
+                                actor=decision.get("actor", "acceptance-reviewer"),
+                                reason=decision.get("reason", ""),
+                                direction=decision.get("direction", "unknown"),
+                                period_no=decision.get("period_no"),
+                                confirmed_col_map=decision.get("col_map"),
+                                confirmed_header_range=(
+                                    tuple(decision["header_range"])
+                                    if decision.get("header_range") is not None else None),
+                                confirmed_data_range=(
+                                    tuple(decision["data_range"])
+                                    if decision.get("data_range") is not None else None),
+                            )
+                            decision_results.append({
+                                "sheet": sheet_name, "action": action,
+                                "status": "confirmed", "n_items": n,
+                                "period_no": decision.get("period_no"),
+                                "direction": decision.get("direction", "unknown"),
+                            })
+                        elif action == "evidence_only":
+                            settlement_io.confirm_sheet_non_settlement_role(
+                                conn, info.project_id, sheet_id,
+                                actor=decision.get("actor", "acceptance-reviewer"),
+                                confirmed_role=decision.get("role", "other_non_settlement"),
+                                reason=decision.get("reason", ""),
+                            )
+                            decision_results.append({
+                                "sheet": sheet_name, "action": action,
+                                "role": decision.get("role", "other_non_settlement"),
+                                "status": "confirmed",
+                            })
+                        else:
+                            raise ValueError("action 必须是 extract 或 evidence_only")
+                    except Exception as exc:  # noqa: BLE001
+                        decision_errors.append({
+                            "sheet": sheet_name,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+                        continue
+                    unresolved_form.discard(sheet_name)
+                    unresolved_gated.discard(sheet_name)
+
+                if decision_results:
+                    rec["manual_sheet_decisions"] = decision_results
+                if decision_errors:
+                    rec["manual_decision_errors"] = decision_errors
+                if unresolved_form:
                     rec["form_route"] = {"needs_manual_review": True,
-                                         "sheets": form_sheets}
-                if gated_sheets:
+                                         "sheets": sorted(unresolved_form)}
+                if unresolved_gated:
                     rec["role_review"] = {"needs_manual_review": True,
-                                          "sheets": gated_sheets}
-                return rec
+                                          "sheets": sorted(unresolved_gated)}
+                if unresolved_form or unresolved_gated or decision_errors:
+                    return rec
+
+                canonical_count = conn.execute(
+                    """SELECT COUNT(*) c FROM line_items li JOIN settlement_periods sp
+                       ON sp.id=li.period_id WHERE sp.project_id=?""",
+                    (info.project_id,),
+                ).fetchone()["c"]
+                rec["settlement_parse"]["needs_manual_review"] = False
+                if canonical_count == 0:
+                    rec["settlement_parse"]["status"] = "reviewed_non_settlement"
+                    return rec
+                rec["settlement_parse"]["ok"] = True
+                rec["settlement_parse"]["status"] = "ok_after_manual_confirmation"
 
             # ---- Decimal 复算（独立路径 1：清洗后明细累计）----
             from costguard.core.engine import aggregate, crosscheck
@@ -225,6 +333,7 @@ def main(run_dir: Path | None = None) -> None:
     """
 
     now = datetime.now()
+    manual_by_test = load_manual_decisions()
     with open(MANIFEST, encoding="utf-8") as f:
         records_raw = list(csv.DictReader(f))
     assert len(records_raw) == 13, f"manifest 应有 13 行，实际 {len(records_raw)}"
@@ -255,7 +364,10 @@ def main(run_dir: Path | None = None) -> None:
             results.append(json.loads(done_marker.read_text(encoding="utf-8")))
             continue
         copy = BASE / rec["copy_path"]
-        result = inspect_file(rec["test_id"], rec["purpose"], copy, run_dir)
+        result = inspect_file(
+            rec["test_id"], rec["purpose"], copy, run_dir,
+            manual_decisions=manual_by_test.get(rec["test_id"]),
+        )
         # 分步状态（监督要求分列，文本只解析不算完整流程成功）
         imp = result.get("import", {})
         sp = result.get("settlement_parse")

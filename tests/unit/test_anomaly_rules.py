@@ -41,6 +41,34 @@ def add_item(conn, period_id, code="C1", name="清单A", qty="10", price="100", 
         )
 
 
+def attach_confirmed_sheet(conn, project_id, period_id, col_map, *, sheet_name="计算明细"):
+    """给既有测试行补充人工确认后的来源 Sheet 与列映射。"""
+    with conn:
+        file_id = conn.execute(
+            """INSERT INTO source_files(project_id, original_path, stored_path, original_name,
+               sha256, size_bytes, file_type, imported_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (project_id, f"/{period_id}.xlsx", f"/{period_id}.xlsx", f"{period_id}.xlsx",
+             f"sha-{period_id}-{sheet_name}", 1, "xlsx", "2026"),
+        ).lastrowid
+        batch_id = conn.execute(
+            "INSERT INTO parse_batches(file_id, parser, parsed_at, status) VALUES (?,?,?,?)",
+            (file_id, "test", "2026", "ok"),
+        ).lastrowid
+        sheet_id = conn.execute(
+            """INSERT INTO raw_sheets(batch_id, sheet_index, sheet_name, n_rows, n_cols,
+               period_id) VALUES (?,?,?,?,?,?)""",
+            (batch_id, 0, sheet_name, 20, max(col_map.values()), period_id),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
+               col_map_json, confidence, needs_review, data_row_start, data_row_end)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (sheet_id, 5, 7, json.dumps(col_map), 1.0, 0, 8, 17),
+        )
+        conn.execute("UPDATE line_items SET sheet_id=? WHERE period_id=?", (sheet_id, period_id))
+    return sheet_id
+
+
 class TestRowRules:
     def test_qty_price_mismatch_high(self, db):
         conn, pid, pmap = db
@@ -80,6 +108,28 @@ class TestRowRules:
         assert rules.rule_qty_price_amount(conn, pid) == []
         assert rules.rule_missing_key_fields(conn, pid) == []
 
+    def test_confirmed_amount_only_path_does_not_require_qty_or_price(self, db):
+        """人工确认名称+金额后，不得继续提示缺工程量、单价。"""
+        conn, pid, pmap = db
+        add_item(conn, pmap[1], qty=None, price=None, amount="3370591.52", flags={"row": 7})
+        attach_confirmed_sheet(
+            conn, pid, pmap[1], {"code": 1, "name": 2, "amount": 7}
+        )
+        assert rules.rule_missing_key_fields(conn, pid) == []
+
+    def test_tax_amount_adjustment_does_not_require_code_qty_or_price(self, db):
+        """税金行是金额调整项，有名称和金额即可，不应制造清单字段误报。"""
+        conn, pid, pmap = db
+        add_item(
+            conn, pmap[1], code="", name="税金", qty=None, price=None,
+            amount="1680", flags={"row": 17},
+        )
+        attach_confirmed_sheet(
+            conn, pid, pmap[1],
+            {"code": 1, "name": 2, "quantity": 9, "unit_price": 4, "amount": 10},
+        )
+        assert rules.rule_missing_key_fields(conn, pid) == []
+
 
 class TestPeriodRules:
     def test_summary_mismatch(self, db):
@@ -97,6 +147,15 @@ class TestPeriodRules:
         add_item(conn, pmap[1], amount="1000", flags={"subtotal": True})
         f = rules.rule_subtotal_vs_details(conn, pid)
         assert f[0].rule_id == "summary_missing_data"
+
+    def test_subtotal_compares_only_preceding_detail_segment(self, db):
+        """税金等后置调整不得被倒灌进前面的税前小计，制造高风险误报。"""
+        conn, pid, pmap = db
+        add_item(conn, pmap[1], amount="28000", flags={"row": 8})
+        add_item(conn, pmap[1], amount="28000", flags={"row": 9})
+        add_item(conn, pmap[1], amount="56000", flags={"row": 16, "subtotal": True})
+        add_item(conn, pmap[1], amount="1680", flags={"row": 17})  # 小计后的税金
+        assert rules.rule_subtotal_vs_details(conn, pid) == []
 
     def test_duplicates(self, db):
         conn, pid, pmap = db

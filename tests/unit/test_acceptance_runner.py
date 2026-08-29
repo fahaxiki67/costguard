@@ -72,6 +72,7 @@ def runner_env(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "BASE", base)
     monkeypatch.setattr(runner, "WORK", base / "work")
     monkeypatch.setattr(runner, "MANIFEST", manifest)
+    monkeypatch.setattr(runner, "DECISIONS", base / "manual_sheet_decisions.json")
     return runner, base
 
 
@@ -372,3 +373,81 @@ class TestStepsRoleFormSeparation:
         rec = t01
         assert (rec.get("role_review") or {}).get("needs_manual_review") is True
         assert rec.get("form_route") in (None, {})
+
+
+class TestManualSheetDecisions:
+    def test_private_decisions_resolve_form_and_amount_only_sheet(self, runner_env):
+        """私有人工决定应可安全完成：表单仅作证据，金额型明细按明确行列抽取。"""
+        runner, base = runner_env
+        import csv
+
+        import openpyxl
+
+        src = base / "corpus" / "T01_sample.xlsx"
+        _make_form_workbook(src)
+        wb = openpyxl.load_workbook(src)
+        ws = wb.create_sheet("计算明细表")
+        ws.cell(4, 1, "序号")
+        ws.cell(4, 2, "项目名称")
+        ws.cell(4, 3, "分包商申报")
+        ws.cell(4, 4, "项目部审核")
+        ws.cell(5, 3, "金额(元)")
+        ws.cell(5, 4, "金额(元)")
+        ws.cell(6, 1, "1")
+        ws.cell(6, 2, "暂估价设备本期结算")
+        ws.cell(6, 3, "3370591.52")
+        ws.cell(6, 4, "3370591.52")
+        ws.cell(10, 2, "金额合计")
+        ws.cell(10, 4, "3370591.52")
+        wb.save(src)
+
+        rows = []
+        for i in range(1, 14):
+            p = base / "corpus" / f"T{i:02d}_sample.xlsx"
+            rows.append({
+                "test_id": f"T{i:02d}", "source_path": f"orig/T{i:02d}",
+                "copy_path": f"corpus/T{i:02d}_sample.xlsx",
+                "sha256": runner.sha256_of(p), "purpose": "脱敏回归",
+            })
+        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(
+                f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
+            w.writeheader()
+            w.writerows(rows)
+
+        (base / "manual_sheet_decisions.json").write_text(json.dumps({
+            "version": 1,
+            "files": {
+                "T01": [
+                    {"sheet": "支付审批单", "action": "evidence_only",
+                     "role": "non_settlement_form", "actor": "验收复核人",
+                     "reason": "人工确认：支付审批表仅作证据"},
+                    {"sheet": "计算明细表", "action": "extract",
+                     "actor": "验收复核人", "reason": "人工确认项目部审核金额列与唯一明细行",
+                     "direction": "downward", "period_no": 2,
+                     "col_map": {"code": 1, "name": 2, "amount": 4},
+                     "header_range": [4, 5], "data_range": [6, 6]},
+                ]
+            },
+        }, ensure_ascii=False), encoding="utf-8")
+
+        runner.main()
+        run = sorted((base / "work").glob("run_*"))[-1]
+        rec = json.loads((run / "done" / "T01.json").read_text(encoding="utf-8"))
+        assert rec["steps"]["full_pipeline"] is True
+        assert rec["settlement_parse"]["status"] == "ok_after_manual_confirmation"
+        assert len(rec["manual_sheet_decisions"]) == 2
+        assert rec.get("form_route") in (None, {})
+        assert rec.get("role_review") in (None, {})
+
+        import sqlite3
+
+        conn = sqlite3.connect(run / "验收-T01" / "project.db")
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT li.quantity, li.amount, sp.period_no, sp.direction "
+            "FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id"
+        ).fetchone()
+        conn.close()
+        assert row["quantity"] is None and row["amount"] == "3370591.52"
+        assert row["period_no"] == 2 and row["direction"] == "downward"

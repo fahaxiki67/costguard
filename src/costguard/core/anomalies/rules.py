@@ -72,6 +72,16 @@ def _is_subtotal(flags_json: str | None) -> bool:
         return False
 
 
+def _is_amount_adjustment(name: str | None) -> bool:
+    """金额调整行不强制要求清单编码或数量单价。
+
+    仅覆盖语义明确的税额/税费行；其他费用或调整仍按普通清单项检查，
+    避免用宽泛关键词吞掉真正缺字段的明细。
+    """
+    text = (name or "").strip().replace(" ", "")
+    return bool(re.fullmatch(r"(?:税金|税额|税费|增值税)(?:[（(].*[）)])?", text))
+
+
 # ---------- 行级规则 ----------
 
 def rule_qty_price_amount(conn, project_id) -> list[Finding]:
@@ -182,38 +192,62 @@ def rule_subtotal_vs_details(conn, project_id) -> list[Finding]:
         rows = conn.execute(
             "SELECT amount, flags_json FROM line_items WHERE period_id=?", (p["id"],)
         ).fetchall()
-        details = [r for r in rows if not _is_subtotal(r["flags_json"])]
-        subtotals = [r for r in rows if _is_subtotal(r["flags_json"])]
+        enriched = []
+        for r in rows:
+            flags = json.loads(r["flags_json"] or "{}")
+            enriched.append({"amount": r["amount"], "flags": flags,
+                             "subtotal": bool(flags.get("subtotal")),
+                             "row": flags.get("row")})
+        details = [r for r in enriched if not r["subtotal"]]
+        subtotals = [r for r in enriched if r["subtotal"]]
         if not subtotals or not details:
             continue
-        det_total, det_missing = D(0), 0
-        for r in details:
-            if r["amount"]:
-                try:
-                    det_total += D(r["amount"])
-                except Exception:
+
+        # 有原始行号时，每个小计只核对其前一段明细。税金、支付比例等位于小计
+        # 之后的调整项不应倒灌进前一个小计；多个章节小计也各自独立。
+        ordered = all(isinstance(r["row"], int) for r in enriched)
+        groups: list[tuple[list[dict], list[dict]]] = []
+        if ordered:
+            prev_subtotal_row = 0
+            for subtotal in sorted(subtotals, key=lambda r: r["row"]):
+                segment = [r for r in details
+                           if prev_subtotal_row < r["row"] < subtotal["row"]]
+                if segment:
+                    groups.append((segment, [subtotal]))
+                prev_subtotal_row = subtotal["row"]
+        else:
+            # 历史/合成数据可能没有 row 证据，保持原有整期比较口径。
+            groups.append((details, subtotals))
+
+        for detail_group, subtotal_group in groups:
+            det_total, det_missing = D(0), 0
+            for r in detail_group:
+                if r["amount"]:
+                    try:
+                        det_total += D(r["amount"])
+                    except Exception:
+                        det_missing += 1
+                else:
                     det_missing += 1
-            else:
-                det_missing += 1
-        sub_total = D(0)
-        for r in subtotals:
-            if r["amount"]:
-                try:
-                    sub_total += D(r["amount"])
-                except Exception:
-                    pass
-        if det_missing:
-            out.append(Finding(
-                "summary_missing_data", "medium", "period", p["id"],
-                f"第{p['period_no']}期存在 {det_missing} 行金额缺失，小计核对不可靠（待补资料）", {},
-            ))
-        elif abs(det_total - sub_total) > ROUND_TOL:
-            out.append(Finding(
-                "summary_mismatch", "high", "period", p["id"],
-                f"第{p['period_no']}期明细合计 {round2(det_total)} ≠ 原表小计 {round2(sub_total)}，"
-                f"差异 {round2(det_total - sub_total)}",
-                {"details_sum": str(det_total), "subtotal": str(sub_total)},
-            ))
+            sub_total = D(0)
+            for r in subtotal_group:
+                if r["amount"]:
+                    try:
+                        sub_total += D(r["amount"])
+                    except Exception:
+                        pass
+            if det_missing:
+                out.append(Finding(
+                    "summary_missing_data", "medium", "period", p["id"],
+                    f"第{p['period_no']}期存在 {det_missing} 行金额缺失，小计核对不可靠（待补资料）", {},
+                ))
+            elif abs(det_total - sub_total) > ROUND_TOL:
+                out.append(Finding(
+                    "summary_mismatch", "high", "period", p["id"],
+                    f"第{p['period_no']}期明细合计 {round2(det_total)} ≠ 原表小计 {round2(sub_total)}，"
+                    f"差异 {round2(det_total - sub_total)}",
+                    {"details_sum": str(det_total), "subtotal": str(sub_total)},
+                ))
     return out
 
 
@@ -599,7 +633,13 @@ def rule_missing_key_fields(conn, project_id) -> list[Finding]:
         ).fetchone()["c"]
         if not n_rows:
             continue
-        missing_cols = [label for f, label in field_labels.items() if f not in col_map]
+        missing_cols = [field_labels[f] for f in ("code", "name") if f not in col_map]
+        # 合法计价有两条路径：直接金额，或工程量×单价。人工已确认直接金额列时，
+        # 工程量/单价不是缺失字段；反之，数量单价齐全时也不强制要求合价列。
+        has_amount_path = "amount" in col_map
+        has_qty_price_path = "quantity" in col_map and "unit_price" in col_map
+        if not (has_amount_path or has_qty_price_path):
+            missing_cols.append("金额路径（合价，或工程量×单价）")
         if missing_cols:
             out.append(Finding(
                 "missing_key_column", "medium", "sheet", sid,
@@ -616,15 +656,27 @@ def rule_missing_key_fields(conn, project_id) -> list[Finding]:
         # 有表头记录时：整列缺失已按表级报告，行级只查存在的列；
         # 无表头记录（如手工数据/旧流程行）：退回逐字段行级判断。
         missing = []
-        for f, label in field_labels.items():
-            if col_map is not None and f not in col_map:
-                continue
-            if f == "code" and not (r["code"] or "").strip():
-                missing.append(label)
-            elif f == "name" and not (r["name"] or "").strip():
-                missing.append(label)
-            elif f in ("quantity", "unit_price", "amount") and not r[f]:
-                missing.append(label)
+        if col_map is None:
+            # 旧流程/手工数据没有已确认表头语义，保持严格逐字段检查。
+            for f, label in field_labels.items():
+                if f in ("code", "name") and not (r[f] or "").strip():
+                    missing.append(label)
+                elif f in ("quantity", "unit_price", "amount") and not r[f]:
+                    missing.append(label)
+        else:
+            if "name" in col_map and not (r["name"] or "").strip():
+                missing.append(field_labels["name"])
+            if ("code" in col_map and not _is_amount_adjustment(r["name"])
+                    and not (r["code"] or "").strip()):
+                missing.append(field_labels["code"])
+
+            amount_complete = "amount" in col_map and bool(r["amount"])
+            qty_price_complete = (
+                "quantity" in col_map and "unit_price" in col_map
+                and bool(r["quantity"]) and bool(r["unit_price"])
+            )
+            if not (amount_complete or qty_price_complete):
+                missing.append("合价或工程量×单价")
         if missing:
             out.append(Finding(
                 "missing_key_fields", "medium", "line_item", r["id"],

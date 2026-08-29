@@ -57,10 +57,11 @@ def extract_items(
     merged_ranges: list[str],
     det: HeaderDetection,
     max_row: int,
+    data_range: tuple[int, int] | None = None,
 ) -> list[ItemDraft]:
     """从网格抽取清单行草稿。跳过全空行；小计/合计行打 flags['subtotal']=True。"""
     anchors = build_anchor_map(merged_ranges)
-    start, end = data_rows_range(cells, det, max_row)
+    start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
     items: list[ItemDraft] = []
     for r in range(start, end + 1):
         row_cells = {f: _text_at(cells, anchors, r, det.col_map.get(f)) for f in det.col_map}

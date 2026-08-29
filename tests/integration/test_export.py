@@ -34,6 +34,26 @@ def full_project(tmp_path):
 
 
 class TestExcelExport:
+    def test_exported_tables_have_borders_and_centered_cells(self, full_project):
+        """正式导出的各张表应具备可直接验收的基础表格格式。"""
+        info, conn, exports = full_project
+        path = excel_export.export_workbook(conn, info.project_id, exports)
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, data_only=False)
+        for ws in wb.worksheets:
+            assert ws.max_row >= 1 and ws.max_column >= 1
+            for row in ws.iter_rows(
+                min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column
+            ):
+                for cell in row:
+                    assert cell.border.left.style == "thin", (ws.title, cell.coordinate)
+                    assert cell.border.right.style == "thin", (ws.title, cell.coordinate)
+                    assert cell.border.top.style == "thin", (ws.title, cell.coordinate)
+                    assert cell.border.bottom.style == "thin", (ws.title, cell.coordinate)
+                    assert cell.alignment.horizontal == "center", (ws.title, cell.coordinate)
+                    assert cell.alignment.vertical == "center", (ws.title, cell.coordinate)
+
     def test_workbook_created_all_sheets(self, full_project):
         info, conn, exports = full_project
         path = excel_export.export_workbook(conn, info.project_id, exports)
@@ -311,3 +331,33 @@ class TestExcelExport:
 
         doc = docx_lib.Document(str(path))
         assert "CostGuard 管理层摘要" in doc.paragraphs[0].text
+        text = "\n".join(p.text for p in doc.paragraphs)
+        assert "合成测试数据" not in text, "通用成果不得把真实资料误写成合成数据"
+        assert "人工复核" in text and "业务审批" in text
+        from docx.oxml.ns import qn
+
+        for style_name in ("Normal", "Title"):
+            style = doc.styles[style_name]
+            assert style.font.name == "Songti SC"
+            assert style._element.rPr.rFonts.get(qn("w:eastAsia")) == "Songti SC"
+            assert style._element.rPr.rFonts.get(qn("w:asciiTheme")) is None
+            assert style._element.rPr.rFonts.get(qn("w:hAnsiTheme")) is None
+        assert doc.paragraphs[0].style.name == "Normal"
+        title_run = doc.paragraphs[0].runs[0]
+        assert title_run.font.name == "Songti SC"
+        assert title_run._element.rPr.rFonts.get(qn("w:eastAsia")) == "Songti SC"
+        zoom = doc.settings.element.find(qn("w:zoom"))
+        assert zoom is not None and zoom.get(qn("w:percent")) == "100"
+
+    def test_workbook_disclaimer_is_valid_for_real_or_synthetic_data(self, full_project):
+        info, conn, exports = full_project
+        path = excel_export.export_workbook(conn, info.project_id, exports)
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, data_only=False)
+        text = "\n".join(
+            str(cell.value) for row in wb["管理层摘要"].iter_rows() for cell in row
+            if cell.value is not None
+        )
+        assert "合成测试数据" not in text
+        assert "人工复核" in text and "业务审批" in text

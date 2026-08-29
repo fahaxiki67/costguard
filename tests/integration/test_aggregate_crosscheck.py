@@ -1,4 +1,5 @@
 """Phase 3 结算累计与双向校核测试。"""
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -89,6 +90,59 @@ class TestAggregate:
         ).fetchall()
         db_total = sum((D(r["amount"]) for r in rows if r["amount"]), D(0))
         assert total == db_total
+
+    def test_confirmed_amount_only_item_is_complete_without_quantity(self, tmp_path):
+        """名称+金额型计价不虚构数量，金额累计仍应是完整状态。"""
+        from costguard.core.models import project as pm
+
+        info = pm.create_project("金额型计价", tmp_path / "ws")
+        info, conn = pm.open_project(Path(info.workspace_path))
+        try:
+            with conn:
+                period_id = conn.execute(
+                    """INSERT INTO settlement_periods(project_id, period_no, title, direction)
+                       VALUES (?,?,?,?)""",
+                    (info.project_id, 2, "第2期", "downward"),
+                ).lastrowid
+                file_id = conn.execute(
+                    """INSERT INTO source_files(project_id, original_path, stored_path,
+                       original_name, sha256, size_bytes, file_type, imported_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (info.project_id, "/amount.xlsx", "/amount.xlsx", "amount.xlsx",
+                     "amount-only", 1, "xlsx", "2026"),
+                ).lastrowid
+                batch_id = conn.execute(
+                    """INSERT INTO parse_batches(file_id, parser, parsed_at, status)
+                       VALUES (?,?,?,?)""",
+                    (file_id, "test", "2026", "ok"),
+                ).lastrowid
+                sheet_id = conn.execute(
+                    """INSERT INTO raw_sheets(batch_id, sheet_index, sheet_name, n_rows,
+                       n_cols, period_id) VALUES (?,?,?,?,?,?)""",
+                    (batch_id, 0, "计算明细表", 7, 7, period_id),
+                ).lastrowid
+                conn.execute(
+                    """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
+                       col_map_json, confidence, needs_review, data_row_start, data_row_end)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (sheet_id, 4, 6, json.dumps({"code": 1, "name": 2, "amount": 7}),
+                     1.0, 0, 7, 7),
+                )
+                conn.execute(
+                    """INSERT INTO line_items(period_id, sheet_id, code, name, amount,
+                       flags_json) VALUES (?,?,?,?,?,?)""",
+                    (period_id, sheet_id, "1", "暂估价设备结算", "3370591.52",
+                     json.dumps({"row": 7})),
+                )
+            result = aggregate.aggregate_project(conn, info.project_id)
+            assert len(result) == 1
+            assert result[0].status == "ok"
+            assert result[0].cum_qty is None
+            assert result[0].cum_amount == D("3370591.52")
+            assert result[0].wavg_price is None
+            assert result[0].warnings == []
+        finally:
+            conn.close()
 
 
 class TestCrossCheck:

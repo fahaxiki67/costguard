@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 
@@ -31,6 +32,7 @@ class ItemAggregate:
     wavg_price: Decimal | None = None
     status: str = "ok"  # 'ok' | 'incomplete' | 'incomparable'
     warnings: list[str] = field(default_factory=list)
+    quantity_required: bool = field(default=False, repr=False)
 
 
 def _dec_or_none(raw: str | None) -> tuple[Decimal | None, bool]:
@@ -62,6 +64,30 @@ def load_line_items(conn: sqlite3.Connection, project_id: int,
     return conn.execute(sql, params).fetchall()
 
 
+def _confirmed_col_maps(conn: sqlite3.Connection, project_id: int) -> dict[int, dict]:
+    rows = conn.execute(
+        """SELECT th.sheet_id, th.col_map_json FROM table_headers th
+           JOIN raw_sheets rs ON rs.id=th.sheet_id
+           JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND th.needs_review=0""",
+        (project_id,),
+    ).fetchall()
+    return {int(r["sheet_id"]): json.loads(r["col_map_json"]) for r in rows}
+
+
+def _quantity_is_optional(row: sqlite3.Row, col_maps: dict[int, dict]) -> bool:
+    """直接金额型计价与明确税额行不要求虚构数量。"""
+    name = (row["name"] or "").strip().replace(" ", "")
+    if re.fullmatch(r"(?:税金|税额|税费|增值税)(?:[（(].*[）)])?", name):
+        return True
+    col_map = col_maps.get(row["sheet_id"])
+    return bool(
+        col_map and "amount" in col_map
+        and not ("quantity" in col_map and "unit_price" in col_map)
+    )
+
+
 def aggregate_project(conn: sqlite3.Connection, project_id: int,
                       direction: str | None = None) -> list[ItemAggregate]:
     """按 item_key 累计项目全部期次。跳过小计行；缺失值不补 0。
@@ -81,6 +107,7 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int,
             (project_id, direction) if direction is not None else (project_id,),
         ).fetchall()
     }
+    col_maps = _confirmed_col_maps(conn, project_id)
     aggs: dict[str, ItemAggregate] = {}
     for row in load_line_items(conn, project_id, direction=direction):
         flags = json.loads(row["flags_json"] or "{}")
@@ -92,6 +119,9 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int,
 
         qty, qty_missing = _dec_or_none(row["quantity"])
         amount, amount_missing = _dec_or_none(row["amount"])
+        quantity_optional = _quantity_is_optional(row, col_maps)
+        if not quantity_optional:
+            agg.quantity_required = True
         pp = agg.per_period.setdefault(
             int(row["period_id"]),
             {"qty": None, "amount": None, "rows": 0, "period_no": int(row["period_no"])},
@@ -101,10 +131,10 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int,
             pp["qty"] = qty if pp["qty"] is None else pp["qty"] + qty
         if amount is not None:
             pp["amount"] = amount if pp["amount"] is None else pp["amount"] + amount
-        if qty_missing or amount_missing:
+        if (qty_missing and not quantity_optional) or amount_missing:
             if agg.status == "ok":
                 agg.status = "incomplete"
-            if qty_missing:
+            if qty_missing and not quantity_optional:
                 agg.warnings.append(f"第{row['period_no']}期 数量缺失/不可解析（行{row['id']}），未参与累计")
             if amount_missing:
                 agg.warnings.append(f"第{row['period_no']}期 金额缺失/不可解析（行{row['id']}），未参与累计")
@@ -132,7 +162,7 @@ def aggregate_project(conn: sqlite3.Connection, project_id: int,
                 agg.warnings.append("累计数量为 0，加权平均单价不可定义（不可比）")
             else:
                 agg.wavg_price = weighted_avg_price(amt_total, qty_total)
-        else:
+        elif amt_total is None or agg.quantity_required:
             agg.status = "incomplete"
     return sorted(aggs.values(), key=lambda a: (a.item_key,))
 

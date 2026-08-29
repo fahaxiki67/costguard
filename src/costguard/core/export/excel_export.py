@@ -14,7 +14,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from costguard.core.engine.aggregate import aggregate_project, group_key_of
@@ -25,6 +25,11 @@ D = Decimal
 HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
 HEADER_FONT = Font(bold=True)
 MONEY_FMT = "#,##0.00"
+_THIN_SIDE = Side(style="thin", color="808080")
+TABLE_BORDER = Border(
+    left=_THIN_SIDE, right=_THIN_SIDE, top=_THIN_SIDE, bottom=_THIN_SIDE
+)
+CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
 def _style_header(ws, row: int, cols: int):
@@ -39,6 +44,16 @@ def _autowidth(ws):
     for col in ws.columns:
         width = max((len(str(c.value or "")) for c in col), default=8)
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(width + 2, 8), 60)
+
+
+def _style_used_range(ws) -> None:
+    """给导出工作表的有效矩形范围统一添加边框、居中和自动换行。"""
+    for row in ws.iter_rows(
+        min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column
+    ):
+        for cell in row:
+            cell.border = TABLE_BORDER
+            cell.alignment = CENTER_WRAP
 
 
 # openpyxl 原生支持 Decimal（XML 层写精确十进制字符串），当前序列化无需 float。
@@ -535,7 +550,8 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     ws.append([])
     ws.append(["说明：本摘要由 CostGuard 自动生成，仅反映已导入数据。缺失数据未补 0；"
                "不可比数据未强行比较；方向未标记的期次仅计入未分离汇总，请先标记对上/对下。"])
-    ws.append(["合成测试数据仅用于软件测试验证，不构成任何真实业务结论。"])
+    ws.append(["自动计算结果必须经过人工复核和业务审批；未经批准，不构成任何真实业务结论，"
+               "包括最终结算、责任认定或正式管理结论。"])
     _autowidth(ws)
 
 
@@ -553,6 +569,8 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     export_contract_risks(conn, project_id, wb)
     export_evidence_index(conn, project_id, wb)
     export_audit_worksheet(conn, project_id, wb)
+    for ws in wb.worksheets:
+        _style_used_range(ws)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"CostGuard审核底稿_{stamp}.xlsx"
     wb.save(path)
@@ -562,6 +580,8 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
 def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """管理层摘要 Word 版。"""
     import docx as docx_lib
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
 
     aggs = aggregate_project(conn, project_id)
     total = sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0))
@@ -574,7 +594,37 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     n_none = len(periods) - n_up - n_down
     n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
     doc = docx_lib.Document()
-    doc.add_heading("CostGuard 管理层摘要", level=0)
+    # python-docx 默认 Title/Normal 使用 Office 主题字体；部分 Mac/WPS 环境会把
+    # asciiTheme/majorHAnsi 优先解析为 Calibri，哪怕同时写了东亚字体。显式移除
+    # 主题字体引用并写入四套字符字体，避免依赖 Office 专有字体替换。
+    theme_attrs = ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme")
+    for style_name in ("Normal", "Title", "Default Paragraph Font"):
+        style = doc.styles[style_name]
+        style.font.name = "Songti SC"
+        fonts = style._element.get_or_add_rPr().get_or_add_rFonts()
+        for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
+            fonts.set(qn(f"w:{attr}"), "Songti SC")
+        for attr in theme_attrs:
+            key = qn(f"w:{attr}")
+            if key in fonts.attrib:
+                del fonts.attrib[key]
+
+    # python-docx 自带模板的 bestFit 缩放节点可能缺少 w:percent，严格 OOXML
+    # 校验器会判为无效。显式补齐，WPS/Word/LibreOffice 均按 100% 处理。
+    zoom = doc.settings.element.find(qn("w:zoom"))
+    if zoom is not None:
+        zoom.set(qn("w:percent"), "100")
+
+    # 不使用会重新套用 Office 主题字体的内置 Title 段落；标题运行本身也固定字体。
+    title = doc.add_paragraph()
+    title.paragraph_format.space_after = Pt(12)
+    title_run = title.add_run("CostGuard 管理层摘要")
+    title_run.bold = True
+    title_run.font.name = "Songti SC"
+    title_run.font.size = Pt(26)
+    title_fonts = title_run._element.get_or_add_rPr().get_or_add_rFonts()
+    for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
+        title_fonts.set(qn(f"w:{attr}"), "Songti SC")
     doc.add_paragraph(
         f"截至 {datetime.now().strftime('%Y-%m-%d %H:%M')}，共识别清单组 {len(aggs)} 组，"
         f"累计金额（可用部分）{round2(total)} 元，高风险异常 {high} 项。"
@@ -590,8 +640,8 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         "《证据索引》工作表，按证据 ID 查询。"
     )
     doc.add_paragraph(
-        "本摘要由软件自动生成，仅反映已导入数据；导入的合成测试数据仅用于软件测试验证，"
-        "不构成任何真实业务结论。"
+        "本摘要由软件自动生成，仅反映已导入数据；自动计算结果必须经过人工复核和业务审批。"
+        "未经批准，不构成任何真实业务结论，包括最终结算、责任认定或正式管理结论。"
     )
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

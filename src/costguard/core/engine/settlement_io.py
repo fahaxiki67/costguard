@@ -12,7 +12,7 @@ from pathlib import Path
 
 from costguard.core.models.source_file import import_file
 from costguard.core.parsing import excel_parser, extract_items
-from costguard.core.parsing.header_detect import detect_header
+from costguard.core.parsing.header_detect import HeaderDetection, detect_header
 
 
 @dataclass
@@ -140,14 +140,19 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
 
 
 def _validate_confirmed_col_map(col_map: dict, max_col: int) -> None:
-    """校验人工确认列映射：name+quantity 必需，amount/unit_price 至少一个，
-    列号存在且不冲突（监督第十轮 B）。"""
-    missing = [f for f in ("name", "quantity") if f not in col_map]
-    if missing:
-        raise ValueError(f"确认列映射缺少必需字段: {'、'.join(missing)}"
-                         "（结算清单至少需要名称与数量）")
-    if "amount" not in col_map and "unit_price" not in col_map:
-        raise ValueError("确认列映射缺少必需字段: amount 或 unit_price 至少一个（金额口径）")
+    """校验人工确认列映射。
+
+    支持两类真实结算结构：
+    - 工程量计价：name + quantity + unit_price；
+    - 金额计价/比例计价：name + amount（工程量可以真实缺失，绝不补 0）。
+    """
+    if "name" not in col_map:
+        raise ValueError("确认列映射缺少必需字段: name")
+    amount_path = "amount" in col_map
+    quantity_price_path = "quantity" in col_map and "unit_price" in col_map
+    if not amount_path and not quantity_price_path:
+        raise ValueError(
+            "确认列映射缺少必需的完整金额口径：需 amount，或同时提供 quantity + unit_price")
     cols = list(col_map.values())
     if len(cols) != len(set(cols)):
         raise ValueError("确认列映射存在冲突：同一列被映射到多个字段")
@@ -158,7 +163,10 @@ def _validate_confirmed_col_map(col_map: dict, max_col: int) -> None:
 def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                                    sheet_id: int, actor: str, reason: str,
                                    direction: str = "unknown",
-                                   confirmed_col_map: dict | None = None) -> int:
+                                   confirmed_col_map: dict | None = None,
+                                   confirmed_header_range: tuple[int, int] | None = None,
+                                   confirmed_data_range: tuple[int, int] | None = None,
+                                   period_no: int | None = None) -> int:
     """人工确认被门控 sheet 的角色为结算清单后，重放语义层抽取（ADR-008）。
 
     - reason 必填（原则 14）；
@@ -176,11 +184,29 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         raise audit_log.AuditReasonRequiredError("人工确认角色必须记录原因（原则 14）")
     cells, merged, n_rows, n_cols = load_sheet_grid(conn, sheet_id)
     meta = conn.execute(
-        "SELECT sheet_name FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
-    sheet_name = meta["sheet_name"] if meta else str(sheet_id)
+        """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name
+           FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE rs.id=? AND sf.project_id=?""",
+        (sheet_id, project_id),
+    ).fetchone()
+    if not meta:
+        raise ValueError(f"sheet {sheet_id} 不属于 project {project_id}")
+    sheet_name = meta["sheet_name"]
     det = detect_header(0, cells, merged, n_rows, n_cols)
     if det is None:
-        raise ValueError("该 sheet 无可识别表头，需人工列映射后才能按清单抽取")
+        if confirmed_col_map is None or confirmed_header_range is None:
+            raise ValueError(
+                "该 sheet 无可识别表头，需同时提供人工列映射与表头范围后才能按清单抽取")
+        det = HeaderDetection(
+            sheet_index=0,
+            header_row_lo=confirmed_header_range[0],
+            header_row_hi=confirmed_header_range[1],
+            col_map=dict(confirmed_col_map),
+            confidence=0.0,
+            needs_review=True,
+            notes=["表头由人工确认"],
+        )
 
     if det.needs_review and confirmed_col_map is None:
         raise ValueError(
@@ -192,6 +218,25 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         _validate_confirmed_col_map(confirmed_col_map, n_cols)
         used_map = dict(confirmed_col_map)
 
+    header_lo, header_hi = det.header_row_lo, det.header_row_hi
+    if confirmed_header_range is not None:
+        header_lo, header_hi = confirmed_header_range
+        if not (isinstance(header_lo, int) and isinstance(header_hi, int)
+                and 1 <= header_lo <= header_hi <= n_rows):
+            raise ValueError(f"确认表头范围无效（有效行 1..{n_rows}）")
+    if confirmed_data_range is not None:
+        data_start, data_end = confirmed_data_range
+        if not (isinstance(data_start, int) and isinstance(data_end, int)
+                and header_hi < data_start <= data_end <= n_rows):
+            raise ValueError(
+                f"确认数据行范围无效：应在表头末行 {header_hi} 之后且不超过 {n_rows}")
+        data_range = (data_start, data_end)
+    else:
+        from costguard.core.parsing.header_detect import data_rows_range
+
+        data_range = data_rows_range(
+            cells, replace(det, header_row_lo=header_lo, header_row_hi=header_hi), n_rows)
+
     # 幂等/重复确认拒绝：已回写 period_id 的 sheet 视为已完成
     already = conn.execute(
         "SELECT period_id FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
@@ -200,8 +245,9 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             f"该 sheet 已完成确认抽取（period_id={already['period_id']}），不得重复确认")
 
     # 先抽取（items 非空才建 period，避免失败留空期次）
-    det_used = replace(det, col_map=used_map, needs_review=False)
-    items = extract_items.extract_items(cells, merged, det_used, n_rows)
+    det_used = replace(det, header_row_lo=header_lo, header_row_hi=header_hi,
+                       col_map=used_map, needs_review=False)
+    items = extract_items.extract_items(cells, merged, det_used, n_rows, data_range=data_range)
     if not items:
         raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
 
@@ -210,9 +256,14 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         {"role": "gated", "needs_review": det.needs_review,
          "mapping": {"detected": det.col_map}},
         {"role": "settlement", "confidence": det.confidence,
-         "mapping": {"detected": det.col_map, "confirmed": used_map}}, reason)
-    pno = next_period_no(conn, project_id, direction)
-    period_id = ensure_period(conn, project_id, pno, f"sheet:{sheet_id}", None,
+         "mapping": {"detected": det.col_map, "confirmed": used_map},
+         "header_range": [header_lo, header_hi], "data_range": list(data_range),
+         "period_no": period_no}, reason)
+    pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
+    if not isinstance(pno, int) or pno < 1:
+        raise ValueError("确认期次必须为正整数")
+    period_id = ensure_period(
+        conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
                               direction=direction)
     n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
     # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
@@ -222,18 +273,78 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
         conn.execute(
             """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
-               col_map_json, confidence, needs_review) VALUES (?,?,?,?,?,0)""",
-            (sheet_id, det.header_row_lo, det.header_row_hi,
-             json.dumps(used_map), det.confidence))
+               col_map_json, confidence, needs_review, data_row_start, data_row_end)
+               VALUES (?,?,?,?,?,0,?,?)""",
+            (sheet_id, header_lo, header_hi, json.dumps(used_map), det.confidence,
+             data_range[0], data_range[1]))
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_confirmed",
         f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
         steps=[{"step": "人工确认", "actor": actor, "reason": reason,
                 "mapping": {"detected": det.col_map, "confirmed": used_map},
-                "confidence": det.confidence}],
+                "header_range": [header_lo, header_hi], "data_range": list(data_range),
+                "period_no": pno, "confidence": det.confidence}],
         sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
     )
     return n
+
+
+NON_SETTLEMENT_ROLES = {
+    "non_settlement_form",
+    "settlement_summary",
+    "supporting_evidence",
+    "contract_control",
+    "other_non_settlement",
+}
+
+
+def confirm_sheet_non_settlement_role(
+    conn: sqlite3.Connection,
+    project_id: int,
+    sheet_id: int,
+    actor: str,
+    confirmed_role: str,
+    reason: str,
+) -> None:
+    """人工确认被门控 sheet 仅作表单/汇总/控制证据，不进入结算模型。"""
+    from costguard.core.evidence import audit as audit_log
+    from costguard.core.evidence import evidence as evidence_api
+
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("人工确认角色必须记录原因（原则 14）")
+    if confirmed_role not in NON_SETTLEMENT_ROLES:
+        raise ValueError(
+            f"不支持的非结算角色 {confirmed_role!r}；允许值: {sorted(NON_SETTLEMENT_ROLES)}")
+    meta = conn.execute(
+        """SELECT rs.sheet_name, rs.period_id, sf.id AS file_id
+           FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE rs.id=? AND sf.project_id=?""",
+        (sheet_id, project_id),
+    ).fetchone()
+    if not meta:
+        raise ValueError(f"sheet {sheet_id} 不属于 project {project_id}")
+    if meta["period_id"] is not None:
+        raise ValueError("该 sheet 已进入结算模型，不能再确认成非结算角色")
+    duplicate = conn.execute(
+        """SELECT id FROM audit_log WHERE project_id=? AND target=?
+           AND action='confirm_sheet_non_settlement_role' LIMIT 1""",
+        (project_id, f"sheet:{sheet_id}"),
+    ).fetchone()
+    if duplicate:
+        raise ValueError("该 sheet 的非结算角色已确认，不得重复确认")
+
+    audit_log.record_audit(
+        conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
+        {"role": "gated"}, {"role": confirmed_role}, reason,
+    )
+    evidence_api.add_evidence(
+        conn, project_id, "sheet_role_confirmed",
+        f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
+        steps=[{"step": "人工确认非结算角色", "actor": actor,
+                "role": confirmed_role, "reason": reason}],
+        sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
+    )
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,

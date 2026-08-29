@@ -248,6 +248,29 @@ def make_ambiguous_header(path: Path) -> None:
     wb.save(path)
 
 
+def make_percentage_amount_sheet(path: Path) -> None:
+    """按合同额比例结算：本期只有金额，没有可用工程量。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "计算明细表"
+    ws.cell(row=4, column=1, value="序号")
+    ws.cell(row=4, column=2, value="项目名称")
+    ws.cell(row=4, column=3, value="分包商申报")
+    ws.cell(row=4, column=4, value="项目部审核")
+    ws.cell(row=5, column=3, value="金额(元)")
+    ws.cell(row=5, column=4, value="金额(元)")
+    ws.cell(row=6, column=1, value="1")
+    ws.cell(row=6, column=2, value="暂估价设备本期结算")
+    ws.cell(row=6, column=3, value="3370591.52")
+    ws.cell(row=6, column=4, value="3370591.52")
+    ws.cell(row=10, column=2, value="金额合计")
+    ws.cell(row=10, column=4, value="3370591.52")
+    ws.cell(row=12, column=2, value="审核签字：")
+    wb.save(path)
+
+
 def make_ledger_named_sheet(path: Path) -> None:
     """sheet 名含'台账'且强表头 → 语义门控挡。"""
     import openpyxl
@@ -425,7 +448,7 @@ class TestRound11ConfirmationGates:
         return conn, pid, sheet_id
 
     def test_colmap_requires_quantity_and_amount_or_price(self, db):
-        """列映射校验收严：name+quantity 必需，amount/unit_price 至少一个。"""
+        """列映射必须含名称，并具备 amount 或 quantity×unit_price 金额路径。"""
         conn, pid, sheet_id = self._gated(db)
         with pytest.raises(ValueError, match="必需"):
             settlement_io.confirm_sheet_role_and_extract(
@@ -497,3 +520,75 @@ class TestRound11ConfirmationGates:
         after = conn.execute("SELECT COUNT(*) c FROM line_items WHERE sheet_id=?",
                              (sheet_id,)).fetchone()["c"]
         assert before == after == 2
+
+
+class TestRealScenarioManualConfirmation:
+    def test_amount_only_range_and_period_are_explicit_and_crosschecked(self, db):
+        """比例计价反例：金额型清单可无工程量，且只抽人工确认的数据行。"""
+        conn, pid, tmp = db
+        src = tmp / "第2期比例结算.xlsx"
+        make_percentage_amount_sheet(src)
+        settlement_io.import_settlement_file(conn, pid, tmp, src, direction="downward")
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='计算明细表'"
+        ).fetchone()["id"]
+
+        n = settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人",
+            reason="人工核对：项目部审核本期金额列；合计和签字行不属于明细",
+            direction="downward", period_no=2,
+            confirmed_col_map={"code": 1, "name": 2, "amount": 4},
+            confirmed_header_range=(4, 5), confirmed_data_range=(6, 6),
+        )
+        assert n == 1
+        row = conn.execute(
+            "SELECT quantity, amount FROM line_items WHERE sheet_id=?", (sheet_id,)
+        ).fetchone()
+        assert row["quantity"] is None, "无工程量的比例计价不得伪造为 0"
+        assert row["amount"] == "3370591.52"
+        period = conn.execute(
+            "SELECT id, period_no, direction FROM settlement_periods"
+        ).fetchone()
+        assert period["period_no"] == 2 and period["direction"] == "downward"
+        header = conn.execute(
+            "SELECT header_row_lo, header_row_hi, data_row_start, data_row_end "
+            "FROM table_headers WHERE sheet_id=?", (sheet_id,)
+        ).fetchone()
+        assert tuple(header) == (4, 5, 6, 6)
+
+        from costguard.core.engine import crosscheck
+
+        checked = crosscheck.check_period(conn, period["id"])
+        assert checked.status == "match"
+        assert str(checked.path_a_total) == "3370591.52"
+        assert str(checked.path_b_total) == "3370591.52"
+
+    def test_confirm_non_settlement_role_keeps_canonical_tables_clean(self, db):
+        """汇总/控制表经人工确认仅作证据，不得写入结算期次或明细。"""
+        conn, pid, report = _import(db, make_ambiguous_header)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='第1期'"
+        ).fetchone()["id"]
+        settlement_io.confirm_sheet_non_settlement_role(
+            conn, pid, sheet_id, actor="复核人", confirmed_role="settlement_summary",
+            reason="人工核对：该表为结算汇总控制表，不是逐项结算明细",
+        )
+        assert _counts(conn) == {
+            "settlement_periods": 0, "line_items": 0, "period_totals": 0
+        }
+        entry = conn.execute(
+            "SELECT after_json FROM audit_log "
+            "WHERE action='confirm_sheet_non_settlement_role'"
+        ).fetchone()
+        assert json.loads(entry["after_json"])["role"] == "settlement_summary"
+        ev = conn.execute(
+            "SELECT sources_json FROM evidence WHERE kind='sheet_role_confirmed' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert json.loads(ev["sources_json"])[0]["sheet_id"] == sheet_id
+
+        with pytest.raises(ValueError, match="已确认|重复"):
+            settlement_io.confirm_sheet_non_settlement_role(
+                conn, pid, sheet_id, actor="复核人", confirmed_role="settlement_summary",
+                reason="重复确认",
+            )

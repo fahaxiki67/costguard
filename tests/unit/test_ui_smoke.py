@@ -29,3 +29,22 @@ def test_new_project_dialog_values():
     dlg.name_edit.setText("冒烟项目")
     name, root = dlg.values()
     assert name == "冒烟项目"
+
+
+def test_installed_entrypoint_constructs_main_window(monkeypatch):
+    """真实 `costguard` 启动入口必须直接构造主窗口，不能依赖隐式子模块属性。"""
+    from PySide6.QtWidgets import QApplication
+
+    from costguard import app as app_entry
+
+    shown = []
+
+    class FakeWindow:
+        def show(self):
+            shown.append(True)
+
+    _app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(app_entry, "MainWindow", FakeWindow)
+    monkeypatch.setattr(QApplication, "exec", lambda self: 0)
+    assert app_entry.main() == 0
+    assert shown == [True]

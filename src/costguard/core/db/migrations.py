@@ -237,6 +237,16 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE settlement_periods_new RENAME TO settlement_periods",
         ],
     ),
+    (
+        # v4: 人工确认多行表头时，必须持久化实际数据行边界。
+        # 双路径 B 复算按同一人工确认的语义范围回读 raw_cells，避免把合计、签字、
+        # 控制额等表外行误纳入明细。
+        4,
+        [
+            "ALTER TABLE table_headers ADD COLUMN data_row_start INTEGER",
+            "ALTER TABLE table_headers ADD COLUMN data_row_end INTEGER",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
