@@ -39,9 +39,11 @@ class ImportReport:
 
 _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
 
-# sheet 级写入闸门（监督第八轮）：
-CONF_WRITE_GATE = 0.70   # 需角色审阅的置信度下限（低于此不写 canonical）
-ROW_GUARD = 500          # 文件级大表护栏：任一 sheet 超过该行数 → 整文件需角色审阅
+# sheet 级写入闸门（监督第九轮）：
+# - det.needs_review 一律不写 canonical（歧义/低置信未经人工确认不得进入结算模型）；
+# - sheet 名/document 语义门控：汇总/核销/台账类 sheet 即使强表头也需角色确认；
+# - 无行数护栏（600 行合法大结算必须解析，判断不按大小）。
+SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账")
 
 
 def _cn_to_int(s: str) -> int:
@@ -116,17 +118,18 @@ def ensure_period(
 
 def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
                        sheet_id: int, sheet_name: str,
-                       confidence: float | None, oversized: bool) -> None:
+                       confidence: float | None, oversized: bool,
+                       reason: str | None = None) -> None:
     """需角色审阅 sheet：留 evidence 候选与审计，不写 canonical tables。"""
     from costguard.core.evidence import audit as audit_log
     from costguard.core.evidence import evidence as evidence_api
 
-    reason = ("超长汇总/台账/核销型结构（行数超护栏），疑似非结算清单"
-              if oversized else f"表头识别置信度不足（{confidence}），不得直接写入结算模型")
+    reason = reason or ("超长汇总/台账/核销型结构，疑似非结算清单"
+                        if oversized else f"表头识别置信度不足（{confidence}）")
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_candidate",
         f"Sheet「{sheet_name}」待人工角色确认：{reason}",
-        steps=[{"step": "角色门控", "confidence": confidence, "oversized": oversized}],
+        steps=[{"step": "角色门控", "confidence": confidence, "reason": reason}],
         sources=[{"file_id": file_id, "sheet_id": sheet_id, "location": "整表",
                   "confidence": confidence}],
     )
@@ -134,6 +137,44 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
         conn, project_id, "system", "route_role_review", f"sheet:{sheet_id}",
         None, {"sheet": sheet_name, "confidence": confidence, "oversized": oversized},
         f"角色审阅路由：{reason}；保留 raw 网格，未进入结算模型")
+
+
+def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
+                                   sheet_id: int, actor: str, reason: str,
+                                   direction: str = "unknown") -> int:
+    """人工确认被门控 sheet 的角色为结算清单后，重放语义层抽取（ADR-008）。
+
+    reason 必填（原则 14）；确认与抽取均留审计/证据；期次按方向递增兜底。
+    返回写入行数。若 sheet 无表头识别结果，要求人工列映射（另行提供），此处拒绝。
+    """
+    from costguard.core.evidence import audit as audit_log
+    from costguard.core.evidence import evidence as evidence_api
+
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("人工确认角色必须记录原因（原则 14）")
+    cells, merged, n_rows, n_cols = load_sheet_grid(conn, sheet_id)
+    meta = conn.execute(
+        "SELECT sheet_name FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
+    sheet_name = meta["sheet_name"] if meta else str(sheet_id)
+    det = detect_header(0, cells, merged, n_rows, n_cols)
+    if det is None:
+        raise ValueError("该 sheet 无可识别表头，需人工列映射后才能按清单抽取")
+    audit_log.record_audit(
+        conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
+        {"role": "gated"}, {"role": "settlement", "confidence": det.confidence}, reason)
+    pno = next_period_no(conn, project_id, direction)
+    period_id = ensure_period(conn, project_id, pno, f"sheet:{sheet_id}", None,
+                              direction=direction)
+    items = extract_items.extract_items(cells, merged, det, n_rows)
+    n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
+    evidence_api.add_evidence(
+        conn, project_id, "sheet_role_confirmed",
+        f"Sheet「{sheet_name if sheet_name else sheet_id}」经人工确认为结算清单，重放抽取 {n} 行",
+        steps=[{"step": "人工确认", "actor": actor, "reason": reason,
+                "col_map": det.col_map, "confidence": det.confidence}],
+        sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
+    )
+    return n
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -228,8 +269,6 @@ def import_settlement_file(
     form_routed = False
     role_gated = False
     period_ids: set[int] = set()
-    # 文件级大表护栏：任一 sheet 超长（汇总/台账/核销典型特征）→ 整文件需角色审阅
-    oversized_file = any(sh.n_rows > ROW_GUARD for sh in result.sheets)
     for sheet in result.sheets:
         sheet_id = conn.execute(
             "SELECT id FROM raw_sheets WHERE batch_id=? AND sheet_index=?", (batch_id, sheet.sheet_index)
@@ -251,15 +290,22 @@ def import_settlement_file(
             form_routed = True
             continue
         no_quantity_column = det is not None and "quantity" not in det.col_map
-        if oversized_file or no_quantity_column or (det is not None and det.needs_review
-                              and det.confidence < CONF_WRITE_GATE):
-            # 需角色审阅：不写 canonical tables，保留 raw 网格与候选证据
+        # 语义门控：sheet 名含汇总/核销/台账 → 无论表头多强都需角色确认
+        summary_like = bool(SUMMARY_LIKE_PATTERN.search(sheet.sheet_name))
+        # needs_review 一律挡（监督第九轮）：歧义/低置信未经人工确认不得写 canonical
+        needs_review_gate = det is not None and det.needs_review
+        no_quantity_column = det is not None and "quantity" not in det.col_map
+        if summary_like or needs_review_gate or no_quantity_column:
+            reason = ("sheet 名含汇总/核销/台账语义" if summary_like else
+                      "表头存在歧义或识别不可靠（needs_review）" if needs_review_gate else
+                      "未识别到数量（计量）列，结算清单结构不完整")
             _route_role_review(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name,
-                               det.confidence if det else None, oversized_file)
+                               det.confidence if det else None, False, reason)
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "needs_role_review",
-                notes=["表头识别不可靠或超长汇总/台账型结构：未经人工确认角色前"
-                       "不写入结算模型；字段候选已存 evidence，请人工选择角色"]))
+                notes=[f"{reason}：未经人工确认角色前不写入结算模型；"
+                       "字段候选已存 evidence，请人工选择角色"
+                       "（confirm_sheet_role_and_extract）"]))
             role_gated = True
             continue
         if det is None:

@@ -1,16 +1,12 @@
-"""业务类型门控（监督第八轮，先红后绿，全部公开合成样例）。
+"""业务类型门控（监督第八/九轮，先红后绿，全部公开合成样例）。
 
-阻断事实：弱表头台账、键值内容页、超长汇总/核销表被误写入结算模型并全流程导出。
-门控设计（sheet 级写入闸门 + 文件级 overall）：
-1. det is None → 表单路由 / no_header（既有）；
-2. 键值对表单结构（form_like）优先于弱清单识别 → non_settlement_form；
-3. det.needs_review 且 confidence < 0.70 → needs_role_review（不写 canonical，
-   保留 raw + evidence 候选 + 审计）；
-4. 文件级大表护栏：任一 sheet 数据行 > 500 → 整个文件 needs_role_review
-   （超长汇总/台账/核销表疑似，需人工确认角色）；
-5. 规范结算表（强表头）与中置信清单（conf≥0.70 无歧义）仍正常解析（主线不破坏）；
-6. 文件 overall：仅当存在 canonical sheet 才 ok；否则 partial/needs_role_review，
-   不进入结算计算/导出管线。
+第九轮口径：
+- 删除行数护栏（过拟合）：600 行合法大结算必须解析，20 行汇总小表仍挡——判断不按大小；
+- 所有 det.needs_review（含歧义/低置信，无论 confidence）一律不写 canonical，
+  未经人工确认前文件级 partial；无歧义强表头（needs_review=False）才可自动解析；
+- sheet 名/document 语义门控：汇总/核销/台账类 sheet 名即使强表头也需角色确认；
+- 人工确认入口 confirm_sheet_role_and_extract：确认后重放语义层抽取；
+- 文件只要还有被挡 sheet，报告列 pending role review；只有无歧义 canonical 计自动成功。
 """
 import json
 from pathlib import Path
@@ -174,11 +170,21 @@ class TestGate:
         assert all(s.status == "needs_role_review" for s in report.sheets)
         assert _counts(conn)["line_items"] == 0
 
-    def test_mixed_file_gated_file_level(self, db):
-        """混合文件：任一大表触发护栏 → 文件整体挡下（含小表）。"""
+    def test_mixed_file_semantic_gate(self, db):
+        """第九轮口径：'汇总大表'按语义挡、'小清单'强表头无歧义照常解析；
+        文件报告必须列出 pending role review。"""
         conn, pid, report = _import(db, make_mixed_oversized)
-        assert report.needs_manual_review
-        assert _counts(conn)["line_items"] == 0
+        by_name = {x.sheet_name: x for x in report.sheets}
+        assert by_name["汇总大表"].status == "needs_role_review", \
+            "汇总语义 sheet 必须挡下"
+        assert by_name["小清单"].status == "parsed", \
+            "无歧义强表头小清单照常解析（判断不按行数）"
+        assert report.status == "ok"  # 存在 canonical sheet → overall ok
+        # pending role review 必须可见（report/audit 双通道）
+        assert any(x.status == "needs_role_review" for x in report.sheets)
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE kind='sheet_role_candidate'"
+        ).fetchone()["c"] >= 1
         assert conn.execute(
             "SELECT COUNT(*) c FROM raw_sheets").fetchone()["c"] == 2  # 保真层保留
 
@@ -195,3 +201,110 @@ class TestGate:
 
         assert any("role" in e.action or "角色" in e.reason
                    for e in audit_log.history_for(conn, pid))
+
+
+def make_large_legal_settlement(path: Path) -> None:
+    """600 行、无歧义强表头、Sheet 名"第1期结算清单"的合法大结算。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "第1期结算清单"
+    rows = [(f"K{i:04d}", f"清单项{i}", "m3", i % 50 + 1, round(10 + i % 30, 2),
+             round((i % 50 + 1) * (10 + i % 30), 2), "0.09") for i in range(1, 601)]
+    _wb_sheet(ws, 1, rows,
+              ["清单编码", "清单名称", "单位", "工程量", "综合单价", "合价", "税率"])
+    wb.save(path)
+
+
+def make_small_resource_summary(path: Path) -> None:
+    """20 行人材机汇总小表（语义门控：汇总类 sheet 名）。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "人材机汇总"
+    rows = [(f"R{i:03d}", f"材料{i}", "kg", i, round(2 + i % 9, 2), i * (2 + i % 9))
+            for i in range(1, 21)]
+    _wb_sheet(ws, 1, rows, ["编号", "名称规格", "单位", "数量", "单价", "合价"])
+    wb.save(path)
+
+
+def make_ambiguous_header(path: Path) -> None:
+    """高置信但歧义表头（两列'综合单价'）→ needs_review，必须挡。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "第1期"
+    _wb_sheet(ws, 1, [
+        ("K1", "某清单", "m3", 10, 465, 4650, 4850, "0.09"),
+        ("K2", "某清单2", "m3", 5, 4850, 24250, 24800, "0.13"),
+    ], ["清单编码", "清单名称", "单位", "工程量", "综合单价", "含税合价", "不含税合价", "税率"])
+    wb.save(path)
+
+
+def make_ledger_named_sheet(path: Path) -> None:
+    """sheet 名含'台账'且强表头 → 语义门控挡。"""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "合同台账"
+    _wb_sheet(ws, 1, [
+        ("K1", "某清单", "m3", 10, 465, 4650),
+        ("K2", "某清单2", "m3", 5, 4850, 24250),
+    ], ["清单编码", "清单名称", "单位", "工程量", "综合单价", "合价"])
+    wb.save(path)
+
+
+class TestRound9Semantics:
+    def test_large_legal_settlement_parsed(self, db):
+        """600 行合法大结算必须解析（判断不按大小）。"""
+        conn, pid, report = _import(db, make_large_legal_settlement)
+        assert report.status == "ok" and not report.needs_manual_review
+        assert any(s.status == "parsed" for s in report.sheets)
+        assert _counts(conn)["line_items"] == 600
+
+    def test_small_resource_summary_gated(self, db):
+        """20 行人材机汇总小表仍需角色复核（判断不按大小）。"""
+        conn, pid, report = _import(db, make_small_resource_summary)
+        assert report.status == "partial" and report.needs_manual_review
+        assert all(s.status in ("needs_role_review", "no_header") for s in report.sheets)
+        assert _counts(conn)["line_items"] == 0
+
+    def test_ambiguous_high_confidence_gated(self, db):
+        """高置信歧义表头（needs_review）→ 不得写 canonical。"""
+        conn, pid, report = _import(db, make_ambiguous_header)
+        assert report.status == "partial" and report.needs_manual_review
+        assert _counts(conn)["line_items"] == 0
+
+    def test_ledger_named_sheet_gated(self, db):
+        """sheet 名含'台账' → 语义门控，即使强表头。"""
+        conn, pid, report = _import(db, make_ledger_named_sheet)
+        assert report.status == "partial" and report.needs_manual_review
+        assert _counts(conn)["line_items"] == 0
+
+    def test_confirm_sheet_role_replays_extraction(self, db):
+        """人工确认入口：确认角色为结算清单后重放抽取写 canonical，并留审计。"""
+        conn, pid, report = _import(db, make_ledger_named_sheet)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='合同台账'").fetchone()["id"]
+        settlement_io.confirm_sheet_role_and_extract(
+            conn, pid, sheet_id, actor="复核人",
+            reason="经人工核对该 sheet 为结算清单")
+        assert _counts(conn)["line_items"] == 2
+        from costguard.core.evidence import audit as audit_log
+
+        assert any(e.action == "confirm_sheet_role"
+                   for e in audit_log.history_for(conn, pid))
+
+    def test_confirm_requires_reason(self, db):
+        conn, pid, report = _import(db, make_ledger_named_sheet)
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE sheet_name='合同台账'").fetchone()["id"]
+        from costguard.core.evidence import audit as audit_log
+
+        with pytest.raises(audit_log.AuditReasonRequiredError):
+            settlement_io.confirm_sheet_role_and_extract(
+                conn, pid, sheet_id, actor="复核人", reason="")
