@@ -1,17 +1,10 @@
-"""CostGuard 主窗口（Phase 1 最小可运行壳）。
-
-Phase 8 将扩展为完整工作台界面；本阶段提供：
-- 项目列表 / 新建 / 打开；
-- 文件导入（拖拽或按钮）进入当前项目 originals/；
-- 状态栏显示当前项目与库版本。
-"""
+"""CostGuard 主窗口：项目列表页 ↔ 工作台页（QStackedWidget）。"""
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -24,13 +17,17 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
 from costguard.core.models import project as project_model
-from costguard.core.models import source_file
+from costguard.ui.workbench import WorkbenchPage
+
+PAGE_PROJECTS = 0
+PAGE_WORKBENCH = 1
 
 
 class NewProjectDialog(QDialog):
@@ -65,10 +62,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CostGuard — 工程经营合规智能工作台")
-        self.resize(920, 600)
+        self.resize(1080, 680)
         self._conn = None
         self._project = None
 
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._projects_page())
+        self.stack.addWidget(QWidget())  # 工作台占位，打开项目时创建
+        self.setCentralWidget(self.stack)
+        self.setStatusBar(QStatusBar())
+
+    # ---- 项目列表页 ----
+    def _projects_page(self) -> QWidget:
         central = QWidget()
         layout = QVBoxLayout(central)
         tip = QLabel("项目列表（双击打开）")
@@ -84,15 +89,11 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(self._on_open_dir)
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self.refresh_projects)
-        import_btn = QPushButton("导入文件到当前项目…")
-        import_btn.clicked.connect(self._on_import)
-        for b in (new_btn, open_btn, refresh_btn, import_btn):
+        for b in (new_btn, open_btn, refresh_btn):
             btn_row.addWidget(b)
         layout.addLayout(btn_row)
-        self.setCentralWidget(central)
-        self.setStatusBar(QStatusBar())
+        return central
 
-    # ---- 生命周期 ----
     def showEvent(self, event):
         super().showEvent(event)
         self.refresh_projects()
@@ -137,11 +138,7 @@ class MainWindow(QMainWindow):
         except project_model.ProjectError as exc:
             QMessageBox.warning(self, "打开项目", str(exc))
             return
-        if self._conn:
-            self._conn.close()
-        self._conn = conn
-        self._project = info
-        self.statusBar().showMessage(f"当前项目：{info.name}（schema v{info.schema_version}）")
+        self._enter_workbench(info, conn)
 
     def _open(self, info: project_model.ProjectInfo):
         try:
@@ -149,35 +146,31 @@ class MainWindow(QMainWindow):
         except project_model.ProjectError as exc:
             QMessageBox.warning(self, "打开项目", str(exc))
             return
+        self._enter_workbench(info, conn)
+
+    def _enter_workbench(self, info: project_model.ProjectInfo, conn):
         if self._conn:
             self._conn.close()
         self._conn = conn
         self._project = info
+        page = WorkbenchPage(conn, info, info.workspace_path, on_back=self._back_to_projects)
+        old = self.stack.widget(PAGE_WORKBENCH)
+        self.stack.removeWidget(old)
+        if old is not None:
+            old.deleteLater()
+        self.stack.insertWidget(PAGE_WORKBENCH, page)
+        self.stack.setCurrentIndex(PAGE_WORKBENCH)
         self.statusBar().showMessage(f"当前项目：{info.name}（schema v{info.schema_version}）")
 
-    def _on_import(self):
-        if not (self._project and self._conn):
-            QMessageBox.information(self, "导入文件", "请先打开一个项目")
-            return
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "选择要导入的文件", "", "工程文件 (*.xlsx *.xlsm *.xls *.csv *.pdf *.docx *.doc *.png *.jpg *.jpeg)"
-        )
-        if not files:
-            return
-        ok, fail = 0, []
-        for f in files:
-            try:
-                source_file.import_file(self._conn, self._project.project_id, Path(self._project.workspace_path), Path(f))
-                ok += 1
-            except source_file.SourceFileError as exc:
-                fail.append(f"{Path(f).name}: {exc}")
-        msg = f"已导入 {ok} 个文件（生成只读副本，原文件未改动）。"
-        if fail:
-            msg += "\n失败：\n" + "\n".join(fail)
-        QMessageBox.information(self, "导入文件", msg)
+    def _back_to_projects(self):
+        self.stack.setCurrentIndex(PAGE_PROJECTS)
+        self.refresh_projects()
+        self.statusBar().showMessage("已返回项目列表")
 
 
 def run_gui() -> int:
+    from PySide6.QtWidgets import QApplication
+
     app = QApplication.instance() or QApplication([])
     win = MainWindow()
     win.show()

@@ -16,7 +16,7 @@
 | 5 | 证据链：Evidence ID、审计日志、匹配五档置信度 | ✅ |
 | 6 | 合同和合规分析（docx/pdf/txt 条款结构化，原文引用，风险清单） | ✅ |
 | 7 | 成果导出：12 类报表、Excel 保留公式、WPS 兼容（LibreOffice 真实重算验证） | ✅ |
-| 8 | 完整 Mac UI | 🔨 |
+| 8 | 完整 Mac UI（项目页+五 Tab 工作台） | ✅ |
 | 9 | Mac 大规模测试和性能优化 | ⬜ |
 | 10 | Mac 打包（unsigned DMG） | ⬜ |
 | 11 | GitHub CI/CD | ⬜ |
