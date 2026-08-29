@@ -223,6 +223,82 @@ def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
     return False
 
 
+def detect_form_like(cells: dict[tuple[int, int], str],
+                     merged_ranges: list[str]) -> str | None:
+    """检测键值对表单结构（如支付审批单）。
+
+    返回 'strong'（键值行占多数——可无视表头词典误命中直接路由）、
+    'weak'（合并密集或少量键值行——仅在完全无表头识别时路由）、None。
+    普通结算表标题区虽含冒号，但占比低、数据行多，不会命中 strong。
+    """
+    if not cells:
+        return None
+    max_row = max(r for r, _c in cells)
+    if max_row > 30:
+        return None
+    row_texts: dict[int, list[str]] = {}
+    for (r, _c), text in cells.items():
+        t = (text or "").strip()
+        if t:
+            row_texts.setdefault(r, []).append(t)
+    data_rows = len(row_texts)
+    kv_rows = sum(
+        1 for texts in row_texts.values()
+        if ("：" in "".join(texts) or ":" in "".join(texts))
+        and not any(w in "".join(texts) for w in ("清单编码", "清单名称", "合价", "综合单价"))
+    )
+    if kv_rows >= 3 and kv_rows * 2 >= data_rows:
+        return "strong"
+    if data_rows and kv_rows >= 2:
+        return "weak"
+    if len(merged_ranges) >= 3 and data_rows <= 20:
+        return "weak"
+    return None
+
+def data_rows_range(cells: dict[tuple[int, int], str], det: HeaderDetection,
+                    max_row: int) -> tuple[int, int]:
+    """数据行区间：表头下一行 → 最后一个非空行。"""
+    anchors = build_anchor_map([])  # 数据行不需要锚点回填
+    start = det.header_row_hi + 1
+    end = start - 1
+    for r in range(start, max_row + 1):
+        row_has_data = any(_cell_text(cells, r, c, anchors) for c in range(1, max_col_of(cells) + 1))
+        if row_has_data:
+            end = r
+    return (start, end) if end >= start else (start, start - 1)
+
+
+def max_col_of(cells: dict[tuple[int, int], str]) -> int:
+    return max((c for (_, c) in cells), default=0)
+
+
+_SUBTOTAL_TRIM = re.compile(
+    r"[\s0-9一二三四五六七八九十\.、（）()\-—:：,，ⅠⅡⅢ]+|部分|章|节|类|段"
+)
+
+
+def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
+    """名称或首列出现小计/合计词 → 汇总行标记。
+
+    规则（保守，防误伤"钢筋合计用量表"这类名称）：
+    - 文本等于小计词；或
+    - 以小计词开头且余下全是编号/标点/空白（"合计：100"）；或
+    - 以小计词结尾且前缀全是编号/章节/标点（"一、二部分 小计"）。
+    中间夹字（"合计用量表"）不算。
+    """
+    for text in (name_text.strip(), first_cell_text.strip()):
+        if not text:
+            continue
+        for w in SUBTOTAL_WORDS:
+            if text == w:
+                return True
+            if text.startswith(w) and not _SUBTOTAL_TRIM.sub("", text[len(w):]):
+                return True
+            if text.endswith(w) and not _SUBTOTAL_TRIM.sub("", text[: -len(w)]):
+                return True
+    return False
+
+
 def detect_form_like(cells: dict[tuple[int, int], str], merged_ranges: list[str]) -> bool:
     """检测键值对表单结构（如支付审批单：'申请单位名称：X'、'开户行' '某银行'）。
 
