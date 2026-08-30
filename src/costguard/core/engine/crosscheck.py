@@ -257,7 +257,7 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         items = extract_items.extract_items(cells, merged, det, n_rows, data_range=data_range)
         rows_b = []
         for it in items:
-            if it.flags.get("subtotal"):
+            if it.flags.get("subtotal") or it.flags.get("title_row"):
                 continue
             rows_b.append(
                 {

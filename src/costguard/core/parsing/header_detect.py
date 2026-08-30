@@ -107,54 +107,133 @@ def _score_header_cell(text: str) -> list[tuple[str, float]]:
     return hits
 
 
+def _merge_width(cells: dict[tuple[int, int], str], merged_ranges: list[str],
+                 row: int, col: int) -> int:
+    """(row,col) 若是横向合并锚点，返回合并宽度；否则 1。"""
+    import re as _re
+
+    from openpyxl.utils import column_index_from_string
+
+    key = (row, col)
+    for rng in merged_ranges:
+        m = _re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", rng.replace("$", ""))
+        if not m:
+            continue
+        r1 = int(m.group(2))
+        c1 = column_index_from_string(m.group(1))
+        if (r1, c1) == key:
+            c2 = column_index_from_string(m.group(3))
+            if int(m.group(2)) == r1:
+                return c2 - c1 + 1
+    return 1
+
+
 def detect_header(sheet_index: int, cells: dict[tuple[int, int], str],
                   merged_ranges: list[str], max_row: int, max_col: int) -> HeaderDetection | None:
-    """扫描前 N 行识别表头。返回 None = 不是结算清单表。"""
+    """扫描前 N 行识别表头。返回 None = 不是结算清单表。
+
+    在全部候选起点中取最优（无 needs_review 且置信度最高者优先），避免
+    标题行/表单行产生的低质候选抢先返回（真实结算书实测缺陷）。
+    叶子资格：横向合并宽度 ≥3 的锚点（表标题/组表头）不能作为叶子——
+    除非该列在块内没有更深命中。
+    """
     anchors = build_anchor_map(merged_ranges)
     best: HeaderDetection | None = None
 
+    def _better(a: HeaderDetection | None, b: HeaderDetection) -> HeaderDetection:
+        if a is None:
+            return b
+        a_ok, b_ok = not a.needs_review, not b.needs_review
+        if b_ok != a_ok:
+            return b if b_ok else a
+        if b.confidence != a.confidence:
+            return b if b.confidence > a.confidence else a
+        return a
+
     for lo in range(1, min(_HEADER_ROW_MAX, max_row) + 1):
-        # 两行表头优先判定：第一行为组表头（如"金额"跨列），第二行为具体字段。
-        # 若 lo 与 lo+1 都有词典命中，必须按两行处理，否则数据行会从组表头下一行
-        # 误抽（"合价"行被当作数据）。
-        if lo + 1 <= min(_HEADER_ROW_MAX, max_row):
-            det2 = _try_header(lo, lo + 1, cells, anchors, max_col, sheet_index, two_row=True)
-            if det2:
-                return det2
-        # 单行表头候选
-        det = _try_header(lo, lo, cells, anchors, max_col, sheet_index)
-        if det:
-            return det
+        # 块式表头（2-3 行）：组表头（"金额（元）"横跨综合单价+合价、"其中"横跨
+        # 定额人工费等）在浅层，叶子字段在更深层（国标 表-08/表-12-3 版式）。
+        # 每列取最深词典命中为叶子；锚点宽度≥3 的命中不是叶子（标题/组表头），
+        # 除非该列块内无更深命中；列间同字段重复仍判歧义。
+        for depth in (3, 2):
+            hi = lo + depth - 1
+            if hi <= min(_HEADER_ROW_MAX, max_row):
+                det_n = _try_header(lo, hi, cells, anchors, max_col, sheet_index,
+                                    two_row=depth >= 2, block=depth,
+                                    merged_ranges=merged_ranges)
+                if det_n is not None:
+                    best = _better(best, det_n)
+        det = _try_header(lo, lo, cells, anchors, max_col, sheet_index,
+                          merged_ranges=merged_ranges)
+        if det is not None:
+            best = _better(best, det)
     return best
 
 
 def _try_header(lo: int, hi: int, cells, anchors, max_col: int, sheet_index: int,
-                two_row: bool = False) -> HeaderDetection | None:
+                two_row: bool = False, block: int = 1,
+                merged_ranges: list[str] | None = None) -> HeaderDetection | None:
+    merged_ranges = merged_ranges or []
     col_hits: dict[int, list[tuple[str, float]]] = {}
     lo_hit_cols: set[int] = set()
     hi_hit_cols: set[int] = set()
-    for c in range(1, max_col + 1):
-        text = _cell_text(cells, lo, c, anchors)
-        hits = _score_header_cell(text)
-        if hits:
+    if block >= 2:
+        # 块式：每列取"最深词典命中"为叶子；浅层同列命中视为组表头（不占映射）。
+        # 锚点宽度≥3（表标题/组表头横跨多列）不得作为叶子，除非该列无更深命中。
+        hit_rows: dict[int, int] = {}
+        width_cache: dict[tuple[int, int], int] = {}
+        for r in range(lo, hi + 1):
+            for c in range(1, max_col + 1):
+                text = _cell_text(cells, r, c, anchors)
+                hits = _score_header_cell(text)
+                if not hits:
+                    continue
+                if (r, c) not in width_cache:
+                    width_cache[(r, c)] = _merge_width(cells, merged_ranges, r, c)
+                if (r, c) in anchors and width_cache[(r, c)] >= 3 and hit_rows.get(c, lo - 1) > r:
+                    continue  # 宽组命中且该列有更深叶子 → 不占映射
+                col_hits[c] = hits
+                hit_rows[c] = r
+                if r == lo:
+                    lo_hit_cols.add(c)
+                if r == hi:
+                    hi_hit_cols.add(c)
+        if not col_hits:
+            return None
+        # 有效块：最深命中行必须有 ≥2 个命中（块底不能整体空悬），且块顶有命中
+        deepest_row = max(hit_rows.values())
+        deepest_count = sum(1 for r in hit_rows.values() if r == deepest_row)
+        # 块顶必须自身有 ≥2 个命中（块顶是表头行，不是噪声/标题行）
+        if len(lo_hit_cols) < 2 or deepest_count < 2:
+            return None
+        two_row = False  # 块式自带叶子解析，不再走两行覆盖逻辑
+    else:
+        for c in range(1, max_col + 1):
+            text = _cell_text(cells, lo, c, anchors)
+            hits = _score_header_cell(text)
+            if not hits:
+                continue
+            if (lo, c) in anchors and _merge_width(cells, merged_ranges, lo, c) >= 3                     and any(_score_header_cell(_cell_text(cells, r2, c, anchors))
+                            for r2 in range(lo + 1, min(lo + 3, hi if hi > lo else lo + 3) + 1)):
+                continue  # 宽组命中且更深行有命中 → 不占映射
             col_hits[c] = hits
             lo_hit_cols.add(c)
-        if two_row:
-            text2 = _cell_text(cells, hi, c, anchors)
-            hits2 = _score_header_cell(text2)
-            if hits2:
-                col_hits[c] = hits2
-                hi_hit_cols.add(c)
-    total_score = 0.0
-    for hits in sorted(col_hits.values()):
-        if not hits:
-            continue
-        total_score += max(s for _, s in hits)
-    if len(col_hits) < 3:  # 至少要识别出 3 个字段才承认是清单表
-        return None
-    if two_row and not (hi_hit_cols and hi_hit_cols & lo_hit_cols):
-        # 第二行自身无命中、或与第一行命中列无重叠 → 不是两行表头
-        return None
+            if two_row:
+                text2 = _cell_text(cells, hi, c, anchors)
+                hits2 = _score_header_cell(text2)
+                if hits2:
+                    col_hits[c] = hits2
+                    hi_hit_cols.add(c)
+        total_score = 0.0
+        for hits in sorted(col_hits.values()):
+            if not hits:
+                continue
+            total_score += max(s for _, s in hits)
+        if len(col_hits) < 3:  # 至少要识别出 3 个字段才承认是清单表
+            return None
+        if two_row and not (hi_hit_cols and hi_hit_cols & lo_hit_cols):
+            # 第二行自身无命中、或与第一行命中列无重叠 → 不是两行表头
+            return None
     col_map: dict[str, int] = {}
     notes: list[str] = []
     ambiguous = 0
@@ -178,6 +257,19 @@ def _try_header(lo: int, hi: int, cells, anchors, max_col: int, sheet_index: int
         confidence = min(confidence, 0.5)
         needs_review = True
         notes.append("neither quantity nor amount column found")
+    if "amount" not in col_map and "unit_price" not in col_map:
+        # 有数量但无任何金额列：无法参与金额校核（如 表-09 综合单价分析表），
+        # 自动解析会写入无法对账的半盲明细——必须人工确认角色/映射。
+        needs_review = True
+        notes.append("no money column (amount/unit_price) — manual confirmation required")
+    if block >= 2 and col_hits:
+        hit_rows = {}
+        for r in range(lo, hi + 1):
+            for c in range(1, max_col + 1):
+                if _score_header_cell(_cell_text(cells, r, c, anchors)):
+                    hit_rows[c] = r
+        if hit_rows:
+            hi = max(hit_rows.values())
     return HeaderDetection(
         sheet_index=sheet_index,
         header_row_lo=lo,
@@ -211,6 +303,11 @@ _SUBTOTAL_TRIM = re.compile(
 )
 
 
+def _norm_ws(text: str) -> str:
+    """归一化全部空白（含全角空格/制表/换行）——真实表小计标签常有排版空格。"""
+    return "".join(text.split()).replace("\u3000", "")
+
+
 def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
     """名称或首列出现小计/合计词 → 汇总行标记。
 
@@ -220,15 +317,16 @@ def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
     - 以小计词结尾且前缀全是编号/章节/标点（"一、二部分 小计"）。
     中间夹字（"合计用量表"）不算。
     """
-    for text in (name_text.strip(), first_cell_text.strip()):
-        if not text:
+    for text in (name_text, first_cell_text):
+        t = _norm_ws(text)
+        if not t:
             continue
         for w in SUBTOTAL_WORDS:
-            if text == w:
+            if t == w:
                 return True
-            if text.startswith(w) and not _SUBTOTAL_TRIM.sub("", text[len(w):]):
+            if t.startswith(w) and not _SUBTOTAL_TRIM.sub("", t[len(w):]):
                 return True
-            if text.endswith(w) and not _SUBTOTAL_TRIM.sub("", text[: -len(w)]):
+            if t.endswith(w) and not _SUBTOTAL_TRIM.sub("", t[: -len(w)]):
                 return True
     return False
 
@@ -259,6 +357,15 @@ def detect_form_like(cells: dict[tuple[int, int], str],
     )
     if kv_rows >= 3 and kv_rows * 2 >= data_rows:
         return "strong"
+    # 存在"金额型表头行"（≥2 个词典命中且含金额/单价字段）→ 是真表格，
+    # weak 表单不得抢在表头/语义门控之前（国标 E.6 汇总表实测误判场景）。
+    for r in range(1, min(15, max_row) + 1):
+        row_text_cells = [t for (_r, c), t in cells.items() if _r == r and (t or "").strip()]
+        hits: list[str] = []
+        for t in row_text_cells:
+            hits.extend(f for f, _s in _score_header_cell(t))
+        if len(hits) >= 2 and any(f in ("amount", "unit_price") for f in hits):
+            return None
     if data_rows and kv_rows >= 2:
         return "weak"
     if len(merged_ranges) >= 3 and data_rows <= 20:
