@@ -4,6 +4,17 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-30
+
+### Fixed
+- The README-documented `uv run pytest` now works on a fresh clone: added
+  `pythonpath = ["."]` to the pytest configuration. `tests/` has no
+  `__init__.py`, so tests that import `scripts.*` / `tests.*` modules need the
+  repo root on `sys.path`. CI was green because it runs `python -m pytest`
+  (which puts the cwd on `sys.path` implicitly), while a fresh clone running
+  `uv run pytest` got 2 failures + 9 `ModuleNotFoundError` errors. No test
+  assertions were changed.
+
 ## [0.1.0] - 2026-08-30
 
 First open-source developer preview. It provides the seven-step settlement workflow,

@@ -1,6 +1,6 @@
 [project]
 name = "costguard"
-version = "0.1.0"
+version = "0.1.1"
 description = "CostGuard - Engineering Cost & Compliance Intelligence Workbench (工程经营合规智能工作台)"
 requires-python = ">=3.12,<3.13"
 readme = "README.md"
@@ -43,6 +43,9 @@ packages = ["src/costguard"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# tests/ 无 __init__.py，test_acceptance_runner/test_export 直接 import scripts/ 包内模块，
+# 需要仓库根在 sys.path 上（CI 用 python -m pytest 隐式具备；此处让 `uv run pytest` 等效）。
+pythonpath = ["."]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
