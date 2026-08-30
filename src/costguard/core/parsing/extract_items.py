@@ -81,6 +81,13 @@ def extract_items(
         )
         item = ItemDraft(row=r)
         item.flags["subtotal"] = is_subtotal_row(name_src, lead_text)
+        # 分部/章节标题行：只有名称（或编码），无任何数值 → 标记并跳过。
+        # 有编码但无数值的行（如"缺数量清单行"）不在此列——它们有名称+编码，
+        # 数值缺失走待补资料流程；本分支仅针对真实结算书分部标题行
+        # （名称非空、编码空、三个数值列全空）。
+        if (not code_src and name_src
+                and not any(row_cells.get(f) for f in ("quantity", "unit_price", "amount"))):
+            continue  # 分部/章节标题行：非清单项，直接跳过（原文在保真层可回溯）
         if not name_src and not code_src:
             if item.flags["subtotal"]:
                 pass  # 合计行保留（异常检测需要它与明细核对）
@@ -139,6 +146,8 @@ def persist_line_items(
 ) -> int:
     rows = []
     for it in items:
+        if it.flags.get("title_row"):
+            continue  # 分部/章节标题行：非清单项（原文在保真层可回溯）
         rows.append(
             (
                 period_id, sheet_id,
