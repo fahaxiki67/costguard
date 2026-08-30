@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from costguard.core import demo as demo_core
 from costguard.core.models import project as project_model
+from costguard.ui.widgets import empty_state, section_header
 from costguard.ui.workbench import WorkbenchPage
 
 PAGE_PROJECTS = 0
@@ -94,29 +95,55 @@ class MainWindow(QMainWindow):
 
     # ---- 项目列表页 ----
     def _projects_page(self) -> QWidget:
+        from costguard.ui import theme
+
         central = QWidget()
         layout = QVBoxLayout(central)
-        tip = QLabel("项目列表（双击打开）")
-        layout.addWidget(tip)
+        layout.setContentsMargins(theme.SP_XL, theme.SP_XL, theme.SP_XL, theme.SP_L)
+        layout.setSpacing(theme.SP_S)
+
+        title = QLabel("CostGuard")
+        title.setStyleSheet(
+            "font-size: 20px; font-weight: 700; background: transparent;")
+        subtitle = QLabel("工程经营合规智能工作台")
+        subtitle.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addSpacing(theme.SP_L)
+        layout.addWidget(section_header("最近项目"))
+
         self.project_list = QListWidget()
         self.project_list.itemDoubleClicked.connect(self._on_open)
         layout.addWidget(self.project_list, 1)
 
-        demo_btn = QPushButton("体验匿名演示")
-        demo_btn.setToolTip("一键创建演示项目并导入完全合成的匿名演示数据，三分钟走完主流程")
-        demo_btn.clicked.connect(self._on_demo)
+        self.empty_box = empty_state(
+            "还没有工程项目",
+            "新建项目开始核对，或先体验匿名演示熟悉完整流程",
+            [("新建项目", "btnPrimary")])
+        layout.addWidget(self.empty_box)
+        for btn in self.empty_box.findChildren(QPushButton):
+            if btn.text() == "新建项目":
+                btn.clicked.connect(self._on_new)
 
         btn_row = QHBoxLayout()
-        new_btn = QPushButton("新建项目")
-        new_btn.clicked.connect(self._on_new)
         open_btn = QPushButton("打开项目目录…")
         open_btn.clicked.connect(self._on_open_dir)
         refresh_btn = QPushButton("刷新")
+        refresh_btn.setObjectName("btnTertiary")
         refresh_btn.clicked.connect(self.refresh_projects)
-        for b in (new_btn, open_btn, refresh_btn):
-            btn_row.addWidget(b)
+        btn_row.addWidget(open_btn)
+        btn_row.addWidget(refresh_btn)
         btn_row.addStretch(1)
+        demo_btn = QPushButton("体验匿名演示")
+        demo_btn.setObjectName("btnTertiary")
+        demo_btn.setToolTip("一键创建演示项目并导入完全合成的匿名演示数据，三分钟走完主流程")
+        demo_btn.clicked.connect(self._on_demo)
         btn_row.addWidget(demo_btn)
+        new_btn = QPushButton("新建项目")
+        new_btn.setObjectName("btnPrimary")
+        new_btn.clicked.connect(self._on_new)
+        btn_row.addWidget(new_btn)
         layout.addLayout(btn_row)
         return central
 
@@ -140,6 +167,9 @@ class MainWindow(QMainWindow):
             item.setToolTip(str(info.path))
             item.setData(Qt.UserRole, info)
             self.project_list.addItem(item)
+        has_items = self.project_list.count() > 0
+        self.project_list.setVisible(has_items)
+        self.empty_box.setVisible(not has_items)
 
     def _on_demo(self):
         answer = QMessageBox.question(
@@ -242,7 +272,10 @@ class MainWindow(QMainWindow):
 def run_gui() -> int:
     from PySide6.QtWidgets import QApplication
 
+    from costguard.ui.theme import apply_theme
+
     app = QApplication.instance() or QApplication([])
+    apply_theme(app)
     app.setApplicationName("CostGuard")
     app.setOrganizationName("CostGuard")
     icon = load_app_icon()
