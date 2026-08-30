@@ -192,14 +192,20 @@ def write_acceptance_report(report: dict) -> Path:
                     f"| {sh.get('confidence')} | {note} |")
         dpc = rec.get("dual_path_check")
         if isinstance(dpc, list) and dpc:
+            level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
+                        "insufficient": "校核不充分"}
             lines.append("")
-            lines.append("| 期次 | 方向 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 |")
-            lines.append("|---|---|---|---|---|---|---|---|---|")
+            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for c in dpc:
                 lines.append(
-                    f"| {c.get('period_no')} | {c.get('direction')} | {c.get('status')} "
+                    f"| {c.get('period_no')} | {c.get('direction')} "
+                    f"| {level_zh.get(c.get('verification_level'), c.get('verification_level'))} "
+                    f"| {c.get('status')} "
                     f"| {c.get('A')} | {c.get('B')} | {c.get('C_subtotal')} "
-                    f"| {c.get('diff_ab')} | {c.get('control_diff')} | {c.get('control_status')} |")
+                    f"| {c.get('diff_ab')} | {c.get('control_diff')} | {c.get('control_status')} "
+                    f"| {c.get('detail_rows')} | {c.get('excluded_subtotal_rows')} "
+                    f"| {c.get('excluded_title_rows')} | {c.get('pending_sheets')} |")
         tp = rec.get("text_parse")
         if tp:
             lines.append("")
@@ -500,6 +506,11 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                         conn, info.project_id, sorted(set(plist)), direction=direction))
                 rec["dual_path_check"] = [
                     {"period_no": c.period_no, "direction": c.direction, "status": c.status,
+                     "verification_level": c.verification_level,
+                     "detail_rows": c.detail_rows,
+                     "excluded_subtotal_rows": c.excluded_subtotal_rows,
+                     "excluded_title_rows": c.excluded_title_rows,
+                     "pending_sheets": c.pending_sheets,
                      "A": str(c.path_a_total) if c.path_a_total is not None else None,
                      "B": str(c.path_b_total) if c.path_b_total is not None else None,
                      "C_subtotal": str(c.raw_subtotal) if c.raw_subtotal is not None else None,

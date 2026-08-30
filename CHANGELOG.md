@@ -4,6 +4,30 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-30
+
+Productization pass (P0): no silent truncation, honest verification levels,
+dual-value audit worksheet, business-language UI.
+
+### Added
+- 清单明细分页：500/页 + 首页/上一页/下一页/末页 + "共 N 条 / 当前显示
+  X-Y 条"；>2500 行回归证明全部数据可翻页到达，导出继续读取完整数据集。
+- 三档校核级别（逐期）：校核充分（A=B 且 C 控制可用且一致 且无待人工
+  工作表）/ 校核有发现（A/B 或 C 差异）/ 校核不充分（C 不可用、数据不
+  完整、有待人工工作表）——纯绿色"一致"措辞废除；每期展示参与累计明细
+  行数、排除小计行数、排除标题说明行数、待人工确认工作表数、C 控制状态。
+- Excel 审核底稿双值列：合价(底稿公式) 保留 Excel 复核值；程序计算合价
+  列写入引擎 Decimal 精确值——主结论不依赖 Office 重算。
+- 业务语言：方向显示 对上结算/对下结算/未标记；确定/取消 中文按钮；
+  schema 版本移入 Tooltip；规则中文名完备性守卫测试。
+
+### Changed
+- 验收报告逐文件逐表新增 校核级别/参与明细/排除小计/排除标题/待人工表 列。
+
+### Pending environments（如实）
+- WPS Office、macOS Excel、Windows Excel 三环境真机重算验证待补；
+  当前以结构/公式/数值可复现检查 + LibreOffice 重算（不宣称等同 WPS）兜底。
+
 ## [0.1.6] - 2026-08-30
 
 Windows-compatibility and correctness release for macOS, driven by the

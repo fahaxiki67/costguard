@@ -1,6 +1,6 @@
 [project]
 name = "costguard"
-version = "0.1.6"
+version = "0.1.7"
 description = "CostGuard - Engineering Cost & Compliance Intelligence Workbench (工程经营合规智能工作台)"
 requires-python = ">=3.12,<3.13"
 readme = "README.md"
