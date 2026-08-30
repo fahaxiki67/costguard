@@ -14,6 +14,7 @@ from costguard.core.parsing.header_detect import (
     HeaderDetection,
     build_anchor_map,
     data_rows_range,
+    is_grand_total_row,
     is_subtotal_row,
 )
 
@@ -58,6 +59,7 @@ def extract_items(
     det: HeaderDetection,
     max_row: int,
     data_range: tuple[int, int] | None = None,
+    stats: dict | None = None,
 ) -> list[ItemDraft]:
     """从网格抽取清单行草稿。跳过全空行；小计/合计行打 flags['subtotal']=True。
 
@@ -69,6 +71,7 @@ def extract_items(
     anchors = build_anchor_map(merged_ranges)
     start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
     items: list[ItemDraft] = []
+    skip_stats = stats if stats is not None else {}
     for r in range(start, end + 1):
         row_cells = {f: _text_at(cells, anchors, r, det.col_map.get(f)) for f in det.col_map}
         if not any(row_cells.values()):
@@ -81,12 +84,15 @@ def extract_items(
         )
         item = ItemDraft(row=r)
         item.flags["subtotal"] = is_subtotal_row(name_src, lead_text)
+        if item.flags["subtotal"]:
+            item.flags["grand_total"] = is_grand_total_row(name_src, lead_text)
         # 分部/章节标题行：只有名称（或编码），无任何数值 → 标记并跳过。
         # 有编码但无数值的行（如"缺数量清单行"）不在此列——它们有名称+编码，
         # 数值缺失走待补资料流程；本分支仅针对真实结算书分部标题行
         # （名称非空、编码空、三个数值列全空）。
         if (not code_src and name_src
                 and not any(row_cells.get(f) for f in ("quantity", "unit_price", "amount"))):
+            skip_stats["title_rows"] = skip_stats.get("title_rows", 0) + 1
             continue  # 分部/章节标题行：非清单项，直接跳过（原文在保真层可回溯）
         if not name_src and not code_src:
             if item.flags["subtotal"]:
@@ -112,8 +118,12 @@ def extract_items(
                 src.value = raw or None
             setattr(item, f, src)
         items.append(item)
+    tail_popped = 0
     while items and items[-1].flags.get("orphan_numeric_row"):
         items.pop()  # 明细区末尾连续尾注行：剔除，保真层已留原文
+        tail_popped += 1
+    if tail_popped:
+        skip_stats["tail_note_rows"] = tail_popped
     return items
 
 

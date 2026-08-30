@@ -485,9 +485,18 @@ def import_settlement_file(
         if det is None:
             report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
             continue
-        items = extract_items.extract_items(cells, merged, det, n_rows)
+        skip_stats: dict = {}
+        items = extract_items.extract_items(cells, merged, det, n_rows, stats=skip_stats)
+        skip_notes = []
+        if skip_stats.get("title_rows"):
+            skip_notes.append(
+                f"跳过分部/章节标题行 {skip_stats['title_rows']} 行（非清单项，原文见保真层）")
+        if skip_stats.get("tail_note_rows"):
+            skip_notes.append(
+                f"剔除明细区尾部尾注行 {skip_stats['tail_note_rows']} 行（原文见保真层）")
         if not items:
-            report.sheets.append(SheetReport(sheet.sheet_name, "no_header", notes=["header-like but 0 data rows"]))
+            notes = ["header-like but 0 data rows"] + skip_notes
+            report.sheets.append(SheetReport(sheet.sheet_name, "no_header", notes=notes))
             continue
 
         # ---- 逐 Sheet 期次判定 ----
@@ -527,7 +536,7 @@ def import_settlement_file(
                 sheet.sheet_name, status,
                 n_items=len([i for i in items if not i.flags.get("subtotal")]),
                 n_subtotal=len([i for i in items if i.flags.get("subtotal")]),
-                confidence=det.confidence, notes=det.notes + notes,
+                confidence=det.confidence, notes=det.notes + notes + skip_notes,
             )
         )
     report.period_id = next(iter(period_ids), -1)

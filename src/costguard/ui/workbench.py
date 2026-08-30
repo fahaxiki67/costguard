@@ -492,9 +492,22 @@ class WorkbenchPage(QWidget):
                 errors.append(str(exc))
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         dir_zh = {"upward": "对上", "downward": "对下", "unknown": ""}
-        msg = "\n".join(
-            f"第{r.period_no}期{dir_zh.get(r.direction, '')}：{status_zh[r.status]}"
-            f"（A={r.path_a_total}，B={r.path_b_total}）" for r in results)
+        lines = []
+        for r in results:
+            line = (f"第{r.period_no}期{dir_zh.get(r.direction, '')}：{status_zh[r.status]}"
+                    f"（A={r.path_a_total}，B={r.path_b_total}）")
+            # C 控制值独立于 A/B：一致时若控制差异仍在，必须显著提示，不得被
+            # A/B 一致掩盖（独立复核发现 #6）
+            if r.control_status == "diff":
+                line += f"　⚠C控制差异={r.control_diff}（待复核）"
+            elif r.control_status == "not_available":
+                line += "　C控制不可用"
+            else:
+                line += f"　C={r.raw_subtotal}"
+            lines.append(line)
+        msg = "\n".join(lines)
+        if any(r.control_status == "diff" for r in results):
+            msg = "⚠ 存在 C 控制差异（A/B 一致也不代表全部通过）：\n" + msg
         if errors:
             msg += "\n\n以下期号存在方向歧义，已跳过（请先标记方向）：\n" + "\n".join(errors)
         QMessageBox.information(self, "双向校核", msg or "无期次可校核")

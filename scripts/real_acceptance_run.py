@@ -164,6 +164,56 @@ def write_acceptance_report(report: dict) -> Path:
             f"| {steps.get('wps', '未记录')} "
             f"| {steps.get('overall_acceptance_status', '未记录')} |"
         )
+    # ---- 逐文件逐表状态 + A/B/C（独立复核要求：逐表状态/唯一明细/A/B/C/门控）----
+    # 口径声明：解析工作表数 ≠ 结算期数——期次由人工确认时逐表指定；
+    # 明细行数=唯一出处行（抽取按原始行 1:1，行号记录于 flags.row）。
+    # A/B 两路径共用同一抽取器（A=明细累计，B=网格重解析），可校验解析保真
+    # 与聚合正确性，不能证明"行集正确"——行集正确性由 C 控制与人工门控兜底
+    #（issue #4 专项处理中）。
+    lines.extend(["", "## 逐文件逐表状态与校核", "",
+                  "> 口径：解析工作表数 ≠ 结算期数；明细行数=唯一出处行；"
+                  "A/B 共用抽取器（校验保真与聚合），行集正确性由 C 控制与人工门控兜底。",
+                  ""])
+    for rec in results:
+        sp = rec.get("settlement_parse") or {}
+        sheets = sp.get("sheets") or []
+        if not sheets and not rec.get("text_parse"):
+            continue
+        lines.append(f"### {rec.get('test_id')}（{sp.get('status', '—')}）")
+        if sheets:
+            lines.append("")
+            lines.append("| 工作表 | 状态 | 明细行(唯一出处) | 小计行 | 置信度 | 说明 |")
+            lines.append("|---|---|---|---|---|---|")
+            for sh in sheets:
+                note = (sh.get("notes") or [""])[0][:60] if sh.get("notes") else ""
+                lines.append(
+                    f"| {str(sh.get('name'))[:52]} | {sh.get('status')} "
+                    f"| {sh.get('n_items')} | {sh.get('n_subtotal')} "
+                    f"| {sh.get('confidence')} | {note} |")
+        dpc = rec.get("dual_path_check")
+        if isinstance(dpc, list) and dpc:
+            lines.append("")
+            lines.append("| 期次 | 方向 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|")
+            for c in dpc:
+                lines.append(
+                    f"| {c.get('period_no')} | {c.get('direction')} | {c.get('status')} "
+                    f"| {c.get('A')} | {c.get('B')} | {c.get('C_subtotal')} "
+                    f"| {c.get('diff_ab')} | {c.get('control_diff')} | {c.get('control_status')} |")
+        tp = rec.get("text_parse")
+        if tp:
+            lines.append("")
+            lines.append(f"- 文本抽取：段落 {tp.get('n_paragraphs')}，事实 {tp.get('n_facts')}（须逐条人工核对原文）")
+        role = rec.get("role_review") or {}
+        form = rec.get("form_route") or {}
+        gating = []
+        if role.get("sheets"):
+            gating.append(f"角色审阅 {len(role['sheets'])} 表")
+        if form.get("sheets"):
+            gating.append(f"表单路由 {len(form['sheets'])} 表")
+        if gating:
+            lines.append(f"- 人工门控：{'、'.join(gating)}（未经确认不写入结算模型）")
+        lines.append("")
     lines.extend(["", "## 逐文件限制", ""])
     for rec in results:
         steps = rec.get("steps") or {}

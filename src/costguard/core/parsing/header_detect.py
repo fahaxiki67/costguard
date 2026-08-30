@@ -47,6 +47,25 @@ FIELD_DICT: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 
 # 名称列中出现的"小计/合计"标记词（不计入明细，也不能当作清单名称）
 SUBTOTAL_WORDS = ("小计", "合计", "总计", "累计", "分部小计", "本章小计", "本页小计", "本页合计")
+# 合计级（全表控制值）vs 页级/分部级：C 路径控制值只认合计级——真实分页表
+# "本页小计"与"合计"并存，全部求和会把控制值翻倍（v0.1.5 已知限制）。
+GRAND_TOTAL_WORDS = ("合计", "总计", "累计")
+
+
+def is_grand_total_row(name_text: str, first_cell_text: str) -> bool:
+    """合计级行（全表控制值）。判定规则与 is_subtotal_row 相同，词表不同。"""
+    for text in (name_text, first_cell_text):
+        t = _norm_ws(text)
+        if not t:
+            continue
+        for w in GRAND_TOTAL_WORDS:
+            if t == w:
+                return True
+            if t.startswith(w) and not _SUBTOTAL_TRIM.sub("", t[len(w):]):
+                return True
+            if t.endswith(w) and not _SUBTOTAL_TRIM.sub("", t[: -len(w)]):
+                return True
+    return False
 
 _HEADER_ROW_MAX = 15  # 表头识别扫描的最大行号
 
@@ -299,7 +318,7 @@ def max_col_of(cells: dict[tuple[int, int], str]) -> int:
 
 
 _SUBTOTAL_TRIM = re.compile(
-    r"[\s0-9一二三四五六七八九十第\.、（）()\-—:：,，ⅠⅡⅢ]+|分部分项|部分|[章节类段]"
+    r"[\s0-9一二三四五六七八九十第\.、（）()\-—:：,，ⅠⅡⅢ]+|分部分项|部分|[章节类段页]"
 )
 
 
@@ -342,6 +361,37 @@ def detect_form_like(cells: dict[tuple[int, int], str],
     if not cells:
         return None
     max_row = max(r for r, _c in cells)
+    # 金额型表头 + 其下 ≥3 个数值行 = 真表格信号：对 strong/weak 一票否决。
+    # 真实缺陷依据：①E.6 汇总表表头仅"金额"一个词典命中（汇总内容不在词典），
+    # weak 签字行误拦；②小页表-08 的特征列满是"1.名称：…2.型号：…"冒号文本，
+    # kv 行占多数触发 strong——两者都是真实结算书的常态结构，不是表单。
+    money_header_row = None
+    money_cols: set[int] = set()
+    for r in range(1, min(15, max_row) + 1):
+        for (rr, c), text in cells.items():
+            if rr != r:
+                continue
+            hits = [f for f, _s in _score_header_cell(text or "")]
+            if any(f in ("amount", "unit_price") for f in hits):
+                money_header_row = r
+                money_cols.add(c)
+        if money_header_row is not None:
+            break
+    if money_header_row is not None:
+        # 数值必须出现在金额命中的列下方（真表金额列下方是数字；
+        # 键值页的金额词在标签格里，其列下方是文本——不构成表格信号）。
+        numeric_re = __import__("re").compile(r"^[\d,，\s．.+-]+$")
+        numeric_rows = 0
+        seen_rows: set[int] = set()
+        for (r, c), text in cells.items():
+            if r <= money_header_row or c not in money_cols or not (text or "").strip():
+                continue
+            t = text.strip().replace("¥", "").replace("￥", "")
+            if numeric_re.match(t) and r not in seen_rows:
+                seen_rows.add(r)
+                numeric_rows += 1
+                if numeric_rows >= 3:
+                    return None  # 是数据表，不是表单
     if max_row > 30:
         return None
     row_texts: dict[int, list[str]] = {}
