@@ -31,10 +31,39 @@ TABLE_BORDER = Border(
 )
 CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
 DIRECTION_LABELS = {
-    "upward": "对上",
-    "downward": "对下",
-    "unknown": "未标记方向",
+    "upward": "对上结算",
+    "downward": "对下结算",
+    "unknown": "未标记",
 }
+RULE_ZH_CN = {
+    "qty_price_amount_mismatch": "工程量×单价与合价不一致",
+    "rounding_difference": "舍入差异",
+    "text_number_in_value_col": "数值列存在文本数字",
+    "unparsed_number": "数值无法解析",
+    "formula_no_cache": "公式缺少缓存值",
+    "formula_error": "公式错误",
+    "duplicate_item": "重复明细",
+    "suspected_duplicate_settlement": "疑似重复结算",
+    "price_changed": "单价变化",
+    "price_abnormal_change": "单价异常变化",
+    "tax_rate_changed": "税率变化",
+    "tax_mode_mixed": "计税口径混用",
+    "unit_changed": "计量单位变化",
+    "qty_sudden_change": "工程量突变",
+    "missing_key_fields": "关键字段缺失",
+    "summary_mismatch": "汇总金额不一致",
+    "summary_missing_data": "汇总数据缺失",
+    "negative_quantity": "负数工程量",
+    "orphan_numeric_row": "无名称数值行",
+    "same_code_diff_name": "同编码不同名称",
+    "same_name_diff_code": "同名称不同编码",
+    "large_round_amount": "大额整数金额",
+    "header_needs_review": "表头识别待复核",
+    "missing_columns": "缺少必需列",
+    "missing_key_column": "缺少关键列",
+}
+SUBJECT_ZH = {"line_item": "清单行", "period": "期次", "sheet": "工作表", "project": "项目"}
+ANOMALY_STATUS_ZH = {"open": "待处理", "resolved": "已处理"}
 
 
 def _style_header(ws, row: int, cols: int):
@@ -124,7 +153,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         if (p["direction"] or "unknown") == direction
     ]
     aggs = aggregate_project(conn, project_id, direction=direction)
-    ws = wb.create_sheet(f"{DIRECTION_LABELS.get(direction, direction)}结算累计表")
+    ws = wb.create_sheet(f"{DIRECTION_LABELS.get(direction, direction)}累计表")
     header = ["清单编码", "清单名称", "单位"] + [f"第{p['period_no']}期金额" for p in periods] + \
              ["累计数量", "累计金额", "加权平均单价", "状态"]
     ws.append(header)
@@ -245,7 +274,7 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
     - 差异列保留公式；缺失不补 0。
     """
     titles = (("单价差异表", "unit_price"), ("工程量差异表", "quantity"), ("金额差异表", "amount"))
-    dir_zh = {"upward": "对上", "downward": "对下", "unknown": "未标记"}
+    dir_zh = DIRECTION_LABELS
     all_series = {f: _diff_series(conn, project_id, f) for _t, f in titles}
 
     for title, field in titles:
@@ -418,26 +447,30 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
            WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, a.id""",
         (project_id,),
     ).fetchall()
+    sev_zh = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
     ws = wb.create_sheet("异常清单")
-    ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态"])
-    _style_header(ws, 1, 8)
+    ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态", "规则代码"])
+    _style_header(ws, 1, 9)
     for r in anomaly_rows:
-        sev = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get(r["severity"], r["severity"])
+        sev = sev_zh.get(r["severity"], r["severity"])
         direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
-        ws.append([r["id"], direction, r["rule_id"], sev,
-                   f"{r['subject_type']}#{r['subject_id']}",
-                   r["message"], r["evidence_id"], r["status"]])
+        subject = SUBJECT_ZH.get(r["subject_type"], r["subject_type"])
+        status = ANOMALY_STATUS_ZH.get(r["status"], r["status"])
+        ws.append([r["id"], direction, RULE_ZH_CN.get(r["rule_id"], r["rule_id"]), sev,
+                   f"{subject}#{r['subject_id']}",
+                   r["message"], r["evidence_id"], status, r["rule_id"]])
     _autowidth(ws)
 
     ws2 = wb.create_sheet("待核实事项清单")
-    ws2.append(["编号", "方向", "类别", "说明", "证据ID"])
-    _style_header(ws2, 1, 5)
+    ws2.append(["编号", "方向", "类别", "说明", "证据ID", "规则代码"])
+    _style_header(ws2, 1, 6)
     idx = 1
     for r in anomaly_rows:
         if r["severity"] not in {"high", "medium"} or r["status"] != "open":
             continue
         direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
-        ws2.append([idx, direction, r["rule_id"], r["message"], r["evidence_id"]])
+        ws2.append([idx, direction, RULE_ZH_CN.get(r["rule_id"], r["rule_id"]),
+                    r["message"], r["evidence_id"], r["rule_id"]])
         idx += 1
     for direction in _project_directions(conn, project_id):
         for agg in aggregate_project(conn, project_id, direction=direction):
@@ -606,9 +639,9 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         ("—— 统计范围 ——", ""),
         ("已导入原始文件数", n_src),
         ("期次数", len(periods)),
-        ("其中：对上", n_up),
-        ("其中：对下", n_down),
-        ("其中：未标记方向", n_none),
+        ("其中：对上结算", n_up),
+        ("其中：对下结算", n_down),
+        ("其中：未标记", n_none),
         ("—— 金额与状态 ——", ""),
     ]
     for direction, stats in direction_stats.items():
