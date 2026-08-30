@@ -1,4 +1,4 @@
-; CostGuard Windows x64 安装器脚本（Inno Setup 6）
+﻿; CostGuard Windows x64 安装器脚本（Inno Setup 6）
 ; 由 scripts/build_windows_x64.ps1 调用；版本号经环境变量注入。
 ; 纪律：
 ; - 只安装程序本体到 Program Files；用户工程数据在 Documents\CostGuardProjects，

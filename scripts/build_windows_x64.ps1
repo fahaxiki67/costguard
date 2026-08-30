@@ -1,4 +1,4 @@
-# CostGuard Windows x64 构建脚本（可重复、失败即非零退出）。
+﻿# CostGuard Windows x64 构建脚本（可重复、失败即非零退出）。
 # 与 scripts/build_macos_arm64.sh 同一门禁纪律：
 #   环境(arch/Python3.12) → ruff+全量测试 → 演示数据确定性 → 只清理可再生输出
 #   → PyInstaller 构建 → PE 架构校验 → 隐私审计 → 便携 zip + Inno 安装器 → SHA256
