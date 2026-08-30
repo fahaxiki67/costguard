@@ -174,6 +174,18 @@ class MainWindow(QMainWindow):
         except project_model.ProjectError as exc:
             QMessageBox.warning(self, "新建项目", str(exc))
             return
+        try:
+            # 自定义工作空间必须持久登记；否则本次窗口能打开，重启后项目列表却
+            # 只扫描默认目录，看起来像“记录丢失”。登记只写软件配置，不动项目库。
+            project_model.set_workspace_root(root)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "工作空间未记住",
+                f"项目已经安全创建在：\n{info.workspace_path}\n\n"
+                f"但工作空间配置保存失败：{exc}\n"
+                "本次仍可继续使用；下次启动可通过“打开项目目录”重新打开。",
+            )
         self._open(info)
 
     def _on_open(self, item: QListWidgetItem):
@@ -188,6 +200,15 @@ class MainWindow(QMainWindow):
         except project_model.ProjectError as exc:
             QMessageBox.warning(self, "打开项目", str(exc))
             return
+        try:
+            project_model.set_workspace_root(Path(d).parent)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "工作空间未记住",
+                f"项目已经成功打开，但工作空间配置保存失败：{exc}\n"
+                "下次启动可再次通过“打开项目目录”打开，项目数据不会因此被删除。",
+            )
         self._enter_workbench(info, conn)
 
     def _open(self, info: project_model.ProjectInfo):

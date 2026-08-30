@@ -145,7 +145,9 @@ class TestMainWindow:
         from costguard.ui.main_window import PAGE_PROJECTS, PAGE_WORKBENCH, MainWindow
 
         monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
-        monkeypatch.setattr(pm, "workspace_root", lambda: tmp_path / "ws")
+        monkeypatch.setattr(
+            pm.platform_paths, "default_workspace_root", lambda: tmp_path / "ws"
+        )
         win = MainWindow()
         assert win.stack.count() == 2
         assert win.stack.currentIndex() == PAGE_PROJECTS
@@ -168,7 +170,9 @@ class TestMainWindow:
         from costguard.ui.main_window import PAGE_WORKBENCH, MainWindow
 
         monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
-        monkeypatch.setattr(pm, "workspace_root", lambda: tmp_path / "ws")
+        monkeypatch.setattr(
+            pm.platform_paths, "default_workspace_root", lambda: tmp_path / "ws"
+        )
         info = pm.create_project("重开项目", tmp_path / "ws")
         win = MainWindow()
         win._open(item_data := info)
@@ -177,3 +181,48 @@ class TestMainWindow:
         second_page = win.stack.widget(PAGE_WORKBENCH)
         assert first_page is not second_page
         win.close()
+
+    def test_new_project_remembers_custom_workspace_across_restart(
+        self, app, tmp_path, monkeypatch
+    ):
+        from PySide6.QtWidgets import QDialog
+
+        from costguard.core.models import project as pm
+        from costguard.ui import main_window
+
+        settings_file = tmp_path / "settings.json"
+        default_root = tmp_path / "default"
+        custom_root = tmp_path / "custom"
+        monkeypatch.setattr(pm, "_SETTINGS_FILE", settings_file)
+        monkeypatch.setattr(
+            pm.platform_paths, "default_workspace_root", lambda: default_root
+        )
+
+        class FakeDialog:
+            def __init__(self, parent=None):
+                pass
+
+            def exec(self):
+                return QDialog.Accepted
+
+            def values(self):
+                return "重启仍可见", custom_root
+
+        monkeypatch.setattr(main_window, "NewProjectDialog", FakeDialog)
+        win = main_window.MainWindow()
+        monkeypatch.setattr(win, "_open", lambda info: None)
+        win._on_new()
+        win.close()
+
+        # 新窗口模拟应用重启；项目列表应从持久化设置中恢复。
+        restarted = main_window.MainWindow()
+        try:
+            restarted.refresh_projects()
+            names = [
+                restarted.project_list.item(i).text()
+                for i in range(restarted.project_list.count())
+            ]
+            assert names == ["重启仍可见"]
+            assert pm.workspace_root() == custom_root
+        finally:
+            restarted.close()

@@ -94,7 +94,10 @@ def test_main_window_smoke_demo_entry_and_privacy(
 
     ws = tmp_path / "CostGuardProjects"
     ws.mkdir(parents=True)
-    monkeypatch.setattr(project_model, "workspace_root", lambda: ws)
+    monkeypatch.setattr(project_model, "_SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(
+        project_model.platform_paths, "default_workspace_root", lambda: ws
+    )
     win = MainWindow()
     try:
         buttons = win.findChildren(QPushButton)
