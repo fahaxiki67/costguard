@@ -74,14 +74,7 @@ if (-not (Test-Path "$App/CostGuard.exe")) { Fail "未找到 $App/CostGuard.exe"
 
 # ---- 8. PE 架构校验（主 exe 必须是 x64）----
 Step "PE 架构校验"
-& uv run python -c @"
-import struct, sys
-data = open('dist/CostGuard/CostGuard.exe','rb').read(4096)
-e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
-machine = struct.unpack_from('<H', data, e_lfanew + 4)[0]
-print('PE machine = 0x%04X' % machine)
-sys.exit(0 if machine == 0x8664 else 1)
-"@
+& uv run python scripts/pe_machine.py "dist/CostGuard/CostGuard.exe" "8664"
 if ($LASTEXITCODE -ne 0) { Fail "CostGuard.exe 不是 x64 (0x8664)" }
 
 # ---- 9. 隐私审计 ----
