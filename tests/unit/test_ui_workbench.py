@@ -98,7 +98,7 @@ class TestWorkbench:
             if table.item(i, 3).text() == "sheet_direction_probe"
         ]
         assert len(probe_rows) == 1
-        assert table.item(probe_rows[0], 1).text() == "对上"
+        assert table.item(probe_rows[0], 1).text() == "对上结算"
 
     def test_match_run_and_levels_zh(self, wb_page):
         from costguard.core.matching import matching

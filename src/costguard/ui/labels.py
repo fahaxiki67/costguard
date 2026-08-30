@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 # 方向
-DIRECTION_ZH = {"upward": "对上", "downward": "对下", "unknown": "未标记"}
+DIRECTION_ZH = {"upward": "对上结算", "downward": "对下结算", "unknown": "未标记"}
 
 # 异常严重度 → (中文, 徽章级别)
 SEVERITY_ZH = {

@@ -59,7 +59,7 @@ def test_labels_fallbacks_never_crash():
     assert labels.rule_zh("rule_error_xxx") == "rule_error_xxx"
     assert labels.parse_group_key("weird:key") == "weird:key"
     assert labels.parse_group_key("pending:orphan") == "待补资料 · 缺失名称/编码"
-    assert labels.parse_group_key("downward:code:0101") == "对下 · 编码 0101"
+    assert labels.parse_group_key("downward:code:0101") == "对下结算 · 编码 0101"
 
 
 @pytest.mark.parametrize("method,expected", [

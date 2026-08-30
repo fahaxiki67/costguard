@@ -103,7 +103,10 @@ class TestExcelExport:
         ws = wb["审核底稿"]
         formulas = [ws.cell(row=r, column=7).value for r in range(2, ws.max_row + 1)]
         assert any(isinstance(v, str) and v.startswith("=E") for v in formulas), formulas[:5]
-        diffs = [ws.cell(row=r, column=9).value for r in range(2, ws.max_row + 1)]
+        program_vals = [ws.cell(row=r, column=8).value for r in range(2, ws.max_row + 1)]
+        assert any(isinstance(v, (int, float)) for v in program_vals), (
+            "程序计算合价列必须有 Decimal 数值（不依赖 Office 重算）")
+        diffs = [ws.cell(row=r, column=10).value for r in range(2, ws.max_row + 1)]
         assert any(isinstance(v, str) and v.startswith("=ROUND(") for v in diffs)
 
     def test_formula_references_match_db(self, full_project):
@@ -132,7 +135,7 @@ class TestExcelExport:
             if not (isinstance(formula, str) and formula.startswith("=E")):
                 continue
             assert formula == f"=E{r}*F{r}", f"formula row mismatch at {r}: {formula}"
-            row_id = ws.cell(row=r, column=13).value  # 行ID
+            row_id = ws.cell(row=r, column=14).value  # 行ID
             assert row_id in db_rows, f"worksheet row {r} references unknown line_item"
             d_code, d_name, d_qty, d_price = db_rows[row_id]
             assert ws.cell(row=r, column=2).value == d_code
@@ -248,25 +251,31 @@ class TestExcelExport:
             qty = ws.cell(row=r, column=5).value
             price = ws.cell(row=r, column=6).value
             g = ws.cell(row=r, column=7).value  # 底稿合价（公式重算值，未舍入的精确乘积）
-            h = ws.cell(row=r, column=8).value  # 原表合价
+            h_prog = ws.cell(row=r, column=8).value  # 程序计算合价（写入的 Decimal 值）
+            h_orig = ws.cell(row=r, column=9).value  # 原表合价
             if qty is None or price is None or g is None:
                 continue
             # 勾稽1：G 必须等于 数量×单价 的精确乘积（数量可能除不尽，不预设舍入口径）
             expect_exact = Decimal(repr(qty)) * Decimal(repr(price))
             assert abs(Decimal(repr(g)) - expect_exact) <= Decimal("0.001"), \
                 f"recalc mismatch row {r}: G={g} expect={expect_exact}"
-            # 勾稽2：差异列 I == ROUND(G-H, 2)（同源数据时必为 0）
-            i_val = ws.cell(row=r, column=9).value
-            if i_val is not None and h is not None:
-                expect_diff = round2(Decimal(repr(g)) - Decimal(repr(h)))
-                assert abs(Decimal(repr(i_val)) - expect_diff) <= Decimal("0.001"), \
-                    f"diff col mismatch row {r}: I={i_val} expect={expect_diff}"
+            # 勾稽1b（双值）：G 重算值必须等于程序写入的 Decimal 值
+            # ——主结论不依赖 Office 重算的直接证据
+            if h_prog is not None and not isinstance(h_prog, str):
+                assert abs(Decimal(repr(g)) - Decimal(repr(h_prog))) <= Decimal("0.001"), \
+                    f"program value mismatch row {r}: G={g} program={h_prog}"
+            # 勾稽2：差异列 J == ROUND(G-I, 2)（同源数据时必为 0）
+            j_val = ws.cell(row=r, column=10).value
+            if j_val is not None and h_orig is not None:
+                expect_diff = round2(Decimal(repr(g)) - Decimal(repr(h_orig)))
+                assert abs(Decimal(repr(j_val)) - expect_diff) <= Decimal("0.001"), \
+                    f"diff col mismatch row {r}: J={j_val} expect={expect_diff}"
             # 勾稽3：原表合价与 DB 一致（LibreOffice 缓存值为 15 位有效数字，
             # 允许 1e-6 的表示误差——远小于业务容差 0.02）
-            row_id = ws.cell(row=r, column=13).value
+            row_id = ws.cell(row=r, column=14).value
             if row_id in db_amounts and db_amounts[row_id] is not None:
-                assert abs(Decimal(repr(h)) - Decimal(db_amounts[row_id])) <= Decimal("1e-6"), \
-                    f"original amount mismatch row {r}: {h} vs {db_amounts[row_id]}"
+                assert abs(Decimal(repr(h_orig)) - Decimal(db_amounts[row_id])) <= Decimal("1e-6"), \
+                    f"original amount mismatch row {r}: {h_orig} vs {db_amounts[row_id]}"
             checked += 1
         assert checked > 0
 
