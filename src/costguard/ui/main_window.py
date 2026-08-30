@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -23,11 +24,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from costguard.core import demo as demo_core
 from costguard.core.models import project as project_model
 from costguard.ui.workbench import WorkbenchPage
 
 PAGE_PROJECTS = 0
 PAGE_WORKBENCH = 1
+
+_GEOMETRY_KEY = "main/geometry"
+
+
+def load_app_icon() -> QIcon | None:
+    """应用图标（打包/源码双模式定位）；缺失时返回 None，用系统默认。"""
+    from costguard.platform import resources as platform_resources
+
+    path = platform_resources.app_icon_path()
+    return QIcon(str(path)) if path else None
 
 
 class NewProjectDialog(QDialog):
@@ -62,7 +74,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CostGuard — 工程经营合规智能工作台")
-        self.resize(1080, 680)
+        icon = load_app_icon()
+        if icon is not None:
+            self.setWindowIcon(icon)
+        settings = QSettings("CostGuard", "CostGuard")
+        geo = settings.value(_GEOMETRY_KEY)
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(1080, 680)
         self._conn = None
         self._project = None
 
@@ -82,6 +102,10 @@ class MainWindow(QMainWindow):
         self.project_list.itemDoubleClicked.connect(self._on_open)
         layout.addWidget(self.project_list, 1)
 
+        demo_btn = QPushButton("体验匿名演示")
+        demo_btn.setToolTip("一键创建演示项目并导入完全合成的匿名演示数据，三分钟走完主流程")
+        demo_btn.clicked.connect(self._on_demo)
+
         btn_row = QHBoxLayout()
         new_btn = QPushButton("新建项目")
         new_btn.clicked.connect(self._on_new)
@@ -91,6 +115,8 @@ class MainWindow(QMainWindow):
         refresh_btn.clicked.connect(self.refresh_projects)
         for b in (new_btn, open_btn, refresh_btn):
             btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        btn_row.addWidget(demo_btn)
         layout.addLayout(btn_row)
         return central
 
@@ -99,6 +125,8 @@ class MainWindow(QMainWindow):
         self.refresh_projects()
 
     def closeEvent(self, event):
+        settings = QSettings("CostGuard", "CostGuard")
+        settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
         if self._conn:
             self._conn.close()
         super().closeEvent(event)
@@ -107,9 +135,31 @@ class MainWindow(QMainWindow):
     def refresh_projects(self):
         self.project_list.clear()
         for info in project_model.list_projects():
-            item = QListWidgetItem(f"{info.name}    [{info.path}]")
+            # 只显示项目名；绝对路径放 tooltip（避免截图/演示泄露本机路径）
+            item = QListWidgetItem(info.name)
+            item.setToolTip(str(info.path))
             item.setData(Qt.UserRole, info)
             self.project_list.addItem(item)
+
+    def _on_demo(self):
+        answer = QMessageBox.question(
+            self, "体验匿名演示",
+            "将自动创建「匿名演示项目」并导入完全合成的匿名演示数据\n"
+            "（对上/对下结算、合同摘录，全部为程序生成的虚构内容）。\n\n"
+            "随后可依次体验：双向校核 → 异常检测 → 匹配复核 → 成果导出。\n\n"
+            "是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            info = demo_core.provision_demo_project()
+        except demo_core.DemoProvisionError as exc:
+            QMessageBox.warning(self, "体验匿名演示", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
+            QMessageBox.warning(self, "体验匿名演示", f"演示项目创建失败：{exc}")
+            return
+        self._open(info)
 
     def _on_new(self):
         dlg = NewProjectDialog(self)
@@ -172,6 +222,11 @@ def run_gui() -> int:
     from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance() or QApplication([])
+    app.setApplicationName("CostGuard")
+    app.setOrganizationName("CostGuard")
+    icon = load_app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
     win = MainWindow()
     win.show()
     return app.exec()

@@ -18,8 +18,8 @@
 | 7 | 成果导出：12 类报表、Excel 保留公式、WPS 兼容（LibreOffice 真实重算验证） | ✅ |
 | 8 | 完整 Mac UI（项目页+五 Tab 工作台） | ✅ |
 | 9 | Mac 大规模测试和性能优化 | 🔨 |
-| 10 | Mac 打包（unsigned DMG） | ⬜ |
-| 11 | GitHub CI/CD（源码 CI 与敏感信息扫描已就绪；自动打包待补） | 🔨 |
+| 10 | Mac 打包（unsigned DMG） | ✅ v0.1.2 预览（ad-hoc 签名未公证；公证版见 Phase 14） |
+| 11 | GitHub CI/CD（源码 CI 与敏感信息扫描已就绪；macOS 打包工作流已就绪） | 🔨 |
 | 12 | Mac Beta Release (v0.9.x) | ⬜ |
 | 13 | 真实案例回归测试和 Bug 修复 | ⬜ |
 | 14 | Mac V1.0 Release Candidate（签名+公证预留） | ⬜ |
