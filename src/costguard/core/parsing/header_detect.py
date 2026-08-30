@@ -361,6 +361,37 @@ def detect_form_like(cells: dict[tuple[int, int], str],
     if not cells:
         return None
     max_row = max(r for r, _c in cells)
+    # 金额型表头 + 其下 ≥3 个数值行 = 真表格信号：对 strong/weak 一票否决。
+    # 真实缺陷依据：①E.6 汇总表表头仅"金额"一个词典命中（汇总内容不在词典），
+    # weak 签字行误拦；②小页表-08 的特征列满是"1.名称：…2.型号：…"冒号文本，
+    # kv 行占多数触发 strong——两者都是真实结算书的常态结构，不是表单。
+    money_header_row = None
+    money_cols: set[int] = set()
+    for r in range(1, min(15, max_row) + 1):
+        for (rr, c), text in cells.items():
+            if rr != r:
+                continue
+            hits = [f for f, _s in _score_header_cell(text or "")]
+            if any(f in ("amount", "unit_price") for f in hits):
+                money_header_row = r
+                money_cols.add(c)
+        if money_header_row is not None:
+            break
+    if money_header_row is not None:
+        # 数值必须出现在金额命中的列下方（真表金额列下方是数字；
+        # 键值页的金额词在标签格里，其列下方是文本——不构成表格信号）。
+        numeric_re = __import__("re").compile(r"^[\d,，\s．.+-]+$")
+        numeric_rows = 0
+        seen_rows: set[int] = set()
+        for (r, c), text in cells.items():
+            if r <= money_header_row or c not in money_cols or not (text or "").strip():
+                continue
+            t = text.strip().replace("¥", "").replace("￥", "")
+            if numeric_re.match(t) and r not in seen_rows:
+                seen_rows.add(r)
+                numeric_rows += 1
+                if numeric_rows >= 3:
+                    return None  # 是数据表，不是表单
     if max_row > 30:
         return None
     row_texts: dict[int, list[str]] = {}
