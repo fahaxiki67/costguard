@@ -42,7 +42,7 @@ def wb_page(tmp_path, app):
 class TestWorkbench:
     def test_tabs_present(self, wb_page):
         names = [wb_page.tabs.tabText(i) for i in range(wb_page.tabs.count())]
-        assert names == ["期次概览", "清单明细", "异常检测", "匹配复核", "成果导出"]
+        assert names == ["期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出"]
 
     def test_period_overview_populated(self, wb_page):
         wb_page.refresh_periods()
@@ -50,6 +50,14 @@ class TestWorkbench:
         assert t.rowCount() == 2  # multi.xlsx 2 期
         assert t.item(0, 0).text() == "1"
         assert t.item(0, 2).text() == "未标记"  # P0-4 业务词统一：未标记（无括号）
+
+    def test_project_overview_shows_counts_and_next_step(self, wb_page):
+        wb_page.refresh_overview()
+        assert wb_page.overview_values["files"].text() == "1"
+        assert wb_page.overview_values["upward"].text() == "0"
+        assert wb_page.overview_values["downward"].text() == "0"
+        assert "下一步：" in wb_page.overview_hint.text()
+        assert wb_page.next_action_btn.text().startswith("下一步：")
 
     def test_items_populated_with_provenance(self, wb_page):
         wb_page.refresh_items()
@@ -61,6 +69,17 @@ class TestWorkbench:
         assert t.item(0, 5).text() not in ("", "—")
         assert t.item(0, 9).text().startswith("行")
 
+    def test_items_search_and_type_filters_keep_full_count(self, wb_page):
+        wb_page.items_search.setText("挖沟槽土方")
+        assert wb_page.items_total == 2
+        assert "共 2 条 / 当前显示 1-2 条" == wb_page.items_total_label.text()
+        wb_page.items_row_type.setCurrentIndex(1)  # 仅明细
+        assert wb_page.items_total == 2
+        wb_page._show_item_evidence(0, 0)
+        evidence_text = wb_page.item_evidence_panel.toPlainText()
+        assert "来源文件：" in evidence_text
+        assert "Evidence ID" in evidence_text and "Sheet：" in evidence_text
+
     def test_anomaly_run_and_display(self, wb_page):
         from costguard.core.anomalies import engine
 
@@ -68,6 +87,52 @@ class TestWorkbench:
         wb_page.refresh_anomalies()
         assert wb_page.anomaly_table.rowCount() == len(findings)
         assert wb_page.anomaly_table.horizontalHeaderItem(1).text() == "方向"
+
+    def test_evidence_renderer_keeps_pretranslated_direction(self):
+        """异常证据已写入中文方向时，渲染器不得二次转换成未标记。"""
+        from costguard.ui.workbench import _evidence_entry_text
+
+        rendered = _evidence_entry_text(
+            {"direction": "对上结算", "file": "第1期.xlsx"}, source=True
+        )
+        assert "方向：对上结算" in rendered
+        assert "方向：未标记" not in rendered
+
+    def test_anomaly_detail_handles_legacy_dict_evidence_and_localizes_history(self, wb_page):
+        """旧版 steps/sources 为对象时，问题中心仍能打开详情且不泄露动作代码。"""
+        from costguard.core.evidence import evidence as evidence_api
+
+        evidence_id = evidence_api.add_evidence(
+            wb_page.conn,
+            wb_page.project.project_id,
+            "ui_probe",
+            "问题中心详情测试",
+            steps={"step": "A路径", "result": "100"},
+            sources={"sheet": "第1期", "location": "行2列5", "raw_value": "100"},
+        )
+        with wb_page.conn:
+            anomaly_id = wb_page.conn.execute(
+                """INSERT INTO anomalies(project_id, rule_id, severity, subject_type,
+                   subject_id, evidence_id, message, status, created_at)
+                   VALUES (?, 'ui_probe', 'medium', 'project', ?, ?, '详情测试', 'open', '2026')""",
+                (wb_page.project.project_id, wb_page.project.project_id, evidence_id),
+            ).lastrowid
+            wb_page.conn.execute(
+                """INSERT INTO audit_log(project_id, ts, actor, action, target,
+                   before_json, after_json, reason) VALUES (?, '2026', 'user',
+                   'resolve_anomaly', ?, '{}', '{}', '人工核对')""",
+                (wb_page.project.project_id, f"anomaly:{anomaly_id}"),
+            )
+        wb_page.refresh_anomalies()
+        row = next(
+            i for i in range(wb_page.anomaly_table.rowCount())
+            if int(wb_page.anomaly_table.item(i, 0).text()) == anomaly_id
+        )
+        wb_page._show_anomaly_detail(row, 0)
+        text = wb_page.anomaly_detail_panel.toPlainText()
+        assert "计算过程" in text and "来源证据" in text and "详情测试" in text
+        assert "处理审核问题" in text
+        assert "resolve_anomaly" not in text
 
     def test_sheet_anomaly_displays_its_period_direction(self, wb_page):
         row = wb_page.conn.execute(
@@ -95,9 +160,10 @@ class TestWorkbench:
         table = wb_page.anomaly_table
         probe_rows = [
             i for i in range(table.rowCount())
-            if table.item(i, 3).text() == "sheet_direction_probe"
+            if table.item(i, 3).toolTip() == "sheet_direction_probe"
         ]
         assert len(probe_rows) == 1
+        assert table.item(probe_rows[0], 3).text() == "其他审核问题"
         assert table.item(probe_rows[0], 1).text() == "对上结算"
 
     def test_match_run_and_levels_zh(self, wb_page):

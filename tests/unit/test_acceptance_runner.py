@@ -110,6 +110,29 @@ def test_decimal_warning_forces_with_findings() -> None:
     assert status == "with_findings"
 
 
+@pytest.mark.parametrize(
+    ("verification_level", "range_unproven_sheets"),
+    [("insufficient", 0), ("findings", 0), ("sufficient", 1)],
+)
+def test_acceptance_never_marks_unproven_crosscheck_as_passed(
+    verification_level, range_unproven_sheets
+) -> None:
+    import scripts.real_acceptance_run as runner
+
+    status = runner.classify_technical_validation(
+        technical_execution_complete=True,
+        ab_check_status="ab_passed",
+        evidence_status="available",
+        high_findings=0,
+        control_status="passed",
+        anomaly_total=0,
+        decimal_warning_groups=0,
+        verification_level=verification_level,
+        range_unproven_sheets=range_unproven_sheets,
+    )
+    assert status == "with_findings"
+
+
 class TestRunnerNonDestructive:
     def test_timestamped_runs_preserve_previous(self, runner_env):
         """两次运行产生两个 run 目录：第一次结果必须原样保留（基线不覆盖）。"""

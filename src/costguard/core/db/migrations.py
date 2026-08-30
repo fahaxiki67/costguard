@@ -284,6 +284,60 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE period_totals ADD COLUMN control_status TEXT NOT NULL DEFAULT 'not_available'",
         ],
     ),
+    (
+        # v6: 运行级校核结果与取数范围证据。
+        # 旧 period_totals 是逐清单行的累计表，无法可靠承载“本期整体校核
+        # 级别/参与行数/待确认数”，因此新增一张按 period_id 唯一的结果表。
+        # table_headers 的范围状态用于区分人工明确确认、程序推断和历史未知值；
+        # 历史 NULL/未知值默认不允许成为绿色校核依据。
+        6,
+        [
+            "ALTER TABLE table_headers ADD COLUMN data_range_status TEXT NOT NULL DEFAULT 'unproven'",
+            "ALTER TABLE table_headers ADD COLUMN data_range_method TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE table_headers ADD COLUMN data_range_evidence_json TEXT NOT NULL DEFAULT '{}'",
+            """CREATE TABLE IF NOT EXISTS crosscheck_results (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                period_id INTEGER NOT NULL REFERENCES settlement_periods(id),
+                verification_level TEXT NOT NULL DEFAULT 'insufficient',
+                status TEXT NOT NULL DEFAULT 'pending',
+                path_a_total TEXT,
+                path_b_total TEXT,
+                raw_subtotal TEXT,
+                diff_ab TEXT,
+                control_diff TEXT,
+                ab_status TEXT NOT NULL DEFAULT 'pending',
+                control_status TEXT NOT NULL DEFAULT 'not_available',
+                detail_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_subtotal_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_title_rows INTEGER NOT NULL DEFAULT 0,
+                pending_sheets INTEGER NOT NULL DEFAULT 0,
+                range_unproven_sheets INTEGER NOT NULL DEFAULT 0,
+                notes_json TEXT NOT NULL DEFAULT '[]',
+                evidence_id INTEGER REFERENCES evidence(id),
+                checked_at TEXT NOT NULL,
+                UNIQUE(period_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_crosscheck_results_project ON crosscheck_results(project_id, period_id)",
+        ],
+    ),
+    (
+        # v7: 将校核级别直接同步到旧的 period_totals 读取面，避免下游只看
+        # cross_check_status='match' 而忽略“校核不充分”的运行级结论。
+        7,
+        [
+            "ALTER TABLE period_totals ADD COLUMN verification_level TEXT NOT NULL DEFAULT 'insufficient'",
+            # v6 及更早版本没有运行级校核结果。旧项目中的 ``match`` 只表示
+            # 当时的二态字段，不足以证明取数范围、C 控制值和人工门控已经闭合；
+            # 升级后必须保守降级，待重新执行校核再恢复为 ``match``。
+            """UPDATE period_totals
+               SET verification_level='insufficient',
+                   cross_check_status=CASE
+                       WHEN cross_check_status='match' THEN 'insufficient'
+                       ELSE cross_check_status
+                   END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

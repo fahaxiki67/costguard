@@ -4,12 +4,23 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+Release gate follow-up for v0.1.7 remains in progress. The current candidate
+contains the P0 evidence/range gates and the UI review workflow improvements;
+WPS, macOS Excel and Windows Excel real-environment checks, large-project
+performance baselines, Developer ID/notarization and real-case regression are
+still required before a production designation.
+
 ## [0.1.7] - 2026-08-30
 
 Productization pass (P0): no silent truncation, honest verification levels,
 dual-value audit worksheet, business-language UI.
 
 ### Added
+- 项目首页卡片、工作台审核总览、下一步建议、异常问题中心、左右对照匹配
+  复核、工作表样例映射和导出完成度提示，统一按证据门控展示。
+- Excel 审核底稿新增《封面与说明》页、冻结表头、筛选、打印重复表头、差异
+  条件提示和 Evidence ID 工作簿内跳转；Word 摘要新增首屏项目状态、关键指标、
+  Top 风险、待决策/待补资料和范围限制。
 - 清单明细分页：500/页 + 首页/上一页/下一页/末页 + "共 N 条 / 当前显示
   X-Y 条"；>2500 行回归证明全部数据可翻页到达，导出继续读取完整数据集。
 - 三档校核级别（逐期）：校核充分（A=B 且 C 控制可用且一致 且无待人工

@@ -45,6 +45,92 @@ _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
 # - 无行数护栏（600 行合法大结算必须解析，判断不按大小）。
 SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账|summary|reconciliation|ledger", re.IGNORECASE)
 
+# 待人工确认工作表的唯一口径。已确认“仅作证据”的工作表仍保留在
+# raw_sheets/audit_log/evidence 中，但不应继续阻塞项目校核状态。
+PENDING_SHEETS_SQL = """
+SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_cols, rs.n_rows, sf.original_name,
+       th.col_map_json, th.header_row_lo, th.header_row_hi, th.needs_review,
+       th.data_row_start, th.data_row_end, th.data_range_status, th.data_range_method
+FROM raw_sheets rs
+JOIN parse_batches pb ON pb.id = rs.batch_id
+JOIN source_files sf ON sf.id = pb.file_id
+LEFT JOIN table_headers th ON th.sheet_id = rs.id
+WHERE sf.project_id=? AND rs.period_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_log al
+      WHERE al.project_id=sf.project_id
+        AND al.target='sheet:'||rs.id
+        AND al.action='confirm_sheet_non_settlement_role'
+  )
+ORDER BY sf.id, rs.id"""
+
+
+def pending_sheet_count(conn: sqlite3.Connection, project_id: int) -> int:
+    """返回当前真正需要人工处理的工作表数量。
+
+    仅存证角色确认不进入结算模型，但它已经完成了人工决策，不能继续被
+    当作“待确认”计数；所有 UI、校核和导出调用同一函数，避免口径漂移。
+    """
+    row = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM raw_sheets rs
+           JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND rs.period_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM audit_log al
+                 WHERE al.project_id=sf.project_id
+                   AND al.target='sheet:'||rs.id
+                   AND al.action='confirm_sheet_non_settlement_role'
+             )""",
+        (project_id,),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def invalidate_crosscheck_results(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_ids: set[int] | list[int] | tuple[int, ...] | None = None,
+) -> int:
+    """在结算范围或人工门控发生变化后撤销旧的最新校核结果。
+
+    证据历史仍保留在 ``evidence`` 表中；这里只清除可被工作台、导出和
+    项目总览当作“最近校核”的结果，避免输入变更后继续显示旧的绿色结论。
+    ``period_ids=None`` 表示项目级变更（新增文件、方向或待确认状态变化）。
+    """
+    ids = sorted({int(pid) for pid in (period_ids or [])})
+    with conn:
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            cur = conn.execute(
+                f"DELETE FROM crosscheck_results WHERE project_id=? AND period_id IN ({placeholders})",
+                (project_id, *ids),
+            )
+            conn.execute(
+                f"""UPDATE period_totals
+                   SET cross_check_status='pending', cross_check_diff=NULL,
+                       evidence_id=NULL, ab_status='pending', ab_diff=NULL,
+                       control_status='not_available', control_diff=NULL,
+                       verification_level='insufficient'
+                   WHERE project_id=? AND period_id IN ({placeholders})""",
+                (project_id, *ids),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM crosscheck_results WHERE project_id=?", (project_id,)
+            )
+            conn.execute(
+                """UPDATE period_totals
+                   SET cross_check_status='pending', cross_check_diff=NULL,
+                       evidence_id=NULL, ab_status='pending', ab_diff=NULL,
+                       control_status='not_available', control_diff=NULL,
+                       verification_level='insufficient'
+                   WHERE project_id=?""",
+                (project_id,),
+            )
+    return int(cur.rowcount if cur.rowcount is not None else 0)
+
 
 def _cn_to_int(s: str) -> int:
     digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -184,7 +270,8 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         raise audit_log.AuditReasonRequiredError("人工确认角色必须记录原因（原则 14）")
     cells, merged, n_rows, n_cols = load_sheet_grid(conn, sheet_id)
     meta = conn.execute(
-        """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name
+        """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name,
+                  rs.hidden_rows_json, rs.hidden_cols_json
            FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
            WHERE rs.id=? AND sf.project_id=?""",
@@ -231,11 +318,15 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             raise ValueError(
                 f"确认数据行范围无效：应在表头末行 {header_hi} 之后且不超过 {n_rows}")
         data_range = (data_start, data_end)
+        data_range_status = "confirmed"
+        data_range_method = "manual_confirmation"
     else:
         from costguard.core.parsing.header_detect import data_rows_range
 
         data_range = data_rows_range(
             cells, replace(det, header_row_lo=header_lo, header_row_hi=header_hi), n_rows)
+        data_range_status = "inferred" if data_range[1] >= data_range[0] else "unproven"
+        data_range_method = "last_non_empty_row" if data_range_status == "inferred" else "no_data_rows"
 
     # 幂等/重复确认拒绝：已回写 period_id 的 sheet 视为已完成
     already = conn.execute(
@@ -273,10 +364,21 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
         conn.execute(
             """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
-               col_map_json, confidence, needs_review, data_row_start, data_row_end)
-               VALUES (?,?,?,?,?,0,?,?)""",
+               col_map_json, confidence, needs_review, data_row_start, data_row_end,
+               data_range_status, data_range_method, data_range_evidence_json)
+               VALUES (?,?,?,?,?,0,?,?,?,?,?)""",
             (sheet_id, header_lo, header_hi, json.dumps(used_map), det.confidence,
-             data_range[0], data_range[1]))
+             data_range[0], data_range[1], data_range_status, data_range_method,
+             json.dumps({
+                 "method": data_range_method,
+                 "header_range": [header_lo, header_hi],
+                 "data_range": list(data_range),
+                 "actor": actor,
+                 "hidden_rows": json.loads(meta["hidden_rows_json"] or "[]"),
+                 "hidden_cols": json.loads(meta["hidden_cols_json"] or "[]"),
+                 "visibility_risk": bool(meta["hidden_rows_json"] and meta["hidden_rows_json"] != "[]")
+                                  or bool(meta["hidden_cols_json"] and meta["hidden_cols_json"] != "[]"),
+             }, ensure_ascii=False)))
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_confirmed",
         f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
@@ -286,6 +388,7 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                 "period_no": pno, "confidence": det.confidence}],
         sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
     )
+    invalidate_crosscheck_results(conn, project_id)
     return n
 
 
@@ -345,6 +448,7 @@ def confirm_sheet_non_settlement_role(
                 "role": confirmed_role, "reason": reason}],
         sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
     )
+    invalidate_crosscheck_results(conn, project_id)
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -483,10 +587,39 @@ def import_settlement_file(
             role_gated = True
             continue
         if det is None:
-            report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
+            # 无法识别表头的 Sheet 仍属于待人工确认，不应被整体报告静默归为
+            # “导入失败”或让项目状态看起来像没有待处理事项。
+            report.sheets.append(SheetReport(
+                sheet.sheet_name, "no_header",
+                notes=["未识别到可靠表头，保留原始网格，需人工指定角色、表头和字段映射"],
+            ))
+            role_gated = True
             continue
+        # 固化本次抽取实际使用的数据范围。旧实现只在校核时临时调用
+        # data_rows_range，无法证明“导入时看到的范围”和“校核时回读的范围”
+        # 一致；现在把推断方法与证据一并落库，后续可检测原始网格是否变化。
+        from costguard.core.parsing.header_detect import data_rows_range
+
+        detected_data_range = data_rows_range(cells, det, n_rows)
+        range_start, range_end = detected_data_range
+        has_data_range = range_end >= range_start
+        stored_start = range_start if has_data_range else None
+        stored_end = range_end if has_data_range else None
+        range_status = "inferred" if has_data_range else "unproven"
+        range_method = "last_non_empty_row" if has_data_range else "no_data_rows"
+        range_evidence = {
+            "method": range_method,
+            "header_range": [det.header_row_lo, det.header_row_hi],
+            "data_range": [stored_start, stored_end],
+            "max_row": n_rows,
+            "basis": "表头之后最后一个非空行",
+            "hidden_rows": list(sheet.hidden_rows),
+            "hidden_cols": list(sheet.hidden_cols),
+            "visibility_risk": bool(sheet.hidden_rows or sheet.hidden_cols),
+        }
         skip_stats: dict = {}
-        items = extract_items.extract_items(cells, merged, det, n_rows, stats=skip_stats)
+        items = extract_items.extract_items(
+            cells, merged, det, n_rows, data_range=detected_data_range, stats=skip_stats)
         skip_notes = []
         if skip_stats.get("title_rows"):
             skip_notes.append(
@@ -522,9 +655,13 @@ def import_settlement_file(
             conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
             conn.execute(
                 """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
-                   confidence, needs_review) VALUES (?,?,?,?,?,?)""",
+                   confidence, needs_review, data_row_start, data_row_end,
+                   data_range_status, data_range_method, data_range_evidence_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (sheet_id, det.header_row_lo, det.header_row_hi,
-                 json.dumps(det.col_map), det.confidence, int(det.needs_review)),
+                 json.dumps(det.col_map), det.confidence, int(det.needs_review),
+                 stored_start, stored_end, range_status, range_method,
+                 json.dumps(range_evidence, ensure_ascii=False)),
             )
         period_ids.add(period_id)
 
@@ -564,4 +701,8 @@ def import_settlement_file(
     else:
         report.status = "failed"
         report.message = "no sheets parsed"
+    if parsed_any or role_gated or form_routed:
+        # 新导入既可能新增明细，也可能只新增待确认工作表；两者都会改变
+        # 项目级校核前提，因此旧的最新结果必须重新计算。
+        invalidate_crosscheck_results(conn, project_id)
     return report

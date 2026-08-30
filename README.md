@@ -11,9 +11,12 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.6 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. See the
-> [release notes](docs/RELEASE_NOTES_v0.1.6.md) and the
+> **Status: v0.1.7 preview.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. v0.1.7 adds
+> evidence-gated verification levels, full-list pagination and dual-value audit
+> worksheets. Real WPS/Excel environment verification and production signing remain
+> open release gates. See the
+> [release notes](docs/RELEASE_NOTES_v0.1.7.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)

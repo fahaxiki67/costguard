@@ -318,6 +318,10 @@ def confirm_match(
     alias_name: str | None = None,
 ) -> None:
     """确认一个匹配。可选地把它固化为项目别名映射（保存依据=reason）。"""
+    # 先校验人工判断原因，再进行任何状态、别名、证据或审计写入。
+    # UI 已有必填门控，核心 API 也必须保持同一边界，避免空原因导致部分写入。
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("人工确认匹配必须记录原因（原则 14）")
     row = conn.execute("SELECT * FROM matches WHERE id=? AND project_id=?", (match_id, project_id)).fetchone()
     if not row:
         raise ValueError(f"match {match_id} not found")
@@ -378,6 +382,8 @@ def override_match(
     reason: str,
 ) -> None:
     """用户随时可修正 AI 的匹配结果（原则 14）。"""
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("人工修正匹配必须记录原因（原则 14）")
     if new_level not in LEVEL_SCORES:
         raise ValueError(f"invalid level: {new_level}")
     row = conn.execute("SELECT level FROM matches WHERE id=? AND project_id=?", (match_id, project_id)).fetchone()

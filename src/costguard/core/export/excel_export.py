@@ -8,17 +8,20 @@ WPS 兼容纪律：
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from costguard.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
 from costguard.core.engine.money import NotANumberError, round2, to_decimal
+from costguard.core.engine.settlement_io import pending_sheet_count
 
 D = Decimal
 
@@ -63,7 +66,49 @@ RULE_ZH_CN = {
     "missing_key_column": "缺少关键列",
 }
 SUBJECT_ZH = {"line_item": "清单行", "period": "期次", "sheet": "工作表", "project": "项目"}
-ANOMALY_STATUS_ZH = {"open": "待处理", "resolved": "已处理"}
+ANOMALY_STATUS_ZH = {
+    "open": "待处理",
+    "resolved": "已处理",
+    "verified_no_issue": "已核实无问题",
+    "supplemented": "已补资料",
+    "corrected": "已修正",
+    "deferred": "暂不处理",
+}
+
+
+def _business_direction(value: str | None, *, project_level: bool = False) -> str:
+    """普通成果列的安全方向文案；绝不把未知内部枚举原样导出。"""
+    if value in DIRECTION_LABELS:
+        return DIRECTION_LABELS[value]
+    return "项目级" if project_level else "未标记"
+
+
+def _business_rule(value: str | None) -> str:
+    return RULE_ZH_CN.get(value or "", "其他审核问题")
+
+
+def _business_subject(value: str | None) -> str:
+    return SUBJECT_ZH.get(value or "", "其他对象")
+
+
+def _business_status(value: str | None) -> str:
+    return ANOMALY_STATUS_ZH.get(value or "", "待人工确认")
+
+
+def _normalize_business_text(value: str | None) -> str:
+    """兼容旧库已生成的短方向词/英文状态摘要。
+
+    新写入内容已经在核心层使用完整业务词；这里的归一化保证旧项目重开后
+    重新导出也不会把历史短词带入普通成果列。
+    """
+    text = str(value or "")
+    text = text.replace("[对上]", "[对上结算]").replace("[对下]", "[对下结算]")
+    text = text.replace("对上双向校核", "对上结算双向校核")
+    text = text.replace("对下双向校核", "对下结算双向校核")
+    # 仅修复明确的前缀/短词场景，避免对已经完整的“对上结算”重复替换。
+    text = re.sub(r"(?<!结算)对上(?=第|清单|编码|名称|各期)", "对上结算", text)
+    text = re.sub(r"(?<!结算)对下(?=第|清单|编码|名称|各期)", "对下结算", text)
+    return text
 
 
 def _style_header(ws, row: int, cols: int):
@@ -88,6 +133,49 @@ def _style_used_range(ws) -> None:
         for cell in row:
             cell.border = TABLE_BORDER
             cell.alignment = CENTER_WRAP
+
+
+def _prepare_data_sheet(ws, *, header_row: int = 1) -> None:
+    """为可审阅工作表启用冻结表头、筛选、打印重复表头和弱网格显示。"""
+    ws.sheet_view.showGridLines = False
+    if ws.max_row >= header_row + 1 and ws.max_column:
+        ws.freeze_panes = ws.cell(row=header_row + 1, column=1).coordinate
+        ws.auto_filter.ref = (
+            f"A{header_row}:{get_column_letter(ws.max_column)}{ws.max_row}"
+        )
+        ws.print_title_rows = f"{header_row}:{header_row}"
+
+
+def _link_evidence_references(wb: Workbook) -> None:
+    """把各成果页 Evidence ID 变为工作簿内跳转链接。"""
+    evidence_ws = wb["证据索引"] if "证据索引" in wb.sheetnames else None
+    if evidence_ws is None:
+        return
+    row_by_id = {
+        evidence_ws.cell(row=row, column=1).value: row
+        for row in range(2, evidence_ws.max_row + 1)
+        if evidence_ws.cell(row=row, column=1).value is not None
+    }
+    for ws in wb.worksheets:
+        if ws.title == "证据索引":
+            continue
+        for row in range(2, ws.max_row + 1):
+            for col in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row, column=col)
+                value = cell.value
+                header = str(ws.cell(row=1, column=col).value or "")
+                evidence_column = "证据" in header or "出处" in header
+                if not evidence_column and not (
+                    isinstance(value, str) and "Evidence ID" in value
+                ):
+                    continue
+                target_id = value if isinstance(value, int) else None
+                if target_id is None and isinstance(value, str):
+                    match = re.search(r"Evidence ID\s+(\d+)", value)
+                    target_id = int(match.group(1)) if match else None
+                target_row = row_by_id.get(target_id)
+                if target_row is not None:
+                    cell.hyperlink = f"#'证据索引'!A{target_row}"
 
 
 # openpyxl 原生支持 Decimal（XML 层写精确十进制字符串），当前序列化无需 float。
@@ -153,7 +241,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         if (p["direction"] or "unknown") == direction
     ]
     aggs = aggregate_project(conn, project_id, direction=direction)
-    ws = wb.create_sheet(f"{DIRECTION_LABELS.get(direction, direction)}累计表")
+    ws = wb.create_sheet(f"{_business_direction(direction)}累计表")
     header = ["清单编码", "清单名称", "单位"] + [f"第{p['period_no']}期金额" for p in periods] + \
              ["累计数量", "累计金额", "加权平均单价", "状态"]
     ws.append(header)
@@ -452,25 +540,31 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
     ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态", "规则代码"])
     _style_header(ws, 1, 9)
     for r in anomaly_rows:
-        sev = sev_zh.get(r["severity"], r["severity"])
-        direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
-        subject = SUBJECT_ZH.get(r["subject_type"], r["subject_type"])
-        status = ANOMALY_STATUS_ZH.get(r["status"], r["status"])
-        ws.append([r["id"], direction, RULE_ZH_CN.get(r["rule_id"], r["rule_id"]), sev,
+        sev = sev_zh.get(r["severity"], "其他")
+        direction = _business_direction(r["direction"], project_level=not r["direction"])
+        subject = _business_subject(r["subject_type"])
+        status = _business_status(r["status"])
+        ws.append([r["id"], direction, _business_rule(r["rule_id"]), sev,
                    f"{subject}#{r['subject_id']}",
-                   r["message"], r["evidence_id"], status, r["rule_id"]])
+                   _normalize_business_text(r["message"]), r["evidence_id"], status, r["rule_id"]])
     _autowidth(ws)
+    # 原始规则编码仅供高级排查，默认隐藏，避免普通业务界面直接暴露开发字段；
+    # 列仍保留以便技术人员在需要时取消隐藏并追溯。
+    ws.column_dimensions["I"].hidden = True
 
     ws2 = wb.create_sheet("待核实事项清单")
     ws2.append(["编号", "方向", "类别", "说明", "证据ID", "规则代码"])
     _style_header(ws2, 1, 6)
     idx = 1
     for r in anomaly_rows:
-        if r["severity"] not in {"high", "medium"} or r["status"] != "open":
+        if r["severity"] not in {"high", "medium"} or r["status"] not in {"open", "deferred"}:
             continue
-        direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
-        ws2.append([idx, direction, RULE_ZH_CN.get(r["rule_id"], r["rule_id"]),
-                    r["message"], r["evidence_id"], r["rule_id"]])
+        direction = _business_direction(r["direction"], project_level=not r["direction"])
+        message = _normalize_business_text(r["message"])
+        if r["status"] == "deferred":
+            message = f"【暂不处理】{message}"
+        ws2.append([idx, direction, _business_rule(r["rule_id"]),
+                    message, r["evidence_id"], r["rule_id"]])
         idx += 1
     for direction in _project_directions(conn, project_id):
         for agg in aggregate_project(conn, project_id, direction=direction):
@@ -478,13 +572,14 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
                 for w in agg.warnings:
                     ws2.append([
                         idx,
-                        DIRECTION_LABELS.get(direction, direction),
-                        "aggregate",
-                        f"「{agg.name}」{w}",
+                        _business_direction(direction),
+                        "汇总校核",
+                        _normalize_business_text(f"「{agg.name}」{w}"),
                         None,
                     ])
                     idx += 1
     _autowidth(ws2)
+    ws2.column_dimensions["F"].hidden = True
 
 
 def export_contract_risks(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
@@ -511,7 +606,8 @@ def export_evidence_index(conn: sqlite3.Connection, project_id: int, wb: Workboo
         "SELECT id, kind, summary, steps_json, sources_json, created_at FROM evidence WHERE project_id=? ORDER BY id",
         (project_id,),
     ):
-        ws.append([r["id"], r["kind"], r["summary"], r["steps_json"], r["sources_json"], r["created_at"]])
+        ws.append([r["id"], r["kind"], _normalize_business_text(r["summary"]),
+                   r["steps_json"], r["sources_json"], r["created_at"]])
     _autowidth(ws)
 
 
@@ -540,6 +636,7 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
         flags = json.loads(row["flags_json"] or "{}")
         if flags.get("subtotal"):
             continue
+        source_evidence_id = flags.get("source_evidence_id")
         r += 1
         # 缺失仅按 is None 判断：Decimal("0") 是有效值必须保留（监督门槛 1）
         qty = _num(row["quantity"]) if row["quantity"] is not None else None
@@ -570,13 +667,27 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
         ws.cell(
             row=r,
             column=15,
-            value=DIRECTION_LABELS.get(row["direction"], row["direction"]),
+            value=_business_direction(row["direction"]),
         )
         for col, evid in ((11, "qty_evid"), (12, "price_evid"), (13, "amount_evid")):
             ev = row[evid]
             if ev:
-                e = json.loads(ev)
-                ws.cell(row=r, column=col, value=f"行{e['row']}列{e['col']}: {e['raw'][:30]}")
+                # 当前导入器保存字段来源 JSON；兼容历史库中可能存在的整数
+                # evidence_id 或损坏的旧值，单个来源异常不得让整本底稿导出失败。
+                try:
+                    e = json.loads(ev) if isinstance(ev, str) else None
+                except (TypeError, json.JSONDecodeError):
+                    e = None
+                if isinstance(e, dict):
+                    row_no, col_no = e.get("row", "—"), e.get("col", "—")
+                    raw = str(e.get("raw", e.get("value", "—")))[:30]
+                    evidence_text = (
+                        f"Evidence ID {e.get('evidence_id') or source_evidence_id} · "
+                        if (e.get("evidence_id") or source_evidence_id) else ""
+                    )
+                    ws.cell(row=r, column=col, value=f"{evidence_text}行{row_no}列{col_no}: {raw}")
+                else:
+                    ws.cell(row=r, column=col, value=f"Evidence ID {ev}")
         for c in (5, 6, 7, 8, 9, 10):
             ws.cell(row=r, column=c).number_format = MONEY_FMT
     _autowidth(ws)
@@ -608,6 +719,118 @@ def _tax_mode_status(conn: sqlite3.Connection, project_id: int) -> str:
     if len(modes) > 1:
         return "混用（存在含税与不含税口径，详见异常清单 tax_mode_mixed）"
     return "含税金额/单价" if "incl_tax" in modes else "不含税金额/单价"
+
+
+def _review_gate_counts(conn: sqlite3.Connection, project_id: int) -> dict[str, int]:
+    """集中计算成果页使用的审核完成度闸门，避免不同成果口径漂移。"""
+    source_files = conn.execute(
+        "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (project_id,)
+    ).fetchone()["c"]
+    pending_sheets = pending_sheet_count(conn, project_id)
+    high_unresolved = conn.execute(
+        """SELECT COUNT(*) AS c FROM anomalies
+           WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""",
+        (project_id,),
+    ).fetchone()["c"]
+    open_findings = conn.execute(
+        """SELECT COUNT(*) AS c FROM anomalies
+           WHERE project_id=? AND status IN ('open', 'deferred')""",
+        (project_id,),
+    ).fetchone()["c"]
+    deferred = conn.execute(
+        "SELECT COUNT(*) AS c FROM anomalies WHERE project_id=? AND status='deferred'",
+        (project_id,),
+    ).fetchone()["c"]
+    pending_matches = conn.execute(
+        "SELECT COUNT(*) AS c FROM matches WHERE project_id=? AND status='pending'",
+        (project_id,),
+    ).fetchone()["c"]
+    period_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM settlement_periods WHERE project_id=?", (project_id,)
+    ).fetchone()["c"]
+    checked_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM crosscheck_results WHERE project_id=?", (project_id,)
+    ).fetchone()["c"]
+    insufficient = conn.execute(
+        """SELECT COUNT(*) AS c FROM crosscheck_results
+           WHERE project_id=? AND verification_level='insufficient'""",
+        (project_id,),
+    ).fetchone()["c"]
+    findings = conn.execute(
+        """SELECT COUNT(*) AS c FROM crosscheck_results
+           WHERE project_id=? AND verification_level='findings'""",
+        (project_id,),
+    ).fetchone()["c"]
+    range_unproven = conn.execute(
+        """SELECT COALESCE(SUM(range_unproven_sheets), 0) AS c
+           FROM crosscheck_results WHERE project_id=?""",
+        (project_id,),
+    ).fetchone()["c"]
+    return {
+        "source_files": int(source_files or 0),
+        "pending_sheets": int(pending_sheets or 0),
+        "high_unresolved": int(high_unresolved or 0),
+        "open_findings": int(open_findings or 0),
+        "deferred": int(deferred or 0),
+        "pending_matches": int(pending_matches or 0),
+        "period_count": int(period_count or 0),
+        "checked_count": int(checked_count or 0),
+        "insufficient": int(insufficient or 0),
+        "findings": int(findings or 0),
+        "range_unproven": int(range_unproven or 0),
+    }
+
+
+def export_cover_page(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+    """生成成果首页，首次打开即可看到范围、状态、限制和使用顺序。"""
+    ws = wb.create_sheet("封面与说明")
+    project = conn.execute(
+        "SELECT name FROM projects WHERE id=?", (project_id,)
+    ).fetchone()
+    project_name = project["name"] if project else "未命名项目"
+    gates = _review_gate_counts(conn, project_id)
+    unchecked = max(0, gates["period_count"] - gates["checked_count"])
+    if not gates["source_files"]:
+        status = "尚未导入资料"
+    elif not gates["period_count"]:
+        status = "暂无可审核结算期次"
+    elif any((
+        gates["pending_sheets"], gates["high_unresolved"], gates["open_findings"],
+        gates["pending_matches"], gates["insufficient"], gates["findings"],
+        gates["range_unproven"], unchecked,
+    )):
+        status = "审核尚未完成"
+    else:
+        status = "当前未发现主要待处理事项"
+    ws.append(["CostGuard Excel 审核底稿"])
+    ws.cell(row=1, column=1).font = Font(bold=True, size=18)
+    ws.append(["项目名称", project_name])
+    ws.append(["生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")])
+    ws.append(["成果版本", "v0.1.7 预览候选"])
+    ws.append(["审核状态", status])
+    completion = (
+        f"待确认工作表 {gates['pending_sheets']} 张；高风险未处理 {gates['high_unresolved']} 项；"
+        f"待确认匹配 {gates['pending_matches']} 组；尚未校核 {unchecked} 期；"
+        f"校核不充分 {gates['insufficient']} 期；取数范围未证明 {gates['range_unproven']} 张工作表"
+    )
+    if not gates["source_files"]:
+        completion = "尚未导入资料；" + completion
+    elif not gates["period_count"]:
+        completion = "暂无可审核结算期次；" + completion
+    ws.append(["审核完成度", completion])
+    ws.append([])
+    ws.append(["建议使用顺序"])
+    ws.append(["1", "先看本页状态和限制，再看《管理层摘要》"])
+    ws.append(["2", "在《异常清单》《待核实事项清单》中处理问题并记录原因"])
+    ws.append(["3", "在《审核底稿》中核对程序 Decimal 值、Excel 复核公式值和原始合价"])
+    ws.append(["4", "按《证据索引》中的 Evidence ID 回溯文件、Sheet、行列和原始值"])
+    ws.append([])
+    ws.append(["重要说明"])
+    ws.append(["缺失数据保持“待补资料”，不可比数据保持“不可比”，不以 0 替代。"])
+    ws.append(["“校核充分”仅表示证据条件充分且验证通过，不等同于业务审批或最终结算确认。"])
+    ws.append(["程序计算值是主审核依据；公式列供 WPS/Excel 打开后复核，不依赖 Office 首次重算。"])
+    ws.append(["WPS、macOS Excel、Windows Excel 真机验证及大规模性能基准仍是发布门槛。"])
+    _autowidth(ws)
 
 
 def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
@@ -645,7 +868,7 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         ("—— 金额与状态 ——", ""),
     ]
     for direction, stats in direction_stats.items():
-        label = DIRECTION_LABELS.get(direction, direction)
+        label = _business_direction(direction)
         data.extend([
             (f"{label}清单组数", stats["groups"]),
             (f"{label}累计金额（可用部分）", _num(round2(stats["total"]))),
@@ -679,6 +902,7 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     out_dir.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     wb.remove(wb.active)
+    export_cover_page(conn, project_id, wb)
     export_management_summary(conn, project_id, wb)
     for direction in _project_directions(conn, project_id):
         export_settlement_summary(conn, project_id, wb, direction=direction)
@@ -690,6 +914,24 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     export_audit_worksheet(conn, project_id, wb)
     for ws in wb.worksheets:
         _style_used_range(ws)
+        if ws.title not in {"封面与说明", "管理层摘要"}:
+            _prepare_data_sheet(ws)
+    audit = wb["审核底稿"]
+    if audit.max_row >= 2:
+        # 差异非零时在 WPS/Excel 中以浅红色提示；缺失/不可比文字仍保持原状态。
+        audit.conditional_formatting.add(
+            f"J2:J{audit.max_row}",
+            CellIsRule(operator="notEqual", formula=["0"],
+                       fill=PatternFill("solid", fgColor="FDECEC")),
+        )
+    _link_evidence_references(wb)
+    # 不能在当前运行环境伪造 Excel 公式缓存值；明确要求 Office 首次打开时
+    # 全量重算，并把程序 Decimal 列作为主审核依据，降低 WPS/Excel 显示旧缓存
+    # 或 0.00 的风险。WPS、macOS Excel、Windows Excel 真机复核仍是发布门槛。
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+    wb.calculation.calcOnSave = True
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"CostGuard审核底稿_{stamp}.xlsx"
     wb.save(path)
@@ -697,26 +939,74 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
 
 
 def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
-    """管理层摘要 Word 版。"""
+    """管理层摘要 Word 版：首屏状态、关键指标、Top 风险和限制均可追溯。"""
     import docx as docx_lib
     from docx.oxml.ns import qn
     from docx.shared import Pt
 
-    direction_stats: dict[str, tuple[int, Decimal]] = {}
+    project = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
+    project_name = project["name"] if project else "未命名项目"
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    direction_stats: dict[str, tuple[int, Decimal | None]] = {}
+    direction_evidence: dict[str, int | None] = {}
     for direction in _project_directions(conn, project_id):
         aggs = aggregate_project(conn, project_id, direction=direction)
+        amounts = [a.cum_amount for a in aggs if a.cum_amount is not None]
         direction_stats[direction] = (
             len(aggs),
-            sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0)),
+            sum(amounts, D(0)) if amounts else None,
         )
+        ev = conn.execute(
+            """SELECT cr.evidence_id FROM crosscheck_results cr
+               JOIN settlement_periods sp ON sp.id=cr.period_id
+               WHERE cr.project_id=? AND COALESCE(sp.direction, 'unknown')=?
+               ORDER BY cr.checked_at DESC, cr.id DESC LIMIT 1""",
+            (project_id, direction),
+        ).fetchone()
+        direction_evidence[direction] = int(ev["evidence_id"]) if ev and ev["evidence_id"] else None
     high = conn.execute(
         "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND severity='high'", (project_id,)
     ).fetchone()["c"]
+    high_open = conn.execute(
+        """SELECT COUNT(*) c FROM anomalies
+           WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""", (project_id,)
+    ).fetchone()["c"]
+    supplemented = conn.execute(
+        "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND status='supplemented'", (project_id,)
+    ).fetchone()["c"]
+    pending_matches = conn.execute(
+        "SELECT COUNT(*) c FROM matches WHERE project_id=? AND status='pending'", (project_id,)
+    ).fetchone()["c"]
+    pending_sheets = pending_sheet_count(conn, project_id)
+    incomparable = 0
+    for direction in direction_stats:
+        incomparable += sum(
+            1 for agg in aggregate_project(conn, project_id, direction=direction)
+            if agg.status == "incomparable"
+        )
     periods = _fetch_periods(conn, project_id)
     n_up = sum(1 for p in periods if p["direction"] == "upward")
     n_down = sum(1 for p in periods if p["direction"] == "downward")
     n_none = len(periods) - n_up - n_down
     n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
+    level_counts = {r["verification_level"]: int(r["c"]) for r in conn.execute(
+        """SELECT verification_level, COUNT(*) c FROM crosscheck_results
+           WHERE project_id=? GROUP BY verification_level""", (project_id,)
+    )}
+    gates = _review_gate_counts(conn, project_id)
+    unchecked = max(0, gates["period_count"] - gates["checked_count"])
+    gates_open = any((
+        not gates["source_files"], not gates["period_count"],
+        pending_sheets, high_open, gates["open_findings"], pending_matches,
+        level_counts.get("insufficient", 0), level_counts.get("findings", 0),
+        gates["range_unproven"], unchecked,
+    ))
+    if not gates["source_files"]:
+        result_status = "尚未导入资料"
+    elif not gates["period_count"]:
+        result_status = "暂无可审核结算期次"
+    else:
+        result_status = "审核尚未完成" if gates_open else "当前未发现主要待处理事项"
     doc = docx_lib.Document()
     # python-docx 默认 Title/Normal 使用 Office 主题字体；部分 Mac/WPS 环境会把
     # asciiTheme/majorHAnsi 优先解析为 Calibri，哪怕同时写了东亚字体。显式移除
@@ -749,22 +1039,134 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     title_fonts = title_run._element.get_or_add_rPr().get_or_add_rFonts()
     for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
         title_fonts.set(qn(f"w:{attr}"), "Songti SC")
+    doc.add_paragraph(f"项目名称：{project_name}")
+    doc.add_paragraph(f"审核范围：已导入文件 {conn.execute('SELECT COUNT(*) c FROM source_files WHERE project_id=?', (project_id,)).fetchone()['c']} 份，"
+                      f"期次 {len(periods)} 期（对上结算 {n_up} 期、对下结算 {n_down} 期、未标记 {n_none} 期）")
+    doc.add_paragraph(f"生成时间/版本：{generated_at} / v0.1.7 预览候选")
+    status_p = doc.add_paragraph(f"成果状态：{result_status}")
+    status_p.runs[0].bold = True
+
+    metrics = doc.add_table(rows=1, cols=2)
+    metrics.style = "Table Grid"
+    metrics.rows[0].cells[0].text = "关键指标"
+    metrics.rows[0].cells[1].text = "当前值"
+    metric_rows = [
+        ("对上累计", direction_stats.get("upward", (0, None))[1]),
+        ("对下累计", direction_stats.get("downward", (0, None))[1]),
+        ("期次数", len(periods)),
+        ("待确认工作表", pending_sheets),
+        ("高风险未处理", high_open),
+        ("高风险总数", high),
+        ("待补资料异常", supplemented),
+        ("不可比清单组", incomparable),
+        ("待确认匹配", pending_matches),
+        ("校核不充分期数", level_counts.get("insufficient", 0)),
+        ("校核有发现期数", level_counts.get("findings", 0)),
+        ("尚未校核期数", unchecked),
+        ("取数范围未证明工作表", gates["range_unproven"]),
+        ("暂不处理异常", gates["deferred"]),
+    ]
+    for label, value in metric_rows:
+        row = metrics.add_row().cells
+        row[0].text = label
+        if isinstance(value, Decimal):
+            row[1].text = f"{round2(value)} 元"
+        elif value is None:
+            row[1].text = "无法确认"
+        else:
+            row[1].text = str(value)
     doc.add_paragraph(
-        f"截至 {datetime.now().strftime('%Y-%m-%d %H:%M')}，高风险异常 {high} 项。"
+        "方向金额仅统计当前可用部分；缺失、待补资料和不可比项目不计入，"
+        "不以 0 替代。对应期次校核证据：对上 Evidence ID "
+        f"{direction_evidence.get('upward') or '待生成'}；对下 Evidence ID "
+        f"{direction_evidence.get('downward') or '待生成'}。"
     )
+    doc.add_page_break()
+
+    doc.add_heading("重点结论", level=1)
+    conclusion_written = False
     for direction, (group_count, total) in direction_stats.items():
-        label = DIRECTION_LABELS.get(direction, direction)
+        label = _business_direction(direction)
+        total_text = f"{round2(total)} 元" if total is not None else "无法确认"
+        ev_text = f"Evidence ID {direction_evidence.get(direction)}" if direction_evidence.get(direction) else "Evidence ID 待生成"
         doc.add_paragraph(
-            f"{label}：识别清单组 {group_count} 组，累计金额（可用部分）{round2(total)} 元。"
+            f"{label}识别清单组 {group_count} 组，累计金额（可用部分）{total_text}；{ev_text}。"
         )
+        conclusion_written = True
+    if not conclusion_written:
+        doc.add_paragraph("当前没有可形成累计金额的清单组，金额无法确认。")
+    if level_counts:
+        doc.add_paragraph(
+            "双向校核分级：" + "；".join(
+                f"{'校核充分' if key == 'sufficient' else '校核有发现' if key == 'findings' else '校核不充分'} {value} 期"
+                for key, value in sorted(level_counts.items())
+            ) + "。校核结果均应按 Evidence ID 回查原始证据。"
+        )
+    else:
+        doc.add_paragraph("尚未生成双向校核结果，暂不能形成校核结论。")
+
+    doc.add_heading("Top 风险事项", level=1)
+    risks = conn.execute(
+        """SELECT id, rule_id, severity, subject_type, subject_id, evidence_id, message, status
+           FROM anomalies WHERE project_id=? AND severity IN ('high', 'medium')
+           ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id
+           LIMIT 10""", (project_id,)
+    ).fetchall()
+    if risks:
+        table = doc.add_table(rows=1, cols=5)
+        table.style = "Table Grid"
+        for cell, text in zip(table.rows[0].cells, ("级别", "风险事项", "处理状态", "金额/结论", "Evidence ID"), strict=False):
+            cell.text = text
+        for risk in risks:
+            cells = table.add_row().cells
+            cells[0].text = {"high": "高", "medium": "中", "low": "低"}.get(risk["severity"], "其他")
+            cells[1].text = (
+                f"{_business_rule(risk['rule_id'])}：{_business_subject(risk['subject_type'])}"
+                f"#{risk['subject_id']}；{_normalize_business_text(risk['message'])}"
+            )
+            cells[2].text = _business_status(risk["status"])
+            cells[3].text = "无法确认（需结合原始证据）"
+            cells[4].text = f"Evidence ID {risk['evidence_id']}" if risk["evidence_id"] else "待生成"
+    else:
+        doc.add_paragraph("当前没有可列示的高/中风险事项；这不等同于校核充分。")
+
+    doc.add_heading("待决策/待补资料", level=1)
+    pending_lines = []
+    if pending_sheets:
+        pending_lines.append(f"待确认工作表 {pending_sheets} 张：需人工确认角色、表头、字段和取数范围。")
+    if pending_matches:
+        pending_lines.append(f"待确认匹配 {pending_matches} 组：非完全匹配需逐项确认并记录原因。")
+    if supplemented:
+        pending_lines.append(f"已有 {supplemented} 项异常标记为已补资料，请核验补充文件并重新校核。")
+    if incomparable:
+        pending_lines.append(f"不可比清单组 {incomparable} 组：暂不下金额或责任结论。")
+    if gates["range_unproven"]:
+        pending_lines.append(
+            f"有 {gates['range_unproven']} 张工作表取数范围完整性无法证明：需人工核对原表边界。"
+        )
+    if unchecked:
+        pending_lines.append(f"尚未执行双向校核 {unchecked} 期：暂不能形成充分校核结论。")
+    if gates["deferred"]:
+        pending_lines.append(f"暂不处理异常 {gates['deferred']} 项：保留原状态，不视为已闭合。")
+    if not pending_lines:
+        pending_lines.append("当前没有登记的待决策事项；仍需按 Evidence ID 完成人工复核和业务审批。")
+    for line in pending_lines:
+        doc.add_paragraph(line, style="List Bullet")
+
+    doc.add_heading("审核范围与限制", level=1)
     doc.add_paragraph(
-        f"统计范围：期次 {len(periods)} 期（对上 {n_up} 期、对下 {n_down} 期、未标记方向 {n_none} 期）；"
-        f"金额为各方向可用部分累计，缺失与不可比项未计入且未补值；"
+        f"统计范围：期次 {len(periods)} 期（对上结算 {n_up} 期、对下结算 {n_down} 期、未标记方向 {n_none} 期）；"
         "对上、对下和未标记方向未作跨方向净额或合计。"
     )
-    doc.add_paragraph("数据纪律：缺失数据未自动补 0；不可比数据未强行比较。")
+    doc.add_paragraph("数据纪律：缺失数据未自动补 0；不可比数据未强行比较；金额无法确认时明确写“无法确认”。")
     doc.add_paragraph(
-        "追溯说明：本 Word 摘要不包含证据入口。逐单元格证据链与证据索引"
+        f"校核门控：已执行 {gates['checked_count']} / {gates['period_count']} 期；"
+        f"校核不充分 {gates['insufficient']} 期；校核有发现 {gates['findings']} 期；"
+        f"取数范围未证明 {gates['range_unproven']} 张工作表。"
+    )
+    doc.add_paragraph(
+        "追溯说明：本 Word 摘要不包含证据入口按钮；正文管理结论均标注 Evidence ID，"
+        "待生成或无法确认处不会伪造证据。逐单元格证据链与证据索引"
         f"（当前共 {n_ev} 条证据记录）请查阅 CostGuard 导出的 Excel 审核底稿工作簿"
         "《证据索引》工作表，按证据 ID 查询。"
     )

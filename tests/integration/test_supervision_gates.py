@@ -192,14 +192,19 @@ class TestDirectionSeparation:
         anomaly_directions = {
             anomaly.cell(row=r, column=2).value
             for r in range(2, anomaly.max_row + 1)
-            if anomaly.cell(row=r, column=3).value == "direction_probe"
+            if anomaly.cell(row=r, column=9).value == "direction_probe"
         }
         assert anomaly_directions == {"对上结算", "对下结算"}
+        assert all(
+            anomaly.cell(row=r, column=3).value == "其他审核问题"
+            for r in range(2, anomaly.max_row + 1)
+            if anomaly.cell(row=r, column=9).value == "direction_probe"
+        )
         pending = wb["待核实事项清单"]
         pending_directions = {
             pending.cell(row=r, column=2).value
             for r in range(2, pending.max_row + 1)
-            if pending.cell(row=r, column=3).value == "direction_probe"
+            if pending.cell(row=r, column=6).value == "direction_probe"
         }
         assert pending_directions == {"对上结算", "对下结算"}
 

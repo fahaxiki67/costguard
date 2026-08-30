@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from costguard.core.engine.money import NotANumberError, to_decimal
+from costguard.core.labels import direction_label
 from costguard.core.parsing.header_detect import (
     HeaderDetection,
     build_anchor_map,
@@ -141,11 +143,13 @@ def _normalize_tax(raw: str) -> str | None:
         return None
 
 
-def _evid_json(src: FieldSource | None) -> str | None:
+def _evid_json(src: FieldSource | None, evidence_id: int | None = None) -> str | None:
     if src is None:
         return None
-    return json.dumps({"value": src.value, "raw": src.raw, "row": src.row, "col": src.col},
-                      ensure_ascii=False)
+    payload = {"value": src.value, "raw": src.raw, "row": src.row, "col": src.col}
+    if evidence_id is not None:
+        payload["evidence_id"] = evidence_id
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def persist_line_items(
@@ -154,32 +158,106 @@ def persist_line_items(
     sheet_id: int,
     items: list[ItemDraft],
 ) -> int:
-    rows = []
-    for it in items:
-        if it.flags.get("title_row"):
-            continue  # 分部/章节标题行：非清单项（原文在保真层可回溯）
-        rows.append(
-            (
-                period_id, sheet_id,
-                it.code.value if it.code else None,
-                (it.name.value if (it.name and it.name.value) else (it.name.raw if it.name else "")),
-                it.feature.value if it.feature else None,
-                it.unit.value if it.unit else None,
-                it.quantity.value if it.quantity else None,
-                it.unit_price.value if it.unit_price else None,
-                it.amount.value if it.amount else None,
-                it.tax_rate.value if it.tax_rate else None,
-                _evid_json(it.quantity), _evid_json(it.unit_price), _evid_json(it.amount),
-                json.dumps({"row": it.row, **it.flags}, ensure_ascii=False),
+    # 字段来源原本只保存在 line_items 的 JSON 中，无法进入成果工作簿的
+    # 证据索引。现在为每一行建立一条真实 Evidence 记录，并把其整数 ID
+    # 回写到各字段来源 JSON；同一行共享一个证据 ID，避免大项目为每个
+    # 字段重复写三份证据，同时保留原始行列和值。
+    meta = conn.execute(
+        """SELECT sp.project_id, sp.period_no, sp.direction, rs.sheet_name,
+                  sf.original_name
+           FROM settlement_periods sp
+           LEFT JOIN raw_sheets rs ON rs.id=?
+           LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+           LEFT JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sp.id=?""",
+        (sheet_id, period_id),
+    ).fetchone()
+    project_id = int(meta["project_id"]) if meta else None
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute("BEGIN")
+    try:
+        rows = []
+        for it in items:
+            if it.flags.get("title_row"):
+                continue  # 分部/章节标题行：非清单项（原文在保真层可回溯）
+            field_sources = []
+            for field_name in ("code", "name", "feature", "unit", "quantity",
+                               "unit_price", "amount", "tax_rate"):
+                src = getattr(it, field_name, None)
+                if src is None or not src.raw:
+                    continue
+                field_sources.append({
+                    "field": field_name,
+                    "row": src.row,
+                    "col": src.col,
+                    "raw_value": src.raw,
+                    "value": src.value,
+                })
+            evidence_id = None
+            if project_id is not None and field_sources:
+                summary = (
+                    f"第{meta['period_no']}期{direction_label(meta['direction'])}清单行来源："
+                    f"第{it.row}行「{(it.name.value if it.name and it.name.value else it.name.raw if it.name else '')}」"
+                )
+                cur = conn.execute(
+                    """INSERT INTO evidence(project_id, kind, summary, steps_json,
+                       sources_json, created_at) VALUES (?,?,?,?,?,?)""",
+                    (
+                        project_id,
+                        "line_item_source",
+                        summary,
+                        json.dumps(
+                            [{"step": "原始字段定位", "result": f"第{it.row}行"}],
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            [{
+                                "file": meta["original_name"] if meta else None,
+                                "sheet": meta["sheet_name"] if meta else None,
+                                "period": meta["period_no"] if meta else None,
+                                "direction": meta["direction"] if meta else "unknown",
+                                **source,
+                            } for source in field_sources],
+                            ensure_ascii=False,
+                        ),
+                        now,
+                    ),
+                )
+                evidence_id = int(cur.lastrowid)
+            flags_payload = {"row": it.row, **it.flags}
+            if evidence_id is not None:
+                # 保持既有字段来源 JSON 结构兼容；证据 ID 放在行级 flags，
+                # 供 UI/Excel 通过真实 evidence 表记录跳转。
+                flags_payload["source_evidence_id"] = evidence_id
+            rows.append(
+                (
+                    period_id, sheet_id,
+                    it.code.value if it.code else None,
+                    (it.name.value if (it.name and it.name.value) else (it.name.raw if it.name else "")),
+                    it.feature.value if it.feature else None,
+                    it.unit.value if it.unit else None,
+                    it.quantity.value if it.quantity else None,
+                    it.unit_price.value if it.unit_price else None,
+                    it.amount.value if it.amount else None,
+                    it.tax_rate.value if it.tax_rate else None,
+                    _evid_json(it.quantity),
+                    _evid_json(it.unit_price),
+                    _evid_json(it.amount),
+                    json.dumps(flags_payload, ensure_ascii=False),
+                )
             )
-        )
-    with conn:
         conn.executemany(
             """INSERT INTO line_items(period_id, sheet_id, code, name, feature, unit,
                quantity, unit_price, amount, tax_rate, qty_evid, price_evid, amount_evid, flags_json)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
-        return conn.execute(
+        n = conn.execute(
             "SELECT COUNT(*) FROM line_items WHERE period_id=?", (period_id,)
         ).fetchone()[0]
+        conn.execute("COMMIT")
+        return n
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise

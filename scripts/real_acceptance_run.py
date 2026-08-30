@@ -26,6 +26,93 @@ WORK = BASE / "work"
 MANIFEST = BASE / "manifest.csv"
 DECISIONS = BASE / "manual_sheet_decisions.json"
 
+DIRECTION_ZH = {"upward": "对上结算", "downward": "对下结算", "unknown": "未标记"}
+CHECK_STATUS_ZH = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
+CONTROL_STATUS_ZH = {
+    "match": "一致", "diff": "存在差异", "not_available": "不可用",
+    "passed": "控制值一致", "difference_open": "控制差异待复核",
+    "bridged_pending_review": "已记录桥接，待复核",
+}
+AB_STATUS_ZH = {
+    "match": "一致", "diff": "存在差异", "incomplete": "数据不完整",
+    "ab_passed": "一致", "ab_checked_with_differences": "存在差异",
+    "failed": "未通过", "not_applicable_or_not_run": "未运行或不适用",
+}
+VALIDATION_STATUS_ZH = {
+    "passed": "通过（技术）",
+    "with_findings": "有发现（技术）",
+    "failed": "未通过",
+    "not_run_or_incomplete": "未运行或不完整",
+    "manual_source_review_required": "需人工来源复核",
+}
+ANOMALY_STATUS_ZH = {
+    "checked_with_findings": "检测有发现",
+    "checked_no_rule_findings": "未发现规则问题（不等同于校核通过）",
+    "not_run": "未运行",
+}
+EVIDENCE_STATUS_ZH = {
+    "available": "可追溯",
+    "needs_review": "需复核证据来源",
+    "not_applicable_or_not_run": "未运行或不适用",
+}
+OVERALL_STATUS_ZH = {
+    "pending_wps": "待 WPS/Excel 三环境复核",
+    "pending_wps_with_findings": "有发现，待 WPS/Excel 复核",
+    "needs_manual_review": "待人工复核",
+    "parsed_needs_manual_review": "已解析，待人工来源复核",
+    "not_passed": "未通过",
+}
+EXECUTION_STATUS_ZH = {
+    "settlement_pipeline_complete": "结算流程完成",
+    "text_parse_complete": "文本已解析，待人工来源复核",
+    "incomplete_or_unsupported": "未完成或暂不支持",
+}
+SHEET_STATUS_ZH = {
+    "parsed": "已解析",
+    "needs_role_review": "待人工角色确认",
+    "non_settlement_form": "非结算表单，待人工复核",
+    "no_header": "无可靠表头，待人工映射",
+    "duplicate_header": "表头重复，待人工复核",
+}
+WPS_STATUS_ZH = {"pending_manual": "待三环境人工复核", "not_applicable": "不适用"}
+
+
+def _safe_report_note(value: object, *, max_chars: int = 60) -> str:
+    """将解析器内部提示转换为可直接给业务人员阅读的中文说明。
+
+    验收报告是产品交付物的一部分，不能把内部状态码或实现字段原样带到
+    工作表状态表中。原始内部值仍保留在结构化结果 JSON，便于技术追溯。
+    """
+    text = "" if value is None else str(value)
+    replacements = {
+        "（needs_review）": "（需要复核）",
+        "needs_review": "需要复核",
+        "通用 evidence 人工复核入口": "通用证据人工复核入口",
+        "字段候选已存 evidence": "字段候选已存证据",
+        "confirm_sheet_role_and_extract": "人工角色确认",
+        "confirm_sheet_non_settlement_role": "人工确认非结算内容",
+        "sheet 名": "工作表名称",
+        " evidence": " 证据",
+    }
+    for raw, safe in replacements.items():
+        text = text.replace(raw, safe)
+    return text[:max_chars]
+
+
+def _report_value(value: object) -> str:
+    """将结构化结果中的空值以业务可读文本呈现。"""
+    if value is None or value == "":
+        return "未记录"
+    return str(value)
+
+
+def _safe_support_limit(value: object) -> str:
+    """把不支持的文件类型限制转为业务人员可读的中文。"""
+    text = "" if value is None else str(value)
+    if "parser not implemented" in text or "未实现" in text:
+        return "该文件类型当前暂不支持自动解析，需人工查阅原件"
+    return _safe_report_note(text, max_chars=120)
+
 
 def costguard_version() -> str:
     try:
@@ -148,21 +235,26 @@ def write_acceptance_report(report: dict) -> Path:
         "技术流程与 WPS 人工门槛分列记录。对适用的表格导出，只要 WPS 尚未完成实际打开、"
         "重算、保存、重开，整体不得标记为通过。",
         "",
-        "| 测试编号 | 导入 | 技术执行 | 技术校验 | A/B独立复算 | C/源表控制 | 异常 | 证据链 | WPS | 整体状态 |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| 测试编号 | 导入 | 技术执行 | 技术校验 | 校核级别 | 取数范围未证明 | A/B独立复算 | C/源表控制 | 异常 | 证据链 | WPS | 整体状态 |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for rec in results:
         steps = rec.get("steps") or {}
+        level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
+                    "insufficient": "校核不充分"}
+        range_unproven = steps.get("range_unproven_sheets", 0)
         lines.append(
             f"| {rec.get('test_id')} | {'通过' if steps.get('import') else '未通过'} "
-            f"| {steps.get('technical_execution_status', '未运行')} "
-            f"| {steps.get('technical_validation_status', '未运行')} "
-            f"| {steps.get('ab_check_status', '未运行')} "
-            f"| {steps.get('control_status', '未运行')} "
-            f"| {steps.get('anomaly_status', '未运行')} "
-            f"| {steps.get('evidence_trace_status', '未运行')} "
-            f"| {steps.get('wps', '未记录')} "
-            f"| {steps.get('overall_acceptance_status', '未记录')} |"
+            f"| {EXECUTION_STATUS_ZH.get(steps.get('technical_execution_status'), '未运行')} "
+            f"| {VALIDATION_STATUS_ZH.get(steps.get('technical_validation_status'), '未运行')} "
+            f"| {level_zh.get(steps.get('verification_level'), '未运行')} "
+            f"| {range_unproven} "
+            f"| {AB_STATUS_ZH.get(steps.get('ab_check_status'), '待复核')} "
+            f"| {CONTROL_STATUS_ZH.get(steps.get('control_status'), '待复核')} "
+            f"| {ANOMALY_STATUS_ZH.get(steps.get('anomaly_status'), '未运行')} "
+            f"| {EVIDENCE_STATUS_ZH.get(steps.get('evidence_trace_status'), '未运行')} "
+            f"| {WPS_STATUS_ZH.get(steps.get('wps'), '未记录')} "
+            f"| {OVERALL_STATUS_ZH.get(steps.get('overall_acceptance_status'), '未记录')} |"
         )
     # ---- 逐文件逐表状态 + A/B/C（独立复核要求：逐表状态/唯一明细/A/B/C/门控）----
     # 口径声明：解析工作表数 ≠ 结算期数——期次由人工确认时逐表指定；
@@ -179,37 +271,49 @@ def write_acceptance_report(report: dict) -> Path:
         sheets = sp.get("sheets") or []
         if not sheets and not rec.get("text_parse"):
             continue
-        lines.append(f"### {rec.get('test_id')}（{sp.get('status', '—')}）")
+        parse_status = {
+            "ok": "解析完成", "ok_after_manual_confirmation": "人工确认后解析完成",
+            "partial": "部分完成，待人工确认", "reviewed_non_settlement": "已确认非结算内容",
+            "failed": "解析未完成",
+        }
+        lines.append(
+            f"### {rec.get('test_id')}（{parse_status.get(sp.get('status'), '待复核')}）"
+        )
         if sheets:
             lines.append("")
             lines.append("| 工作表 | 状态 | 明细行(唯一出处) | 小计行 | 置信度 | 说明 |")
             lines.append("|---|---|---|---|---|---|")
             for sh in sheets:
-                note = (sh.get("notes") or [""])[0][:60] if sh.get("notes") else ""
+                note = _safe_report_note(
+                    (sh.get("notes") or [""])[0] if sh.get("notes") else "")
                 lines.append(
-                    f"| {str(sh.get('name'))[:52]} | {sh.get('status')} "
-                    f"| {sh.get('n_items')} | {sh.get('n_subtotal')} "
-                    f"| {sh.get('confidence')} | {note} |")
+                    f"| {_report_value(sh.get('name'))[:52]} | {SHEET_STATUS_ZH.get(sh.get('status'), '待复核')} "
+                    f"| {_report_value(sh.get('n_items'))} | {_report_value(sh.get('n_subtotal'))} "
+                    f"| {_report_value(sh.get('confidence'))} | {note} |")
         dpc = rec.get("dual_path_check")
         if isinstance(dpc, list) and dpc:
             level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                         "insufficient": "校核不充分"}
             lines.append("")
-            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 |")
-            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for c in dpc:
                 lines.append(
-                    f"| {c.get('period_no')} | {c.get('direction')} "
-                    f"| {level_zh.get(c.get('verification_level'), c.get('verification_level'))} "
-                    f"| {c.get('status')} "
-                    f"| {c.get('A')} | {c.get('B')} | {c.get('C_subtotal')} "
-                    f"| {c.get('diff_ab')} | {c.get('control_diff')} | {c.get('control_status')} "
-                    f"| {c.get('detail_rows')} | {c.get('excluded_subtotal_rows')} "
-                    f"| {c.get('excluded_title_rows')} | {c.get('pending_sheets')} |")
+                    f"| {_report_value(c.get('period_no'))} | {DIRECTION_ZH.get(c.get('direction'), '未标记')} "
+                    f"| {level_zh.get(c.get('verification_level'), '待复核')} "
+                    f"| {CHECK_STATUS_ZH.get(c.get('status'), '待复核')} "
+                    f"| {_report_value(c.get('A'))} | {_report_value(c.get('B'))} | {_report_value(c.get('C_subtotal'))} "
+                    f"| {_report_value(c.get('diff_ab'))} | {_report_value(c.get('control_diff'))} | "
+                    f"{CONTROL_STATUS_ZH.get(c.get('control_status'), '待复核')} "
+                    f"| {_report_value(c.get('detail_rows'))} | {_report_value(c.get('excluded_subtotal_rows'))} "
+                    f"| {_report_value(c.get('excluded_title_rows'))} | {_report_value(c.get('pending_sheets'))} "
+                    f"| {_report_value(c.get('range_unproven_sheets', 0))} |")
         tp = rec.get("text_parse")
         if tp:
             lines.append("")
-            lines.append(f"- 文本抽取：段落 {tp.get('n_paragraphs')}，事实 {tp.get('n_facts')}（须逐条人工核对原文）")
+            lines.append(
+                f"- 文本抽取：段落 {_report_value(tp.get('n_paragraphs'))}，"
+                f"事实 {_report_value(tp.get('n_facts'))}（须逐条人工核对原文）")
         role = rec.get("role_review") or {}
         form = rec.get("form_route") or {}
         gating = []
@@ -234,11 +338,17 @@ def write_acceptance_report(report: dict) -> Path:
             limitations.append("存在未完成的表单或表格角色人工确认")
         if steps.get("overall_acceptance_status") == "parsed_needs_manual_review":
             limitations.append("文本解析已执行，自动提取事实必须回到原页或原段落人工确认")
+        if steps.get("range_unproven_sheets"):
+            limitations.append(
+                f"有 {steps['range_unproven_sheets']} 张工作表取数范围完整性无法证明，校核不得标绿"
+            )
+        if steps.get("verification_level") == "insufficient":
+            limitations.append("校核条件不足（A/B 一致也不等同于结算正确）")
         text_parse = rec.get("text_parse") or {}
         if text_parse.get("expected_limit"):
-            limitations.append(f"当前支持边界：{text_parse['expected_limit']}")
+            limitations.append(f"当前支持边界：{_safe_support_limit(text_parse['expected_limit'])}")
         elif text_parse.get("error"):
-            limitations.append(f"文本解析失败：{text_parse['error']}")
+            limitations.append("文本解析失败，需人工复核原始文档")
         if rec.get("source_evidence_status"):
             limitations.append(f"资料边界：{rec['source_evidence_status']}")
         for item in rec.get("acceptance_controls") or []:
@@ -519,7 +629,8 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                          str(c.control_diff) if c.control_diff is not None else None
                      ),
                      "control_status": c.control_status,
-                     "missing_rows": c.missing_rows}
+                     "missing_rows": c.missing_rows,
+                     "range_unproven_sheets": c.range_unproven_sheets}
                     for c in checks
                 ]
             except Exception as exc:  # noqa: BLE001
@@ -624,6 +735,8 @@ def classify_technical_validation(
     control_status: str,
     anomaly_total: int | None,
     decimal_warning_groups: int,
+    verification_level: str | None = None,
+    range_unproven_sheets: int = 0,
 ) -> str:
     """把验收事实分类为技术验证状态。
 
@@ -634,6 +747,11 @@ def classify_technical_validation(
         return "not_run_or_incomplete"
     if ab_check_status != "ab_passed" or evidence_status != "available" or high_findings:
         return "failed"
+    # A/B 数字相等不能替代运行级证据门控。C 不可用、范围未证明、待人工
+    # 工作表等情况由 crosscheck 统一归为 insufficient；即使其他技术步骤
+    # 完成，也只能保留“有发现”，不得被误标为通过。
+    if verification_level in {"insufficient", "findings"} or range_unproven_sheets:
+        return "with_findings"
     if (
         control_status in {"difference_open", "bridged_pending_review"}
         or (isinstance(anomaly_total, int) and anomaly_total > 0)
@@ -708,6 +826,23 @@ def main(run_dir: Path | None = None) -> None:
         dual_checks = result.get("dual_path_check")
         dual_ran = bool(isinstance(dual_checks, list) and dual_checks)
         compute_ok = decimal_ok and dual_ran
+        crosscheck_count = len(dual_checks) if dual_ran else 0
+        verification_levels = [
+            c.get("verification_level") for c in (dual_checks or [])
+            if isinstance(c, dict) and c.get("verification_level")
+        ]
+        if "insufficient" in verification_levels:
+            verification_level = "insufficient"
+        elif "findings" in verification_levels:
+            verification_level = "findings"
+        elif verification_levels and all(level == "sufficient" for level in verification_levels):
+            verification_level = "sufficient"
+        else:
+            verification_level = None
+        range_unproven_sheets = sum(
+            int(c.get("range_unproven_sheets") or 0)
+            for c in (dual_checks or []) if isinstance(c, dict)
+        )
         anomalies_ok = "total" in (result.get("anomalies") or {})
         matches_ok = "total" in (result.get("matches") or {})
         excel_ok = "xlsx" in (result.get("export") or {})
@@ -769,6 +904,8 @@ def main(run_dir: Path | None = None) -> None:
             control_status=control_status,
             anomaly_total=anomaly_total,
             decimal_warning_groups=decimal_warning_groups,
+            verification_level=verification_level,
+            range_unproven_sheets=range_unproven_sheets,
         )
         if not spreadsheet_file and (tp or {}).get("ok"):
             technical_validation_status = "manual_source_review_required"
@@ -799,6 +936,9 @@ def main(run_dir: Path | None = None) -> None:
             "technical_execution_complete": technical_execution_complete,
             "technical_execution_status": technical_execution_status,
             "technical_validation_status": technical_validation_status,
+            "verification_level": verification_level or "insufficient",
+            "range_unproven_sheets": range_unproven_sheets,
+            "crosscheck_results_count": crosscheck_count,
             "ab_check_status": ab_check_status,
             "control_status": control_status,
             "anomaly_status": anomaly_status,

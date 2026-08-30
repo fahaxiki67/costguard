@@ -20,7 +20,8 @@ from costguard.core.engine.money import (
     round2,  # noqa: F401  (money 入口纪律：保留显式依赖)
     to_decimal,
 )
-from costguard.core.engine.settlement_io import load_sheet_grid
+from costguard.core.engine.settlement_io import load_sheet_grid, pending_sheet_count
+from costguard.core.labels import direction_label
 from costguard.core.parsing import extract_items
 from costguard.core.parsing.header_detect import HeaderDetection, detect_header
 
@@ -65,6 +66,7 @@ class CheckResult:
     excluded_subtotal_rows: int = 0
     excluded_title_rows: int = 0
     pending_sheets: int = 0       # 项目级待人工确认工作表数
+    range_unproven_sheets: int = 0  # 取数范围无法证明完整的工作表数
 
 
 @dataclass
@@ -204,6 +206,54 @@ def _merge_summaries(target: _AmountSummary, incoming: _AmountSummary) -> None:
         target.amount_status = "missing"
 
 
+def _range_is_proven(
+    cells: dict[tuple[int, int], str],
+    max_row: int,
+    det: HeaderDetection,
+    confirmed: sqlite3.Row | None,
+) -> bool:
+    """判断 B 路径使用的取数范围是否有可复核的完整性依据。
+
+    - ``manual_confirmation`` 表示用户明确给出边界；
+    - ``last_non_empty_row`` 只在原始网格没有新增的非空行时视为可复核；
+    - 历史 NULL/unknown 或范围越界一律不充分，不能因为 A/B/C 数字碰巧相等
+      就显示绿色。
+    """
+    if confirmed is None:
+        return False
+    start = confirmed["data_row_start"]
+    end = confirmed["data_row_end"]
+    status = confirmed["data_range_status"] or "unproven"
+    method = confirmed["data_range_method"] or "unknown"
+    if start is None or end is None:
+        return False
+    start, end = int(start), int(end)
+    if start <= int(det.header_row_hi) or end < start or end > int(max_row):
+        return False
+    if status == "confirmed" and method == "manual_confirmation":
+        return True
+    # 隐藏行/列可能包含未参与抽取的金额或明细。自动推断不能把“最后非空行”
+    # 当作完整范围；只有人工明确确认过边界后才允许继续。
+    try:
+        hidden_rows = json.loads(confirmed["hidden_rows_json"] or "[]")
+        hidden_cols = json.loads(confirmed["hidden_cols_json"] or "[]")
+    except (TypeError, json.JSONDecodeError, KeyError):
+        hidden_rows, hidden_cols = [], []
+    if (hidden_rows or hidden_cols) and not (
+        status == "confirmed" and method == "manual_confirmation"
+    ):
+        return False
+    if status != "inferred" or method != "last_non_empty_row":
+        return False
+    non_empty_rows = {
+        row for (row, _col), value in cells.items()
+        if start <= row <= max_row and value not in (None, "")
+    }
+    # 自动推断的边界必须仍覆盖当前原始网格中表头之后的最后非空行；
+    # 若原始网格后来新增一行/发生截断，旧结果立即降为不充分。
+    return bool(non_empty_rows) and max(non_empty_rows) == end
+
+
 def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     """对单期做 A/B/C 三重校核。全部查询以 period_id 锁定，
     A/B/C 三路径、异常与证据都落在同一期次上。"""
@@ -261,12 +311,17 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     ).fetchall()
     summary_b = _AmountSummary()
     excluded_title_rows = 0
-    for (sheet_id,) in [(r["id"],) for r in sheet_ids]:
+    range_unproven_sheets = 0
+    for sheet_row in sheet_ids:
+        sheet_id = int(sheet_row["id"])
         cells, merged, n_rows, _n_cols = load_sheet_grid(conn, sheet_id)
         confirmed = conn.execute(
             """SELECT header_row_lo, header_row_hi, col_map_json, confidence,
-                      needs_review, data_row_start, data_row_end
-               FROM table_headers WHERE sheet_id=?""",
+                      needs_review, data_row_start, data_row_end,
+                      data_range_status, data_range_method,
+                      rs.hidden_rows_json, rs.hidden_cols_json
+               FROM table_headers th JOIN raw_sheets rs ON rs.id=th.sheet_id
+               WHERE th.sheet_id=?""",
             (sheet_id,),
         ).fetchone()
         data_range = None
@@ -284,6 +339,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         else:
             det = detect_header(
                 0, cells, merged, n_rows, max((c for _, c in cells), default=0))
+        if det is None or not _range_is_proven(cells, n_rows, det, confirmed):
+            range_unproven_sheets += 1
         if det is None:
             continue
         _skip_stats: dict = {}
@@ -356,17 +413,13 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
 
     # ---- 校核级别（P0-2/P0-5）：A/B 一致不等于结算正确 ----
     # 绿色（校核充分）仅当：A=B 且 C 控制可用且控制一致，且项目无待人工工作表。
-    pending_sheets = conn.execute(
-        """SELECT COUNT(*) c FROM raw_sheets rs
-           JOIN parse_batches pb ON pb.id=rs.batch_id
-           JOIN source_files sf ON sf.id=pb.file_id
-           WHERE sf.project_id=? AND rs.period_id IS NULL""",
-        (project_id,),
-    ).fetchone()["c"]
+    pending_sheets = pending_sheet_count(conn, project_id)
     detail_count = len(detail_rows)
     reasons: list[str] = []
     if pending_sheets:
         reasons.append(f"{pending_sheets} 张工作表待人工确认")
+    if range_unproven_sheets:
+        reasons.append(f"{range_unproven_sheets} 张工作表取数范围完整性无法证明")
     if control_status == "not_available":
         reasons.append("C 控制不可用")
     if status == "incomplete":
@@ -391,6 +444,7 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         excluded_subtotal_rows=len(subtotal_rows),
         excluded_title_rows=excluded_title_rows,
         pending_sheets=pending_sheets,
+        range_unproven_sheets=range_unproven_sheets,
         notes=notes,
         path_a_raw_total=summary_a.raw_total,
         path_a_calculated_total=summary_a.calculated_total,
@@ -428,10 +482,15 @@ def check_period_by_no(conn: sqlite3.Connection, project_id: int, period_no: int
 
 
 def make_evidence(project_id: int, res: CheckResult) -> str:
+    status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
     return json.dumps(
         {
             "kind": "cross_check",
-            "summary": f"第{res.period_no}期双向校核：{res.status}",
+            "summary": (
+                f"第{res.period_no}期{direction_label(res.direction)}双向校核："
+                f"{status_zh.get(res.status, '待复核')}，"
+                f"{ {'sufficient': '校核充分', 'findings': '校核有发现', 'insufficient': '校核不充分'}.get(res.verification_level, '待复核') }"
+            ),
             "steps": [
                 {"step": "A 直接累计清洗明细", "result": str(res.path_a_total)},
                 {"step": "B 从原始网格独立重算", "result": str(res.path_b_total)},
@@ -439,6 +498,11 @@ def make_evidence(project_id: int, res: CheckResult) -> str:
                 {"step": "差异 A-B", "result": str(res.diff_ab)},
                 {"step": "差异 A-C", "result": str(res.control_diff)},
                 {"step": "C 控制状态", "result": res.control_status},
+                {"step": "参与明细行数", "result": res.detail_rows},
+                {"step": "排除小计行数", "result": res.excluded_subtotal_rows},
+                {"step": "排除标题/说明行数", "result": res.excluded_title_rows},
+                {"step": "待确认工作表数量", "result": res.pending_sheets},
+                {"step": "取数范围未证明工作表数量", "result": res.range_unproven_sheets},
             ],
             "sources": [{"period_id": res.period_id, "period": res.period_no,
                          "direction": res.direction, "missing_rows": res.missing_rows}],
@@ -460,7 +524,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     for pno in period_nos:
         res = check_period_by_no(conn, project_id, pno, direction=direction)
         results.append(res)
-        dir_label = {"upward": "对上", "downward": "对下"}.get(res.direction, "")
+        dir_label = direction_label(res.direction)
+        status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         if res.status != "match":
             combined_status = res.status
             combined_diff = res.diff_ab
@@ -473,12 +538,19 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
         else:
             combined_status = "ab_match_control_not_available"
             combined_diff = res.diff_ab
+        # 兼容旧读取面的同时，禁止“数值碰巧一致但证据条件不足”仍落成
+        # ``cross_check_status='match'``。逐清单旧字段保留 A/B/C 原始状态，
+        # 但项目级整体状态以三档校核级别为最终门控；所有新界面/成果读取
+        # verification_level，历史消费者也能从此值看出不能按通过解释。
+        if res.verification_level == "insufficient" and combined_status == "match":
+            combined_status = "insufficient"
         with conn:
             cur = conn.execute(
                 "INSERT INTO evidence(project_id, kind, summary, steps_json, sources_json, created_at)"
                 " VALUES (?,?,?,?,?,?)",
                 (project_id, "cross_check",
-                 f"第{pno}期{dir_label}双向校核：{res.status}".replace("期", "期", 1),
+                 f"第{pno}期{dir_label}双向校核：{status_zh.get(res.status, '待复核')}；"
+                 f"{'校核充分' if res.verification_level == 'sufficient' else '校核有发现' if res.verification_level == 'findings' else '校核不充分'}",
                  json.dumps(res.__dict__ | {"path_a_total": str(res.path_a_total),
                                             "path_b_total": str(res.path_b_total),
                                             "raw_subtotal": str(res.raw_subtotal),
@@ -491,7 +563,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             conn.execute(
                 """UPDATE period_totals SET
                    cross_check_status=?, cross_check_diff=?, evidence_id=?,
-                   ab_status=?, ab_diff=?, control_status=?, control_diff=?
+                   ab_status=?, ab_diff=?, control_status=?, control_diff=?,
+                   verification_level=?
                    WHERE period_id=?""",
                 (
                     combined_status,
@@ -501,7 +574,48 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     str(res.diff_ab) if res.diff_ab is not None else None,
                     res.control_status,
                     str(res.control_diff) if res.control_diff is not None else None,
+                    res.verification_level,
                     res.period_id,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO crosscheck_results(
+                       project_id, period_id, verification_level, status,
+                       path_a_total, path_b_total, raw_subtotal, diff_ab, control_diff,
+                       ab_status, control_status, detail_rows, excluded_subtotal_rows,
+                       excluded_title_rows, pending_sheets, range_unproven_sheets,
+                       notes_json, evidence_id, checked_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(period_id) DO UPDATE SET
+                       project_id=excluded.project_id,
+                       verification_level=excluded.verification_level,
+                       status=excluded.status,
+                       path_a_total=excluded.path_a_total,
+                       path_b_total=excluded.path_b_total,
+                       raw_subtotal=excluded.raw_subtotal,
+                       diff_ab=excluded.diff_ab,
+                       control_diff=excluded.control_diff,
+                       ab_status=excluded.ab_status,
+                       control_status=excluded.control_status,
+                       detail_rows=excluded.detail_rows,
+                       excluded_subtotal_rows=excluded.excluded_subtotal_rows,
+                       excluded_title_rows=excluded.excluded_title_rows,
+                       pending_sheets=excluded.pending_sheets,
+                       range_unproven_sheets=excluded.range_unproven_sheets,
+                       notes_json=excluded.notes_json,
+                       evidence_id=excluded.evidence_id,
+                       checked_at=excluded.checked_at""",
+                (
+                    project_id, res.period_id, res.verification_level, combined_status,
+                    str(res.path_a_total) if res.path_a_total is not None else None,
+                    str(res.path_b_total) if res.path_b_total is not None else None,
+                    str(res.raw_subtotal) if res.raw_subtotal is not None else None,
+                    str(res.diff_ab) if res.diff_ab is not None else None,
+                    str(res.control_diff) if res.control_diff is not None else None,
+                    res.status, res.control_status, res.detail_rows,
+                    res.excluded_subtotal_rows, res.excluded_title_rows,
+                    res.pending_sheets, res.range_unproven_sheets,
+                    json.dumps(res.notes, ensure_ascii=False), ev_id, now,
                 ),
             )
     return results

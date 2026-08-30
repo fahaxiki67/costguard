@@ -387,7 +387,15 @@ def aggregate_project(
 def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[ItemAggregate],
                           evidence_id: int | None = None) -> int:
     n = 0
+    period_ids = sorted({int(pid) for agg in aggs for pid in agg.per_period})
     with conn:
+        if period_ids:
+            placeholders = ",".join("?" for _ in period_ids)
+            # 聚合结果改变后，旧的整体校核结论不能继续作为最新状态展示。
+            conn.execute(
+                f"DELETE FROM crosscheck_results WHERE project_id=? AND period_id IN ({placeholders})",
+                (project_id, *period_ids),
+            )
         for agg in aggs:
             for pid, pp in agg.per_period.items():  # 键即 period_id
                 conn.execute(
@@ -395,8 +403,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                        project_id, period_id, item_key, qty_sum, amount_sum, wavg_price,
                        cross_check_diff, cross_check_status, evidence_id,
                        raw_amount_sum, calculated_amount_sum, calculated_amount_used_sum,
-                       effective_amount_sum, amount_source, amount_status)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       effective_amount_sum, amount_source, amount_status, verification_level)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(period_id, item_key) DO UPDATE SET
                          qty_sum=excluded.qty_sum, amount_sum=excluded.amount_sum,
                          wavg_price=excluded.wavg_price,
@@ -410,7 +418,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                          calculated_amount_used_sum=excluded.calculated_amount_used_sum,
                          effective_amount_sum=excluded.effective_amount_sum,
                          amount_source=excluded.amount_source,
-                         amount_status=excluded.amount_status""",
+                         amount_status=excluded.amount_status,
+                         verification_level='insufficient'""",
                     (project_id, pid, agg.item_key,
                      str(pp["qty"]) if pp["qty"] is not None else None,
                      str(pp["effective_amount"]) if pp["effective_amount"] is not None else None,
@@ -422,7 +431,7 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                       if pp["calculated_amount_used"] is not None else None),
                      (str(pp["effective_amount"])
                       if pp["effective_amount"] is not None else None),
-                     pp["amount_source"], pp["amount_status"]),
+                     pp["amount_source"], pp["amount_status"], "insufficient"),
                 )
                 n += 1
     return n

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from costguard.core.engine.money import round2
+from costguard.core.labels import DIRECTION_ZH, direction_label
 
 D = Decimal
 
@@ -53,7 +54,9 @@ def _norm_unit(u: str | None) -> str:
     return u
 
 
-DIR_ZH = {"upward": "对上", "downward": "对下", "unknown": ""}
+# 规则消息会直接进入异常页、证据记录和导出成果，必须使用完整业务词。
+# 保留别名供旧调用方/外部复核脚本兼容，但不再维护短方向词。
+DIR_ZH = DIRECTION_ZH
 
 
 def _rows(conn, project_id: int):
@@ -103,7 +106,7 @@ def rule_qty_price_amount(conn, project_id) -> list[Finding]:
                 "qty_price_amount_mismatch", "high", "line_item", r["id"],
                 f"第{r['pno']}期「{r['name']}」：{q}×{p}={expect}，但合价为{round2(a)}，差异{diff}",
                 {"qty": str(q), "price": str(p), "amount": str(a), "expect": str(expect),
-                 "row": json.loads(r["flags_json"]).get("row")},
+                 "difference": str(diff), "row": json.loads(r["flags_json"]).get("row")},
             ))
         else:
             out.append(Finding(
@@ -246,7 +249,8 @@ def rule_subtotal_vs_details(conn, project_id) -> list[Finding]:
                     "summary_mismatch", "high", "period", p["id"],
                     f"第{p['period_no']}期明细合计 {round2(det_total)} ≠ 原表小计 {round2(sub_total)}，"
                     f"差异 {round2(det_total - sub_total)}",
-                    {"details_sum": str(det_total), "subtotal": str(sub_total)},
+                    {"details_sum": str(det_total), "subtotal": str(sub_total),
+                     "difference": str(round2(det_total - sub_total))},
                 ))
     return out
 
@@ -328,8 +332,8 @@ def _item_series(conn, project_id: int) -> dict[tuple[str, str], dict[int, list]
 
 
 def _dir_label(direction: str) -> str:
-    zh = DIR_ZH.get(direction, direction)
-    return f"[{zh}]" if zh else ""
+    zh = direction_label(direction, "未标记")
+    return f"[{zh}] "
 
 
 def rule_unit_changed(conn, project_id) -> list[Finding]:

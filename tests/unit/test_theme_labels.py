@@ -56,10 +56,13 @@ def test_rule_zh_covers_all_rules_in_engine():
 
 
 def test_labels_fallbacks_never_crash():
-    assert labels.rule_zh("rule_error_xxx") == "rule_error_xxx"
-    assert labels.parse_group_key("weird:key") == "weird:key"
+    assert labels.rule_zh("rule_error_xxx") == "其他审核问题"
+    assert labels.parse_group_key("weird:key") == "其他匹配对象"
     assert labels.parse_group_key("pending:orphan") == "待补资料 · 缺失名称/编码"
     assert labels.parse_group_key("downward:code:0101") == "对下结算 · 编码 0101"
+    assert labels.method_zh("unknown_method") == "其他匹配方式"
+    assert labels.level_short_zh("unknown_level") == "待人工确认"
+    assert labels.item_status_zh("verified_no_issue") == "已核实无问题"
 
 
 @pytest.mark.parametrize("method,expected", [

@@ -22,7 +22,7 @@ class TestMigrate:
             "projects", "source_files", "parse_batches", "raw_sheets", "raw_cells",
             "table_headers", "settlement_periods", "line_items", "item_aliases",
             "matches", "period_totals", "anomalies", "evidence", "audit_log",
-            "contract_docs", "contract_facts", "schema_migrations",
+            "contract_docs", "contract_facts", "crosscheck_results", "schema_migrations",
         ]:
             assert expected in tables, f"missing table {expected}"
         alias_columns = {r[1] for r in conn.execute("PRAGMA table_info(item_aliases)")}
@@ -32,7 +32,10 @@ class TestMigrate:
             "raw_amount_sum", "calculated_amount_sum", "calculated_amount_used_sum",
             "effective_amount_sum", "amount_source", "amount_status",
             "ab_diff", "ab_status", "control_diff", "control_status",
+            "verification_level",
         } <= total_columns
+        header_columns = {r[1] for r in conn.execute("PRAGMA table_info(table_headers)")}
+        assert {"data_range_status", "data_range_method", "data_range_evidence_json"} <= header_columns
         conn.close()
 
     def test_idempotent(self, tmp_path):
@@ -131,9 +134,10 @@ class TestLegacyUpgrade:
             conn.close()
 
         broken = [*migrations.MIGRATIONS]
-        broken[-1] = (5, [*broken[-1][1], "THIS IS NOT SQL"])
+        latest_version, latest_scripts = broken[-1]
+        broken[-1] = (latest_version, [*latest_scripts, "THIS IS NOT SQL"])
         monkeypatch.setattr(migrations, "MIGRATIONS", broken)
-        monkeypatch.setattr(migrations, "LATEST_SCHEMA_VERSION", 5)
+        monkeypatch.setattr(migrations, "LATEST_SCHEMA_VERSION", latest_version)
 
         with pytest.raises(migrations.MigrationError):
             migrations.migrate(db, tmp_path / "backups")
@@ -248,5 +252,57 @@ class TestLegacyUpgrade:
                        VALUES (?, 'upward', 'code:C9', '旧别名', '重复', '用户', '2026')""",
                     (pid,),
                 )
+        finally:
+            conn.close()
+
+    def test_v6_legacy_match_is_conservatively_downgraded_on_v7(self, tmp_path):
+        """v7 升级旧库时，历史二态 match 必须先降级为待重新校核。"""
+        db = tmp_path / "legacy_v6.db"
+        conn = migrations.connect(db)
+        try:
+            # 手工构造 v6 结构，避免先跑完 v7 再倒推字段，确保覆盖真实升级路径。
+            conn.execute("PRAGMA foreign_keys=OFF")
+            for version, scripts in migrations.MIGRATIONS:
+                if version > 6:
+                    break
+                for sql in scripts:
+                    conn.execute(sql)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026-01-01')",
+                    (version,),
+                )
+            project_id = conn.execute(
+                "INSERT INTO projects(name, schema_version, workspace_path, created_at)"
+                " VALUES ('v6旧项目', 6, '/legacy-v6', '2026')"
+            ).lastrowid
+            period_id = conn.execute(
+                "INSERT INTO settlement_periods(project_id, period_no, title, direction)"
+                " VALUES (?, 1, '旧第1期', 'upward')",
+                (project_id,),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO period_totals(project_id, period_id, item_key, amount_sum, cross_check_status)"
+                " VALUES (?, ?, 'code:OLD', '100', 'match')",
+                (project_id, period_id),
+            )
+        finally:
+            conn.close()
+
+        probe = migrations.connect(db)
+        try:
+            assert migrations.current_version(probe) == 6
+        finally:
+            probe.close()
+        assert migrations.migrate(db, tmp_path / "backups") == migrations.LATEST_SCHEMA_VERSION
+
+        conn = migrations.connect(db)
+        try:
+            row = conn.execute(
+                "SELECT verification_level, cross_check_status FROM period_totals WHERE period_id=?",
+                (period_id,),
+            ).fetchone()
+            assert row is not None
+            assert row["verification_level"] == "insufficient"
+            assert row["cross_check_status"] == "insufficient"
         finally:
             conn.close()

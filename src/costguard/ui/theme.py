@@ -46,7 +46,7 @@ def build_qss() -> str:
 QWidget {{
     background: {BG};
     color: {TEXT};
-    font-size: 13px;
+    font-size: 14px;
 }}
 
 QToolTip {{
@@ -61,9 +61,9 @@ QPushButton {{
     background: {SURFACE};
     color: {TEXT};
     border: 1px solid {BORDER};
-    border-radius: 4px;
+    border-radius: 6px;
     padding: 5px 14px;
-    min-height: 22px;
+    min-height: 26px;
 }}
 QPushButton:hover {{ border-color: {PRIMARY}; color: {PRIMARY}; }}
 QPushButton:pressed {{ background: {BG}; }}
@@ -104,8 +104,9 @@ QPushButton[btnLink="true"] {{
 QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{
     background: {SURFACE};
     border: 1px solid {BORDER};
-    border-radius: 4px;
+    border-radius: 6px;
     padding: 3px 6px;
+    min-height: 26px;
     selection-background-color: {PRIMARY_SOFT};
     selection-color: {TEXT};
 }}
@@ -175,7 +176,7 @@ QScrollBar::handle:horizontal {{ background: #D0D5DD; border-radius: 5px; min-wi
 QSplitter::handle {{ background: {BORDER}; }}
 QGroupBox {{
     border: 1px solid {BORDER};
-    border-radius: 4px;
+    border-radius: 6px;
     margin-top: 12px;
     background: {SURFACE};
 }}
