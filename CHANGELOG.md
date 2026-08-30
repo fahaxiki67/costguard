@@ -5,7 +5,6 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 ## [Unreleased]
 
 ## [0.1.3] - 2026-08-30
-
 Bugfix release driven by real-world Windows + municipal payment-report feedback
 (issues #1, #2, #3, #6). No engine-semantics changes beyond the fixes below.
 
@@ -27,6 +26,31 @@ Bugfix release driven by real-world Windows + municipal payment-report feedback
 - **#2 (short-term) dictionary gap**: added 子目号/细目号/子目编码/细目编码 code
   aliases and 子目名称/细目名称 name aliases; contains-terms deliberately
   exclude bare 子目/细目 so the 子目名称 column cannot be misclassified.
+
+## [0.1.4] - 2026-08-30
+
+### Fixed
+- Custom workspaces selected while creating or manually opening a project are
+  now persisted. Restarting the app no longer makes those projects disappear
+  from the project list.
+- The project list scans both the default workspace and all remembered
+  workspaces, deduplicates project databases, and reads project metadata without
+  triggering a database migration.
+- A moved project opens from the directory the user selected or the app found,
+  instead of trusting a stale `workspace_path` stored inside `project.db`.
+- Global settings use atomic replacement so an interrupted write cannot leave a
+  partially written `settings.json`.
+
+### Recovery
+- This defect hid projects from the list; it did not delete `project.db` or the
+  imported read-only copies. If a workspace was created with v0.1.2 and is not
+  listed after upgrading, use **打开项目目录…** once and select the directory
+  containing `project.db`. CostGuard remembers its parent workspace thereafter.
+
+### Testing
+- 230 tests passed, including restart simulation, multi-workspace discovery,
+  idempotent registration, moved-project reopening, and a schema v3 → v5 copy
+  migration that preserved all record counts and imported-file hashes.
 
 ## [0.1.2] - 2026-08-30
 

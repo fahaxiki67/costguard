@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -45,19 +46,87 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
+    """原子写入全局设置，避免应用中断留下半截 JSON。"""
     _SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = _SETTINGS_FILE.with_name(f".{_SETTINGS_FILE.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(settings, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, _SETTINGS_FILE)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _path_key(path: Path) -> str:
+    """用于跨设置项去重；不要求目录已经存在。"""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def workspace_roots() -> list[Path]:
+    """返回需要扫描的全部工作空间，首项是当前默认空间。
+
+    旧版本只保存一个 ``workspace_root``，并且 UI 创建/打开自定义项目时没有
+    调用保存函数。新格式保留当前空间及历史空间；默认目录始终参与扫描，避免
+    用户切换工作空间后另一批项目从列表中消失。
+    """
+    settings = load_settings()
+    configured = settings.get("workspace_root")
+    known = settings.get("known_workspaces", [])
+    if not isinstance(known, list):
+        known = []
+
+    candidates = [
+        Path(configured) if isinstance(configured, str) and configured else None,
+        platform_paths.default_workspace_root(),
+        *(Path(item) for item in known if isinstance(item, str) and item),
+    ]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        root = candidate.expanduser()
+        key = _path_key(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
+    return roots
 
 
 def workspace_root() -> Path:
-    root = load_settings().get("workspace_root")
-    return Path(root) if root else platform_paths.default_workspace_root()
+    return workspace_roots()[0]
+
+
+def remember_workspace(path: Path, *, make_default: bool = False) -> None:
+    """持久登记用户选择的工作空间，不移动也不修改其中的工程数据。"""
+    root = Path(path).expanduser()
+    settings = load_settings()
+    known = settings.get("known_workspaces", [])
+    if not isinstance(known, list):
+        known = []
+
+    values = [str(root), *(item for item in known if isinstance(item, str) and item)]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _path_key(Path(value))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+
+    settings["known_workspaces"] = deduped
+    if make_default or not settings.get("workspace_root"):
+        settings["workspace_root"] = str(root)
+    save_settings(settings)
 
 
 def set_workspace_root(path: Path) -> None:
-    settings = load_settings()
-    settings["workspace_root"] = str(path)
-    save_settings(settings)
+    remember_workspace(path, make_default=True)
 
 
 def _project_dir(root: Path, name: str) -> Path:
@@ -69,28 +138,57 @@ def _project_dir(root: Path, name: str) -> Path:
     return root / safe
 
 
+def _read_project_info(project_dir: Path) -> ProjectInfo | None:
+    """只读获取项目概要；列表刷新不得触发迁移或写入用户数据库。"""
+    db = project_dir / "project.db"
+    try:
+        uri = f"{db.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT id, name, schema_version, workspace_path, created_at "
+                "FROM projects ORDER BY id LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return None
+    if not row:
+        return None
+    # 数据库内的 workspace_path 可能因项目目录被移动而过期；实际打开路径以本次
+    # 扫描到的目录为准，数据库内容保持原样，待用户打开时再按正常迁移纪律处理。
+    return ProjectInfo(
+        row["id"],
+        row["name"],
+        str(project_dir),
+        row["schema_version"],
+        row["created_at"],
+    )
+
+
 def list_projects() -> list[ProjectInfo]:
-    """扫描工作空间根目录下所有有效项目。"""
-    root = workspace_root()
+    """扫描默认及已登记工作空间下的全部有效项目。"""
     result: list[ProjectInfo] = []
-    if not root.exists():
-        return result
-    for child in sorted(root.iterdir()):
-        db = child / "project.db"
-        if not child.is_dir() or not db.exists():
+    seen: set[str] = set()
+    for root in workspace_roots():
+        if not root.exists() or not root.is_dir():
             continue
         try:
-            conn = migrations.connect(db)
-            row = conn.execute(
-                "SELECT id, name, schema_version, workspace_path, created_at FROM projects ORDER BY id LIMIT 1"
-            ).fetchone()
-            conn.close()
-        except sqlite3.Error:
+            children = sorted(root.iterdir())
+        except OSError:
             continue
-        if row:
-            result.append(
-                ProjectInfo(row["id"], row["name"], row["workspace_path"], row["schema_version"], row["created_at"])
-            )
+        for child in children:
+            db = child / "project.db"
+            if not child.is_dir() or not db.is_file():
+                continue
+            key = _path_key(db)
+            if key in seen:
+                continue
+            info = _read_project_info(child)
+            if info is not None:
+                seen.add(key)
+                result.append(info)
     return result
 
 
@@ -133,6 +231,6 @@ def open_project(pdir: Path) -> tuple[ProjectInfo, sqlite3.Connection]:
         conn.close()
         raise ProjectError(f"project.db has no project record: {pdir}")
     return (
-        ProjectInfo(row["id"], row["name"], row["workspace_path"], row["schema_version"], row["created_at"]),
+        ProjectInfo(row["id"], row["name"], str(Path(pdir)), row["schema_version"], row["created_at"]),
         conn,
     )

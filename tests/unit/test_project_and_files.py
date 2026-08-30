@@ -13,7 +13,11 @@ from costguard.core.models import source_file
 @pytest.fixture()
 def ws(tmp_path, monkeypatch):
     monkeypatch.setattr(project_model, "_SETTINGS_FILE", tmp_path / "settings.json")
-    monkeypatch.setattr(project_model, "workspace_root", lambda: tmp_path / "ws")
+    monkeypatch.setattr(
+        project_model.platform_paths,
+        "default_workspace_root",
+        lambda: tmp_path / "ws",
+    )
     return tmp_path / "ws"
 
 
@@ -43,6 +47,46 @@ class TestProject:
         project_model.create_project("P2", ws)
         names = {p.name for p in project_model.list_projects()}
         assert names == {"P1", "P2"}
+
+    def test_custom_workspace_persists_and_default_stays_visible(self, ws, tmp_path):
+        project_model.create_project("默认空间项目", ws)
+        custom = tmp_path / "用户自选空间"
+        project_model.create_project("自选空间项目", custom)
+        project_model.set_workspace_root(custom)
+
+        # 每次调用都从磁盘重新读取 settings.json，等价于应用重启后的发现路径。
+        assert project_model.workspace_root() == custom
+        assert project_model.workspace_roots() == [custom, ws]
+        assert {p.name for p in project_model.list_projects()} == {
+            "默认空间项目",
+            "自选空间项目",
+        }
+
+    def test_remember_workspace_is_idempotent(self, ws, tmp_path):
+        custom = tmp_path / "custom"
+        project_model.remember_workspace(custom)
+        project_model.remember_workspace(custom)
+        project_model.remember_workspace(ws)
+        project_model.remember_workspace(custom, make_default=True)
+        settings = project_model.load_settings()
+        assert settings["workspace_root"] == str(custom)
+        assert settings["known_workspaces"] == [str(custom), str(ws)]
+
+    def test_list_uses_actual_path_after_project_directory_is_moved(self, ws, tmp_path):
+        created = project_model.create_project("可移动项目", ws)
+        moved_root = tmp_path / "moved"
+        moved_root.mkdir()
+        moved = moved_root / Path(created.workspace_path).name
+        Path(created.workspace_path).rename(moved)
+        project_model.set_workspace_root(moved_root)
+
+        [listed] = [p for p in project_model.list_projects() if p.name == "可移动项目"]
+        assert listed.workspace_path == str(moved)
+        reopened, conn = project_model.open_project(moved)
+        try:
+            assert reopened.workspace_path == str(moved)
+        finally:
+            conn.close()
 
     def test_open_and_reopen(self, ws):
         created = project_model.create_project("重开项目", ws)
