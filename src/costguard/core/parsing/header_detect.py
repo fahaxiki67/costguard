@@ -197,7 +197,7 @@ def max_col_of(cells: dict[tuple[int, int], str]) -> int:
 
 
 _SUBTOTAL_TRIM = re.compile(
-    r"[\s0-9一二三四五六七八九十\.、（）()\-—:：,，ⅠⅡⅢ]+|部分|章|节|类|段"
+    r"[\s0-9一二三四五六七八九十第\.、（）()\-—:：,，ⅠⅡⅢ]+|分部分项|部分|[章节类段]"
 )
 
 

@@ -59,7 +59,13 @@ def extract_items(
     max_row: int,
     data_range: tuple[int, int] | None = None,
 ) -> list[ItemDraft]:
-    """从网格抽取清单行草稿。跳过全空行；小计/合计行打 flags['subtotal']=True。"""
+    """从网格抽取清单行草稿。跳过全空行；小计/合计行打 flags['subtotal']=True。
+
+    小计标签扫描名称列与首个映射列之前的所有行首列（支表二的"总计"
+    写在序号列，编码列从 2 开始时也会命中）。明细区末尾连续的孤儿
+    数值行（尾注/比例计算行）剔除，不进入 line_items——原文仍保留
+    在保真层 raw_cells。
+    """
     anchors = build_anchor_map(merged_ranges)
     start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
     items: list[ItemDraft] = []
@@ -69,9 +75,12 @@ def extract_items(
             continue
         name_src = row_cells.get("name", "")
         code_src = row_cells.get("code", "")
-        first_col_text = _text_at(cells, anchors, r, min(det.col_map.values()))
+        min_col = min(det.col_map.values())
+        lead_text = "".join(
+            t for t in (_text_at(cells, anchors, r, c) for c in range(1, min_col + 1)) if t
+        )
         item = ItemDraft(row=r)
-        item.flags["subtotal"] = is_subtotal_row(name_src, first_col_text)
+        item.flags["subtotal"] = is_subtotal_row(name_src, lead_text)
         if not name_src and not code_src:
             if item.flags["subtotal"]:
                 pass  # 合计行保留（异常检测需要它与明细核对）
@@ -96,6 +105,8 @@ def extract_items(
                 src.value = raw or None
             setattr(item, f, src)
         items.append(item)
+    while items and items[-1].flags.get("orphan_numeric_row"):
+        items.pop()  # 明细区末尾连续尾注行：剔除，保真层已留原文
     return items
 
 
