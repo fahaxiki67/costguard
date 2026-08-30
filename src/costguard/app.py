@@ -9,10 +9,12 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from costguard.ui.main_window import MainWindow, load_app_icon
+from costguard.ui.theme import apply_theme
 
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
+    apply_theme(app)
     app.setApplicationName("CostGuard")
     app.setApplicationDisplayName("CostGuard")
     app.setOrganizationName("CostGuard")

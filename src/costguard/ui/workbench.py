@@ -9,6 +9,7 @@ Tab 结构：期次概览 | 清单明细 | 异常检测 | 匹配复核 | 成果�
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -18,16 +19,11 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
-    QListWidget,
     QMessageBox,
     QPushButton,
-    QSpinBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -41,244 +37,27 @@ from costguard.core.engine import crosscheck, settlement_io
 from costguard.core.export import excel_export
 from costguard.core.matching import matching
 from costguard.platform import paths as platform_paths
+from costguard.ui import theme
+from costguard.ui.labels import (
+    DIRECTION_ZH,
+    ITEM_STATUS_ZH,
+    LEVEL_SHORT_ZH,
+    LEVEL_ZH,
+    METHOD_ZH,
+    parse_group_key,
+    rule_zh,
+)
+from costguard.ui.widgets import badge_item, fill_cell, make_data_table
 
+# 展示层与数据层分离（复核项 #6 同源）：内部枚举原样保留在 DB/Tooltip，
+# 本表只做 UI 显示转换；未知值回退原值。
 SEVERITY_ZH = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
-DIRECTION_ZH = {"upward": "对上", "downward": "对下", "unknown": "未标记"}
-LEVEL_ZH = {
-    "confirmed": "规则完全匹配（待人工确认）",
-    "probable": "高概率匹配",
-    "suspected": "疑似匹配",
-    "incomparable": "不可比",
-    "pending_data": "待补资料",
-}
-SHEET_FIELD_ZH = [
-    ("code", "编码"), ("name", "名称"), ("feature", "特征"), ("unit", "单位"),
-    ("quantity", "工程量"), ("unit_price", "单价"), ("amount", "合价"), ("tax_rate", "税率"),
-]
-NON_SETTLEMENT_ROLE_ZH = {
-    "non_settlement_form": "非结算表单（封面/审批表/承诺书等）",
-    "settlement_summary": "汇总/统计表",
-    "supporting_evidence": "支持证据（计量/收方/照片等）",
-    "contract_control": "合同/控制性内容",
-    "other_non_settlement": "其他非结算",
-}
-
-# 待人工确认 sheet：尚未进入结算模型，且未确认过非结算角色
-PENDING_SHEETS_SQL = """
-SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_cols, rs.n_rows, sf.original_name,
-       th.col_map_json, th.header_row_lo, th.header_row_hi, th.needs_review
-FROM raw_sheets rs
-JOIN parse_batches pb ON pb.id = rs.batch_id
-JOIN source_files sf ON sf.id = pb.file_id
-LEFT JOIN table_headers th ON th.sheet_id = rs.id
-WHERE sf.project_id=? AND rs.period_id IS NULL
-  AND NOT EXISTS (SELECT 1 FROM audit_log al
-                  WHERE al.project_id=sf.project_id AND al.target='sheet:'||rs.id
-                  AND al.action='confirm_sheet_non_settlement_role')
-ORDER BY sf.id, rs.id"""
-
-
-class SheetConfirmDialog(QDialog):
-    """人工确认被门控工作表：选列映射/表头范围 → 按清单抽取，或仅存证。
-
-    对应核心接口 confirm_sheet_role_and_extract / confirm_sheet_non_settlement_role。
-    """
-
-    def __init__(self, conn, project_id: int, parent=None):
-        super().__init__(parent)
-        self.conn = conn
-        self.project_id = project_id
-        self.setWindowTitle("人工确认工作表（表头歧义/无表头/表单）")
-        self.resize(860, 560)
-        self._sheets: list[dict] = []
-        self._col_spins: dict[str, QSpinBox] = {}
-
-        split = QSplitter(self)
-        self.sheet_list = QListWidget()
-        self.sheet_list.currentRowChanged.connect(self._on_select)
-        split.addWidget(self.sheet_list)
-
-        right = QWidget()
-        form = QVBoxLayout(right)
-        self.info_label = QLabel("（无待确认工作表）")
-        self.info_label.setWordWrap(True)
-        form.addWidget(self.info_label)
-
-        row_dir = QHBoxLayout()
-        self.dir_combo = QComboBox()
-        for key in ("upward", "downward", "unknown"):
-            self.dir_combo.addItem(DIRECTION_ZH[key], key)
-        self.period_spin = QSpinBox()
-        self.period_spin.setRange(1, 999)
-        row_dir.addWidget(QLabel("方向："))
-        row_dir.addWidget(self.dir_combo)
-        row_dir.addWidget(QLabel("期次："))
-        row_dir.addWidget(self.period_spin)
-        row_dir.addStretch(1)
-        form.addLayout(row_dir)
-
-        form.addWidget(QLabel("列映射（0 = 该字段不使用；列号为 1 起始）："))
-        grid = QGridLayout()
-        for i, (field, zh) in enumerate(SHEET_FIELD_ZH):
-            spin = QSpinBox()
-            spin.setRange(0, 256)
-            grid.addWidget(QLabel(zh), i // 2, (i % 2) * 2)
-            grid.addWidget(spin, i // 2, (i % 2) * 2 + 1)
-            self._col_spins[field] = spin
-        form.addLayout(grid)
-
-        row_hdr = QHBoxLayout()
-        self.hdr_lo = QSpinBox()
-        self.hdr_hi = QSpinBox()
-        for s in (self.hdr_lo, self.hdr_hi):
-            s.setRange(1, 9999)
-        row_hdr.addWidget(QLabel("表头行范围："))
-        row_hdr.addWidget(self.hdr_lo)
-        row_hdr.addWidget(QLabel("至"))
-        row_hdr.addWidget(self.hdr_hi)
-        row_hdr.addStretch(1)
-        form.addLayout(row_hdr)
-
-        self.reason_edit = QTextEdit()
-        self.reason_edit.setPlaceholderText("必填：说明确认依据（写入审计日志）")
-        form.addWidget(QLabel("确认原因（必填）："))
-        form.addWidget(self.reason_edit, 1)
-
-        role_row = QHBoxLayout()
-        role_row.addWidget(QLabel("仅存证角色："))
-        self.role_combo = QComboBox()
-        for key, zh in NON_SETTLEMENT_ROLE_ZH.items():
-            self.role_combo.addItem(zh, key)
-        role_row.addWidget(self.role_combo, 1)
-        form.addLayout(role_row)
-
-        btn_row = QHBoxLayout()
-        extract_btn = QPushButton("按结算清单抽取")
-        extract_btn.clicked.connect(self._do_extract)
-        evidence_btn = QPushButton("仅存证（非结算表单）")
-        evidence_btn.clicked.connect(self._do_evidence_only)
-        close_btn = QPushButton("关闭")
-        close_btn.clicked.connect(self.reject)
-        btn_row.addWidget(extract_btn)
-        btn_row.addWidget(evidence_btn)
-        btn_row.addStretch(1)
-        btn_row.addWidget(close_btn)
-        form.addLayout(btn_row)
-        split.addWidget(right)
-        split.setSizes([260, 600])
-
-        outer = QVBoxLayout(self)
-        outer.addWidget(split)
-        self.reload()
-
-    # ---- 数据 ----
-    def reload(self):
-        self._sheets = [dict(r) for r in self.conn.execute(
-            PENDING_SHEETS_SQL, (self.project_id,)).fetchall()]
-        self.sheet_list.clear()
-        for s in self._sheets:
-            state = "表头歧义待复核" if s["col_map_json"] else "无表头（需完整人工映射）"
-            self.sheet_list.addItem(f"{s['sheet_name']}　[{state}]")
-        if self._sheets:
-            self.sheet_list.setCurrentRow(0)
-        else:
-            self.info_label.setText("当前项目没有待人工确认的工作表。")
-
-    def _current(self) -> dict | None:
-        row = self.sheet_list.currentRow()
-        return self._sheets[row] if 0 <= row < len(self._sheets) else None
-
-    def _on_select(self, row: int):
-        s = self._current()
-        if not s:
-            return
-        max_col = int(s["n_cols"] or 1)
-        for spin in self._col_spins.values():
-            spin.setMaximum(max(1, max_col))
-        if s["col_map_json"]:
-            import json as _json
-
-            col_map = _json.loads(s["col_map_json"])
-            for field, spin in self._col_spins.items():
-                spin.setValue(int(col_map.get(field, 0)))
-            self.hdr_lo.setValue(int(s["header_row_lo"] or 1))
-            self.hdr_hi.setValue(int(s["header_row_hi"] or 1))
-            src = f"来自文件「{s['original_name']}」；自动识别有歧义，已预填候选，请核对后确认"
-        else:
-            for spin in self._col_spins.values():
-                spin.setValue(0)
-            self.hdr_lo.setValue(1)
-            self.hdr_hi.setValue(1)
-            src = f"来自文件「{s['original_name']}」；该表无自动表头，请人工指定列映射与表头行"
-        self.info_label.setText(f"工作表「{s['sheet_name']}」（共 {max_col} 列）\n{src}")
-
-    def _col_map(self) -> dict[str, int]:
-        return {f: sp.value() for f, sp in self._col_spins.items() if sp.value() > 0}
-
-    def _validated(self) -> tuple[dict, tuple[int, int], str]:
-        s = self._current()
-        if not s:
-            raise ValueError("没有选中的工作表")
-        reason = self.reason_edit.toPlainText().strip()
-        if not reason:
-            raise ValueError("确认原因必填（原则 14）")
-        col_map = self._col_map()
-        if "name" not in col_map:
-            raise ValueError("列映射必须包含「名称」列")
-        if "amount" not in col_map and not ("quantity" in col_map and "unit_price" in col_map):
-            raise ValueError("金额口径不完整：需「合价」列，或同时提供「工程量」+「单价」列")
-        cols = list(col_map.values())
-        if len(cols) != len(set(cols)):
-            raise ValueError("同一列被映射到了多个字段")
-        hdr = (self.hdr_lo.value(), self.hdr_hi.value())
-        n_rows = int(s["n_rows"] or 1)
-        if not (1 <= hdr[0] <= hdr[1] <= n_rows):
-            raise ValueError(f"表头行范围无效（有效行 1..{n_rows}）")
-        return col_map, hdr, reason
-
-    def _do_extract(self):
-        s = self._current()
-        if not s:
-            return
-        try:
-            col_map, hdr, reason = self._validated()
-        except ValueError as exc:
-            QMessageBox.warning(self, "人工确认", str(exc))
-            return
-        from costguard.core.engine import settlement_io
-
-        direction = self.dir_combo.currentData()
-        try:
-            n = settlement_io.confirm_sheet_role_and_extract(
-                self.conn, self.project_id, int(s["sheet_id"]), actor="user",
-                reason=reason, direction=direction, period_no=self.period_spin.value(),
-                confirmed_col_map=col_map, confirmed_header_range=hdr)
-            QMessageBox.information(self, "人工确认", f"已抽取 {n} 行明细。")
-        except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
-            QMessageBox.warning(self, "人工确认失败", f"{type(exc).__name__}: {exc}")
-            return
-        self.reason_edit.clear()
-        self.reload()
-
-    def _do_evidence_only(self):
-        s = self._current()
-        if not s:
-            return
-        reason = self.reason_edit.toPlainText().strip()
-        if not reason:
-            QMessageBox.warning(self, "人工确认", "确认原因必填（原则 14）")
-            return
-        from costguard.core.engine import settlement_io
-
-        try:
-            settlement_io.confirm_sheet_non_settlement_role(
-                self.conn, self.project_id, int(s["sheet_id"]), actor="user",
-                confirmed_role=self.role_combo.currentData(), reason=reason)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "仅存证失败", f"{type(exc).__name__}: {exc}")
-            return
-        self.reason_edit.clear()
-        self.reload()
+SEVERITY_KIND = {"high": "danger", "medium": "warning", "low": "neutral", "info": "info"}
+# SheetConfirmDialog 已移至 ui.dialogs.sheet_confirm（视觉分组重构版）；
+# 业务规则/校验/接口保持不变。此处 re-export 维持既有导入路径兼容。
+from costguard.ui.dialogs.sheet_confirm import (  # noqa: E402
+    SheetConfirmDialog,
+)
 
 
 class ReasonDialog(QDialog):
@@ -310,28 +89,22 @@ class ReasonDialog(QDialog):
         return self.reason_edit.toPlainText().strip()
 
 
-def _make_table(headers: list[str]) -> QTableWidget:
-    t = QTableWidget()
-    t.setColumnCount(len(headers))
-    t.setHorizontalHeaderLabels(headers)
-    t.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-    t.setEditTriggers(QTableWidget.NoEditTriggers)
-    t.setAlternatingRowColors(True)
-    return t
+def _make_table(headers: list[str], **spec) -> QTableWidget:
+    """统一表格工厂（theme/widgets）；spec 透传列宽/对齐策略。"""
+    return make_data_table(headers, **spec)
 
 
-def _polish_table(t: QTableWidget, right_align_cols: tuple[int, ...]) -> None:
-    """统一观感：数字列右对齐、表头加粗，按内容自适应列宽。"""
-    for row in range(t.rowCount()):
-        for col in right_align_cols:
-            item = t.item(row, col)
-            if item is not None:
-                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-    t.resizeColumnsToContents()
-    header = t.horizontalHeader()
-    font = header.font()
-    font.setBold(True)
-    header.setFont(font)
+def project_status_summary(conn, project_id: int) -> str:
+    """工作台顶部状态信息：待人工确认工作表数（0 时返回空串）。"""
+    row = conn.execute(
+        """SELECT COUNT(*) c FROM raw_sheets rs
+           JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND rs.period_id IS NULL""",
+        (project_id,),
+    ).fetchone()
+    n = row["c"] if row else 0
+    return f"待人工确认工作表 {n} 张" if n else ""
 
 
 class WorkbenchPage(QWidget):
@@ -341,13 +114,25 @@ class WorkbenchPage(QWidget):
         self.project = project
         self.project_dir = project_dir
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("workbenchTabs")
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(theme.SP_L, theme.SP_M, theme.SP_L, theme.SP_M)
+        layout.setSpacing(theme.SP_S)
         top = QHBoxLayout()
         back_btn = QPushButton("← 返回项目列表")
+        back_btn.setObjectName("btnTertiary")
         back_btn.clicked.connect(on_back)
-        title = QLabel(f"当前项目：{project.name}")
+        title = QLabel(project.name)
+        title.setStyleSheet(
+            "font-size: 15px; font-weight: 600; background: transparent;")
+        pending_count = project_status_summary(conn, project.project_id)
+        status = QLabel(f"Schema v{project.schema_version}" + (f" · {pending_count}" if pending_count else ""))
+        status.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
         top.addWidget(back_btn)
-        top.addWidget(title, 1)
+        top.addSpacing(theme.SP_S)
+        top.addWidget(title)
+        top.addSpacing(theme.SP_M)
+        top.addWidget(status, 1)
         layout.addLayout(top)
         layout.addWidget(self.tabs, 1)
         self.tabs.addTab(self._period_tab(), "期次概览")
@@ -363,6 +148,7 @@ class WorkbenchPage(QWidget):
         v = QVBoxLayout(w)
         btn_row = QHBoxLayout()
         import_btn = QPushButton("导入结算文件…")
+        import_btn.setObjectName("btnPrimary")
         import_btn.clicked.connect(self._import_files)
         contract_btn = QPushButton("导入合同/纪要…")
         contract_btn.clicked.connect(self._import_contract)
@@ -372,12 +158,17 @@ class WorkbenchPage(QWidget):
         check_btn.clicked.connect(self._run_crosscheck)
         confirm_btn = QPushButton("人工确认清单页…")
         confirm_btn.clicked.connect(self._open_sheet_confirm)
-        for b in (import_btn, contract_btn, confirm_btn, detect_btn, check_btn):
+        for b, name in ((import_btn, "btnPrimary"), (contract_btn, None),
+                        (confirm_btn, None), (detect_btn, None), (check_btn, None)):
+            if name:
+                b.setObjectName(name)
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
         self.period_table = _make_table(
-            ["期次", "标题", "方向", "明细行数", "小计行", "合同单位"])
+            ["期次", "标题", "方向", "明细行数", "小计行", "合同单位"],
+            stretch_cols=(1,), center_cols=(2,), right_cols=(3, 4),
+            fixed_widths={0: 56, 2: 72, 3: 88, 4: 72})
         v.addWidget(self.period_table, 1)
         self.dir_combo = QComboBox()
         self.dir_combo.addItems(["", "upward", "downward"])
@@ -405,12 +196,15 @@ class WorkbenchPage(QWidget):
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             direction = {"upward": "对上", "downward": "对下"}.get(r["direction"], "（未标记）")
-            vals = [r["period_no"], r["title"], direction, r["items"], r["subs"], r["contract_party"]]
-            for c, v in enumerate(vals):
-                t.setItem(i, c, QTableWidgetItem(str(v if v is not None else "—")))
+            t.setItem(i, 0, QTableWidgetItem(str(r["period_no"])))
+            t.setItem(i, 1, QTableWidgetItem(str(r["title"] or "—")))
+            kind = {"upward": "info", "downward": "neutral"}.get(r["direction"], "warning")
+            t.setItem(i, 2, badge_item(direction, kind))
+            fill_cell(t, i, 3, r["items"], right=True)
+            fill_cell(t, i, 4, r["subs"], right=True)
+            fill_cell(t, i, 5, r["contract_party"] or "—", secondary=True)
             # 行必须绑定明确 period_id：对上/对下可同期号，按期号更新会双向覆盖
             t.item(i, 0).setData(Qt.UserRole, int(r["id"]))
-        _polish_table(t, (0, 3, 4))
 
     def _import_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -561,7 +355,9 @@ class WorkbenchPage(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         self.items_table = _make_table(
-            ["方向", "期次", "编码", "名称", "单位", "数量", "单价", "合价", "税率", "出处(数量)"])
+            ["方向", "期次", "编码", "名称", "单位", "数量", "单价", "合价", "税率", "出处(数量)"],
+            stretch_cols=(3,), right_cols=(5, 6, 7, 8),
+            fixed_widths={0: 60, 1: 52, 2: 118, 4: 56, 9: 96})
         v.addWidget(self.items_table, 1)
         return w
 
@@ -577,15 +373,18 @@ class WorkbenchPage(QWidget):
         for i, r in enumerate(rows):
             flags = json.loads(r["flags_json"] or "{}")
             ev = json.loads(r["qty_evid"]) if r["qty_evid"] else None
-            vals = [
-                DIRECTION_ZH.get(r["direction"], r["direction"]), r["pno"], r["code"],
-                ("【小计】" if flags.get("subtotal") else "") + (r["name"] or ""),
-                r["unit"], r["quantity"], r["unit_price"], r["amount"], r["tax_rate"],
-                (f"行{ev['row']}列{ev['col']}" if ev else "—"),
-            ]
-            for c, v in enumerate(vals):
-                t.setItem(i, c, QTableWidgetItem(str(v if v is not None else "—")))
-        _polish_table(t, (1, 5, 6, 7, 8))
+            t.setItem(i, 0, QTableWidgetItem(DIRECTION_ZH.get(r["direction"], r["direction"])))
+            t.setItem(i, 1, QTableWidgetItem(str(r["pno"])))
+            t.setItem(i, 2, QTableWidgetItem(str(r["code"] or "—")))
+            prefix = "【小计】" if flags.get("subtotal") else ""
+            t.setItem(i, 3, QTableWidgetItem(prefix + (r["name"] or "—")))
+            t.setItem(i, 4, QTableWidgetItem(str(r["unit"] or "—")))
+            for c, key in ((5, "quantity"), (6, "unit_price"), (7, "amount"), (8, "tax_rate")):
+                v = r[key]
+                fill_cell(t, i, c, v if v is not None else None, right=True,
+                          secondary=v is None)
+            ev_txt = f"行{ev['row']}列{ev['col']}" if ev else "—"
+            fill_cell(t, i, 9, ev_txt, secondary=(ev is None), mono=bool(ev))
 
     # ---------- 异常检测 ----------
     def _anomaly_tab(self) -> QWidget:
@@ -600,7 +399,10 @@ class WorkbenchPage(QWidget):
         row.addWidget(resolve_btn)
         row.addStretch(1)
         v.addLayout(row)
-        self.anomaly_table = _make_table(["编号", "方向", "级别", "规则", "说明", "证据ID", "状态"])
+        self.anomaly_table = _make_table(
+            ["编号", "方向", "级别", "规则", "说明", "证据ID", "状态"],
+            stretch_cols=(4,), center_cols=(2,),
+            fixed_widths={0: 56, 1: 56, 3: 150, 5: 90, 6: 64})
         v.addWidget(self.anomaly_table, 1)
         return w
 
@@ -626,15 +428,17 @@ class WorkbenchPage(QWidget):
         t = self.anomaly_table
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            vals = [r["id"], DIRECTION_ZH.get(r["direction"], r["direction"] or "项目级"),
-                    SEVERITY_ZH.get(r["severity"], r["severity"]), r["rule_id"],
-                    r["message"], r["evidence_id"], r["status"]]
-            for c, v in enumerate(vals):
-                item = QTableWidgetItem(str(v if v is not None else "—"))
-                if r["severity"] == "high" and c <= 3:
-                    item.setForeground(Qt.red)
-                t.setItem(i, c, item)
-        _polish_table(t, (0,))
+            sev_text = SEVERITY_ZH.get(r["severity"], r["severity"])
+            sev_kind = SEVERITY_KIND.get(r["severity"], "neutral")
+            t.setItem(i, 0, QTableWidgetItem(str(r["id"])))
+            t.setItem(i, 1, QTableWidgetItem(DIRECTION_ZH.get(r["direction"], r["direction"] or "项目级")))
+            t.setItem(i, 2, badge_item(sev_text, sev_kind))
+            rule_item = QTableWidgetItem(rule_zh(r["rule_id"]))
+            rule_item.setToolTip(r["rule_id"])
+            t.setItem(i, 3, rule_item)
+            t.setItem(i, 4, QTableWidgetItem(r["message"]))
+            fill_cell(t, i, 5, r["evidence_id"], secondary=True, mono=True)
+            fill_cell(t, i, 6, ITEM_STATUS_ZH.get(r["status"], r["status"]))
 
     def _resolve_anomaly(self):
         row = self.anomaly_table.currentRow()
@@ -677,7 +481,10 @@ class WorkbenchPage(QWidget):
             row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
-        self.match_table = _make_table(["编号", "组键", "级别", "方法", "得分", "行数", "备注"])
+        self.match_table = _make_table(
+            ["编号", "匹配对象", "级别", "匹配方式", "得分", "行数", "状态"],
+            stretch_cols=(1,), center_cols=(2,),
+            fixed_widths={0: 56, 3: 110, 4: 72, 5: 56, 6: 64})
         v.addWidget(self.match_table, 1)
         return w
 
@@ -699,11 +506,19 @@ class WorkbenchPage(QWidget):
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             n_items = len(json.loads(r["item_ids_json"] or "[]"))
-            vals = [r["id"], r["group_key"], LEVEL_ZH.get(r["level"], r["level"]),
-                    r["method"], f"{r['score']:.2f}" if r["score"] is not None else "—", n_items, r["status"]]
-            for c, v in enumerate(vals):
-                t.setItem(i, c, QTableWidgetItem(str(v)))
-        _polish_table(t, (0, 4, 5))
+            t.setItem(i, 0, QTableWidgetItem(str(r["id"])))
+            obj = QTableWidgetItem(parse_group_key(r["group_key"]))
+            obj.setToolTip(r["group_key"])
+            t.setItem(i, 1, obj)
+            kind = ("success" if r["level"] == "confirmed"
+                    else "warning" if r["level"] in ("suspected", "pending_data")
+                    else "neutral")
+            t.setItem(i, 2, badge_item(LEVEL_SHORT_ZH.get(r["level"], r["level"]), kind))
+            t.setItem(i, 3, QTableWidgetItem(METHOD_ZH.get(r["method"], r["method"])))
+            fill_cell(t, i, 4, f"{r['score']:.2f}" if r["score"] is not None else "—",
+                      right=True, secondary=r["score"] is None)
+            fill_cell(t, i, 5, n_items, right=True)
+            fill_cell(t, i, 6, ITEM_STATUS_ZH.get(r["status"], r["status"]))
 
     def _confirm_match(self):
         row = self.match_table.currentRow()
@@ -741,28 +556,57 @@ class WorkbenchPage(QWidget):
     def _export_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
-        export_btn = QPushButton("导出全部报表（Excel）")
-        export_btn.clicked.connect(self._export_excel)
-        doc_btn = QPushButton("导出管理层摘要（Word）")
+        fm = "Finder" if sys.platform == "darwin" else "资源管理器"
+        excel_title = QLabel("Excel 审核底稿")
+        excel_title.setStyleSheet("font-weight: 600; background: transparent;")
+        excel_desc = QLabel(
+            "12 类报表：结算累计、差异、异常、待核实、证据索引等；"
+            "保留公式（合价=数量×单价、差异列），WPS/Excel 打开自动重算。")
+        excel_desc.setWordWrap(True)
+        excel_desc.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        excel_btn = QPushButton("导出 Excel 审核底稿")
+        excel_btn.setObjectName("btnPrimary")
+        excel_btn.clicked.connect(self._export_excel)
+        doc_title = QLabel("Word 管理层摘要")
+        doc_title.setStyleSheet("font-weight: 600; background: transparent;")
+        doc_desc = QLabel(
+            "面向管理层汇报的摘要文档：范围口径、金额与状态、异常与待核实、证据索引。")
+        doc_desc.setWordWrap(True)
+        doc_desc.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        doc_btn = QPushButton("导出 Word 摘要")
         doc_btn.clicked.connect(self._export_docx)
-        import sys as _sys
-
-        _fm = "Finder" if _sys.platform == "darwin" else "资源管理器"
-        open_dir_btn = QPushButton(f"在{_fm}中显示导出目录")
+        open_dir_btn = QPushButton(f"在{fm}中显示导出目录")
+        open_dir_btn.setObjectName("btnTertiary")
         open_dir_btn.clicked.connect(self._open_export_dir)
-        row = QHBoxLayout()
-        for b in (export_btn, doc_btn, open_dir_btn):
-            row.addWidget(b)
-        row.addStretch(1)
-        v.addLayout(row)
+
+        block = QVBoxLayout()
+        block.setSpacing(theme.SP_XS)
+        block.addWidget(excel_title)
+        block.addWidget(excel_desc)
+        erow = QHBoxLayout()
+        erow.addWidget(excel_btn)
+        erow.addStretch(1)
+        block.addLayout(erow)
+        block.addSpacing(theme.SP_L)
+        block.addWidget(doc_title)
+        block.addWidget(doc_desc)
+        drow = QHBoxLayout()
+        drow.addWidget(doc_btn)
+        drow.addStretch(1)
+        block.addLayout(drow)
+        block.addSpacing(theme.SP_M)
+        drow2 = QHBoxLayout()
+        drow2.addWidget(open_dir_btn)
+        drow2.addStretch(1)
+        block.addLayout(drow2)
         tip = QLabel(
-            "导出说明：\n"
-            "· 审核底稿保留公式（合价=数量×单价、差异列），WPS/Excel 打开自动计算；\n"
-            "· 缺失数据不自动补 0，标注「待补资料」；不可比数据不强行比较；\n"
-            "· 全部结论附证据索引，可追溯至原始单元格。")
+            "缺失数据不自动补 0，标注「待补资料」；不可比数据不强行比较；"
+            "全部结论附证据索引，可追溯至原始单元格；自动结果不等于已批准业务结论。")
         tip.setWordWrap(True)
-        v.addWidget(tip)
-        v.addStretch(1)
+        tip.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        block.addWidget(tip)
+        block.addStretch(1)
+        v.addLayout(block)
         return w
 
     def _export_excel(self):
