@@ -47,6 +47,25 @@ FIELD_DICT: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 
 # 名称列中出现的"小计/合计"标记词（不计入明细，也不能当作清单名称）
 SUBTOTAL_WORDS = ("小计", "合计", "总计", "累计", "分部小计", "本章小计", "本页小计", "本页合计")
+# 合计级（全表控制值）vs 页级/分部级：C 路径控制值只认合计级——真实分页表
+# "本页小计"与"合计"并存，全部求和会把控制值翻倍（v0.1.5 已知限制）。
+GRAND_TOTAL_WORDS = ("合计", "总计", "累计")
+
+
+def is_grand_total_row(name_text: str, first_cell_text: str) -> bool:
+    """合计级行（全表控制值）。判定规则与 is_subtotal_row 相同，词表不同。"""
+    for text in (name_text, first_cell_text):
+        t = _norm_ws(text)
+        if not t:
+            continue
+        for w in GRAND_TOTAL_WORDS:
+            if t == w:
+                return True
+            if t.startswith(w) and not _SUBTOTAL_TRIM.sub("", t[len(w):]):
+                return True
+            if t.endswith(w) and not _SUBTOTAL_TRIM.sub("", t[: -len(w)]):
+                return True
+    return False
 
 _HEADER_ROW_MAX = 15  # 表头识别扫描的最大行号
 

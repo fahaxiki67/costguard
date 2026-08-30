@@ -219,9 +219,27 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     summary_a = _sum_line_item_amounts(detail_rows)
     total_a = summary_a.total
 
-    # C：原表小计行金额
+    # C：原表小计行金额。控制值只认"合计级"行（合计/总计/累计）——真实分页
+    # 结算书"本页小计"与"合计"并存，全部求和会把控制值翻倍（v0.1.5 已知限制）。
+    # 唯一合计级有值行 → 控制值；零个 → not_available；多个 → 不唯一，
+    # not_available 并留注（不擅自挑行或求和）。
     subtotal_rows = [r for r in rows if json.loads(r["flags_json"] or "{}").get("subtotal")]
-    raw_subtotal, _ = _sum_amounts(subtotal_rows)
+    grand_rows = [
+        r for r in subtotal_rows
+        if json.loads(r["flags_json"] or "{}").get("grand_total")
+    ]
+    grand_with_amount = [r for r in grand_rows if r["amount"] is not None]
+    control_note = None
+    if len(grand_with_amount) == 1:
+        raw_subtotal, _ = _sum_amounts(grand_with_amount)
+    else:
+        raw_subtotal, _ = _sum_amounts([])  # None
+        if len(grand_with_amount) > 1:
+            control_note = (
+                f"{len(grand_with_amount)} 个合计级行均有金额，C 控制值不唯一，"
+                "请人工核对原表（未擅自挑行或求和）")
+        elif subtotal_rows:
+            control_note = "仅有页级/分部级小计行，无合计级控制行，C 控制不可用"
 
     # B：从原始网格独立重算（不复用 line_items）
     sheet_ids = conn.execute(
@@ -316,6 +334,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         control_status = "match" if abs(control_diff) <= TOL else "diff"
         if control_status == "diff":
             notes.append(f"A路径与C原表控制额差异{control_diff}，保持待复核，未调平")
+    if control_note:
+        notes.append(control_note)
     return CheckResult(
         period_id=period_id, period_no=period_no, direction=direction,
         path_a_total=total_a, path_b_total=total_b, raw_subtotal=raw_subtotal,

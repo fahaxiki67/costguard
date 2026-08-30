@@ -14,6 +14,7 @@ from costguard.core.parsing.header_detect import (
     HeaderDetection,
     build_anchor_map,
     data_rows_range,
+    is_grand_total_row,
     is_subtotal_row,
 )
 
@@ -81,6 +82,8 @@ def extract_items(
         )
         item = ItemDraft(row=r)
         item.flags["subtotal"] = is_subtotal_row(name_src, lead_text)
+        if item.flags["subtotal"]:
+            item.flags["grand_total"] = is_grand_total_row(name_src, lead_text)
         # 分部/章节标题行：只有名称（或编码），无任何数值 → 标记并跳过。
         # 有编码但无数值的行（如"缺数量清单行"）不在此列——它们有名称+编码，
         # 数值缺失走待补资料流程；本分支仅针对真实结算书分部标题行
