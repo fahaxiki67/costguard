@@ -3,7 +3,8 @@ name = "costguard"
 version = "0.1.0"
 description = "CostGuard - Engineering Cost & Compliance Intelligence Workbench (工程经营合规智能工作台)"
 requires-python = ">=3.12,<3.13"
-license = { text = "Proprietary" }  # License 待定：见 docs/adr/ADR-009-license-decision.md
+readme = "README.md"
+license = "Apache-2.0"
 dependencies = [
     "pyside6>=6.7,<7",
     "openpyxl>=3.1,<4",
@@ -25,6 +26,12 @@ dev = [
 
 [project.gui-scripts]
 costguard = "costguard.app:main"
+
+[project.urls]
+Homepage = "https://github.com/fahaxiki67/costguard"
+Documentation = "https://github.com/fahaxiki67/costguard#readme"
+Issues = "https://github.com/fahaxiki67/costguard/issues"
+Changelog = "https://github.com/fahaxiki67/costguard/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]

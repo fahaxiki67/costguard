@@ -247,6 +247,43 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE table_headers ADD COLUMN data_row_end INTEGER",
         ],
     ),
+    (
+        # v5: 别名按结算方向隔离；period_totals 明确保存 A/B、C 控制与金额来源。
+        # 旧别名无法可靠推断方向，迁移为 unknown，只在未标记方向中继续生效；
+        # 对上/对下需要按各自证据重新确认，禁止默认跨方向复用。
+        5,
+        [
+            """CREATE TABLE item_aliases_new (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                canonical_key TEXT NOT NULL,
+                alias_text TEXT NOT NULL,
+                mapping_basis TEXT NOT NULL,
+                confirmed_by TEXT DEFAULT 'user',
+                confirmed_at TEXT NOT NULL,
+                UNIQUE(project_id, direction, alias_text)
+            )""",
+            """INSERT INTO item_aliases_new
+               (id, project_id, direction, canonical_key, alias_text, mapping_basis,
+                confirmed_by, confirmed_at)
+               SELECT id, project_id, 'unknown', canonical_key, alias_text, mapping_basis,
+                      confirmed_by, confirmed_at
+               FROM item_aliases""",
+            "DROP TABLE item_aliases",
+            "ALTER TABLE item_aliases_new RENAME TO item_aliases",
+            "ALTER TABLE period_totals ADD COLUMN raw_amount_sum TEXT",
+            "ALTER TABLE period_totals ADD COLUMN calculated_amount_sum TEXT",
+            "ALTER TABLE period_totals ADD COLUMN calculated_amount_used_sum TEXT",
+            "ALTER TABLE period_totals ADD COLUMN effective_amount_sum TEXT",
+            "ALTER TABLE period_totals ADD COLUMN amount_source TEXT NOT NULL DEFAULT 'missing'",
+            "ALTER TABLE period_totals ADD COLUMN amount_status TEXT NOT NULL DEFAULT 'missing'",
+            "ALTER TABLE period_totals ADD COLUMN ab_diff TEXT",
+            "ALTER TABLE period_totals ADD COLUMN ab_status TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE period_totals ADD COLUMN control_diff TEXT",
+            "ALTER TABLE period_totals ADD COLUMN control_status TEXT NOT NULL DEFAULT 'not_available'",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

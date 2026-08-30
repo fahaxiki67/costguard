@@ -275,36 +275,37 @@ def rule_duplicates(conn, project_id) -> list[Finding]:
 
 
 def rule_same_code_diff_name(conn, project_id) -> list[Finding]:
-    out: dict[str, Finding] = {}
-    seen: dict[str, set] = {}
+    out: list[Finding] = []
+    seen: dict[tuple[str, str], set[str]] = {}
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]) or not r["code"]:
             continue
-        seen.setdefault(r["code"], set()).add((r["name"] or "").strip())
-    for code, names in seen.items():
+        seen.setdefault((r["dir"], r["code"]), set()).add((r["name"] or "").strip())
+    for (direction, code), names in seen.items():
         if len(names) > 1:
-            out[code] = Finding(
+            out.append(Finding(
                 "same_code_diff_name", "medium", "project", project_id,
-                f"编码 {code} 对应多个名称：{sorted(names)}，请核实口径",
-                {"names": sorted(names)},
-            )
-    return list(out.values())
+                f"{_dir_label(direction)}编码 {code} 对应多个名称：{sorted(names)}，请核实口径",
+                {"direction": direction, "names": sorted(names)},
+            ))
+    return out
 
 
 def rule_same_name_diff_code(conn, project_id) -> list[Finding]:
-    seen: dict[str, set] = {}
+    seen: dict[tuple[str, str], set[str]] = {}
     out = []
     for r in _rows(conn, project_id):
         if _is_subtotal(r["flags_json"]) or not (r["name"] or "").strip():
             continue
-        seen.setdefault((r["name"] or "").strip(), set()).add(r["code"] or "")
-    for name, codes in seen.items():
+        seen.setdefault((r["dir"], (r["name"] or "").strip()), set()).add(r["code"] or "")
+    for (direction, name), codes in seen.items():
         codes.discard("")
         if len(codes) > 1:
             out.append(Finding(
                 "same_name_diff_code", "low", "project", project_id,
-                f"名称「{name}」对应多个编码：{sorted(codes)}，可能为不同部位/阶段，亦可能录入不一致",
-                {"codes": sorted(codes)},
+                f"{_dir_label(direction)}名称「{name}」对应多个编码：{sorted(codes)}，"
+                "可能为不同部位/阶段，亦可能录入不一致",
+                {"direction": direction, "codes": sorted(codes)},
             ))
     return out
 
@@ -401,9 +402,9 @@ def rule_tax_changed(conn, project_id) -> list[Finding]:
 def rule_tax_mode_mixed(conn, project_id) -> list[Finding]:
     """含税/不含税混用：从表头文本推断每期单价口径。"""
     out = []
-    modes: dict[int, set] = {}
+    modes: dict[tuple[str, int], set[str]] = {}
     headers = conn.execute(
-        """SELECT th.*, sp.period_no AS pno FROM table_headers th
+        """SELECT th.*, sp.period_no AS pno, sp.direction AS direction FROM table_headers th
            JOIN raw_sheets rs ON rs.id = th.sheet_id
            JOIN settlement_periods sp ON sp.id = rs.period_id
            WHERE sp.project_id=?""",
@@ -420,15 +421,23 @@ def rule_tax_mode_mixed(conn, project_id) -> list[Finding]:
         ).fetchall()
         sheet_text = "".join((r["raw_value"] or "") for r in row)
         if "不含税" in sheet_text:
-            modes.setdefault(h["pno"], set()).add("excl_tax")
+            modes.setdefault((h["direction"], h["pno"]), set()).add("excl_tax")
         elif "含税" in sheet_text:
-            modes.setdefault(h["pno"], set()).add("incl_tax")
-    if len({m for s in modes.values() for m in s}) > 1:
-        out.append(Finding(
-            "tax_mode_mixed", "high", "project", project_id,
-            f"各期单价含税口径不一致（{modes}），直接累计会产生口径混淆，请统一后比较",
-            {"modes": {str(k): sorted(v) for k, v in modes.items()}},
-        ))
+            modes.setdefault((h["direction"], h["pno"]), set()).add("incl_tax")
+    directions = {direction for direction, _ in modes}
+    for direction in sorted(directions):
+        direction_modes = {
+            pno: values for (row_direction, pno), values in modes.items()
+            if row_direction == direction
+        }
+        if len({mode for values in direction_modes.values() for mode in values}) > 1:
+            out.append(Finding(
+                "tax_mode_mixed", "high", "project", project_id,
+                f"{_dir_label(direction)}各期单价含税口径不一致（{direction_modes}），"
+                "直接累计会产生口径混淆，请统一后比较",
+                {"direction": direction,
+                 "modes": {str(k): sorted(v) for k, v in direction_modes.items()}},
+            ))
     return out
 
 

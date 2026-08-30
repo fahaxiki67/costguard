@@ -93,6 +93,23 @@ def _make_simple(src: Path) -> None:
     wb.save(src)
 
 
+def test_decimal_warning_forces_with_findings() -> None:
+    """Decimal 复算警告必须阻止无条件 passed，即使其他门槛全绿。"""
+    import scripts.real_acceptance_run as runner
+
+    status = runner.classify_technical_validation(
+        technical_execution_complete=True,
+        ab_check_status="ab_passed",
+        evidence_status="available",
+        high_findings=0,
+        control_status="not_available",
+        anomaly_total=0,
+        decimal_warning_groups=1,
+    )
+
+    assert status == "with_findings"
+
+
 class TestRunnerNonDestructive:
     def test_timestamped_runs_preserve_previous(self, runner_env):
         """两次运行产生两个 run 目录：第一次结果必须原样保留（基线不覆盖）。"""
@@ -232,7 +249,7 @@ class TestFormRouting:
 class TestPureFormProjectHandling:
     def test_pure_form_project_partial_and_skips_settlement_pipeline(self, runner_env, monkeypatch):
         """纯表单项目：status=partial（非 ok/failed），不进计算/异常/匹配/导出，
-        steps 单列 non_settlement_form_needs_manual_review，full_pipeline=False。"""
+        steps 单列 non_settlement_form_needs_manual_review，技术执行状态为 False。"""
         runner, base = runner_env
         # T01 换成纯表单，其余 simple 清单
         manifest_t01 = base / "corpus" / "T01_sample.xlsx"
@@ -258,7 +275,10 @@ class TestPureFormProjectHandling:
         steps = t01.get("steps", {})
         assert steps.get("non_settlement_form_needs_manual_review") is True, \
             f"纯表单必须单列 needs_manual_review: {steps}"
-        assert steps.get("full_pipeline") is False
+        assert steps.get("technical_execution_complete") is False
+        assert steps.get("technical_validation_status") == "not_run_or_incomplete"
+        assert steps.get("overall_acceptance_status") == "needs_manual_review"
+        assert "full_pipeline" not in steps
         for k in ("compute", "anomalies", "matches", "excel", "word"):
             assert steps.get(k) is False, f"纯表单 steps.{k} 必须为 False: {steps}"
         # 口径：settlement parse 仅在 report.status=='ok' 时算成功；
@@ -434,7 +454,13 @@ class TestManualSheetDecisions:
         runner.main()
         run = sorted((base / "work").glob("run_*"))[-1]
         rec = json.loads((run / "done" / "T01.json").read_text(encoding="utf-8"))
-        assert rec["steps"]["full_pipeline"] is True
+        assert rec["steps"]["technical_execution_complete"] is True
+        assert rec["steps"]["technical_validation_status"] == "with_findings"
+        assert rec["steps"]["overall_acceptance_status"] == "pending_wps_with_findings"
+        assert rec["steps"]["ab_check_status"] == "ab_passed"
+        assert rec["steps"]["control_status"] == "not_available"
+        assert rec["steps"]["wps"] == "pending_manual"
+        assert "full_pipeline" not in rec["steps"]
         assert rec["settlement_parse"]["status"] == "ok_after_manual_confirmation"
         assert len(rec["manual_sheet_decisions"]) == 2
         assert rec.get("form_route") in (None, {})
@@ -451,3 +477,43 @@ class TestManualSheetDecisions:
         conn.close()
         assert row["quantity"] is None and row["amount"] == "3370591.52"
         assert row["period_no"] == 2 and row["direction"] == "downward"
+
+
+class TestAcceptanceControls:
+    def test_bridge_is_evidence_and_difference_remains_open_anomaly(
+        self, runner_env, tmp_path
+    ):
+        runner, _ = runner_env
+        from costguard.core.models import project as pm
+
+        info = pm.create_project("控制值记录", tmp_path / "workspace")
+        info, conn = pm.open_project(Path(info.workspace_path))
+        try:
+            recorded = runner.record_acceptance_controls(conn, info.project_id, {
+                "bridges": [{
+                    "summary": "小计加税金桥接",
+                    "steps": [{"formula": "100+3", "value": "103"}],
+                    "sources": [{"sheet": "计算明细表", "location": "J16:J17"}],
+                }],
+                "differences": [{
+                    "severity": "medium",
+                    "summary": "公式值与旧缓存差异0.48元",
+                    "sources": [{"sheet": "计算明细表", "location": "G7,K7"}],
+                }],
+            })
+            assert [r["kind"] for r in recorded] == ["bridge", "difference"]
+            assert conn.execute(
+                "SELECT COUNT(*) c FROM evidence WHERE project_id=?",
+                (info.project_id,),
+            ).fetchone()["c"] == 2
+            anomaly = conn.execute(
+                "SELECT rule_id, severity, status FROM anomalies WHERE project_id=?",
+                (info.project_id,),
+            ).fetchone()
+            assert dict(anomaly) == {
+                "rule_id": "acceptance_control_difference",
+                "severity": "medium",
+                "status": "open",
+            }
+        finally:
+            conn.close()

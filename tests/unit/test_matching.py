@@ -38,6 +38,30 @@ def levels_of(groups):
 
 
 class TestLevels:
+    def test_same_item_in_upward_and_downward_is_never_merged(self, db):
+        """同码同名跨方向也必须是两个组，默认入口不得混合。"""
+        conn, pid, (p1, p2) = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (p1,)
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?", (p2,)
+            )
+        add(conn, p1, "C1", "平整场地")
+        add(conn, p2, "C1", "平整场地")
+
+        groups = levels_of(matching_mod.match_items(conn, pid))
+
+        assert set(groups) == {"downward:code:C1", "upward:code:C1"}
+        assert all(len(group.item_ids) == 1 for group in groups.values())
+        assert {group.item_ids[0] for group in groups.values()} == {
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM line_items ORDER BY id"
+            ).fetchall()
+        }
+
     def test_same_code_same_name_confirmed(self, db):
         conn, pid, (p1, p2) = db
         add(conn, p1, "C1", "平整场地")
@@ -113,6 +137,66 @@ class TestLevels:
 
 
 class TestHumanReview:
+    def test_direction_prefix_is_not_persisted_into_alias_core_key(self, db):
+        conn, pid, (p1, p2) = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (p1,)
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?", (p2,)
+            )
+        add(conn, p1, None, "对上临时别名")
+        add(conn, p2, None, "对下清单")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        row = conn.execute(
+            "SELECT id, group_key FROM matches WHERE group_key LIKE 'upward:%'"
+        ).fetchone()
+        with conn:
+            conn.execute(
+                "UPDATE matches SET level=? WHERE id=?", (matching_mod.SUSPECTED, row["id"])
+            )
+
+        matching_mod.confirm_match(
+            conn, pid, row["id"], "王工", "人工确认同义名称", alias_name="对上临时别名"
+        )
+
+        alias = conn.execute(
+            "SELECT canonical_key, direction FROM item_aliases WHERE project_id=?", (pid,)
+        ).fetchone()
+        assert alias["canonical_key"] == row["group_key"].removeprefix("upward:")
+        assert not alias["canonical_key"].startswith("upward:")
+        assert alias["direction"] == "upward"
+
+    def test_upward_alias_never_applies_to_downward_items(self, db):
+        """对上的人工别名是方向性业务结论，不得自动合并对下同名行。"""
+        conn, pid, (p1, p2) = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (p1,)
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?", (p2,)
+            )
+            conn.execute(
+                """INSERT INTO item_aliases(project_id, direction, canonical_key,
+                   alias_text, mapping_basis, confirmed_by, confirmed_at)
+                   VALUES (?, 'upward', 'code:C1', '已确认别名', '对上人工确认', '王工', '2026')""",
+                (pid,),
+            )
+        add(conn, p1, "C1", "标准名称")
+        add(conn, p1, None, "已确认别名")
+        add(conn, p2, "C1", "标准名称")
+        add(conn, p2, None, "已确认别名")
+
+        groups = levels_of(matching_mod.match_items(conn, pid))
+
+        assert groups["upward:code:C1"].method == "alias"
+        assert len(groups["upward:code:C1"].item_ids) == 2
+        assert len(groups["downward:code:C1"].item_ids) == 1
+        assert "downward:name:已确认别名" in groups
+        assert groups["downward:name:已确认别名"].method != "alias"
+
     def test_confirm_requires_reason(self, db):
         conn, pid, (p1, p2) = db
         add(conn, p1, "C1", "平整场地")

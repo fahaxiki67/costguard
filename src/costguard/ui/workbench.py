@@ -39,8 +39,9 @@ from costguard.core.matching import matching
 from costguard.platform import paths as platform_paths
 
 SEVERITY_ZH = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
+DIRECTION_ZH = {"upward": "对上", "downward": "对下", "unknown": "未标记"}
 LEVEL_ZH = {
-    "confirmed": "确认匹配",
+    "confirmed": "规则完全匹配（待人工确认）",
     "probable": "高概率匹配",
     "suspected": "疑似匹配",
     "incomparable": "不可比",
@@ -281,13 +282,13 @@ class WorkbenchPage(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         self.items_table = _make_table(
-            ["期次", "编码", "名称", "单位", "数量", "单价", "合价", "税率", "出处(数量)"])
+            ["方向", "期次", "编码", "名称", "单位", "数量", "单价", "合价", "税率", "出处(数量)"])
         v.addWidget(self.items_table, 1)
         return w
 
     def refresh_items(self):
         rows = self.conn.execute(
-            """SELECT li.*, sp.period_no AS pno FROM line_items li
+            """SELECT li.*, sp.period_no AS pno, sp.direction AS direction FROM line_items li
                JOIN settlement_periods sp ON sp.id = li.period_id
                WHERE sp.project_id=? ORDER BY sp.period_no, li.id LIMIT 2000""",
             (self.project.project_id,),
@@ -298,7 +299,8 @@ class WorkbenchPage(QWidget):
             flags = json.loads(r["flags_json"] or "{}")
             ev = json.loads(r["qty_evid"]) if r["qty_evid"] else None
             vals = [
-                r["pno"], r["code"], ("【小计】" if flags.get("subtotal") else "") + (r["name"] or ""),
+                DIRECTION_ZH.get(r["direction"], r["direction"]), r["pno"], r["code"],
+                ("【小计】" if flags.get("subtotal") else "") + (r["name"] or ""),
                 r["unit"], r["quantity"], r["unit_price"], r["amount"], r["tax_rate"],
                 (f"行{ev['row']}列{ev['col']}" if ev else "—"),
             ]
@@ -318,25 +320,38 @@ class WorkbenchPage(QWidget):
         row.addWidget(resolve_btn)
         row.addStretch(1)
         v.addLayout(row)
-        self.anomaly_table = _make_table(["编号", "级别", "规则", "说明", "证据ID", "状态"])
+        self.anomaly_table = _make_table(["编号", "方向", "级别", "规则", "说明", "证据ID", "状态"])
         v.addWidget(self.anomaly_table, 1)
         return w
 
     def refresh_anomalies(self):
         rows = self.conn.execute(
-            """SELECT id, rule_id, severity, message, evidence_id, status FROM anomalies
-               WHERE project_id=? ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1
-               WHEN 'low' THEN 2 ELSE 3 END, id""",
+            """SELECT a.id, a.rule_id, a.severity, a.message, a.evidence_id, a.status,
+                      COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
+                        AS direction
+               FROM anomalies a
+               LEFT JOIN line_items li
+                 ON a.subject_type='line_item' AND li.id=a.subject_id
+               LEFT JOIN settlement_periods sp_item ON sp_item.id=li.period_id
+               LEFT JOIN settlement_periods sp_period
+                 ON a.subject_type='period' AND sp_period.id=a.subject_id
+               LEFT JOIN raw_sheets rs
+                 ON a.subject_type='sheet' AND rs.id=a.subject_id
+               LEFT JOIN settlement_periods sp_sheet ON sp_sheet.id=rs.period_id
+               WHERE a.project_id=? ORDER BY CASE a.severity
+               WHEN 'high' THEN 0 WHEN 'medium' THEN 1
+               WHEN 'low' THEN 2 ELSE 3 END, a.id""",
             (self.project.project_id,),
         ).fetchall()
         t = self.anomaly_table
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            vals = [r["id"], SEVERITY_ZH.get(r["severity"], r["severity"]), r["rule_id"],
+            vals = [r["id"], DIRECTION_ZH.get(r["direction"], r["direction"] or "项目级"),
+                    SEVERITY_ZH.get(r["severity"], r["severity"]), r["rule_id"],
                     r["message"], r["evidence_id"], r["status"]]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v if v is not None else "—"))
-                if r["severity"] == "high" and c <= 2:
+                if r["severity"] == "high" and c <= 3:
                     item.setForeground(Qt.red)
                 t.setItem(i, c, item)
 
@@ -415,7 +430,7 @@ class WorkbenchPage(QWidget):
             return
         mid = int(self.match_table.item(row, 0).text())
         alias = self.match_table.item(row, 1).text()
-        dlg = ReasonDialog("确认匹配", f"将匹配组 #{mid} 确认为「确认匹配」？", self)
+        dlg = ReasonDialog("人工确认匹配", f"将匹配组 #{mid} 标记为人工已确认？", self)
         if dlg.exec() != QDialog.Accepted:
             return
         matching.confirm_match(self.conn, self.project.project_id, mid, "user", dlg.reason(),

@@ -4,6 +4,12 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-30
+
+First open-source developer preview. It provides the seven-step settlement workflow,
+macOS Apple Silicon GUI, source distribution and Python wheel. A signed/notarized DMG
+is not included in this release.
+
 ### Added
 - **Phase 1** framework: platform abstraction (macOS arm64 first), SQLite with
   versioned migrations + auto-backup + rollback, Decimal money engine, project
@@ -43,29 +49,53 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
   count with direction split, tax mode status, evidence record count; docx no
   longer claims full traceability without an evidence entry (points to the
   Excel evidence index instead); synthetic-data disclaimer added
+- Migration v5 scopes confirmed item aliases by settlement direction. Legacy
+  aliases migrate to `unknown` and must be reconfirmed before use in an upward
+  or downward workflow; the same alias text may be confirmed independently per
+  direction.
+- `period_totals` now persists raw amount, calculated candidate, calculated
+  fallback actually used, effective amount, amount source/status, A/B status and
+  difference, and C/control status and difference. Compatibility fields remain
+  populated but cannot hide an open control difference.
+- Excel anomaly and pending-review sheets now carry an explicit direction column
+  for line-item, period, and sheet findings; project-level findings are labeled
+  accordingly.
 
-### Fixed (environment)
-- LibreOffice.app on the dev machine had a broken installation (codesign
-  "sealed resource invalid": main bundle + soffice binary + Python framework;
-  LO python SIGKILL/segfault) — root cause of the intermittent headless
-  SIGABRT (rc -6/134) in the recalc test. Reinstalled via
-  `brew reinstall --cask libreoffice` (26.2.5.2 -> 26.8.0.3): codesign clean,
-  conversion smoke OK, recalc test 5/5, full suite 2x152+1skip green.
+### Fixed
+- Migration failure recovery now restores the pre-migration database and records
+  the schema version without leaving a half-migrated database.
+- Re-aggregating a period now invalidates stale A/B/C differences, statuses, and
+  evidence links before a new cross-check, preventing old results from being read
+  as current validation.
+- Sheet-level anomalies now retain their settlement direction in the desktop UI,
+  matching the Excel anomaly export.
+- Direct `costguard` startup now creates the real main window and remains in the
+  Qt event loop on macOS arm64.
+- The WPS acceptance generator now writes to the repository-local ignored workspace
+  instead of a developer-specific `.zcode` path.
+- LibreOffice headless conversion remains environment-dependent. In the current
+  controlled run it returned rc=1 without output, so that test is reported as
+  skipped and is not used as evidence that WPS passed.
 
 ### Real-data acceptance (formal round)
 - 13/13 private copies imported, hashes verified before/after (zero modification);
-  10/13 full pipeline success, 3 expected boundaries with explicit messages
-  (.doc/image unsupported, non-standard-header workbook rejected without guessing)
-- Per-file isolated projects (period semantics no longer cross-file);
-  dual/triple-path Decimal reconciliation per file; R05 chapter-summary table
-  keeps true zeros and marks 19/22 missing amounts as pending (never zero-filled)
-- WPS manual acceptance PASSED (2026-08-29, dynamic formula recalc verified by user)
+  private corpus and outputs remain excluded by `.gitignore`.
+- R05–R07 completed the settlement execution pipeline. A/B independent Decimal
+  recomputation matches; R05 retains a 1,680.00 tax bridge to C, while R06/R07
+  retain source-cache/control differences as open findings without balancing.
+- R04, R11 and R12 completed text extraction but require page/paragraph source
+  review. R01, R02 and R08–R10 remain at explicit spreadsheet role-review gates;
+  legacy `.doc` and image parsing remain unsupported with recoverable messages.
+- The synthetic minimum WPS sample passed manual verification on 2026-08-29.
+  The latest R05–R07 private real-data exports remain a separate conditional WPS
+  open/recalculate/save/reopen gate and are not marked as accepted.
 
 ### Testing
-- 129 tests + 1 explicit skip: WPS has no headless xlsx recalc CLI (wpscli is
-  PDF-conversion only) — real-engine recalculation is verified via LibreOffice
-  (same OOXML formula spec); WPS manual-open verification remains a human step
+- Latest controlled run: 207 passed. WPS remains an explicit manual compatibility
+  and visual gate rather than being inferred from unit tests.
+- Targeted regressions prove that an upward alias is never applied to downward
+  items, A/B and control states survive persistence, anomaly exports retain
+  direction, and Decimal warning groups force `with_findings` rather than an
+  unconditional pass.
 - Second-path reconciliation: exported workbook re-read and recomputed with
   Decimal (detail sums vs cumulative sheet), independent of LibreOffice
-
-

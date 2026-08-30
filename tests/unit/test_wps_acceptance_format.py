@@ -16,6 +16,13 @@ def _load_generator():
     return module
 
 
+def test_default_output_dir_is_repo_local_and_privately_ignored():
+    generator = _load_generator()
+    repo_root = Path(__file__).resolve().parents[2]
+
+    assert generator.default_output_dir() == repo_root / "local_private_data" / "wps_acceptance"
+
+
 def test_wps_acceptance_workbook_has_borders_and_centered_cells(tmp_path):
     generator = _load_generator()
     xlsx_path, _ = generator.generate(tmp_path)

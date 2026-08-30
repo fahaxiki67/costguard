@@ -55,9 +55,11 @@ class TestWorkbench:
         wb_page.refresh_items()
         t = wb_page.items_table
         assert t.rowCount() > 0
-        # 数量列有值；出处列非空（保真层证据）
-        assert t.item(0, 4).text() not in ("", "—")
-        assert t.item(0, 8).text().startswith("行")
+        # 方向直接可见；数量列有值；出处列非空（保真层证据）
+        assert t.horizontalHeaderItem(0).text() == "方向"
+        assert t.item(0, 0).text() == "未标记"
+        assert t.item(0, 5).text() not in ("", "—")
+        assert t.item(0, 9).text().startswith("行")
 
     def test_anomaly_run_and_display(self, wb_page):
         from costguard.core.anomalies import engine
@@ -65,6 +67,38 @@ class TestWorkbench:
         findings = engine.run_anomalies(wb_page.conn, wb_page.project.project_id)
         wb_page.refresh_anomalies()
         assert wb_page.anomaly_table.rowCount() == len(findings)
+        assert wb_page.anomaly_table.horizontalHeaderItem(1).text() == "方向"
+
+    def test_sheet_anomaly_displays_its_period_direction(self, wb_page):
+        row = wb_page.conn.execute(
+            """SELECT rs.id AS sheet_id, rs.period_id
+               FROM raw_sheets rs
+               WHERE rs.period_id IS NOT NULL
+               ORDER BY rs.id LIMIT 1"""
+        ).fetchone()
+        assert row is not None
+        with wb_page.conn:
+            wb_page.conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?",
+                (row["period_id"],),
+            )
+            wb_page.conn.execute(
+                """INSERT INTO anomalies(
+                   project_id, rule_id, severity, subject_type, subject_id,
+                   message, status, created_at)
+                   VALUES (?, 'sheet_direction_probe', 'medium', 'sheet', ?,
+                           '工作表方向回溯测试', 'open', '2026-08-30T00:00:00')""",
+                (wb_page.project.project_id, row["sheet_id"]),
+            )
+
+        wb_page.refresh_anomalies()
+        table = wb_page.anomaly_table
+        probe_rows = [
+            i for i in range(table.rowCount())
+            if table.item(i, 3).text() == "sheet_direction_probe"
+        ]
+        assert len(probe_rows) == 1
+        assert table.item(probe_rows[0], 1).text() == "对上"
 
     def test_match_run_and_levels_zh(self, wb_page):
         from costguard.core.matching import matching
@@ -74,7 +108,9 @@ class TestWorkbench:
         wb_page.refresh_matches()
         assert wb_page.match_table.rowCount() == len(groups)
         levels = {wb_page.match_table.item(i, 2).text() for i in range(wb_page.match_table.rowCount())}
-        assert levels & {"确认匹配", "高概率匹配", "疑似匹配", "不可比", "待补资料"}
+        assert levels & {
+            "规则完全匹配（待人工确认）", "高概率匹配", "疑似匹配", "不可比", "待补资料"
+        }
 
     def test_reason_dialog_requires_reason(self, app, wb_page, monkeypatch):
         """空原因拒绝接受； QMessageBox 打桩避免 offscreen 模态阻塞。"""

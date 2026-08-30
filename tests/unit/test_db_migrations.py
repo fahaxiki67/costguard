@@ -18,7 +18,6 @@ class TestMigrate:
         assert v == migrations.LATEST_SCHEMA_VERSION
         conn = migrations.connect(db)
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        conn.close()
         for expected in [
             "projects", "source_files", "parse_batches", "raw_sheets", "raw_cells",
             "table_headers", "settlement_periods", "line_items", "item_aliases",
@@ -26,6 +25,15 @@ class TestMigrate:
             "contract_docs", "contract_facts", "schema_migrations",
         ]:
             assert expected in tables, f"missing table {expected}"
+        alias_columns = {r[1] for r in conn.execute("PRAGMA table_info(item_aliases)")}
+        assert "direction" in alias_columns
+        total_columns = {r[1] for r in conn.execute("PRAGMA table_info(period_totals)")}
+        assert {
+            "raw_amount_sum", "calculated_amount_sum", "calculated_amount_used_sum",
+            "effective_amount_sum", "amount_source", "amount_status",
+            "ab_diff", "ab_status", "control_diff", "control_status",
+        } <= total_columns
+        conn.close()
 
     def test_idempotent(self, tmp_path):
         db = _tmp_db(tmp_path)
@@ -95,7 +103,7 @@ class TestFkAndWal:
 
 class TestLegacyUpgrade:
     def test_late_failure_restores_v1_database_completely(self, tmp_path, monkeypatch):
-        """v1→v4 后续迁移失败时，不得留下 v2/v3 的部分提交。"""
+        """v1→v5 后续迁移失败时，不得留下任何部分提交。"""
         db = tmp_path / "legacy.db"
         conn = migrations.connect(db)
         try:
@@ -123,9 +131,9 @@ class TestLegacyUpgrade:
             conn.close()
 
         broken = [*migrations.MIGRATIONS]
-        broken[-1] = (4, [*broken[-1][1], "THIS IS NOT SQL"])
+        broken[-1] = (5, [*broken[-1][1], "THIS IS NOT SQL"])
         monkeypatch.setattr(migrations, "MIGRATIONS", broken)
-        monkeypatch.setattr(migrations, "LATEST_SCHEMA_VERSION", 4)
+        monkeypatch.setattr(migrations, "LATEST_SCHEMA_VERSION", 5)
 
         with pytest.raises(migrations.MigrationError):
             migrations.migrate(db, tmp_path / "backups")
@@ -167,7 +175,7 @@ class TestLegacyUpgrade:
             conn.close()
 
     def test_v1_database_upgrades_to_latest_with_data(self, tmp_path):
-        """旧库兼容：v1 结构 + 已有数据 → migrate 到 v3，数据完整保留。"""
+        """旧库兼容：v1 结构 + 已有数据 → migrate 到最新，数据保留。"""
         from costguard.core.db import migrations as m
 
         db = tmp_path / "legacy.db"
@@ -192,6 +200,11 @@ class TestLegacyUpgrade:
             conn.execute(
                 "INSERT INTO line_items(period_id, code, name, unit, quantity, amount)"
                 " VALUES (?, 'C1', '旧清单', 'm3', '10', '1000')", (old_period_id,))
+            conn.execute(
+                """INSERT INTO item_aliases(project_id, canonical_key, alias_text,
+                   mapping_basis, confirmed_by, confirmed_at) VALUES (?,?,?,?,?,?)""",
+                (pid, "code:C1", "旧别名", "旧库人工确认", "用户", "2026"),
+            )
         conn.close()
 
         # migrate 到最新（v3 表重建）
@@ -215,5 +228,25 @@ class TestLegacyUpgrade:
                 (pid,),
             ).fetchone()["c"]
             assert n1 == 2
+            alias = conn.execute(
+                "SELECT canonical_key, alias_text, direction FROM item_aliases WHERE project_id=?",
+                (pid,),
+            ).fetchone()
+            assert tuple(alias) == ("code:C1", "旧别名", "unknown")
+            # 同文本别名可以在不同方向重新确认，同方向仍唯一。
+            with conn:
+                conn.execute(
+                    """INSERT INTO item_aliases(project_id, direction, canonical_key,
+                       alias_text, mapping_basis, confirmed_by, confirmed_at)
+                       VALUES (?, 'upward', 'code:C1', '旧别名', '对上重新确认', '用户', '2026')""",
+                    (pid,),
+                )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    """INSERT INTO item_aliases(project_id, direction, canonical_key,
+                       alias_text, mapping_basis, confirmed_by, confirmed_at)
+                       VALUES (?, 'upward', 'code:C9', '旧别名', '重复', '用户', '2026')""",
+                    (pid,),
+                )
         finally:
             conn.close()

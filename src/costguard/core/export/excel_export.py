@@ -17,7 +17,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from costguard.core.engine.aggregate import aggregate_project, group_key_of
+from costguard.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
 from costguard.core.engine.money import NotANumberError, round2, to_decimal
 
 D = Decimal
@@ -30,6 +30,11 @@ TABLE_BORDER = Border(
     left=_THIN_SIDE, right=_THIN_SIDE, top=_THIN_SIDE, bottom=_THIN_SIDE
 )
 CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
+DIRECTION_LABELS = {
+    "upward": "对上",
+    "downward": "对下",
+    "unknown": "未标记方向",
+}
 
 
 def _style_header(ws, row: int, cols: int):
@@ -91,18 +96,35 @@ def _num(value, money: bool = False):
 def _fetch_periods(conn, project_id):
     return conn.execute(
         "SELECT id, period_no, title, direction, contract_party, tax_mode FROM settlement_periods"
-        " WHERE project_id=? ORDER BY period_no",
+        " WHERE project_id=? ORDER BY CASE direction WHEN 'upward' THEN 0 "
+        "WHEN 'downward' THEN 1 ELSE 2 END, period_no, id",
         (project_id,),
     ).fetchall()
+
+
+def _project_directions(conn: sqlite3.Connection, project_id: int) -> list[str]:
+    """返回项目实际存在的方向；空项目仍给出未标记方向占位。"""
+    rows = conn.execute(
+        """SELECT DISTINCT COALESCE(direction, 'unknown') AS direction
+           FROM settlement_periods WHERE project_id=?
+           ORDER BY CASE COALESCE(direction, 'unknown')
+             WHEN 'upward' THEN 0 WHEN 'downward' THEN 1 ELSE 2 END""",
+        (project_id,),
+    ).fetchall()
+    return [r["direction"] for r in rows] or ["unknown"]
 
 
 def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook,
                               direction: str | None = None) -> str:
     """结算累计表（对上/对下各自独立累计，绝不混入另一方向数据）。"""
-    periods = [p for p in _fetch_periods(conn, project_id) if direction in (None, p["direction"])]
+    if direction is None:
+        raise ValueError("结算累计表必须明确 direction，禁止生成跨方向混合汇总")
+    periods = [
+        p for p in _fetch_periods(conn, project_id)
+        if (p["direction"] or "unknown") == direction
+    ]
     aggs = aggregate_project(conn, project_id, direction=direction)
-    ws = wb.create_sheet("对上结算累计表" if direction == "upward" else
-                         "对下结算累计表" if direction == "downward" else "结算累计表")
+    ws = wb.create_sheet(f"{DIRECTION_LABELS.get(direction, direction)}结算累计表")
     header = ["清单编码", "清单名称", "单位"] + [f"第{p['period_no']}期金额" for p in periods] + \
              ["累计数量", "累计金额", "加权平均单价", "状态"]
     ws.append(header)
@@ -111,7 +133,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         row = [agg.code, agg.name, ""]
         for p in periods:
             pp = agg.per_period.get(p["id"])  # period_id 键：防对上/对下同期号串表
-            row.append(_num(pp["amount"], money=True) if pp else None)
+            row.append(_num(pp["effective_amount"], money=True) if pp else None)
         row.append(_num(agg.cum_qty))
         row.append(_num(agg.cum_amount, money=True))
         row.append(_num(agg.wavg_price, money=True))
@@ -153,7 +175,8 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
         by_period = series.setdefault(key, {})
         series_names.setdefault(key, set()).add(r["name"] or "")
         pp = by_period.setdefault(int(r["pno"]), {
-            "qty": None, "amount": None, "prices": set(), "units": set(), "qty_missing": False,
+            "qty": None, "amount": None, "effective_amount": None,
+            "amount_source": "missing", "prices": set(), "units": set(), "qty_missing": False,
             "period_no": int(r["pno"]), "name": r["name"] or "",
         })
         if r["quantity"] is not None:
@@ -165,13 +188,19 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
                 pp["qty"] = q if pp["qty"] is None else pp["qty"] + q
         else:
             pp["qty_missing"] = True
-        if r["amount"] is not None:
-            try:
-                a = D(r["amount"])
-            except Exception:
-                a = None
-            if a is not None:
-                pp["amount"] = a if pp["amount"] is None else pp["amount"] + a
+        assessment, _qty_missing, _price_missing = assess_amount(r)
+        if assessment.raw is not None:
+            a = assessment.raw
+            pp["amount"] = a if pp["amount"] is None else pp["amount"] + a
+        if assessment.effective is not None:
+            a = assessment.effective
+            pp["effective_amount"] = (
+                a if pp["effective_amount"] is None else pp["effective_amount"] + a
+            )
+            if pp["amount_source"] in ("missing", assessment.source):
+                pp["amount_source"] = assessment.source
+            else:
+                pp["amount_source"] = "mixed"
         if r["unit_price"]:
             try:
                 pp["prices"].add(D(r["unit_price"]))
@@ -251,7 +280,10 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                     else:
                         cur_val = _num(pp["qty"]) if pp["qty"] is not None else None
                 else:
-                    cur_val = _num(pp["amount"], money=True) if pp["amount"] is not None else None
+                    cur_val = (
+                        _num(pp["effective_amount"], money=True)
+                        if pp["effective_amount"] is not None else None
+                    )
 
                 ws.cell(row=r, column=1, value=dir_zh.get(item["direction"], item["direction"]))
                 ws.cell(row=r, column=2, value=item["code"])
@@ -300,7 +332,8 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
 def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction: str) -> dict[str, dict]:
     """按方向聚合：item_key -> {qty, amount, names}。缺失值不补 0。"""
     rows = conn.execute(
-        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.amount, li.flags_json FROM line_items li
+        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
+                  li.flags_json FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
            WHERE sp.project_id=? AND sp.direction=?""",
         (project_id, direction),
@@ -313,7 +346,8 @@ def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction
         key = group_key_of(r["code"], r["name"] or "")
         agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
         agg["names"].add(r["name"] or "")
-        for field, val in (("qty", r["quantity"]), ("amount", r["amount"])):
+        assessment, _qty_missing, _price_missing = assess_amount(r)
+        for field, val in (("qty", r["quantity"]), ("amount", assessment.effective)):
             if val is not None:  # "0" 是有效值参与累计；缺失(None)不参与也不补 0
                 try:
                     d = D(val)
@@ -366,36 +400,57 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
 
 def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
     """异常清单 + 待核实事项清单。"""
-    ws = wb.create_sheet("异常清单")
-    ws.append(["编号", "规则", "级别", "对象", "说明", "证据ID", "状态"])
-    _style_header(ws, 1, 7)
-    for r in conn.execute(
-        """SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id, a.evidence_id, a.message, a.status
-           FROM anomalies a WHERE a.project_id=? ORDER BY CASE a.severity
+    anomaly_rows = conn.execute(
+        """SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
+                  a.evidence_id, a.message, a.status,
+                  COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
+                    AS direction
+           FROM anomalies a
+           LEFT JOIN line_items li
+             ON a.subject_type='line_item' AND li.id=a.subject_id
+           LEFT JOIN settlement_periods sp_item ON sp_item.id=li.period_id
+           LEFT JOIN settlement_periods sp_period
+             ON a.subject_type='period' AND sp_period.id=a.subject_id
+           LEFT JOIN raw_sheets rs
+             ON a.subject_type='sheet' AND rs.id=a.subject_id
+           LEFT JOIN settlement_periods sp_sheet ON sp_sheet.id=rs.period_id
+           WHERE a.project_id=? ORDER BY CASE a.severity
            WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, a.id""",
         (project_id,),
-    ):
+    ).fetchall()
+    ws = wb.create_sheet("异常清单")
+    ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态"])
+    _style_header(ws, 1, 8)
+    for r in anomaly_rows:
         sev = {"high": "高", "medium": "中", "low": "低", "info": "提示"}.get(r["severity"], r["severity"])
-        ws.append([r["id"], r["rule_id"], sev, f"{r['subject_type']}#{r['subject_id']}",
+        direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
+        ws.append([r["id"], direction, r["rule_id"], sev,
+                   f"{r['subject_type']}#{r['subject_id']}",
                    r["message"], r["evidence_id"], r["status"]])
     _autowidth(ws)
 
     ws2 = wb.create_sheet("待核实事项清单")
-    ws2.append(["编号", "类别", "说明", "证据ID"])
-    _style_header(ws2, 1, 4)
+    ws2.append(["编号", "方向", "类别", "说明", "证据ID"])
+    _style_header(ws2, 1, 5)
     idx = 1
-    for r in conn.execute(
-        """SELECT id, rule_id, message, evidence_id FROM anomalies
-           WHERE project_id=? AND severity IN ('high','medium') AND status='open'""",
-        (project_id,),
-    ):
-        ws2.append([idx, r["rule_id"], r["message"], r["evidence_id"]])
+    for r in anomaly_rows:
+        if r["severity"] not in {"high", "medium"} or r["status"] != "open":
+            continue
+        direction = DIRECTION_LABELS.get(r["direction"], r["direction"] or "项目级")
+        ws2.append([idx, direction, r["rule_id"], r["message"], r["evidence_id"]])
         idx += 1
-    for agg in aggregate_project(conn, project_id):
-        if agg.status in ("incomplete", "incomparable"):
-            for w in agg.warnings:
-                ws2.append([idx, "aggregate", f"「{agg.name}」{w}", None])
-                idx += 1
+    for direction in _project_directions(conn, project_id):
+        for agg in aggregate_project(conn, project_id, direction=direction):
+            if agg.status in ("incomplete", "incomparable"):
+                for w in agg.warnings:
+                    ws2.append([
+                        idx,
+                        DIRECTION_LABELS.get(direction, direction),
+                        "aggregate",
+                        f"「{agg.name}」{w}",
+                        None,
+                    ])
+                    idx += 1
     _autowidth(ws2)
 
 
@@ -431,12 +486,16 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
     """Excel 审核底稿：逐行明细 + 出处 + 保留公式的校验列。"""
     ws = wb.create_sheet("审核底稿")
     ws.append(["期次", "清单编码", "清单名称", "单位", "数量", "单价", "合价(底稿公式)",
-               "原表合价", "差异(公式)", "数量出处", "单价出处", "合价出处", "行ID"])
-    _style_header(ws, 1, 13)
+               "原表合价", "差异(公式)", "数量出处", "单价出处", "合价出处", "行ID", "方向"])
+    _style_header(ws, 1, 14)
     rows = conn.execute(
-        """SELECT li.*, sp.period_no AS pno FROM line_items li
+        """SELECT li.*, sp.period_no AS pno, COALESCE(sp.direction, 'unknown') AS direction
+           FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
-           WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
+           WHERE sp.project_id=?
+           ORDER BY CASE COALESCE(sp.direction, 'unknown')
+             WHEN 'upward' THEN 0 WHEN 'downward' THEN 1 ELSE 2 END,
+             sp.period_no, li.id""",
         (project_id,),
     ).fetchall()
     r = 1
@@ -465,6 +524,11 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
         else:
             ws.cell(row=r, column=9, value="不可比")
         ws.cell(row=r, column=13, value=row["id"])  # 行ID：唯一标识，复核回溯用
+        ws.cell(
+            row=r,
+            column=14,
+            value=DIRECTION_LABELS.get(row["direction"], row["direction"]),
+        )
         for col, evid in ((10, "qty_evid"), (11, "price_evid"), (12, "amount_evid")):
             ev = row[evid]
             if ev:
@@ -485,7 +549,7 @@ def _tax_mode_status(conn: sqlite3.Connection, project_id: int) -> str:
         (project_id,),
     ):
         col_map = json.loads(h["col_map_json"])
-        if "unit_price" not in col_map:
+        if not ({"unit_price", "amount"} & set(col_map)):
             continue
         texts = [r["raw_value"] or "" for r in conn.execute(
             "SELECT raw_value FROM raw_cells WHERE sheet_id=? AND row BETWEEN ? AND ?",
@@ -500,7 +564,7 @@ def _tax_mode_status(conn: sqlite3.Connection, project_id: int) -> str:
         return "未识别（表头未标注含税/不含税，请人工确认）"
     if len(modes) > 1:
         return "混用（存在含税与不含税口径，详见异常清单 tax_mode_mixed）"
-    return "含税单价" if "incl_tax" in modes else "不含税单价"
+    return "含税金额/单价" if "incl_tax" in modes else "不含税金额/单价"
 
 
 def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
@@ -508,11 +572,16 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     ws = wb.create_sheet("管理层摘要")
     ws.append(["CostGuard 管理层摘要"])
     ws.cell(row=1, column=1).font = Font(bold=True, size=14)
-    aggs = aggregate_project(conn, project_id)
-    total = sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0))
-    n_ok = sum(1 for a in aggs if a.status == "ok")
-    n_inc = sum(1 for a in aggs if a.status == "incomplete")
-    n_inc2 = sum(1 for a in aggs if a.status == "incomparable")
+    direction_stats: dict[str, dict] = {}
+    for direction in _project_directions(conn, project_id):
+        aggs = aggregate_project(conn, project_id, direction=direction)
+        direction_stats[direction] = {
+            "groups": len(aggs),
+            "total": sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0)),
+            "ok": sum(1 for a in aggs if a.status == "ok"),
+            "incomplete": sum(1 for a in aggs if a.status == "incomplete"),
+            "incomparable": sum(1 for a in aggs if a.status == "incomparable"),
+        }
     sev = {"high": 0, "medium": 0, "low": 0}
     for r in conn.execute("SELECT severity, COUNT(*) c FROM anomalies WHERE project_id=? GROUP BY severity", (project_id,)):
         sev[r["severity"]] = r["c"]
@@ -530,26 +599,32 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         ("其中：对上", n_up),
         ("其中：对下", n_down),
         ("其中：未标记方向", n_none),
-        ("清单组数", len(aggs)),
         ("—— 金额与状态 ——", ""),
-        ("累计金额合计（可用部分）", _num(round2(total))),
-        ("正常清单组", n_ok),
-        ("待补资料清单组", n_inc),
-        ("不可比清单组", n_inc2),
+    ]
+    for direction, stats in direction_stats.items():
+        label = DIRECTION_LABELS.get(direction, direction)
+        data.extend([
+            (f"{label}清单组数", stats["groups"]),
+            (f"{label}累计金额（可用部分）", _num(round2(stats["total"]))),
+            (f"{label}正常清单组", stats["ok"]),
+            (f"{label}待补资料清单组", stats["incomplete"]),
+            (f"{label}不可比清单组", stats["incomparable"]),
+        ])
+    data.extend([
         ("—— 口径与风险 ——", ""),
-        ("单价税口径", _tax_mode_status(conn, project_id)),
+        ("金额/单价税口径", _tax_mode_status(conn, project_id)),
         ("高风险异常数", sev["high"]),
         ("中风险异常数", sev["medium"]),
         ("低风险异常数", sev["low"]),
         ("—— 追溯 ——", ""),
         ("证据记录数", n_ev),
         ("证据索引位置", "本工作簿《证据索引》工作表（evidence ID）"),
-    ]
+    ])
     for k, v in data:
         ws.append([k, v])
     ws.append([])
     ws.append(["说明：本摘要由 CostGuard 自动生成，仅反映已导入数据。缺失数据未补 0；"
-               "不可比数据未强行比较；方向未标记的期次仅计入未分离汇总，请先标记对上/对下。"])
+               "不可比数据未强行比较；对上、对下和未标记方向分别列示，未作跨方向净额或合计。"])
     ws.append(["自动计算结果必须经过人工复核和业务审批；未经批准，不构成任何真实业务结论，"
                "包括最终结算、责任认定或正式管理结论。"])
     _autowidth(ws)
@@ -562,7 +637,8 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     wb = Workbook()
     wb.remove(wb.active)
     export_management_summary(conn, project_id, wb)
-    export_settlement_summary(conn, project_id, wb)
+    for direction in _project_directions(conn, project_id):
+        export_settlement_summary(conn, project_id, wb, direction=direction)
     export_updown_comparison(conn, project_id, wb)
     export_diff_sheets(conn, project_id, wb)
     export_anomaly_lists(conn, project_id, wb)
@@ -583,8 +659,13 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     from docx.oxml.ns import qn
     from docx.shared import Pt
 
-    aggs = aggregate_project(conn, project_id)
-    total = sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0))
+    direction_stats: dict[str, tuple[int, Decimal]] = {}
+    for direction in _project_directions(conn, project_id):
+        aggs = aggregate_project(conn, project_id, direction=direction)
+        direction_stats[direction] = (
+            len(aggs),
+            sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0)),
+        )
     high = conn.execute(
         "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND severity='high'", (project_id,)
     ).fetchone()["c"]
@@ -626,12 +707,17 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
         title_fonts.set(qn(f"w:{attr}"), "Songti SC")
     doc.add_paragraph(
-        f"截至 {datetime.now().strftime('%Y-%m-%d %H:%M')}，共识别清单组 {len(aggs)} 组，"
-        f"累计金额（可用部分）{round2(total)} 元，高风险异常 {high} 项。"
+        f"截至 {datetime.now().strftime('%Y-%m-%d %H:%M')}，高风险异常 {high} 项。"
     )
+    for direction, (group_count, total) in direction_stats.items():
+        label = DIRECTION_LABELS.get(direction, direction)
+        doc.add_paragraph(
+            f"{label}：识别清单组 {group_count} 组，累计金额（可用部分）{round2(total)} 元。"
+        )
     doc.add_paragraph(
         f"统计范围：期次 {len(periods)} 期（对上 {n_up} 期、对下 {n_down} 期、未标记方向 {n_none} 期）；"
-        f"金额为可用部分累计，缺失与不可比项未计入且未补值。"
+        f"金额为各方向可用部分累计，缺失与不可比项未计入且未补值；"
+        "对上、对下和未标记方向未作跨方向净额或合计。"
     )
     doc.add_paragraph("数据纪律：缺失数据未自动补 0；不可比数据未强行比较。")
     doc.add_paragraph(

@@ -114,8 +114,14 @@ class TestDirectionSeparation:
         # per_period 键为 period_id，两方向各自一期，互不串
         assert list(ups["code:K1"].per_period) == [up_pid]
         assert list(downs["code:K1"].per_period) == [down_pid]
-        # 无方向过滤的全量 = 300
-        alls = {a.item_key: a for a in excel_export.aggregate_project(conn, info.project_id)}
+        # 只有调用方明确声明项目跨方向展示时，才允许全项目 = 300
+        with pytest.raises(ValueError, match="direction"):
+            excel_export.aggregate_project(conn, info.project_id)
+        alls = {
+            a.item_key: a for a in excel_export.aggregate_project(
+                conn, info.project_id, include_all_directions=True
+            )
+        }
         assert alls["code:K1"].cum_amount == Decimal("300")
 
     def test_summary_sheets_separated(self, mixed_direction_project):
@@ -138,6 +144,63 @@ class TestDirectionSeparation:
         assert up.cell(row=2, column=4).value == Decimal("100")
         assert down.cell(row=2, column=4).value == Decimal("200")
 
+    def test_full_export_has_no_ambiguous_cross_direction_summary(self, mixed_direction_project):
+        info, conn, pdir, up_pid, down_pid = mixed_direction_project
+
+        with conn:
+            up_item = conn.execute(
+                "SELECT id FROM line_items WHERE period_id=?", (up_pid,)
+            ).fetchone()["id"]
+            down_item = conn.execute(
+                "SELECT id FROM line_items WHERE period_id=?", (down_pid,)
+            ).fetchone()["id"]
+            conn.executemany(
+                """INSERT INTO anomalies(project_id, rule_id, severity, subject_type,
+                   subject_id, message, status, created_at)
+                   VALUES (?, 'direction_probe', 'medium', 'line_item', ?, ?, 'open', '2026')""",
+                [
+                    (info.project_id, up_item, "对上方向反例"),
+                    (info.project_id, down_item, "对下方向反例"),
+                ],
+            )
+
+        path = excel_export.export_workbook(conn, info.project_id, pdir / "exports")
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, data_only=False)
+        assert "结算累计表" not in wb.sheetnames
+        assert "对上结算累计表" in wb.sheetnames
+        assert "对下结算累计表" in wb.sheetnames
+        audit = wb["审核底稿"]
+        assert audit.cell(row=1, column=14).value == "方向"
+        assert {audit.cell(row=r, column=14).value for r in range(2, audit.max_row + 1)} == {
+            "对上", "对下"
+        }
+        summary_text = " | ".join(
+            str(wb["管理层摘要"].cell(row=r, column=1).value)
+            for r in range(1, wb["管理层摘要"].max_row + 1)
+        )
+        assert "对上累计金额（可用部分）" in summary_text
+        assert "对下累计金额（可用部分）" in summary_text
+        assert "累计金额合计（可用部分）" not in summary_text
+        anomaly = wb["异常清单"]
+        assert [anomaly.cell(row=1, column=c).value for c in range(1, 9)] == [
+            "编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态",
+        ]
+        anomaly_directions = {
+            anomaly.cell(row=r, column=2).value
+            for r in range(2, anomaly.max_row + 1)
+            if anomaly.cell(row=r, column=3).value == "direction_probe"
+        }
+        assert anomaly_directions == {"对上", "对下"}
+        pending = wb["待核实事项清单"]
+        pending_directions = {
+            pending.cell(row=r, column=2).value
+            for r in range(2, pending.max_row + 1)
+            if pending.cell(row=r, column=3).value == "direction_probe"
+        }
+        assert pending_directions == {"对上", "对下"}
+
 
 class TestSecondPathRecompute:
     """门槛 3：第二路径 —— 从导出文件读回，Decimal 复算明细→汇总关系。"""
@@ -153,7 +216,7 @@ class TestSecondPathRecompute:
 
         wb = openpyxl.load_workbook(path, data_only=False)
         ws_detail = wb["审核底稿"]
-        ws_summary = wb["结算累计表"]
+        ws_summary = wb["未标记方向结算累计表"]
 
         # 第二路径：明细按归组键 Decimal 累计（读回的是写入值，非 DB）。
         # 归组口径必须与累计表一致：code 优先，无码用名称（同码异名属同组）。
@@ -179,17 +242,6 @@ class TestSecondPathRecompute:
                 f"summary mismatch for {key}: detail={detail_sum[key]} summary={cum}"
             checked += 1
         assert checked > 0
-
-    def test_wps_headless_recalc_unverified(self):
-        """WPS 真实打开重算：本机 wpscli 仅支持 PDF 系转换，无 xlsx headless 重算，
-        无法自动验证。公式重算已由 LibreOffice（同遵 OOXML 公式规范）真实重算覆盖。
-        WPS 打开验证为人工步骤。"""
-        import shutil
-
-        assert shutil.which("wpscli") is None or True  # 占位：无自动 WPS 重算通道
-        pytest.skip("WPS 无 headless 重算 CLI（wpscli 仅 PDF 转换），未自动验证；"
-                    "重算验证由 LibreOffice 等价引擎覆盖，WPS 打开验证为人工步骤")
-
 
 class TestSummaryScope:
     """门槛 5：摘要声明范围/期次/方向/税口径/证据数；Word 不声称无入口的追溯。"""

@@ -73,4 +73,5 @@
   不得后台静默下载/执行新程序。
 - 发布物：`CostGuard-x.y.z-macos-arm64.dmg`、`CostGuard-x.y.z-windows-x64.exe`
   与 `SHA256SUMS.txt`；版本遵循 SemVer。
-- License 最终由用户确定（当前暂不公开，见 `docs/adr/ADR-009`）。
+- 源码采用 Apache License 2.0（见 `docs/adr/ADR-009`）；真实工程资料和
+  `local_private_data/` 不属于开源内容，永远不得提交或发布。

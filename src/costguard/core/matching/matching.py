@@ -1,7 +1,8 @@
 """清单匹配引擎（Phase 5 核心）。
 
 五档置信度（最高优先级原则 9）：
-  confirmed   确认匹配：编码一致且名称归一化一致，或命中用户别名库
+  confirmed   规则完全匹配候选：编码一致且名称归一化一致，或命中用户别名库；
+              数据库人工状态仍为 pending，需人工复核后才变为 confirmed
   probable    高概率匹配：编码一致但名称不同（同码异名），或名称归一化一致但编码不同
   suspected   疑似匹配：仅语义相似（rapidfuzz ≥ SIM_SUSPECTED），必须人工确认
   incomparable 不可比：单位不一致（归一化后）或口径冲突，禁止合并
@@ -63,10 +64,14 @@ class MatchGroup:
     notes: list[str] = field(default_factory=list)
 
 
-def load_aliases(conn: sqlite3.Connection, project_id: int) -> dict[str, str]:
-    """alias_text(归一化) -> canonical_key"""
+def load_aliases(
+    conn: sqlite3.Connection, project_id: int, direction: str
+) -> dict[str, str]:
+    """读取一个明确方向的别名；项目级查询不得跨方向复用人工结论。"""
     rows = conn.execute(
-        "SELECT alias_text, canonical_key FROM item_aliases WHERE project_id=?", (project_id,)
+        """SELECT alias_text, canonical_key FROM item_aliases
+           WHERE project_id=? AND direction=?""",
+        (project_id, direction),
     ).fetchall()
     return {normalize_name(r["alias_text"]): r["canonical_key"] for r in rows}
 
@@ -75,15 +80,28 @@ def _canonical_of(code: str, name: str) -> str:
     return f"code:{code}" if code else f"name:{name}"
 
 
-def match_items(conn: sqlite3.Connection, project_id: int) -> list[MatchGroup]:
-    """对项目全部明细行做五档归组（不修改行数据，只产出匹配建议）。"""
+def _unscoped_group_key(group_key: str) -> str:
+    """匹配范围前缀只用于隔离展示，不写进可复用的别名核心键。"""
+    prefix, separator, remainder = group_key.partition(":")
+    if separator and prefix in {"upward", "downward", "unknown"}:
+        return remainder
+    return group_key
+
+
+def _match_items_for_direction(
+    conn: sqlite3.Connection, project_id: int, direction: str
+) -> list[MatchGroup]:
+    """只在一个明确方向内做五档归组。"""
     rows = conn.execute(
-        """SELECT li.id, li.code, li.name, li.unit, sp.period_no AS pno FROM line_items li
+        """SELECT li.id, li.code, li.name, li.unit, sp.period_no AS pno,
+                  COALESCE(sp.direction, 'unknown') AS direction
+           FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
-           WHERE sp.project_id=? ORDER BY li.id""",
-        (project_id,),
+           WHERE sp.project_id=? AND COALESCE(sp.direction, 'unknown')=?
+           ORDER BY li.id""",
+        (project_id, direction),
     ).fetchall()
-    aliases = load_aliases(conn, project_id)
+    aliases = load_aliases(conn, project_id, direction)
 
     # ---- 逐行归到候选键 ----
     exact: dict[str, list[int]] = {}  # canonical_key -> ids（编码精确）
@@ -241,6 +259,40 @@ def match_items(conn: sqlite3.Connection, project_id: int) -> list[MatchGroup]:
     return sorted(result, key=lambda g: g.group_key)
 
 
+def match_items(
+    conn: sqlite3.Connection, project_id: int, direction: str | None = None
+) -> list[MatchGroup]:
+    """对项目明细做五档归组，默认也严格隔离对上、对下和未标记方向。
+
+    同一编码或名称出现在不同方向时不得自动归入同一匹配组。显式传入
+    ``direction`` 可只处理一个方向；未传入时逐方向独立运行，并把方向写进
+    ``group_key``，确保保存后的人工复核记录仍可辨认范围。
+    """
+    if direction is not None:
+        return _match_items_for_direction(conn, project_id, direction)
+
+    directions = [
+        r["direction"]
+        for r in conn.execute(
+            """SELECT DISTINCT COALESCE(direction, 'unknown') AS direction
+               FROM settlement_periods WHERE project_id=? ORDER BY direction""",
+            (project_id,),
+        ).fetchall()
+    ]
+    if not directions:
+        return []
+    if len(directions) == 1:
+        return _match_items_for_direction(conn, project_id, directions[0])
+
+    result: list[MatchGroup] = []
+    for current_direction in directions:
+        for group in _match_items_for_direction(conn, project_id, current_direction):
+            group.group_key = f"{current_direction}:{group.group_key}"
+            group.notes.append(f"匹配范围：{current_direction}")
+            result.append(group)
+    return sorted(result, key=lambda g: g.group_key)
+
+
 def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGroup]) -> int:
     with conn:
         conn.execute("DELETE FROM matches WHERE project_id=? AND status='pending'", (project_id,))
@@ -269,6 +321,24 @@ def confirm_match(
     row = conn.execute("SELECT * FROM matches WHERE id=? AND project_id=?", (match_id, project_id)).fetchone()
     if not row:
         raise ValueError(f"match {match_id} not found")
+    item_ids = json.loads(row["item_ids_json"])
+    if not item_ids:
+        raise ValueError(f"match {match_id} has no line items")
+    placeholders = ",".join("?" for _ in item_ids)
+    directions = {
+        r["direction"] or "unknown"
+        for r in conn.execute(
+            f"""SELECT DISTINCT COALESCE(sp.direction, 'unknown') AS direction
+                FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
+                WHERE li.id IN ({placeholders})""",  # noqa: S608 - placeholders only
+            item_ids,
+        ).fetchall()
+    }
+    if len(directions) != 1:
+        raise ValueError(
+            f"match {match_id} spans {sorted(directions)}; direction-isolated confirmation required"
+        )
+    direction = next(iter(directions))
     with conn:
         conn.execute(
             "UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=? WHERE id=?",
@@ -276,23 +346,26 @@ def confirm_match(
         )
     if alias_name and row["level"] == SUSPECTED:
         # 疑似 → 确认后可沉淀为别名（原则 9/14：保存依据与确认记录）
-        canonical = row["group_key"]
+        canonical = _unscoped_group_key(row["group_key"])
         with conn:
             conn.execute(
-                """INSERT OR IGNORE INTO item_aliases(project_id, canonical_key, alias_text, mapping_basis,
-                   confirmed_by, confirmed_at) VALUES (?,?,?,?,?,?)""",
-                (project_id, canonical, alias_name, f"人工确认 match#{match_id}: {reason}",
+                """INSERT OR IGNORE INTO item_aliases(project_id, direction, canonical_key,
+                   alias_text, mapping_basis, confirmed_by, confirmed_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (project_id, direction, canonical, alias_name,
+                 f"人工确认 match#{match_id}: {reason}",
                  actor, datetime.now().isoformat(timespec="seconds")),
             )
     evidence_api.add_evidence(
         conn, project_id, "match_confirmation",
         f"匹配组 {row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
         steps=[{"step": "人工复核", "actor": actor, "reason": reason}],
-        sources=[{"match_id": match_id, "items": json.loads(row["item_ids_json"])}],
+        sources=[{"match_id": match_id, "direction": direction, "items": item_ids}],
     )
     audit_log.record_audit(
         conn, project_id, actor, "confirm_match", f"match:{match_id}",
-        {"level": row["level"]}, {"level": CONFIRMED, "alias": alias_name}, reason,
+        {"level": row["level"]},
+        {"level": CONFIRMED, "alias": alias_name, "direction": direction}, reason,
     )
 
 

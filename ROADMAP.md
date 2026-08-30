@@ -17,9 +17,9 @@
 | 6 | 合同和合规分析（docx/pdf/txt 条款结构化，原文引用，风险清单） | ✅ |
 | 7 | 成果导出：12 类报表、Excel 保留公式、WPS 兼容（LibreOffice 真实重算验证） | ✅ |
 | 8 | 完整 Mac UI（项目页+五 Tab 工作台） | ✅ |
-| 9 | Mac 大规模测试和性能优化 | ⬜ |
+| 9 | Mac 大规模测试和性能优化 | 🔨 |
 | 10 | Mac 打包（unsigned DMG） | ⬜ |
-| 11 | GitHub CI/CD | ⬜ |
+| 11 | GitHub CI/CD（源码 CI 与敏感信息扫描已就绪；自动打包待补） | 🔨 |
 | 12 | Mac Beta Release (v0.9.x) | ⬜ |
 | 13 | 真实案例回归测试和 Bug 修复 | ⬜ |
 | 14 | Mac V1.0 Release Candidate（签名+公证预留） | ⬜ |
@@ -34,9 +34,15 @@
 - [x] ARCHITECTURE.md（含数据模型、证据链设计、风险对策）
 - [x] ADR-001..010
 - [x] ROADMAP / README 双语 / 社区文件 / CHANGELOG
-- [ ] Python 3.12 环境 + 关键依赖导入验证
-- [ ] Phase 0 commit
+- [x] Python 3.12 环境 + 关键依赖导入验证
+- [x] Phase 0 commit
 
 ## 自动升级策略（Phase 12 起生效）
 提示新版本 → 用户点击查看 GitHub Release → 用户主动决定升级。
 不实现后台静默更新。
+
+## 开源首发策略
+
+v0.1.0 先发布源码和 Python wheel，验证真实用户的安装、导入、校核和导出反馈；
+签名 DMG、自动发布、Windows 安装包和更多格式支持按真实 Issue/下载数据迭代，
+不因追求一次性全平台而延误 Mac 主线。

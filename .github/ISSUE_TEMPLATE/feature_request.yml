@@ -1,0 +1,26 @@
+name: 功能建议
+description: 提议一个真实业务场景驱动的改进
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 业务问题
+      description: 请说明当前流程在哪里耗时、容易出错或缺少证据，不要只写功能名称。
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: 匿名化示例与期望结果
+      description: 只可使用匿名化字段或人工合成数据。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 建议的验收标准
+      description: 什么可重复结果能证明这个功能有效？
+    validations:
+      required: true

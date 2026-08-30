@@ -29,6 +29,11 @@ AUDIT_WIDTHS = (15, 26, 7, 11, 11, 14, 14, 14, 18)
 CHECK_WIDTHS = (26, 18)
 
 
+def default_output_dir() -> Path:
+    """返回仓库内、已被 Git 忽略的本地验收目录。"""
+    return Path(__file__).resolve().parents[1] / "local_private_data" / "wps_acceptance"
+
+
 def _style_region(ws, n_rows: int, n_cols: int, widths: tuple[int, ...],
                   center_cols: tuple[int, ...] | None = None) -> None:
     """表头加粗+统一底色；数据区细边框+水平垂直居中+自动换行；列宽设置。
@@ -141,6 +146,6 @@ def count_formulas_and_errors(xlsx_path: Path, recalc_dir: Path | None = None) -
 
 
 if __name__ == "__main__":
-    out = Path.home() / ".zcode/workspace/default/costguard/local_private_data/wps_acceptance"
+    out = default_output_dir()
     x, d = generate(out)
     print(f"xlsx: {x}\ndocx: {d}")

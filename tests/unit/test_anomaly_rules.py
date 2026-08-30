@@ -178,8 +178,58 @@ class TestPeriodRules:
         f = rules.rule_same_name_diff_code(conn, pid)
         assert len(f) == 1
 
+    def test_code_and_name_consistency_rules_do_not_mix_directions(self, db):
+        conn, pid, pmap = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (pmap[1],)
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?", (pmap[2],)
+            )
+        add_item(conn, pmap[1], code="C1", name="对上名称")
+        add_item(conn, pmap[2], code="C1", name="对下名称")
+        add_item(conn, pmap[1], code="U1", name="同名清单")
+        add_item(conn, pmap[2], code="D1", name="同名清单")
+
+        assert rules.rule_same_code_diff_name(conn, pid) == []
+        assert rules.rule_same_name_diff_code(conn, pid) == []
+
 
 class TestCrossPeriodRules:
+    def test_tax_mode_comparison_is_isolated_by_direction(self, db):
+        conn, pid, pmap = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (pmap[1],)
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?", (pmap[2],)
+            )
+        up_sheet = attach_confirmed_sheet(
+            conn, pid, pmap[1], {"name": 1, "unit_price": 2}, sheet_name="对上"
+        )
+        down_sheet = attach_confirmed_sheet(
+            conn, pid, pmap[2], {"name": 1, "unit_price": 2}, sheet_name="对下"
+        )
+        with conn:
+            conn.execute(
+                "INSERT INTO raw_cells(sheet_id,row,col,raw_value) VALUES (?,?,?,?)",
+                (up_sheet, 5, 2, "含税单价"),
+            )
+            conn.execute(
+                "INSERT INTO raw_cells(sheet_id,row,col,raw_value) VALUES (?,?,?,?)",
+                (down_sheet, 5, 2, "不含税单价"),
+            )
+        assert rules.rule_tax_mode_mixed(conn, pid) == []
+
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?", (pmap[2],)
+            )
+        findings = rules.rule_tax_mode_mixed(conn, pid)
+        assert len(findings) == 1
+        assert findings[0].details["direction"] == "upward"
     def test_unit_changed_and_alias_ok(self, db):
         conn, pid, pmap = db
         add_item(conn, pmap[1], unit="m3")
