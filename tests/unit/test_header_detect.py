@@ -8,6 +8,7 @@ from generator import make_clean, make_messy  # noqa: E402
 
 from costguard.core.parsing.excel_parser import parse_file  # noqa: E402
 from costguard.core.parsing.header_detect import (  # noqa: E402
+    FIELD_DICT,
     detect_header,
     is_subtotal_row,
 )
@@ -70,3 +71,24 @@ class TestSubtotal:
         assert not is_subtotal_row("钢筋合计用量表", "")
         assert not is_subtotal_row("C25混凝土垫层", "010501001001")
         assert not is_subtotal_row("", "平整场地")
+
+
+class TestFieldDictZimuAlias:
+    """issue #2 词典缺口：市政/公路清单通用列名"子目号/细目号"。"""
+
+    def test_code_aliases_include_zimu(self):
+        exact, contains = FIELD_DICT["code"]
+        for w in ("子目号", "细目号", "子目编码", "细目编码"):
+            assert w in exact
+        assert "子目号" in contains and "细目号" in contains
+
+    def test_contains_must_not_swallow_zimu_name_column(self):
+        """contains 词表禁止裸"子目/细目"——否则"子目名称"列会被误判为编码列。"""
+        _exact, contains = FIELD_DICT["code"]
+        for w in contains:
+            assert w in ("编码", "编号", "子目号", "细目号")
+            assert not w.endswith(("子目", "细目"))
+
+    def test_name_aliases_include_zimu(self):
+        exact, _contains = FIELD_DICT["name"]
+        assert "子目名称" in exact and "细目名称" in exact
