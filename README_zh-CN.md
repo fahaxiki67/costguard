@@ -9,9 +9,9 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 → 对上对下差异 → 异常项识别 → Excel/Word 报告导出
 ```
 
-> 当前状态：**v0.1.4 预览版**。七步主链和 Mac 图形界面已可运行，并提供
+> 当前状态：**v0.1.5 预览版**。七步主链和 Mac 图形界面已可运行，并提供
 > **未公证、ad-hoc 本地签名的 macOS DMG**（Apple Silicon 原生）。
-> 详见[发布说明](docs/RELEASE_NOTES_v0.1.4.md)和
+> 详见[发布说明](docs/RELEASE_NOTES_v0.1.5.md)和
 > [三分钟上手](docs/QUICKSTART_zh-CN.md)。
 
 ![期次概览](examples/screenshots/03-期次概览.png)
