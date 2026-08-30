@@ -9,9 +9,12 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 → 对上对下差异 → 异常项识别 → Excel/Word 报告导出
 ```
 
-> 当前状态：**v0.1.0 开源开发者预览**。七步主链和 Mac 图形界面已可运行；
-> 首发提供源码和 Python wheel，尚未提供签名、公证的 macOS DMG。
-> 详见[首发说明](docs/RELEASE_NOTES_v0.1.0.md)和[路线图](ROADMAP.md)。
+> 当前状态：**v0.1.2 预览版**。七步主链和 Mac 图形界面已可运行，并提供
+> **未公证、ad-hoc 本地签名的 macOS DMG**（Apple Silicon 原生）。
+> 详见[发布说明](docs/RELEASE_NOTES_v0.1.2.md)和
+> [三分钟上手](docs/QUICKSTART_zh-CN.md)。
+
+![期次概览](examples/screenshots/03-期次概览.png)
 
 ## 解决什么问题
 
@@ -55,7 +58,24 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 
 ## 安装与运行
 
-当前开发者预览优先支持 macOS Apple Silicon，需要先安装 [uv](https://docs.astral.sh/uv/)：
+### 普通用户（macOS Apple Silicon，推荐）
+
+1. 从 [Releases](https://github.com/fahaxiki67/costguard/releases) 下载
+   `CostGuard-<版本号>-macos-arm64.dmg`，可用 `SHA256SUMS.txt` 校验。
+2. 双击打开 DMG，把 **CostGuard.app** 拖入 **Applications**。
+3. 从"应用程序"启动。**当前版本未做 Apple 公证**：首次打开如提示"无法验证开发者"，
+   在应用程序文件夹**右键 → 打开**即可（详见[三分钟上手](docs/QUICKSTART_zh-CN.md)）。
+4. 点击 **「体验匿名演示」**，三分钟走完
+   导入 → 标准化 → Decimal 金额校核 → 同义匹配 → 对上对下差异 → 异常检测 →
+   Excel/Word 导出 的完整流程（全程使用完全合成的匿名演示数据）。
+
+![异常检测](examples/screenshots/05-异常检测.png)
+
+更多截图见 [examples/screenshots/](examples/screenshots/)，图文步骤见
+**[三分钟上手 QUICKSTART_zh-CN](docs/QUICKSTART_zh-CN.md)**。
+截图由 `scripts/generate_screenshots.py` 驱动真实运行的程序生成，可在本地复现。
+
+### 开发者（源码运行）
 
 ```bash
 brew install uv
@@ -96,7 +116,9 @@ uv run ruff check src scripts tests
 - 合成最小样例已完成人工 WPS 验证；不同 WPS/Office 版本仍建议用自己的匿名化样例复核。
 - LLM 辅助功能默认关闭，全部核心功能可离线运行。
 - 软件提示新版本但不自动更新，由用户决定是否升级。
-- 当前没有签名、公证的 Mac DMG；普通用户免命令安装是下一阶段工作。
+- 当前 DMG 为 **ad-hoc 本地签名、未公证** 的预览版：首次启动可能需要右键打开；
+  签名公证版是后续工作。打包构建见 `scripts/build_macos_arm64.sh` 与
+  手动打包工作流 `.github/workflows/package-macos-arm64.yml`。
 
 ## 开发路线
 
@@ -107,6 +129,12 @@ uv run ruff check src scripts tests
 - CostGuard 使用 [Apache License 2.0](LICENSE)。
 - 欢迎提交 Issue、复现样例、规则建议和 Pull Request；优先处理带匿名化样例和可重复验收标准的问题。
 - 真实合同、结算表、企业数据、个人信息和账号凭证不得上传到公开 Issue、PR 或仓库。
+
+## 文档
+
+- [三分钟上手 QUICKSTART_zh-CN](docs/QUICKSTART_zh-CN.md) · [英文说明 README.md](README.md)
+- [架构 ARCHITECTURE.md](ARCHITECTURE.md) · [路线图 ROADMAP.md](ROADMAP.md) · [开发原则 AGENTS.md](AGENTS.md)
+- 架构决策记录：`docs/adr/`
 
 许可证决策见 [ADR-009](docs/adr/ADR-009-license-deferral.md)，贡献规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
