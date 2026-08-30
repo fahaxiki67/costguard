@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from costguard.platform.paths import IS_WINDOWS
+
 
 def is_frozen() -> bool:
     """是否运行在 PyInstaller 打包产物中。"""
@@ -36,12 +38,17 @@ def bundled_demo_dir() -> Path:
 
 
 def app_icon_path() -> Path | None:
-    """应用图标（.icns/.png）；不存在时返回 None（UI 使用系统默认图标）。"""
+    """应用图标；Windows 优先 .ico，macOS 优先 .icns；缺失返回 None（系统默认）。"""
     candidates: list[Path] = []
     if is_frozen():
+        if IS_WINDOWS:
+            candidates.append(_bundle_base() / "costguard_resources" / "icon.ico")
         candidates.append(_bundle_base() / "costguard_resources" / "icon.icns")
     here = Path(__file__).resolve()
     for parent in here.parents:
+        if IS_WINDOWS:
+            candidates.append(parent / "src" / "costguard" / "resources" / "icon.ico")
+            candidates.append(parent / "costguard" / "resources" / "icon.ico")
         candidates.append(parent / "src" / "costguard" / "resources" / "icon.icns")
         candidates.append(parent / "costguard" / "resources" / "icon.icns")
     for cand in candidates:

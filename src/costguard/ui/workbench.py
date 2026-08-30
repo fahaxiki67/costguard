@@ -18,12 +18,16 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
+    QListWidget,
     QMessageBox,
     QPushButton,
+    QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -47,6 +51,234 @@ LEVEL_ZH = {
     "incomparable": "不可比",
     "pending_data": "待补资料",
 }
+SHEET_FIELD_ZH = [
+    ("code", "编码"), ("name", "名称"), ("feature", "特征"), ("unit", "单位"),
+    ("quantity", "工程量"), ("unit_price", "单价"), ("amount", "合价"), ("tax_rate", "税率"),
+]
+NON_SETTLEMENT_ROLE_ZH = {
+    "non_settlement_form": "非结算表单（封面/审批表/承诺书等）",
+    "settlement_summary": "汇总/统计表",
+    "supporting_evidence": "支持证据（计量/收方/照片等）",
+    "contract_control": "合同/控制性内容",
+    "other_non_settlement": "其他非结算",
+}
+
+# 待人工确认 sheet：尚未进入结算模型，且未确认过非结算角色
+PENDING_SHEETS_SQL = """
+SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_cols, rs.n_rows, sf.original_name,
+       th.col_map_json, th.header_row_lo, th.header_row_hi, th.needs_review
+FROM raw_sheets rs
+JOIN parse_batches pb ON pb.id = rs.batch_id
+JOIN source_files sf ON sf.id = pb.file_id
+LEFT JOIN table_headers th ON th.sheet_id = rs.id
+WHERE sf.project_id=? AND rs.period_id IS NULL
+  AND NOT EXISTS (SELECT 1 FROM audit_log al
+                  WHERE al.project_id=sf.project_id AND al.target='sheet:'||rs.id
+                  AND al.action='confirm_sheet_non_settlement_role')
+ORDER BY sf.id, rs.id"""
+
+
+class SheetConfirmDialog(QDialog):
+    """人工确认被门控工作表：选列映射/表头范围 → 按清单抽取，或仅存证。
+
+    对应核心接口 confirm_sheet_role_and_extract / confirm_sheet_non_settlement_role。
+    """
+
+    def __init__(self, conn, project_id: int, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.project_id = project_id
+        self.setWindowTitle("人工确认工作表（表头歧义/无表头/表单）")
+        self.resize(860, 560)
+        self._sheets: list[dict] = []
+        self._col_spins: dict[str, QSpinBox] = {}
+
+        split = QSplitter(self)
+        self.sheet_list = QListWidget()
+        self.sheet_list.currentRowChanged.connect(self._on_select)
+        split.addWidget(self.sheet_list)
+
+        right = QWidget()
+        form = QVBoxLayout(right)
+        self.info_label = QLabel("（无待确认工作表）")
+        self.info_label.setWordWrap(True)
+        form.addWidget(self.info_label)
+
+        row_dir = QHBoxLayout()
+        self.dir_combo = QComboBox()
+        for key in ("upward", "downward", "unknown"):
+            self.dir_combo.addItem(DIRECTION_ZH[key], key)
+        self.period_spin = QSpinBox()
+        self.period_spin.setRange(1, 999)
+        row_dir.addWidget(QLabel("方向："))
+        row_dir.addWidget(self.dir_combo)
+        row_dir.addWidget(QLabel("期次："))
+        row_dir.addWidget(self.period_spin)
+        row_dir.addStretch(1)
+        form.addLayout(row_dir)
+
+        form.addWidget(QLabel("列映射（0 = 该字段不使用；列号为 1 起始）："))
+        grid = QGridLayout()
+        for i, (field, zh) in enumerate(SHEET_FIELD_ZH):
+            spin = QSpinBox()
+            spin.setRange(0, 256)
+            grid.addWidget(QLabel(zh), i // 2, (i % 2) * 2)
+            grid.addWidget(spin, i // 2, (i % 2) * 2 + 1)
+            self._col_spins[field] = spin
+        form.addLayout(grid)
+
+        row_hdr = QHBoxLayout()
+        self.hdr_lo = QSpinBox()
+        self.hdr_hi = QSpinBox()
+        for s in (self.hdr_lo, self.hdr_hi):
+            s.setRange(1, 9999)
+        row_hdr.addWidget(QLabel("表头行范围："))
+        row_hdr.addWidget(self.hdr_lo)
+        row_hdr.addWidget(QLabel("至"))
+        row_hdr.addWidget(self.hdr_hi)
+        row_hdr.addStretch(1)
+        form.addLayout(row_hdr)
+
+        self.reason_edit = QTextEdit()
+        self.reason_edit.setPlaceholderText("必填：说明确认依据（写入审计日志）")
+        form.addWidget(QLabel("确认原因（必填）："))
+        form.addWidget(self.reason_edit, 1)
+
+        role_row = QHBoxLayout()
+        role_row.addWidget(QLabel("仅存证角色："))
+        self.role_combo = QComboBox()
+        for key, zh in NON_SETTLEMENT_ROLE_ZH.items():
+            self.role_combo.addItem(zh, key)
+        role_row.addWidget(self.role_combo, 1)
+        form.addLayout(role_row)
+
+        btn_row = QHBoxLayout()
+        extract_btn = QPushButton("按结算清单抽取")
+        extract_btn.clicked.connect(self._do_extract)
+        evidence_btn = QPushButton("仅存证（非结算表单）")
+        evidence_btn.clicked.connect(self._do_evidence_only)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(extract_btn)
+        btn_row.addWidget(evidence_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        form.addLayout(btn_row)
+        split.addWidget(right)
+        split.setSizes([260, 600])
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(split)
+        self.reload()
+
+    # ---- 数据 ----
+    def reload(self):
+        self._sheets = [dict(r) for r in self.conn.execute(
+            PENDING_SHEETS_SQL, (self.project_id,)).fetchall()]
+        self.sheet_list.clear()
+        for s in self._sheets:
+            state = "表头歧义待复核" if s["col_map_json"] else "无表头（需完整人工映射）"
+            self.sheet_list.addItem(f"{s['sheet_name']}　[{state}]")
+        if self._sheets:
+            self.sheet_list.setCurrentRow(0)
+        else:
+            self.info_label.setText("当前项目没有待人工确认的工作表。")
+
+    def _current(self) -> dict | None:
+        row = self.sheet_list.currentRow()
+        return self._sheets[row] if 0 <= row < len(self._sheets) else None
+
+    def _on_select(self, row: int):
+        s = self._current()
+        if not s:
+            return
+        max_col = int(s["n_cols"] or 1)
+        for spin in self._col_spins.values():
+            spin.setMaximum(max(1, max_col))
+        if s["col_map_json"]:
+            import json as _json
+
+            col_map = _json.loads(s["col_map_json"])
+            for field, spin in self._col_spins.items():
+                spin.setValue(int(col_map.get(field, 0)))
+            self.hdr_lo.setValue(int(s["header_row_lo"] or 1))
+            self.hdr_hi.setValue(int(s["header_row_hi"] or 1))
+            src = f"来自文件「{s['original_name']}」；自动识别有歧义，已预填候选，请核对后确认"
+        else:
+            for spin in self._col_spins.values():
+                spin.setValue(0)
+            self.hdr_lo.setValue(1)
+            self.hdr_hi.setValue(1)
+            src = f"来自文件「{s['original_name']}」；该表无自动表头，请人工指定列映射与表头行"
+        self.info_label.setText(f"工作表「{s['sheet_name']}」（共 {max_col} 列）\n{src}")
+
+    def _col_map(self) -> dict[str, int]:
+        return {f: sp.value() for f, sp in self._col_spins.items() if sp.value() > 0}
+
+    def _validated(self) -> tuple[dict, tuple[int, int], str]:
+        s = self._current()
+        if not s:
+            raise ValueError("没有选中的工作表")
+        reason = self.reason_edit.toPlainText().strip()
+        if not reason:
+            raise ValueError("确认原因必填（原则 14）")
+        col_map = self._col_map()
+        if "name" not in col_map:
+            raise ValueError("列映射必须包含「名称」列")
+        if "amount" not in col_map and not ("quantity" in col_map and "unit_price" in col_map):
+            raise ValueError("金额口径不完整：需「合价」列，或同时提供「工程量」+「单价」列")
+        cols = list(col_map.values())
+        if len(cols) != len(set(cols)):
+            raise ValueError("同一列被映射到了多个字段")
+        hdr = (self.hdr_lo.value(), self.hdr_hi.value())
+        n_rows = int(s["n_rows"] or 1)
+        if not (1 <= hdr[0] <= hdr[1] <= n_rows):
+            raise ValueError(f"表头行范围无效（有效行 1..{n_rows}）")
+        return col_map, hdr, reason
+
+    def _do_extract(self):
+        s = self._current()
+        if not s:
+            return
+        try:
+            col_map, hdr, reason = self._validated()
+        except ValueError as exc:
+            QMessageBox.warning(self, "人工确认", str(exc))
+            return
+        from costguard.core.engine import settlement_io
+
+        direction = self.dir_combo.currentData()
+        try:
+            n = settlement_io.confirm_sheet_role_and_extract(
+                self.conn, self.project_id, int(s["sheet_id"]), actor="user",
+                reason=reason, direction=direction, period_no=self.period_spin.value(),
+                confirmed_col_map=col_map, confirmed_header_range=hdr)
+            QMessageBox.information(self, "人工确认", f"已抽取 {n} 行明细。")
+        except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
+            QMessageBox.warning(self, "人工确认失败", f"{type(exc).__name__}: {exc}")
+            return
+        self.reason_edit.clear()
+        self.reload()
+
+    def _do_evidence_only(self):
+        s = self._current()
+        if not s:
+            return
+        reason = self.reason_edit.toPlainText().strip()
+        if not reason:
+            QMessageBox.warning(self, "人工确认", "确认原因必填（原则 14）")
+            return
+        from costguard.core.engine import settlement_io
+
+        try:
+            settlement_io.confirm_sheet_non_settlement_role(
+                self.conn, self.project_id, int(s["sheet_id"]), actor="user",
+                confirmed_role=self.role_combo.currentData(), reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "仅存证失败", f"{type(exc).__name__}: {exc}")
+            return
+        self.reason_edit.clear()
+        self.reload()
 
 
 class ReasonDialog(QDialog):
@@ -138,7 +370,9 @@ class WorkbenchPage(QWidget):
         detect_btn.clicked.connect(self._run_anomalies)
         check_btn = QPushButton("双向校核")
         check_btn.clicked.connect(self._run_crosscheck)
-        for b in (import_btn, contract_btn, detect_btn, check_btn):
+        confirm_btn = QPushButton("人工确认清单页…")
+        confirm_btn.clicked.connect(self._open_sheet_confirm)
+        for b in (import_btn, contract_btn, confirm_btn, detect_btn, check_btn):
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
@@ -184,14 +418,31 @@ class WorkbenchPage(QWidget):
         if not files:
             return
         ok, fail = 0, []
+        pending = 0
         for f in files:
             try:
-                settlement_io.import_settlement_file(
+                report = settlement_io.import_settlement_file(
                     self.conn, self.project.project_id, self.project_dir, f)
                 ok += 1
+                pending += sum(
+                    1 for s in report.sheets
+                    if s.status in ("needs_role_review", "no_header", "non_settlement_form"))
             except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
                 fail.append(f"{Path(f).name}: {exc}")
-        self._notify_import(ok, fail)
+        self._notify_import(ok, fail, pending)
+        self.refresh_all()
+        if pending:
+            ret = QMessageBox.question(
+                self, "待人工确认",
+                f"有 {pending} 个工作表因表头歧义/无表头/表单结构待人工确认，"
+                "未进入结算模型。\n现在打开「人工确认清单页」处理吗？",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret == QMessageBox.Yes:
+                self._open_sheet_confirm()
+
+    def _open_sheet_confirm(self):
+        dlg = SheetConfirmDialog(self.conn, self.project.project_id, self)
+        dlg.exec()
         self.refresh_all()
 
     def _import_contract(self):
@@ -481,7 +732,10 @@ class WorkbenchPage(QWidget):
         export_btn.clicked.connect(self._export_excel)
         doc_btn = QPushButton("导出管理层摘要（Word）")
         doc_btn.clicked.connect(self._export_docx)
-        open_dir_btn = QPushButton("在 Finder 中显示导出目录")
+        import sys as _sys
+
+        _fm = "Finder" if _sys.platform == "darwin" else "资源管理器"
+        open_dir_btn = QPushButton(f"在{_fm}中显示导出目录")
         open_dir_btn.clicked.connect(self._open_export_dir)
         row = QHBoxLayout()
         for b in (export_btn, doc_btn, open_dir_btn):
@@ -520,8 +774,10 @@ class WorkbenchPage(QWidget):
         self.refresh_anomalies()
         self.refresh_matches()
 
-    def _notify_import(self, ok: int, fail: list[str]):
+    def _notify_import(self, ok: int, fail: list[str], pending: int = 0):
         msg = f"成功导入 {ok} 个文件（原文件未改动）。"
+        if pending:
+            msg += f"\n其中 {pending} 个工作表待人工确认（表头歧义/无表头/表单），可用「人工确认清单页…」处理。"
         if fail:
             msg += "\n失败：\n" + "\n".join(fail)
         QMessageBox.information(self, "导入", msg)

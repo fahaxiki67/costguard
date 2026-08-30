@@ -9,9 +9,9 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 → 对上对下差异 → 异常项识别 → Excel/Word 报告导出
 ```
 
-> 当前状态：**v0.1.4 预览版**。七步主链和 Mac 图形界面已可运行，并提供
-> **未公证、ad-hoc 本地签名的 macOS DMG**（Apple Silicon 原生）。
-> 详见[发布说明](docs/RELEASE_NOTES_v0.1.4.md)和
+> 当前状态：**v0.1.5 预览版**。七步主链和图形界面已可运行：macOS Apple
+> Silicon 提供**未公证、ad-hoc 签名的 DMG**；Windows x64 提供**未签名
+> 安装器与便携版**。详见[发布说明](docs/RELEASE_NOTES_v0.1.5.md)和
 > [三分钟上手](docs/QUICKSTART_zh-CN.md)。
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -58,7 +58,20 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 
 ## 安装与运行
 
-### 普通用户（macOS Apple Silicon，推荐）
+### 普通用户（Windows x64）
+
+1. 从 [Releases](https://github.com/fahaxiki67/costguard/releases) 下载
+   `CostGuard-<版本号>-windows-x64-setup.exe`（或便携版 zip），用
+   `SHA256SUMS.txt` 校验。
+2. 双击安装（可选"仅当前用户"，无需管理员）。**安装器未签名**：首次运行若
+   SmartScreen 提示"已保护你的电脑"，选"更多信息 → 仍要运行"（属预期行为，
+   不承诺无提示）。
+3. 从开始菜单/桌面启动。工程数据保存在 `Documents\CostGuardProjects`，
+   安装/卸载均不触碰；无后台常驻、无自动更新。
+4. 点 **「体验匿名演示」** 走完全流程；被门控的工作表用 **「人工确认清单页…」**
+   人工确认（原因必填、写审计）。
+
+### 普通用户（macOS Apple Silicon）
 
 1. 从 [Releases](https://github.com/fahaxiki67/costguard/releases) 下载
    `CostGuard-<版本号>-macos-arm64.dmg`，可用 `SHA256SUMS.txt` 校验。
@@ -116,9 +129,10 @@ uv run ruff check src scripts tests
 - 合成最小样例已完成人工 WPS 验证；不同 WPS/Office 版本仍建议用自己的匿名化样例复核。
 - LLM 辅助功能默认关闭，全部核心功能可离线运行。
 - 软件提示新版本但不自动更新，由用户决定是否升级。
-- 当前 DMG 为 **ad-hoc 本地签名、未公证** 的预览版：首次启动可能需要右键打开；
-  签名公证版是后续工作。打包构建见 `scripts/build_macos_arm64.sh` 与
-  手动打包工作流 `.github/workflows/package-macos-arm64.yml`。
+- macOS DMG 为 **ad-hoc 本地签名、未公证** 预览版（首次启动可能需右键打开）；
+  Windows 安装器**未签名**（SmartScreen 提示已在文档如实说明）。签名/公证是
+  后续工作。打包构建见 `scripts/build_macos_arm64.sh`、
+  `scripts/build_windows_x64.ps1` 与两个手动打包工作流。
 
 ## 开发路线
 

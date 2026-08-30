@@ -1,0 +1,107 @@
+name: Package Windows x64 (manual)
+
+# Windows x64 打包流水线（真实 windows runner 全门槛）：
+# Python 3.12 → lint → 全量测试 → 演示确定性 → 构建（PyInstaller+便携zip+Inno安装器）
+# → PE 架构校验 → 隐私审计 → 演示全链 E2E → 安装/启动/退出/卸载冒烟 → 敏感扫描
+# → SHA256 → 上传 artifact。
+# 触发：
+# - pull_request（目标 main，限定打包/核心相关路径）：合并前在 PR 上真机执行全部
+#   发布门槛——工作流文件必须存在于 PR 分支即可运行，不受默认分支限制；
+# - workflow_dispatch：合并后复验。不创建 Release、不推送 tag——发布由维护者确认执行。
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/package-windows-x64.yml"
+      - ".github/workflows/ci.yml"
+      - "scripts/build_windows_x64.ps1"
+      - "scripts/windows_smoke.py"
+      - "scripts/generate_demo_data.py"
+      - "scripts/audit_bundle_privacy.py"
+      - "src/costguard/**"
+      - "tests/**"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: uv pip install -e ".[dev]"
+
+      - name: Lint
+        run: uv run ruff check src scripts tests
+
+      - name: Tests
+        run: uv run python -m pytest tests/ -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+
+      - name: Demo data determinism
+        run: uv run python scripts/generate_demo_data.py --check
+
+      - name: Build portable zip + installer (tests already run above)
+        run: powershell -ExecutionPolicy Bypass -File scripts/build_windows_x64.ps1 -SkipChecks
+
+      - name: Anonymous demo end-to-end (source)
+        run: uv run python scripts/windows_smoke.py e2e
+
+      - name: Install / launch / quit / uninstall smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content pyproject.toml | Select-String '^version = "(.+)"').Matches[0].Groups[1].Value
+          $setup = "dist/installer/CostGuard-$version-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "未找到安装器 $setup" }
+          # 静默安装（当前用户，无需管理员）
+          Start-Process -FilePath $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/CURRENTUSER","/NORESTART" -Wait
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\CostGuard\CostGuard.exe"
+          if (-not (Test-Path $exe)) { throw "安装后未找到 $exe" }
+          # 启动/退出冒烟
+          uv run python scripts/windows_smoke.py installed $exe
+          # 卸载并确认程序目录消失（用户 Documents 数据不受影响）
+          $unins = Join-Path $env:LOCALAPPDATA "Programs\CostGuard\unins000.exe"
+          if (-not (Test-Path $unins)) { throw "未找到卸载器 $unins" }
+          Start-Process -FilePath $unins -ArgumentList "/SILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\CostGuard")) {
+            throw "卸载后程序目录仍存在"
+          }
+          Write-Host "安装/启动/退出/卸载冒烟 PASS"
+
+      - name: Sensitive-data scan (tracked files)
+        shell: bash
+        run: |
+          set -e
+          echo "== scanning tracked paths =="
+          forbidden_paths=$(git ls-files | grep -Ei '(^|/)(local_private_data|secrets|credentials)(/|$)|(^|/)\.env($|\.)|\.(pem|p12|pfx|key|mobileprovision)$' || true)
+          if [ -n "$forbidden_paths" ]; then
+            echo "FORBIDDEN SENSITIVE PATHS:"; echo "$forbidden_paths"; exit 1
+          fi
+          echo "== scanning dist text artifacts for build-machine identity =="
+          if grep -rIlE "runneradmin|C:\\\\Users\\\\[A-Za-z]" dist/*.txt 2>/dev/null; then
+            echo "IDENTITY-LIKE CONTENT IN SHA256SUMS"; exit 1
+          fi
+          echo "clean"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CostGuard-windows-x64
+          path: |
+            dist/installer/*.exe
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14

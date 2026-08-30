@@ -23,8 +23,8 @@
 | 12 | Mac Beta Release (v0.9.x) | ⬜ |
 | 13 | 真实案例回归测试和 Bug 修复 | ⬜ |
 | 14 | Mac V1.0 Release Candidate（签名+公证预留） | ⬜ |
-| 15 | Windows x64 兼容 | ⬜ |
-| 16 | Windows 安装包 | ⬜ |
+| 15 | Windows x64 兼容（真机全量测试） | 🔨 PR CI + 打包工作流验证中 |
+| 16 | Windows 安装包（未签名 Inno Setup + 便携 zip） | 🔨 v0.1.5 预览 |
 | 17 | Windows Beta | ⬜ |
 | 18 | 跨平台 V1.x | ⬜ |
 

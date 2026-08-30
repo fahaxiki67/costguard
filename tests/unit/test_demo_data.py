@@ -75,7 +75,8 @@ def test_demo_data_regenerates_byte_identical(tmp_path: Path) -> None:
     """确定性：独立子进程重新生成（跨进程/跨秒），所有文件字节一致。"""
     result = subprocess.run(
         [sys.executable, str(GENERATOR), "--out", str(tmp_path)],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, encoding="utf-8", errors="strict",
+        timeout=120,
     )
     assert result.returncode == 0, result.stderr
     for name in DEMO_FILES + ["manifest.json", "SHA256SUMS"]:

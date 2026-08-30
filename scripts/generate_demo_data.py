@@ -73,8 +73,19 @@ def _normalize_zip(path: Path) -> None:
             info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o600 << 16
+            info.create_system = 3  # 固定为 Unix，否则 Windows 生成字节与 macOS 不一致
             dst.writestr(info, data)
-    tmp.replace(path)
+    # Windows：杀毒软件可能短暂锁定刚写完的文件，os.replace 会 WinError 5，退避重试
+    import time
+
+    for attempt in range(6):
+        try:
+            tmp.replace(path)
+            break
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 def _style_table(ws: openpyxl.Worksheet, header_row: int, last_row: int,
@@ -499,7 +510,19 @@ def generate(out_dir: Path) -> dict:
     return manifest
 
 
+def force_utf8_stdio() -> None:
+    """CLI 入口专用：Windows 控制台默认 cp1252，中文输出会 UnicodeEncodeError。
+
+    重配置为 UTF-8（errors=replace）保证中文可输出；仅在脚本自身作为命令行
+    入口运行时调用，不做 import 期全局副作用（库内/测试进程不受影响）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="生成匿名演示数据（examples/demo）")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="输出目录")
     parser.add_argument("--check", action="store_true",

@@ -11,9 +11,10 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.4 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. See the
-> [release notes](docs/RELEASE_NOTES_v0.1.4.md) and the
+> **Status: v0.1.5 preview.** The seven-step core workflow, the macOS GUI with an
+> unsigned ad-hoc-signed DMG (Apple Silicon), and a **Windows x64 installer and
+> portable zip** (unsigned) are available. See the
+> [release notes](docs/RELEASE_NOTES_v0.1.5.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -43,6 +44,18 @@ Excel import → field standardization → quantity/unit-price/amount checks
 ## Tech stack
 
 Python 3.12 · PySide6 · SQLite · openpyxl/xlrd · pandas · rapidfuzz · pdfplumber · python-docx
+
+## Install on Windows x64 (regular users)
+
+Download `CostGuard-<version>-windows-x64-setup.exe` (or the portable zip) from
+[Releases](https://github.com/fahaxiki67/costguard/releases) and verify with the
+published `SHA256SUMS.txt`. The installer is **unsigned**: SmartScreen may show
+"Windows protected your PC" on first run — choose **More info → Run anyway**;
+this is expected and cannot be promised away. User data lives in
+`Documents\CostGuardProjects` and is never touched by install or uninstall.
+The full workflow (import → standardize → Decimal checks → matching →
+direction differences → anomalies → Excel/Word export) is verified on a real
+Windows runner with the bundled anonymous demo data.
 
 ## Install on macOS Apple Silicon (regular users)
 
@@ -101,9 +114,12 @@ Licensed under the [Apache License 2.0](LICENSE). See
   exports remain a separate conditional acceptance gate.
 - The macOS DMG is **ad-hoc signed, not notarized** (first-launch right-click Open
   may be required); a Developer-ID signed and notarized build is future work.
-- Building the DMG requires macOS Apple Silicon; see
-  `scripts/build_macos_arm64.sh` and the manual packaging workflow
-  (`.github/workflows/package-macos-arm64.yml`).
+- Building the DMG requires macOS Apple Silicon; building the Windows
+  installer requires Windows x64 — see `scripts/build_macos_arm64.sh`,
+  `scripts/build_windows_x64.ps1` and the manual packaging workflows
+  (`.github/workflows/package-macos-arm64.yml`,
+  `.github/workflows/package-windows-x64.yml`).
+- The Windows installer is unsigned (SmartScreen right-through documented).
 
 ## Documentation
 
