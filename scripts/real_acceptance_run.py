@@ -595,7 +595,11 @@ def main(run_dir: Path | None = None) -> None:
     controls_by_test = load_acceptance_controls()
     with open(MANIFEST, encoding="utf-8") as f:
         records_raw = list(csv.DictReader(f))
-    assert len(records_raw) == 13, f"manifest 应有 13 行，实际 {len(records_raw)}"
+    # 语料集允许增长（如 T 系列真实新增副本），但必须不少于最初 13 行且 id 唯一，
+    # 防止意外截断/重复行破坏既有验收对照。
+    assert len(records_raw) >= 13, f"manifest 不应少于 13 行，实际 {len(records_raw)}"
+    _ids = [r["test_id"] for r in records_raw]
+    assert len(_ids) == len(set(_ids)), f"manifest test_id 存在重复：{_ids}"
 
     pre = verify_corpus(records_raw)
     bad = [r for r in pre if not r["hash_match"] or not r["exists"]]
