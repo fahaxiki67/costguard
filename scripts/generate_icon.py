@@ -82,6 +82,26 @@ def _render_master(size: int = 1024) -> bytes:
     return bytes(buf.data())
 
 
+OUT_ICO = REPO_ROOT / "src" / "costguard" / "resources" / "icon.ico"
+
+
+def _render_ico() -> None:
+    """Windows 图标：同一母版的 256x256 ICO（Qt 原生 ICO 编码）。"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication, QPixmap
+
+    png = _render_master(1024)
+
+    _app = QGuiApplication.instance() or QGuiApplication([])
+    pm = QPixmap()
+    pm.loadFromData(png)
+    OUT_ICO.parent.mkdir(parents=True, exist_ok=True)
+    scaled = pm.scaled(256, 256, Qt.AspectRatioMode.IgnoreAspectRatio,
+                       Qt.SmoothTransformation)
+    if not scaled.save(str(OUT_ICO), "ICO"):
+        raise RuntimeError("ICO 保存失败")
+
+
 def main() -> int:
     if sys.platform != "darwin":
         print("仅支持 macOS（iconutil）", file=sys.stderr)
@@ -107,6 +127,8 @@ def main() -> int:
         subprocess.run(["iconutil", "-c", "icns", str(iconset),
                         "-o", str(OUT_ICNS)], check=True)
     print(f"已生成 {OUT_ICNS}（{OUT_ICNS.stat().st_size} bytes）")
+    _render_ico()
+    print(f"已生成 {OUT_ICO}（{OUT_ICO.stat().st_size} bytes）")
     return 0
 
 

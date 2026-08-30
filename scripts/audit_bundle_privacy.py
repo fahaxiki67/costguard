@@ -48,6 +48,10 @@ def _identity_patterns() -> dict[str, bytes]:
         py_only[f"用户名路径 /home/{user}/"] = f"/home/{user}/".encode()
     if home:
         py_only["本机HOME路径"] = home.encode()
+        # Windows 形态（HOME=C:\Users\<user>）：反斜杠用户目录前缀
+        home_win = home.replace("/", "\\")
+        if home_win != home:
+            py_only["本机HOME路径(Windows)"] = home_win.encode()
     return {"binary": base, "pyz": {**base, **py_only}}
 
 
@@ -91,27 +95,31 @@ def _scan_uncompressed(app_dir: Path, patterns: dict[str, bytes]) -> list[dict]:
     return hits
 
 
-def _extract_pyz(exe: Path) -> bytes | None:
+def _extract_pyz(exe: Path) -> tuple[bytes | None, str]:
+    """返回 (pyz 字节, 失败原因)；成功时原因为空。绝不静默降级。"""
     from PyInstaller.archive.readers import CArchiveReader
 
     try:
         ar = CArchiveReader(str(exe))
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"CArchive 打开失败：{type(exc).__name__}: {exc}"
     pyz_names = [n for n in ar.toc if "pyz" in n.lower()]
     if not pyz_names:
-        return None
-    return ar.extract(pyz_names[0])
+        return None, "CArchive 中无 PYZ 成员"
+    try:
+        return ar.extract(pyz_names[0]), ""
+    except Exception as exc:
+        return None, f"PYZ 提取失败：{type(exc).__name__}: {exc}"
 
 
-def _scan_pyz(exe: Path, patterns: dict[str, bytes]) -> list[dict]:
-    pyz = _extract_pyz(exe)
+def _scan_pyz(exe: Path, patterns: dict[str, bytes]) -> tuple[list[dict], str]:
+    pyz, reason = _extract_pyz(exe)
     if pyz is None:
-        return []
+        return [], f"PYZ 层不可用（{reason}）——本层身份扫描未执行，需人工复核"
     hits: list[dict] = []
     magic, _pymagic, tocpos = struct.unpack("!4s4sI", pyz[:12])
     if magic != b"PYZ\x00":
-        return [{"label": "PYZ异常", "where": str(exe), "excerpt": "PYZ 头部无法解析", "suffix": ""}]
+        return [{"label": "PYZ异常", "where": str(exe), "excerpt": "PYZ 头部无法解析", "suffix": ""}], ""
     toc = __import__("marshal").loads(pyz[tocpos:])
     for item in toc:
         name, (typ, pos, length) = item
@@ -126,7 +134,7 @@ def _scan_pyz(exe: Path, patterns: dict[str, bytes]) -> list[dict]:
             while start != -1:
                 hits.append(_hit(label, f"PYZ模块 {name}", blob, start, len(pat)))
                 start = blob.find(pat, start + 1)
-    return hits
+    return hits, ""
 
 
 _UPSTREAM_TOOLCHAIN_DIRS = (
@@ -176,7 +184,10 @@ def main() -> int:
         print("FAIL: 无法确定本机身份特征（仓库路径/网段为空），拒绝盲审", file=sys.stderr)
         return 1
 
-    raw_hits = _scan_uncompressed(app, patterns["binary"]) + _scan_pyz(exe, patterns["pyz"])
+    pyz_hits, pyz_note = _scan_pyz(exe, patterns["pyz"])
+    raw_hits = _scan_uncompressed(app, patterns["binary"]) + pyz_hits
+    if pyz_note:
+        print(f"注意：{pyz_note}")
     # 按（特征, 位置）聚合：任一处不可豁免即该组阻断；豁免组只计数，避免日志膨胀
     groups: dict[tuple[str, str], list[dict]] = {}
     for h in raw_hits:

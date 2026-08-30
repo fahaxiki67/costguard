@@ -4,28 +4,55 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-## [0.1.3] - 2026-08-30
-Bugfix release driven by real-world Windows + municipal payment-report feedback
-(issues #1, #2, #3, #6). No engine-semantics changes beyond the fixes below.
+## [0.1.5] - 2026-08-30
 
-### Fixed
-- **#1 Windows crash on startup/test collection**: `paths.py` used the
-  nonexistent `pathlib.Path.expandvars`; `APPDATA`/`USERPROFILE` are now read
-  from the environment with sane fallbacks (no literal `%APPDATA%` junk paths).
-- **#3 grand-total/footnote rows absorbed into detail (7.8× amount inflation)**:
-  "分部分项合计" is now matched atomically as a subtotal label (plus "第…"-
-  prefixed section totals); the "总计" label in the index column is detected by
-  scanning every leading column; consecutive trailing orphan-numeric footnote
-  rows are excluded from detail (originals retained in the fidelity layer).
-- **#6 scanned PDFs failed silently**: a zero-text-layer PDF now raises
-  `NotImplementedError` (surfaced by the runner's expected-limit channel and
-  the GUI) instead of returning ok/0 paragraphs/0 facts.
-- **#6 text-number alert flood**: `text_number_in_value_col` findings now
-  aggregate one per sheet×field with full row lists in details (a real
-  workbook went from 344 findings to 3), raw-value samples retained.
-- **#2 (short-term) dictionary gap**: added 子目号/细目号/子目编码/细目编码 code
-  aliases and 子目名称/细目名称 name aliases; contains-terms deliberately
-  exclude bare 子目/细目 so the 子目名称 column cannot be misclassified.
+First Windows x64 installer. Same shared core engine, data model, tests and UI
+as macOS — platform differences stay inside `platform/` and packaging
+(AGENTS.md: not two separate applications).
+
+### Added
+- **Windows x64 packaging** (`scripts/build_windows_x64.ps1` +
+  `platform/packaging/windows_x64.spec` + Inno Setup `windows_x64.iss`):
+  PyInstaller onedir app (x64, `icon.ico` from the same master as the macOS
+  icon), portable zip, and a setup installer that installs per-user or to
+  Program Files, creates Start-menu/desktop shortcuts, and never touches user
+  data under `Documents\CostGuardProjects` on uninstall. No background
+  services, no auto-update. Unsigned — SmartScreen may prompt on first run;
+  documented honestly, no "no prompt" claims.
+- **Manual packaging workflow** `.github/workflows/package-windows-x64.yml`
+  (workflow_dispatch, real `windows-latest` runner): lint → full pytest →
+  demo determinism → build → PE x64 check → privacy audit → anonymous-demo
+  end-to-end (import → standardize → Decimal checks → matching → direction
+  isolation → anomalies → Excel/Word export) → silent install / launch / quit /
+  uninstall smoke → sensitive-data scan → SHA256SUMS → artifact upload.
+- **Windows test job** in `ci.yml`: every PR now runs the full suite on a real
+  Windows runner alongside macOS.
+- **Sheet confirmation GUI** (`SheetConfirmDialog`, ported from the Windows
+  collaborator patch, issue #5): gated sheets (header ambiguity / no header /
+  form-like) can be confirmed in the app — pending list with states, candidate
+  column-map prefill, direction/period and 8-field column mapping, header-row
+  range, mandatory reason with audit; "extract as settlement list" or
+  "evidence-only (non-settlement role)". Import reports pending count and
+  offers the dialog.
+- `SUBTOTAL_WORDS` adds 本页小计/本页合计 (per-page subtotal rows in payment
+  reports).
+- `_normalize_zip` pins zip entry `create_system=3` and retries `os.replace`
+  with backoff on `PermissionError` (antivirus file lock) — demo data
+  regenerates byte-identical on Windows and macOS (issue #9 scenario).
+
+### Provenance
+- The three ported changes come from the Windows collaborator delivery package
+  (SHA-256 768e8b9f…32c), whose source snapshot matches upstream v0.1.3
+  (6a3da73) exactly outside the patch; provenance and forensic review recorded
+  in the PR. The package's own documents carried inconsistent v0.1.2/v0.1.3
+  labels — the correct lineage is: v0.1.3 baseline + the three enhancements
+  above.
+
+### Changed
+- No discipline rule changed: missing values stay unfilled (never 0), amounts
+  stay Decimal, upward/downward stay isolated, originals stay read-only, and
+  the evidence chain / human-review gates are unchanged (locked by the shared
+  test suite, now green on both macOS arm64 and Windows x64 runners).
 
 ## [0.1.4] - 2026-08-30
 
@@ -56,6 +83,30 @@ Bugfix release driven by real-world Windows + municipal payment-report feedback
   untouched, read-only directories still discoverable, corrupted settings.json
   archived and recovered, symlinked workspace roots deduplicated, and
   originals paths repaired after a project directory move.
+
+## [0.1.3] - 2026-08-30
+Bugfix release driven by real-world Windows + municipal payment-report feedback
+(issues #1, #2, #3, #6). No engine-semantics changes beyond the fixes below.
+
+### Fixed
+- **#1 Windows crash on startup/test collection**: `paths.py` used the
+  nonexistent `pathlib.Path.expandvars`; `APPDATA`/`USERPROFILE` are now read
+  from the environment with sane fallbacks (no literal `%APPDATA%` junk paths).
+- **#3 grand-total/footnote rows absorbed into detail (7.8× amount inflation)**:
+  "分部分项合计" is now matched atomically as a subtotal label (plus "第…"-
+  prefixed section totals); the "总计" label in the index column is detected by
+  scanning every leading column; consecutive trailing orphan-numeric footnote
+  rows are excluded from detail (originals retained in the fidelity layer).
+- **#6 scanned PDFs failed silently**: a zero-text-layer PDF now raises
+  `NotImplementedError` (surfaced by the runner's expected-limit channel and
+  the GUI) instead of returning ok/0 paragraphs/0 facts.
+- **#6 text-number alert flood**: `text_number_in_value_col` findings now
+  aggregate one per sheet×field with full row lists in details (a real
+  workbook went from 344 findings to 3), raw-value samples retained.
+- **#2 (short-term) dictionary gap**: added 子目号/细目号/子目编码/细目编码 code
+  aliases and 子目名称/细目名称 name aliases; contains-terms deliberately
+  exclude bare 子目/细目 so the 子目名称 column cannot be misclassified.
+
 
 ## [0.1.2] - 2026-08-30
 
