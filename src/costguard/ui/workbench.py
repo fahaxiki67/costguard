@@ -88,6 +88,20 @@ def _make_table(headers: list[str]) -> QTableWidget:
     return t
 
 
+def _polish_table(t: QTableWidget, right_align_cols: tuple[int, ...]) -> None:
+    """统一观感：数字列右对齐、表头加粗，按内容自适应列宽。"""
+    for row in range(t.rowCount()):
+        for col in right_align_cols:
+            item = t.item(row, col)
+            if item is not None:
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    t.resizeColumnsToContents()
+    header = t.horizontalHeader()
+    font = header.font()
+    font.setBold(True)
+    header.setFont(font)
+
+
 class WorkbenchPage(QWidget):
     def __init__(self, conn, project, project_dir: str, on_back):
         super().__init__()
@@ -162,6 +176,7 @@ class WorkbenchPage(QWidget):
                 t.setItem(i, c, QTableWidgetItem(str(v if v is not None else "—")))
             # 行必须绑定明确 period_id：对上/对下可同期号，按期号更新会双向覆盖
             t.item(i, 0).setData(Qt.UserRole, int(r["id"]))
+        _polish_table(t, (0, 3, 4))
 
     def _import_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -306,6 +321,7 @@ class WorkbenchPage(QWidget):
             ]
             for c, v in enumerate(vals):
                 t.setItem(i, c, QTableWidgetItem(str(v if v is not None else "—")))
+        _polish_table(t, (1, 5, 6, 7, 8))
 
     # ---------- 异常检测 ----------
     def _anomaly_tab(self) -> QWidget:
@@ -354,6 +370,7 @@ class WorkbenchPage(QWidget):
                 if r["severity"] == "high" and c <= 3:
                     item.setForeground(Qt.red)
                 t.setItem(i, c, item)
+        _polish_table(t, (0,))
 
     def _resolve_anomaly(self):
         row = self.anomaly_table.currentRow()
@@ -422,6 +439,7 @@ class WorkbenchPage(QWidget):
                     r["method"], f"{r['score']:.2f}" if r["score"] is not None else "—", n_items, r["status"]]
             for c, v in enumerate(vals):
                 t.setItem(i, c, QTableWidgetItem(str(v)))
+        _polish_table(t, (0, 4, 5))
 
     def _confirm_match(self):
         row = self.match_table.currentRow()
@@ -463,7 +481,7 @@ class WorkbenchPage(QWidget):
         export_btn.clicked.connect(self._export_excel)
         doc_btn = QPushButton("导出管理层摘要（Word）")
         doc_btn.clicked.connect(self._export_docx)
-        open_dir_btn = QPushButton("打开导出目录")
+        open_dir_btn = QPushButton("在 Finder 中显示导出目录")
         open_dir_btn.clicked.connect(self._open_export_dir)
         row = QHBoxLayout()
         for b in (export_btn, doc_btn, open_dir_btn):

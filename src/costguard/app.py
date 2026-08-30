@@ -8,7 +8,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from costguard.ui.main_window import MainWindow
+from costguard.ui.main_window import MainWindow, load_app_icon
 
 
 def main() -> int:
@@ -16,6 +16,9 @@ def main() -> int:
     app.setApplicationName("CostGuard")
     app.setApplicationDisplayName("CostGuard")
     app.setOrganizationName("CostGuard")
+    icon = load_app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
     win = MainWindow()
     win.show()
     return app.exec()
