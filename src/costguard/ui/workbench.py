@@ -74,7 +74,10 @@ class ReasonDialog(QDialog):
         self.reason_edit = QTextEdit()
         self.reason_edit.setPlaceholderText("必填：请说明修改原因（将写入审计日志）")
         form.addRow("原因：", self.reason_edit)
-        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb = QDialogButtonBox()
+        ok_btn = bb.addButton("确定", QDialogButtonBox.AcceptRole)
+        ok_btn.setObjectName("btnPrimary")
+        bb.addButton("取消", QDialogButtonBox.RejectRole)
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
@@ -126,7 +129,8 @@ class WorkbenchPage(QWidget):
         title.setStyleSheet(
             "font-size: 15px; font-weight: 600; background: transparent;")
         pending_count = project_status_summary(conn, project.project_id)
-        status = QLabel(f"Schema v{project.schema_version}" + (f" · {pending_count}" if pending_count else ""))
+        status = QLabel(pending_count)
+        status.setToolTip(f"数据结构版本：{project.schema_version}")
         status.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
         top.addWidget(back_btn)
         top.addSpacing(theme.SP_S)
@@ -359,17 +363,60 @@ class WorkbenchPage(QWidget):
             stretch_cols=(3,), right_cols=(5, 6, 7, 8),
             fixed_widths={0: 60, 1: 52, 2: 118, 4: 56, 9: 96})
         v.addWidget(self.items_table, 1)
+
+        # ---- 分页器（P0-1：取消静默 LIMIT 2000，全部数据可翻页到达）----
+        self.PAGE_SIZE = 500
+        self.items_page = 0
+        self.items_total = 0
+        pager = QHBoxLayout()
+        first_btn = QPushButton("首页")
+        prev_btn = QPushButton("上一页")
+        next_btn = QPushButton("下一页")
+        last_btn = QPushButton("末页")
+        for b in (first_btn, prev_btn, next_btn, last_btn):
+            b.setObjectName("btnTertiary")
+        first_btn.clicked.connect(lambda: self._goto_items_page(0))
+        prev_btn.clicked.connect(lambda: self._goto_items_page(self.items_page - 1))
+        next_btn.clicked.connect(lambda: self._goto_items_page(self.items_page + 1))
+        last_btn.clicked.connect(lambda: self._goto_items_page(10 ** 9))
+        pager.addWidget(first_btn)
+        pager.addWidget(prev_btn)
+        self.items_total_label = QLabel("共 0 条")
+        pager.addWidget(self.items_total_label)
+        pager.addWidget(next_btn)
+        pager.addWidget(last_btn)
+        pager.addStretch(1)
+        v.addLayout(pager)
         return w
 
+    def _goto_items_page(self, page: int):
+        max_page = max(0, (self.items_total - 1) // self.PAGE_SIZE) if self.items_total else 0
+        self.items_page = max(0, min(page, max_page))
+        self.refresh_items()
+
     def refresh_items(self):
+        # P0-1：全量计数 + 分页查询，杜绝静默 LIMIT 截断（搜索/导出用完整数据集）
+        self.items_total = self.conn.execute(
+            """SELECT COUNT(*) c FROM line_items li
+               JOIN settlement_periods sp ON sp.id = li.period_id
+               WHERE sp.project_id=?""",
+            (self.project.project_id,),
+        ).fetchone()["c"]
+        max_page = max(0, (self.items_total - 1) // self.PAGE_SIZE) if self.items_total else 0
+        self.items_page = max(0, min(self.items_page, max_page))
+        offset = self.items_page * self.PAGE_SIZE
         rows = self.conn.execute(
             """SELECT li.*, sp.period_no AS pno, sp.direction AS direction FROM line_items li
                JOIN settlement_periods sp ON sp.id = li.period_id
-               WHERE sp.project_id=? ORDER BY sp.period_no, li.id LIMIT 2000""",
-            (self.project.project_id,),
+               WHERE sp.project_id=? ORDER BY sp.period_no, li.id LIMIT ? OFFSET ?""",
+            (self.project.project_id, self.PAGE_SIZE, offset),
         ).fetchall()
         t = self.items_table
         t.setRowCount(len(rows))
+        shown_from = offset + 1 if rows else 0
+        shown_to = offset + len(rows)
+        self.items_total_label.setText(
+            f"共 {self.items_total} 条 / 当前显示 {shown_from}-{shown_to} 条")
         for i, r in enumerate(rows):
             flags = json.loads(r["flags_json"] or "{}")
             ev = json.loads(r["qty_evid"]) if r["qty_evid"] else None

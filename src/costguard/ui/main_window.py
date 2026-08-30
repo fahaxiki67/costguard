@@ -261,7 +261,8 @@ class MainWindow(QMainWindow):
             old.deleteLater()
         self.stack.insertWidget(PAGE_WORKBENCH, page)
         self.stack.setCurrentIndex(PAGE_WORKBENCH)
-        self.statusBar().showMessage(f"当前项目：{info.name}（schema v{info.schema_version}）")
+        self.statusBar().showMessage(f"当前项目：{info.name}")
+        self.statusBar().setToolTip(f"数据结构版本：{info.schema_version}")
 
     def _back_to_projects(self):
         self.stack.setCurrentIndex(PAGE_PROJECTS)

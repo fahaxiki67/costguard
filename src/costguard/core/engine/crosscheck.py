@@ -60,6 +60,11 @@ class CheckResult:
     amount_status: str = "missing"  # 'raw' | 'calculated' | 'raw_checked_match' | 'raw_checked_diff'
     derived_rows: int = 0
     formula_mismatch_rows: int = 0
+    verification_level: str = "insufficient"  # 'sufficient' | 'findings' | 'insufficient'
+    detail_rows: int = 0          # 参与累计明细行数（排除小计行）
+    excluded_subtotal_rows: int = 0
+    excluded_title_rows: int = 0
+    pending_sheets: int = 0       # 项目级待人工确认工作表数
 
 
 @dataclass
@@ -203,11 +208,13 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     """对单期做 A/B/C 三重校核。全部查询以 period_id 锁定，
     A/B/C 三路径、异常与证据都落在同一期次上。"""
     meta = conn.execute(
-        "SELECT period_no, direction FROM settlement_periods WHERE id=?", (period_id,)
+        "SELECT period_no, direction, project_id FROM settlement_periods WHERE id=?",
+        (period_id,),
     ).fetchone()
     if not meta:
         raise ValueError(f"period {period_id} not found")
     period_no, direction = int(meta["period_no"]), meta["direction"]
+    project_id = int(meta["project_id"])
 
     # A：直接累计清洗后的明细；原始合价缺失时仅在计算路径中回退到数量×单价。
     rows = conn.execute(
@@ -253,6 +260,7 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         (period_id,),
     ).fetchall()
     summary_b = _AmountSummary()
+    excluded_title_rows = 0
     for (sheet_id,) in [(r["id"],) for r in sheet_ids]:
         cells, merged, n_rows, _n_cols = load_sheet_grid(conn, sheet_id)
         confirmed = conn.execute(
@@ -278,7 +286,10 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
                 0, cells, merged, n_rows, max((c for _, c in cells), default=0))
         if det is None:
             continue
-        items = extract_items.extract_items(cells, merged, det, n_rows, data_range=data_range)
+        _skip_stats: dict = {}
+        items = extract_items.extract_items(cells, merged, det, n_rows,
+                                            data_range=data_range, stats=_skip_stats)
+        excluded_title_rows += _skip_stats.get("title_rows", 0)
         rows_b = []
         for it in items:
             if it.flags.get("subtotal") or it.flags.get("title_row"):
@@ -342,12 +353,44 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
             notes.append(f"A路径与C原表控制额差异{control_diff}，保持待复核，未调平")
     if control_note:
         notes.append(control_note)
+
+    # ---- 校核级别（P0-2/P0-5）：A/B 一致不等于结算正确 ----
+    # 绿色（校核充分）仅当：A=B 且 C 控制可用且控制一致，且项目无待人工工作表。
+    pending_sheets = conn.execute(
+        """SELECT COUNT(*) c FROM raw_sheets rs
+           JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND rs.period_id IS NULL""",
+        (project_id,),
+    ).fetchone()["c"]
+    detail_count = len(detail_rows)
+    reasons: list[str] = []
+    if pending_sheets:
+        reasons.append(f"{pending_sheets} 张工作表待人工确认")
+    if control_status == "not_available":
+        reasons.append("C 控制不可用")
+    if status == "incomplete":
+        reasons.append("明细数据不完整")
+    if reasons or status == "incomplete":
+        verification_level = "insufficient"
+        notes.append("校核不充分：" + "；".join(reasons))
+    elif status == "diff" or control_status == "diff":
+        verification_level = "findings"
+        notes.append("校核有发现：A/B 或 C 控制存在差异，保持待复核，未调平")
+    else:
+        verification_level = "sufficient"
+
     return CheckResult(
         period_id=period_id, period_no=period_no, direction=direction,
         path_a_total=total_a, path_b_total=total_b, raw_subtotal=raw_subtotal,
         diff_ab=diff_ab, status=status,
         control_diff=control_diff, control_status=control_status,
         missing_rows=summary_a.missing_rows + summary_b.missing_rows,
+        verification_level=verification_level,
+        detail_rows=detail_count,
+        excluded_subtotal_rows=len(subtotal_rows),
+        excluded_title_rows=excluded_title_rows,
+        pending_sheets=pending_sheets,
         notes=notes,
         path_a_raw_total=summary_a.raw_total,
         path_a_calculated_total=summary_a.calculated_total,
