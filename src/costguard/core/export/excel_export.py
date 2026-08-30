@@ -483,11 +483,15 @@ def export_evidence_index(conn: sqlite3.Connection, project_id: int, wb: Workboo
 
 
 def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
-    """Excel 审核底稿：逐行明细 + 出处 + 保留公式的校验列。"""
+    """Excel 审核底稿：逐行明细 + 出处 + 双值列（公式 + 程序 Decimal 值）。
+
+    双值纪律（P0-3）：合价列保留公式（Office 打开重算=复核值）；
+    程序计算合价列写入引擎 Decimal 精确值——主结论不依赖 Office 重算。
+    """
     ws = wb.create_sheet("审核底稿")
     ws.append(["期次", "清单编码", "清单名称", "单位", "数量", "单价", "合价(底稿公式)",
-               "原表合价", "差异(公式)", "数量出处", "单价出处", "合价出处", "行ID", "方向"])
-    _style_header(ws, 1, 14)
+               "程序计算合价", "原表合价", "差异(公式)", "数量出处", "单价出处", "合价出处", "行ID", "方向"])
+    _style_header(ws, 1, 15)
     rows = conn.execute(
         """SELECT li.*, sp.period_no AS pno, COALESCE(sp.direction, 'unknown') AS direction
            FROM line_items li
@@ -514,27 +518,33 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
         ws.cell(row=r, column=4, value=row["unit"])
         ws.cell(row=r, column=5, value=qty)
         ws.cell(row=r, column=6, value=price)
+        program_amount = None
         if qty is not None and price is not None:
-            ws.cell(row=r, column=7, value=f"=E{r}*F{r}")  # 保留公式
+            ws.cell(row=r, column=7, value=f"=E{r}*F{r}")  # 保留公式（Excel 复核值）
+            from costguard.core.engine.money import money_mul
+
+            program_amount = money_mul(qty, price)  # 引擎 Decimal 精确值
+            ws.cell(row=r, column=8, value=program_amount)
         else:
             ws.cell(row=r, column=7, value="待补资料")
-        ws.cell(row=r, column=8, value=amount)
+            ws.cell(row=r, column=8, value="待补资料")
+        ws.cell(row=r, column=9, value=amount)
         if qty is not None and price is not None and amount is not None:
-            ws.cell(row=r, column=9, value=f"=ROUND(G{r}-H{r},2)")
+            ws.cell(row=r, column=10, value=f"=ROUND(G{r}-I{r},2)")
         else:
-            ws.cell(row=r, column=9, value="不可比")
-        ws.cell(row=r, column=13, value=row["id"])  # 行ID：唯一标识，复核回溯用
+            ws.cell(row=r, column=10, value="不可比")
+        ws.cell(row=r, column=14, value=row["id"])  # 行ID：唯一标识，复核回溯用
         ws.cell(
             row=r,
-            column=14,
+            column=15,
             value=DIRECTION_LABELS.get(row["direction"], row["direction"]),
         )
-        for col, evid in ((10, "qty_evid"), (11, "price_evid"), (12, "amount_evid")):
+        for col, evid in ((11, "qty_evid"), (12, "price_evid"), (13, "amount_evid")):
             ev = row[evid]
             if ev:
                 e = json.loads(ev)
                 ws.cell(row=r, column=col, value=f"行{e['row']}列{e['col']}: {e['raw'][:30]}")
-        for c in (5, 6, 7, 8, 9):
+        for c in (5, 6, 7, 8, 9, 10):
             ws.cell(row=r, column=c).number_format = MONEY_FMT
     _autowidth(ws)
 

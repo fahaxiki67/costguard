@@ -67,12 +67,14 @@ class TestZeroPreserved:
             if name == "零值清单":
                 # 0 必须以数值 0 写入（缺失才会写 "待补资料"/None）
                 assert ws.cell(row=r, column=5).value == 0
-                assert ws.cell(row=r, column=8).value == 0
+                assert ws.cell(row=r, column=9).value == 0   # 原表合价 = 0
+                assert ws.cell(row=r, column=8).value == 0   # 程序计算合价 = 0
                 assert ws.cell(row=r, column=7).value == f"=E{r}*F{r}"  # 公式保留
                 found_zero = True
             if name == "缺失金额清单":
-                assert ws.cell(row=r, column=8).value is None  # 缺失 = None
+                assert ws.cell(row=r, column=9).value is None  # 缺失 = None（原表合价）
                 assert ws.cell(row=r, column=7).value == "待补资料"
+                assert ws.cell(row=r, column=8).value == "待补资料"  # 程序值同标
                 found_missing = True
         assert found_zero and found_missing
 
@@ -172,8 +174,8 @@ class TestDirectionSeparation:
         assert "对上结算累计表" in wb.sheetnames
         assert "对下结算累计表" in wb.sheetnames
         audit = wb["审核底稿"]
-        assert audit.cell(row=1, column=14).value == "方向"
-        assert {audit.cell(row=r, column=14).value for r in range(2, audit.max_row + 1)} == {
+        assert audit.cell(row=1, column=15).value == "方向"
+        assert {audit.cell(row=r, column=15).value for r in range(2, audit.max_row + 1)} == {
             "对上", "对下"
         }
         summary_text = " | ".join(
