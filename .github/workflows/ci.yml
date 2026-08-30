@@ -14,11 +14,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: uv pip install -e ".[dev]" --system
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
       - name: Lint
-        run: ruff check src tests
+        run: .venv/bin/ruff check src scripts tests
       - name: Tests
-        run: python -m pytest tests/ -v
+        run: .venv/bin/python -m pytest tests/ -v
         env:
           QT_QPA_PLATFORM: offscreen
 
@@ -32,13 +34,18 @@ jobs:
         run: |
           # 真实工程资料/密钥不得进入仓库（AGENTS.md 第三节）
           set -e
-          echo "== scanning tracked files =="
-          patterns='(\.pem|\.p12|\.pfx|\.key|\.mobileprovision|API_KEY|SECRET|PASSWORD|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY)'
-          hits=$(git ls-files | grep -viE 'local_private_data' | xargs grep -lEI "$patterns" 2>/dev/null || true)
-          if [ -n "$hits" ]; then
-            echo "SENSITIVE PATTERNS FOUND:"; echo "$hits"; exit 1
+          echo "== scanning tracked paths =="
+          forbidden_paths=$(git ls-files | grep -Ei '(^|/)(local_private_data|secrets|credentials)(/|$)|(^|/)\.env($|\.)|\.(pem|p12|pfx|key|mobileprovision)$' || true)
+          if [ -n "$forbidden_paths" ]; then
+            echo "FORBIDDEN SENSITIVE PATHS:"; echo "$forbidden_paths"; exit 1
           fi
-          if git ls-files | grep -qE '^local_private_data/'; then
-            echo "local_private_data/ must never be tracked"; exit 1
+          non_synthetic_business_files=$(git ls-files | grep -Ei '\.(xlsx|xls|csv|docx|doc|pdf|png|jpg|jpeg)$' | grep -Ev '^(synthetic_test_data|examples)/' || true)
+          if [ -n "$non_synthetic_business_files" ]; then
+            echo "BUSINESS-LIKE FILES OUTSIDE SYNTHETIC/EXAMPLES:"; echo "$non_synthetic_business_files"; exit 1
+          fi
+          echo "== scanning tracked content =="
+          secret_hits=$(git grep -IlE 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|BEGIN (RSA|EC|OPENSSH) PRIVATE KEY|(API[_-]?KEY|SECRET|PASSWORD)[[:space:]]*[:=][[:space:]]*[^[:space:]$<{][^[:space:]]{7,}' -- . ':!.github/workflows/ci.yml' ':!.gitignore' ':!*.md' 2>/dev/null || true)
+          if [ -n "$secret_hits" ]; then
+            echo "CREDENTIAL-LIKE CONTENT FOUND:"; echo "$secret_hits"; exit 1
           fi
           echo "clean"
