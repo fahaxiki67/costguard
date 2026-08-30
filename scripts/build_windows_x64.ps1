@@ -24,7 +24,7 @@ if ($args -contains "--skip-checks" -or $args -contains "-SkipChecks") { $SkipCh
 
 # ---- 1. 环境 ----
 Step "环境检查"
-if (-not $IsWindows -and $env:OS -ne "Windows_NT") { Fail "本脚本仅支持 Windows" }
+if ($env:OS -ne "Windows_NT") { Fail "本脚本仅支持 Windows（$env:OS 缺失或非 Windows_NT）" }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -ne "AMD64") { Fail "仅支持 x64 (AMD64)，当前 $arch" }
 $pyv = & uv run python -c "import platform; print(platform.python_version())"
