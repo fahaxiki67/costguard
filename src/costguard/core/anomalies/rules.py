@@ -556,7 +556,11 @@ def rule_formula_issues(conn, project_id) -> list[Finding]:
 
 
 def rule_text_numbers_in_value_cols(conn, project_id) -> list[Finding]:
-    """数值列（数量/单价/金额位置）存在文本数字。"""
+    """数值列（数量/单价/金额位置）存在文本数字，按 Sheet×字段聚合成一条。
+
+    真实报表里文本数字极常见，逐格出告警会淹没更有价值的发现；
+    details.rows 保留全量行号，消息里预览前 10 行。
+    """
     out = []
     for s in _sheets(conn, project_id):
         h = conn.execute(
@@ -571,15 +575,23 @@ def rule_text_numbers_in_value_cols(conn, project_id) -> list[Finding]:
                WHERE sheet_id=? AND is_number_stored_as_text=1""",
             (s["id"],),
         ).fetchall()
+        grouped: dict[str, list[dict]] = {}
         for c in cells:
             field_name = value_cols.get(c["col"])
             if field_name:
-                out.append(Finding(
-                    "text_number_in_value_col", "medium", "sheet", s["id"],
-                    f"第{s['pno']}期 Sheet「{s['sheet_name']}」{field_name} 列第 {c['row']} 行"
-                    f"为文本数字 '{c['raw_value']}'，已按数值解析，请确认无误",
-                    {"row": c["row"], "field": field_name, "raw": c["raw_value"]},
-                ))
+                grouped.setdefault(field_name, []).append(
+                    {"row": c["row"], "raw": c["raw_value"]})
+        for field_name, hits in grouped.items():
+            rows = sorted(hit["row"] for hit in hits)
+            preview = "、".join(str(r) for r in rows[:10])
+            suffix = f" 等 {len(rows)} 行" if len(rows) > 10 else ""
+            out.append(Finding(
+                "text_number_in_value_col", "medium", "sheet", s["id"],
+                f"第{s['pno']}期 Sheet「{s['sheet_name']}」{field_name} 列有 {len(rows)} 处"
+                f"文本数字（第 {preview}{suffix}），已按数值解析，请确认无误",
+                {"rows": rows, "count": len(rows), "field": field_name,
+                 "samples": [hit["raw"] for hit in hits[:10]]},
+            ))
     return out
 
 

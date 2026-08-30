@@ -37,6 +37,13 @@ def parse_pdf(path: Path) -> list[dict]:
                 line = line.strip()
                 if line:
                     paras.append({"index": f"p{pi}:{j}", "text": line})
+    if not paras:
+        # 扫描件无文本层时必须显式失败（验收执行器/Gui 均有 NotImplementedError
+        # 通道），绝不静默返回空结果让用户误以为"合同里没有该条款"。
+        raise NotImplementedError(
+            f"PDF 未提取到任何文本层（疑似扫描件，OCR 尚未支持）：{path.name}；"
+            "扫描资料不得直接形成业务结论，需人工复核原件"
+        )
     return paras
 
 

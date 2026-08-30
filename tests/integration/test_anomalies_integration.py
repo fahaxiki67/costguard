@@ -80,6 +80,18 @@ class TestMessyAnomalies:
         ).fetchone()
         assert row and row["steps_json"]
 
+    def test_text_number_findings_aggregated_per_sheet_field(self, project_messy):
+        """issue #6 现象二：同一 Sheet×字段的文本数字聚合成 1 条，不再逐格洪水。"""
+        info, conn = project_messy
+        findings = engine.run_anomalies(conn, info.project_id)
+        tn = [f for f in findings if f.rule_id == "text_number_in_value_col"]
+        assert tn, "messy 样本应触发文本数字规则"
+        keys = [(f.subject_id, f.details["field"]) for f in tn]
+        assert len(keys) == len(set(keys)), f"存在同 Sheet×字段重复告警: {keys}"
+        for f in tn:
+            assert f.details["count"] == len(f.details["rows"]) >= 1
+            assert f.details["samples"], "应保留原文样本供人工核对"
+
 
 class TestMultiAnomalies:
     def test_multi_period_rules(self, project_multi):
