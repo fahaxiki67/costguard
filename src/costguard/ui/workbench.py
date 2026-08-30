@@ -175,8 +175,9 @@ class WorkbenchPage(QWidget):
             fixed_widths={0: 56, 2: 72, 3: 88, 4: 72})
         v.addWidget(self.period_table, 1)
         self.dir_combo = QComboBox()
-        self.dir_combo.addItems(["", "upward", "downward"])
-        self.dir_combo.setItemText(0, "（未标记）")
+        for key, label in (("unknown", "未标记"), ("upward", "对上结算"),
+                           ("downward", "对下结算")):
+            self.dir_combo.addItem(label, key)  # 显示中文，userData 存内部值
         set_dir_btn = QPushButton("标记选中期次方向")
         set_dir_btn.clicked.connect(self._set_direction)
         row2 = QHBoxLayout()
@@ -199,7 +200,7 @@ class WorkbenchPage(QWidget):
         t = self.period_table
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            direction = {"upward": "对上", "downward": "对下"}.get(r["direction"], "（未标记）")
+            direction = DIRECTION_ZH.get(r["direction"], "（未标记）")
             t.setItem(i, 0, QTableWidgetItem(str(r["period_no"])))
             t.setItem(i, 1, QTableWidgetItem(str(r["title"] or "—")))
             kind = {"upward": "info", "downward": "neutral"}.get(r["direction"], "warning")
@@ -289,11 +290,16 @@ class WorkbenchPage(QWidget):
             except AmbiguousPeriodError as exc:
                 errors.append(str(exc))
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
-        dir_zh = {"upward": "对上", "downward": "对下", "unknown": ""}
+        level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
+                    "insufficient": "校核不充分"}
+        dir_zh = DIRECTION_ZH
         lines = []
         for r in results:
-            line = (f"第{r.period_no}期{dir_zh.get(r.direction, '')}：{status_zh[r.status]}"
-                    f"（A={r.path_a_total}，B={r.path_b_total}）")
+            line = (f"第{r.period_no}期{dir_zh.get(r.direction, '')}："
+                    f"{level_zh.get(r.verification_level, r.verification_level)}"
+                    f"（A/B {status_zh[r.status]}；A={r.path_a_total}，B={r.path_b_total}"
+                    f"；参与明细 {r.detail_rows}，排除小计 {r.excluded_subtotal_rows}，"
+                    f"排除标题 {r.excluded_title_rows}）")
             # C 控制值独立于 A/B：一致时若控制差异仍在，必须显著提示，不得被
             # A/B 一致掩盖（独立复核发现 #6）
             if r.control_status == "diff":
@@ -304,7 +310,9 @@ class WorkbenchPage(QWidget):
                 line += f"　C={r.raw_subtotal}"
             lines.append(line)
         msg = "\n".join(lines)
-        if any(r.control_status == "diff" for r in results):
+        if any(r.verification_level == "insufficient" for r in results):
+            msg = "⚠ 校核不充分：证据不足或仍有工作表待人工确认，不得视为通过：\n" + msg
+        elif any(r.control_status == "diff" for r in results):
             msg = "⚠ 存在 C 控制差异（A/B 一致也不代表全部通过）：\n" + msg
         if errors:
             msg += "\n\n以下期号存在方向歧义，已跳过（请先标记方向）：\n" + "\n".join(errors)
@@ -323,10 +331,8 @@ class WorkbenchPage(QWidget):
             QMessageBox.warning(self, "标记方向", "行缺少期次标识，请刷新后重试")
             return
         pno = int(self.period_table.item(row, 0).text())
-        direction = self.dir_combo.currentText()
-        # 未标记方向使用 schema 允许的明确值，不写 NULL
-        direction = "unknown" if direction.startswith("（") else direction
-        dir_zh = {"upward": "对上", "downward": "对下", "unknown": "未标记"}[direction]
+        direction = self.dir_combo.currentData() or "unknown"
+        dir_zh = DIRECTION_ZH[direction]
         dlg = ReasonDialog("标记期次方向", f"将第 {pno} 期方向标记为「{dir_zh}」", self)
         if dlg.exec() != QDialog.Accepted:
             return

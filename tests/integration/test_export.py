@@ -90,7 +90,7 @@ class TestExcelExport:
         import openpyxl
 
         wb = openpyxl.load_workbook(path)
-        expected = {"管理层摘要", "未标记方向结算累计表", "对上对下对比表", "单价差异表", "工程量差异表",
+        expected = {"管理层摘要", "未标记累计表", "对上对下对比表", "单价差异表", "工程量差异表",
                     "金额差异表", "异常清单", "待核实事项清单", "证据索引", "审核底稿"}
         assert expected <= set(wb.sheetnames), wb.sheetnames
 

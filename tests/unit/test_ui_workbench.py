@@ -49,7 +49,7 @@ class TestWorkbench:
         t = wb_page.period_table
         assert t.rowCount() == 2  # multi.xlsx 2 期
         assert t.item(0, 0).text() == "1"
-        assert "（未标记）" in t.item(0, 2).text()
+        assert t.item(0, 2).text() == "未标记"  # P0-4 业务词统一：未标记（无括号）
 
     def test_items_populated_with_provenance(self, wb_page):
         wb_page.refresh_items()
