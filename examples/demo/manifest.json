@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "generated_by": "scripts/generate_demo_data.py",
+  "random_seed": 20260830,
+  "generated_at_fixed": "2026-01-01T00:00:00+00:00（时间戳固定，实际内容可重复生成）",
+  "disclaimer": "本目录全部内容为 scripts/generate_demo_data.py 程序生成的合成演示数据，不包含任何真实公司、项目、人员、金额或业务结构，不代表真实业务结论，仅用于功能演示与上手练习。",
+  "project_profile": {
+    "project_name": "示例花园小区二期工程（虚构）",
+    "parties": "演示发包人 / 演示承包人 / 演示劳务分包（均为虚构）"
+  },
+  "files": [
+    {
+      "file_name": "演示-对上结算-第1至3期.xlsx",
+      "sha256": "523e2878528050da83f2899ea7864986da8b6bf9fc708fa8a085c0bf78e73583",
+      "data_type": "xlsx",
+      "direction": "upward",
+      "periods": [
+        1,
+        2,
+        3
+      ],
+      "expected_parsed_rows": {
+        "第1期": 13,
+        "第2期": 8,
+        "第3期": 4
+      },
+      "expected_anomalies": [
+        "qty_price_amount_mismatch",
+        "rounding_difference",
+        "text_number_in_value_col",
+        "formula_no_cache",
+        "unparsed_number",
+        "negative_quantity",
+        "duplicate_item",
+        "price_changed",
+        "price_abnormal_change",
+        "tax_rate_changed",
+        "unit_changed",
+        "qty_sudden_change",
+        "missing_key_fields",
+        "summary_mismatch",
+        "summary_missing_data",
+        "large_round_amount",
+        "same_code_diff_name"
+      ],
+      "expected_matching": "同码同名=规则完全匹配（待人工确认）；同码异名/近似名进入人工复核",
+      "coverage": [
+        "多期",
+        "多Sheet",
+        "不同表头位置",
+        "合并单元格",
+        "文本数字",
+        "千分位",
+        "真实零值",
+        "缺失不填零",
+        "负数调整",
+        "数量单价合价不符",
+        "一分钱舍入差异",
+        "同码名称轻微不同",
+        "名称相似实际不同",
+        "单位不一致",
+        "单价变化",
+        "税率变化",
+        "重复项",
+        "漏项",
+        "公式单元格",
+        "公式缺少缓存值",
+        "小计合计行"
+      ],
+      "known_limitations": [
+        "第1期两条公式行无缓存值，导入后合价显示待补资料并触发 formula_no_cache",
+        "合并单元格仅用于标题区，数据区不使用合并单元格"
+      ]
+    },
+    {
+      "file_name": "演示-对下结算-第1至3期.xlsx",
+      "sha256": "b2ef15368ee040b34149e8b56a2c5dd7d72aa207d928c89d3d4bc2d6d341dc73",
+      "data_type": "xlsx",
+      "direction": "downward",
+      "periods": [
+        1,
+        2,
+        3
+      ],
+      "expected_parsed_rows": {
+        "第1期": 6,
+        "第2期": 4,
+        "第3期": 2
+      },
+      "expected_anomalies": [
+        "missing_key_fields",
+        "price_changed",
+        "orphan_numeric_row"
+      ],
+      "expected_matching": "无编码行按名称独立成组（高概率匹配）；缺名称行为待补资料档",
+      "coverage": [
+        "对下方向",
+        "与对上同期号（方向隔离演示）",
+        "匹配置信度多档",
+        "自定义编码（D1-001）",
+        "需要人工复核"
+      ],
+      "known_limitations": [
+        "对下单价低于对上为演示设定，无调差含义"
+      ]
+    },
+    {
+      "file_name": "演示-对下结算-附表.xlsx",
+      "sha256": "fab2c9e2277954a96e20bd5ce08776b34e51cd2c053af9b45f6cb0d1f9a72f33",
+      "data_type": "xlsx",
+      "direction": "downward",
+      "periods": [
+        1
+      ],
+      "expected_parsed_rows": {
+        "第1期补充": 2
+      },
+      "expected_anomalies": [],
+      "expected_matching": "补充 Sheet 并入对下第1期后参与累计",
+      "coverage": [
+        "多文件同期次合并",
+        "角色门控演示（人材机汇总 Sheet 待人工确认）"
+      ],
+      "known_limitations": [
+        "Sheet「人材机汇总」被语义门控拦截属预期行为：演示程序不猜测角色，需人工确认后才写入结算模型"
+      ]
+    },
+    {
+      "file_name": "演示-合同摘录-合成.docx",
+      "sha256": "c60c61ceaf71e01dca615b50becfa0231c584148d04942b33b7921a6f54a9c91",
+      "data_type": "docx",
+      "direction": "contract",
+      "periods": [],
+      "expected_parsed_rows": {
+        "paragraphs": 17
+      },
+      "expected_anomalies": [
+        "未识别工期约定（medium 风险提示）",
+        "未识别税务条款（medium 风险提示）",
+        "条款提取结果须逐条人工核对原文引用"
+      ],
+      "expected_matching": "不参与清单匹配；风险提示为程序识别结果，不是业务结论",
+      "coverage": [
+        "合同演示文本",
+        "完全合成的原文引用",
+        "合同风险提示演示"
+      ],
+      "known_limitations": [
+        "条款提取为初步能力，自动结果不等于业务结论"
+      ]
+    }
+  ],
+  "coverage_matrix": {
+    "对上结算与对下结算": "演示-对上结算-第1至3期.xlsx + 演示-对下结算-第1至3期.xlsx",
+    "同项目同期号不同方向（方向隔离）": "两个文件均含 第1/2/3期",
+    "多期 Excel": "两个结算文件各含 3 期",
+    "多 Sheet": "附表文件含 2 个 Sheet",
+    "不同表头位置": "表头分别位于第 1/2/4 行",
+    "合并单元格": "标题行合并（数据区不用合并，避免解析歧义）",
+    "文本数字": "对上第1期 水泥砂浆楼地面 工程量为文本 680.00",
+    "千分位金额": "数字列统一千分位格式，含 125,130.00 大额行",
+    "真实零值": "对上第1期 钢筋接头行 工程量 0、合价 0",
+    "缺失数量/单价/金额": "对上第1期缺单价金额行；第3期零星工作行；对下第1期缺数量行",
+    "缺失不填零": "缺失单元格导入后为待补资料，程序不自动补 0",
+    "负数调整项": "对上第1期 脚手架搭拆费冲减行",
+    "数量x单价与合价不一致": "对上第1期 砌块墙行（差 1000.00）",
+    "一分钱舍入差异": "对上第1期 构造柱行（差 0.01）",
+    "同编码名称轻微不同": "挖沟槽土方 → 挖沟槽土方（机械）",
+    "名称相似实际不同": "C25混凝土垫层 与 C30混凝土垫层",
+    "单位不一致": "C25混凝土垫层 第1期 m3 → 第2期 m2",
+    "单价变化": "砖基础 420→425；挖沟槽土方 35.20→46.00（超阈值升级）",
+    "税率变化": "砖基础 9% → 13%",
+    "重复项": "对上第2期 现浇构件钢筋 完全重复两行",
+    "漏项": "对上第3期缺 现浇构件钢筋/挖沟槽土方/屋面防水",
+    "公式单元格": "对上第1期 预埋铁件行",
+    "公式错误或缺少缓存值": "对上第1期 安全文明施工费行（无缓存）",
+    "小计合计行不重复计入": "各 Sheet 末尾 小计/合计 行，导入打小计标记",
+    "合同演示文本": "演示-合同摘录-合成.docx（条款全部虚构）",
+    "匹配置信度多档": "规则完全匹配（待人工确认）/疑似匹配/待补资料",
+    "需要人工复核的项目": "人材机汇总 Sheet 角色门控 + 各缺失行",
+    "可导出 Excel 和 Word": "导入演示数据后可从成果导出页导出审核底稿与摘要"
+  }
+}
