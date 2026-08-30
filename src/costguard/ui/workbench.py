@@ -38,10 +38,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from costguard.core.anomalies import coverage as detection_coverage
 from costguard.core.anomalies import engine as anomaly_engine
+from costguard.core.contracts import run_contract
 from costguard.core.engine import crosscheck, settlement_io
 from costguard.core.export import excel_export
 from costguard.core.matching import matching
+from costguard.core.reporting import build_report_model
 from costguard.platform import paths as platform_paths
 from costguard.ui import theme
 from costguard.ui.labels import (
@@ -84,6 +87,9 @@ def _evidence_entry_text(entry, *, source: bool = False) -> str:
         "amount": "原始合价", "expect": "计算合价", "details_sum": "明细合计",
         "subtotal": "原表小计", "raw": "原始值", "value": "标准值",
         "evidence_id": "Evidence ID", "file_id": "文件标识", "sheet_id": "工作表标识",
+        "finding_id": "问题标识", "fingerprint": "问题指纹", "impact": "影响",
+        "limitations": "限制", "recommendation": "建议", "raw_values": "原始值",
+        "normalized_values": "标准化值", "detection_mode": "检测方式",
     }
     chunks = []
     for key, value in entry.items():
@@ -164,28 +170,12 @@ def _make_table(headers: list[str], **spec) -> QTableWidget:
 
 def project_status_summary(conn, project_id: int) -> str:
     """工作台顶部状态信息：集中显示当前待处理事项和最近校核级别。"""
-    source_files = conn.execute(
-        "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (project_id,)
-    ).fetchone()["c"]
-    n = settlement_io.pending_sheet_count(conn, project_id)
-    latest = conn.execute(
-        """SELECT verification_level, checked_at
-           FROM crosscheck_results
-           WHERE project_id=?
-           ORDER BY checked_at DESC, id DESC LIMIT 1""",
-        (project_id,),
-    ).fetchone()
-    high_open = conn.execute(
-        "SELECT COUNT(*) AS c FROM anomalies WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')",
-        (project_id,),
-    ).fetchone()["c"]
-    pending_matches = conn.execute(
-        "SELECT COUNT(*) AS c FROM matches WHERE project_id=? AND status='pending'",
-        (project_id,),
-    ).fetchone()["c"]
-    period_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM settlement_periods WHERE project_id=?", (project_id,)
-    ).fetchone()["c"]
+    summary = build_report_model(conn, project_id).project_summary
+    source_files = summary.source_files
+    n = summary.pending["sheets"]
+    high_open = summary.pending["high_risk"]
+    pending_matches = summary.pending["matches"]
+    period_count = sum(summary.directions.values())
     parts = []
     if not source_files:
         parts.append("尚未导入资料")
@@ -198,10 +188,17 @@ def project_status_summary(conn, project_id: int) -> str:
     if pending_matches:
         parts.append(f"待确认匹配 {pending_matches} 组")
     level_zh = {"sufficient": "校核充分", "findings": "校核有发现", "insufficient": "校核不充分"}
-    if latest:
-        parts.append(f"最近校核：{level_zh.get(latest['verification_level'], '待复核')}")
+    verification_status = summary.verification["status"]
+    if verification_status != "not_started":
+        parts.append(f"最近校核：{level_zh.get(verification_status, '待复核')}")
     elif period_count:
         parts.append("最近校核：尚未校核")
+    if period_count and summary.detection_coverage["status"] != "complete":
+        parts.append("异常检测覆盖率未完整")
+    if period_count and summary.aggregate_coverage["status"] != "complete":
+        parts.append("聚合验证覆盖率未完整")
+    if summary.pending["manifest_status"] in {"incomplete", "mismatch"}:
+        parts.append("权威批次清单未闭合")
     return " · ".join(p for p in parts if p)
 
 
@@ -293,33 +290,18 @@ class WorkbenchPage(QWidget):
 
     def refresh_overview(self):
         pid = self.project.project_id
-        files = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (pid,)
-        ).fetchone()["c"]
-        periods = self.conn.execute(
-            """SELECT COALESCE(direction, 'unknown') AS direction, COUNT(*) AS c
-               FROM settlement_periods WHERE project_id=? GROUP BY COALESCE(direction, 'unknown')""",
-            (pid,),
-        ).fetchall()
-        period_counts = {r["direction"]: int(r["c"]) for r in periods}
-        pending_sheets = settlement_io.pending_sheet_count(self.conn, pid)
-        high = self.conn.execute(
-            """SELECT COUNT(*) AS c FROM anomalies
-               WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""", (pid,)
-        ).fetchone()["c"]
-        matches = self.conn.execute(
-            """SELECT COUNT(*) AS c FROM matches
-               WHERE project_id=? AND status='pending'""", (pid,)
-        ).fetchone()["c"]
-        latest = self.conn.execute(
-            """SELECT verification_level FROM crosscheck_results
-               WHERE project_id=? ORDER BY checked_at DESC, id DESC LIMIT 1""", (pid,)
-        ).fetchone()
+        summary = build_report_model(self.conn, pid).project_summary
+        files = summary.source_files
+        period_counts = summary.directions
+        pending_sheets = summary.pending["sheets"]
+        high = summary.pending["high_risk"]
+        matches = summary.pending["matches"]
         period_total = sum(period_counts.values())
         level_zh = {
             "sufficient": "校核充分", "findings": "校核有发现", "insufficient": "校核不充分",
         }
-        latest_text = level_zh.get(latest["verification_level"], "待复核") if latest else "尚未校核"
+        latest_text = level_zh.get(summary.verification["status"], "待复核") \
+            if summary.verification["status"] != "not_started" else "尚未校核"
         values = {
             "files": str(files), "pending_sheets": str(pending_sheets),
             "upward": str(period_counts.get("upward", 0)),
@@ -340,9 +322,15 @@ class WorkbenchPage(QWidget):
         elif latest_text in {"校核不充分", "校核有发现"}:
             self._next_action = "crosscheck"
             suggestion = f"最近校核为“{latest_text}”，请查看校核明细"
-        elif period_total and not latest:
+        elif period_total and summary.verification["status"] == "not_started":
             self._next_action = "crosscheck"
             suggestion = "尚未执行双向校核，请先运行校核"
+        elif period_total and summary.detection_coverage["status"] != "complete":
+            self._next_action = "anomalies"
+            suggestion = "异常检测覆盖率未完整，请先查看检测状态"
+        elif period_total and summary.aggregate_coverage["status"] != "complete":
+            self._next_action = "crosscheck"
+            suggestion = "聚合验证覆盖率未完整，请先运行或查看双向校核"
         elif not files:
             self._next_action = "import"
             suggestion = "尚未导入文件，请先导入结算资料"
@@ -945,8 +933,9 @@ class WorkbenchPage(QWidget):
         return w
 
     def refresh_anomalies(self):
+        scope, scope_params = run_contract.current_scope(self.conn, self.project.project_id, "a")
         rows = self.conn.execute(
-            """SELECT a.id, a.rule_id, a.severity, a.message, a.evidence_id, a.status,
+            f"""SELECT a.id, a.rule_id, a.severity, a.message, a.evidence_id, a.status,
                       COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
                         AS direction
                FROM anomalies a
@@ -958,10 +947,10 @@ class WorkbenchPage(QWidget):
                LEFT JOIN raw_sheets rs
                  ON a.subject_type='sheet' AND rs.id=a.subject_id
                LEFT JOIN settlement_periods sp_sheet ON sp_sheet.id=rs.period_id
-               WHERE a.project_id=? ORDER BY CASE a.severity
+               WHERE a.project_id=? AND {scope} ORDER BY CASE a.severity
                WHEN 'high' THEN 0 WHEN 'medium' THEN 1
                WHEN 'low' THEN 2 ELSE 3 END, a.id""",
-            (self.project.project_id,),
+            (self.project.project_id, *scope_params),
         ).fetchall()
         counts = {"high": 0, "medium": 0, "pending": 0, "deferred": 0, "processed": 0}
         for row in rows:
@@ -978,10 +967,16 @@ class WorkbenchPage(QWidget):
             else:
                 # 未知历史状态仍归入待人工确认，避免被误算为已处理。
                 counts["pending"] += 1
+        coverage = detection_coverage.coverage_summary(self.conn, self.project.project_id)
+        coverage_text = (
+            f"检测覆盖率 {coverage['status']}（应执行 {coverage['expected_count']}，"
+            f"已执行 {coverage['executed_count']}，跳过 {coverage['skipped_count']}，"
+            f"失败 {coverage['failed_count']}）"
+        )
         self.anomaly_summary_label.setText(
             f"高风险 {counts['high']} 项　中风险 {counts['medium']} 项　"
             f"待处理 {counts['pending']} 项　暂不处理 {counts['deferred']} 项　"
-            f"已处理 {counts['processed']} 项"
+            f"已处理 {counts['processed']} 项　{coverage_text}"
         )
         t = self.anomaly_table
         t.setSortingEnabled(False)
@@ -1009,7 +1004,9 @@ class WorkbenchPage(QWidget):
             return
         anomaly = self.conn.execute(
             """SELECT id, rule_id, severity, subject_type, subject_id, evidence_id,
-                      message, status, resolved_note, created_at
+                      message, status, resolved_note, created_at, finding_id, fingerprint,
+                      confidence, detection_mode, raw_values_json, normalized_values_json,
+                      impact, limitations_json, recommendation, suppression_reason
                FROM anomalies WHERE id=? AND project_id=?""",
             (int(anomaly_id), self.project.project_id),
         ).fetchone()
@@ -1023,6 +1020,32 @@ class WorkbenchPage(QWidget):
             f"说明：{normalize_business_text(anomaly['message'])}",
             f"发现时间：{anomaly['created_at'] or '—'}",
         ]
+        if anomaly["finding_id"]:
+            lines.append(f"Finding ID：{anomaly['finding_id']}")
+        if anomaly["fingerprint"]:
+            lines.append(f"问题指纹：{anomaly['fingerprint']}")
+        lines.append(
+            f"置信度：{anomaly['confidence'] or '未标注'}　检测方式：{anomaly['detection_mode'] or '未标注'}"
+        )
+        if anomaly["impact"]:
+            lines.append(f"影响：{normalize_business_text(anomaly['impact'])}")
+        if anomaly["recommendation"]:
+            lines.append(f"建议：{normalize_business_text(anomaly['recommendation'])}")
+        try:
+            limitations = json.loads(anomaly["limitations_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            limitations = []
+        if limitations:
+            lines.append(f"限制：{'；'.join(normalize_business_text(str(v)) for v in limitations)}")
+        for label, key in (("原始值", "raw_values_json"), ("标准化值", "normalized_values_json")):
+            try:
+                values = json.loads(anomaly[key] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                values = {}
+            if values:
+                lines.append(f"{label}：{_evidence_entry_text(values, source=(label == '原始值'))}")
+        if anomaly["suppression_reason"]:
+            lines.append(f"抑制原因：{normalize_business_text(anomaly['suppression_reason'])}")
         if anomaly["evidence_id"]:
             evidence = self.conn.execute(
                 "SELECT summary, steps_json, sources_json FROM evidence WHERE id=?",
@@ -1092,23 +1115,28 @@ class WorkbenchPage(QWidget):
         from costguard.core.evidence import evidence as evidence_api
 
         old = self.conn.execute(
-            "SELECT status FROM anomalies WHERE id=? AND project_id=?", (aid, self.project.project_id)
+            "SELECT status, run_signature, finding_id FROM anomalies WHERE id=? AND project_id=?",
+            (aid, self.project.project_id),
         ).fetchone()
         if not old:
             QMessageBox.warning(self, "处理异常", "未找到对应问题，请刷新后重试。")
             return
-        with self.conn:
+        with run_contract._transaction(self.conn, "resolve_anomaly"):
             self.conn.execute(
                 "UPDATE anomalies SET status=?, resolved_note=? WHERE id=? AND project_id=?",
                 (new_status, dlg.reason(), aid, self.project.project_id))
-        evidence_api.add_evidence(
-            self.conn, self.project.project_id, "anomaly_resolution",
-            f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
-            steps=[{"step": "人工处理", "status": new_status, "reason": dlg.reason()}],
-            sources=[{"anomaly_id": aid}])
-        audit_log.record_audit(
-            self.conn, self.project.project_id, "user", "resolve_anomaly", f"anomaly:{aid}",
-            {"status": old["status"]}, {"status": new_status}, dlg.reason())
+            evidence_api.add_evidence(
+                self.conn, self.project.project_id, "anomaly_resolution",
+                f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
+                steps=[{"step": "人工处理", "status": new_status, "reason": dlg.reason()}],
+                sources=[{"anomaly_id": aid}],
+                commit=False,
+                run_signature=old["run_signature"],
+                finding_id=old["finding_id"],
+            )
+            audit_log.record_audit(
+                self.conn, self.project.project_id, "user", "resolve_anomaly", f"anomaly:{aid}",
+                {"status": old["status"]}, {"status": new_status}, dlg.reason(), commit=False)
         self.refresh_anomalies()
         self.refresh_overview()
         self.refresh_export_status()
@@ -1160,12 +1188,13 @@ class WorkbenchPage(QWidget):
         self.refresh_export_status()
 
     def refresh_matches(self):
+        scope, scope_params = run_contract.current_scope(self.conn, self.project.project_id, "m")
         rows = self.conn.execute(
-            """SELECT id, group_key, level, method, score, item_ids_json, status FROM matches
-               WHERE project_id=? ORDER BY CASE level
+            f"""SELECT id, group_key, level, method, score, item_ids_json, status FROM matches m
+               WHERE m.project_id=? AND {scope} ORDER BY CASE level
                WHEN 'confirmed' THEN 0 WHEN 'probable' THEN 1 WHEN 'suspected' THEN 2
-               WHEN 'incomparable' THEN 3 ELSE 4 END, id""",
-            (self.project.project_id,),
+               WHEN 'incomparable' THEN 3 ELSE 4 END, m.id""",
+            (self.project.project_id, *scope_params),
         ).fetchall()
         t = self.match_table
         t.setSortingEnabled(False)
@@ -1475,36 +1504,44 @@ class WorkbenchPage(QWidget):
 
     def refresh_export_status(self):
         pid = self.project.project_id
+        anomaly_scope, anomaly_params = run_contract.current_scope(self.conn, pid, "a")
+        match_scope, match_params = run_contract.current_scope(self.conn, pid, "m")
+        check_scope, check_params = run_contract.current_scope(self.conn, pid, "cr")
         pending_sheets = settlement_io.pending_sheet_count(self.conn, pid)
         high = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM anomalies WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')",
-            (pid,),
+            f"SELECT COUNT(*) AS c FROM anomalies a WHERE a.project_id=? AND {anomaly_scope} "
+            "AND a.severity='high' AND a.status IN ('open', 'deferred')",
+            (pid, *anomaly_params),
         ).fetchone()["c"]
         pending_matches = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM matches WHERE project_id=? AND status='pending'",
-            (pid,),
+            f"SELECT COUNT(*) AS c FROM matches m WHERE m.project_id=? AND {match_scope} "
+            "AND m.status='pending'", (pid, *match_params),
         ).fetchone()["c"]
         insufficient = self.conn.execute(
-            """SELECT COUNT(*) AS c FROM crosscheck_results
-               WHERE project_id=? AND verification_level='insufficient'""", (pid,)
+            f"""SELECT COUNT(*) AS c FROM crosscheck_results cr
+               WHERE cr.project_id=? AND {check_scope} AND cr.verification_level='insufficient'""",
+            (pid, *check_params),
         ).fetchone()["c"]
         findings = self.conn.execute(
-            """SELECT COUNT(*) AS c FROM crosscheck_results
-               WHERE project_id=? AND verification_level='findings'""", (pid,)
+            f"""SELECT COUNT(*) AS c FROM crosscheck_results cr
+               WHERE cr.project_id=? AND {check_scope} AND cr.verification_level='findings'""",
+            (pid, *check_params),
         ).fetchone()["c"]
         period_count = self.conn.execute(
             "SELECT COUNT(*) AS c FROM settlement_periods WHERE project_id=?", (pid,)
         ).fetchone()["c"]
         checked_count = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM crosscheck_results WHERE project_id=?", (pid,)
+            f"SELECT COUNT(*) AS c FROM crosscheck_results cr WHERE cr.project_id=? AND {check_scope}",
+            (pid, *check_params),
         ).fetchone()["c"]
         range_unproven = self.conn.execute(
-            """SELECT COALESCE(SUM(range_unproven_sheets), 0) AS c
-               FROM crosscheck_results WHERE project_id=?""", (pid,)
+            f"""SELECT COALESCE(SUM(cr.range_unproven_sheets), 0) AS c
+               FROM crosscheck_results cr WHERE cr.project_id=? AND {check_scope}""",
+            (pid, *check_params),
         ).fetchone()["c"]
         deferred = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM anomalies WHERE project_id=? AND status='deferred'",
-            (pid,),
+            f"SELECT COUNT(*) AS c FROM anomalies a WHERE a.project_id=? AND {anomaly_scope} "
+            "AND a.status='deferred'", (pid, *anomaly_params),
         ).fetchone()["c"]
         source_files = self.conn.execute(
             "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (pid,)
@@ -1539,8 +1576,12 @@ class WorkbenchPage(QWidget):
         # 成果卡片显示最近生成时间和文件状态，避免用户只看到“导出”按钮而
         # 不知道是否已有可用成果。文件名沿用导出器前缀，不读取文件内容。
         export_dir = Path(self.project_dir) / "exports"
-        for key, pattern in (("excel", "CostGuard审核底稿_*.xlsx"),
-                             ("docx", "CostGuard管理层摘要_*.docx")):
+        registry_by_kind = {
+            "excel": run_contract.export_status(self.conn, pid, "excel_workbook"),
+            "docx": run_contract.export_status(self.conn, pid, "management_summary_docx"),
+        }
+        for key, pattern, kind in (("excel", "CostGuard审核底稿_*.xlsx", "excel_workbook"),
+                                   ("docx", "CostGuard管理层摘要_*.docx", "management_summary_docx")):
             card = getattr(self, "export_card_values", {}).get(key)
             if not card:
                 continue
@@ -1551,8 +1592,18 @@ class WorkbenchPage(QWidget):
                 continue
             latest_path = files[-1]
             stamp = datetime.fromtimestamp(latest_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            card["generated"].setText(f"最近生成：{stamp}")
-            card["status"].setText(f"文件状态：可用（{latest_path.name}）")
+            registered = registry_by_kind[kind]
+            if registered:
+                item = registered[0]
+                status_zh = {
+                    "current": "可用", "stale": "已失效，请重新生成",
+                    "missing": "文件缺失，请重新生成", "changed": "文件已变化，请重新生成",
+                }.get(item["status"], "需复核")
+                card["generated"].setText(f"最近生成：{stamp}")
+                card["status"].setText(f"文件状态：{status_zh}（{Path(item['path']).name}）")
+            else:
+                card["generated"].setText(f"最近生成：{stamp}")
+                card["status"].setText(f"文件状态：未登记，需重新生成（{latest_path.name}）")
 
     def _export_excel(self):
         try:

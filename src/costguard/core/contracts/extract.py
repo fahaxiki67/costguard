@@ -7,14 +7,16 @@
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from costguard.core.contracts import docx_parser
+from costguard.core.contracts import docx_parser, run_contract
 from costguard.core.evidence import evidence as evidence_api
+from costguard.core.evidence.finding import Finding
 
 _MONEY = r"([¥￥]\s*[\d,，]+(?:\s*\.\s*\d+)?\s*(?:万元|亿元|元)?|\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?\s*(?:万元|亿元|元)?|\d{4,}(?:\.\d+)?\s*(?:万元|亿元|元)?)"
 _DAYS = r"(\d+)\s*(?:个)?\s*(日历天|工作日|天|日内)"
@@ -131,6 +133,9 @@ def import_contract(
                 (doc_id, f["fact_key"], f["fact_value"], f["quote_text"], f["location"],
                  f["confidence"], ev_id),
             )
+    # 合同事实是运行输入的一部分；已有计算结果的项目在合同资料变化后
+    # 立即切换到新签名，旧成果保留但不再作为当前结论使用。
+    run_contract.ensure_if_materialized(conn, project_id)
     return doc_id
 
 
@@ -167,20 +172,61 @@ def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
 
 
 def persist_risks(conn: sqlite3.Connection, project_id: int, risks: list[dict]) -> int:
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
     now = datetime.now().isoformat(timespec="seconds")
     n = 0
-    with conn:
+    with run_contract._transaction(conn, "persist_contract_risks"):
+        conn.execute(
+            """DELETE FROM anomalies
+               WHERE project_id=? AND rule_id='contract_risk' AND status='open'
+                 AND run_signature=?""",
+            (project_id, active_contract.signature),
+        )
         for r in risks:
+            finding = Finding(
+                "contract_risk",
+                r["severity"],
+                "contract_doc",
+                r["doc_id"],
+                r["message"],
+                {"missing": r["fact_key"], "doc_title": r["doc_title"]},
+            )
             ev_id = evidence_api.add_evidence(
-                conn, project_id, "contract_risk", r["message"],
-                steps=[{"step": "风险检查", "missing": r["fact_key"]}],
+                conn,
+                project_id,
+                "contract_risk",
+                finding.message,
+                steps=[{
+                    "step": "风险检查",
+                    "missing": r["fact_key"],
+                    "finding_id": finding.finding_id,
+                    "fingerprint": finding.fingerprint,
+                    "impact": finding.impact,
+                    "limitations": finding.limitations,
+                    "recommendation": finding.recommendation,
+                }],
                 sources=[{"doc": r["doc_title"], "doc_id": r["doc_id"]}],
+                commit=False,
+                run_signature=active_contract.signature,
+                finding_id=finding.finding_id,
             )
             conn.execute(
-                """INSERT INTO anomalies(project_id, rule_id, severity, subject_type, subject_id,
-                   evidence_id, message, status, created_at) VALUES (?,?,?,?,?,?,?,'open',?)""",
+                """INSERT INTO anomalies(
+                       project_id, rule_id, severity, subject_type, subject_id,
+                       evidence_id, message, status, created_at, run_signature,
+                       finding_id, fingerprint, confidence, detection_mode,
+                       raw_values_json, normalized_values_json, impact,
+                       limitations_json, recommendation)
+                   VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?)""",
                 (project_id, "contract_risk", r["severity"], "contract_doc", r["doc_id"],
-                 ev_id, r["message"], now),
+                 ev_id, r["message"], now, active_contract.signature,
+                 finding.finding_id, finding.fingerprint, finding.confidence,
+                 finding.detection_mode,
+                 json.dumps(finding.raw_values, ensure_ascii=False, default=str),
+                 json.dumps(finding.normalized_values, ensure_ascii=False, default=str),
+                 finding.impact,
+                 json.dumps(finding.limitations, ensure_ascii=False, default=str),
+                 finding.recommendation),
             )
             n += 1
     return n

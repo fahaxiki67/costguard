@@ -338,6 +338,169 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                    END""",
         ],
     ),
+    (
+        # v8: 运行契约与成果登记。
+        # 任何源文件/工作表范围/字段映射/规则配置变化都必须产生新的运行签名；
+        # 旧校核、匹配和导出只能作为历史记录，不能继续冒充当前输入下的成果。
+        8,
+        [
+            "ALTER TABLE period_totals ADD COLUMN run_signature TEXT",
+            "ALTER TABLE crosscheck_results ADD COLUMN run_signature TEXT",
+            "ALTER TABLE matches ADD COLUMN run_signature TEXT",
+            "ALTER TABLE anomalies ADD COLUMN run_signature TEXT",
+            """CREATE TABLE IF NOT EXISTS run_contracts (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                signature TEXT NOT NULL,
+                components_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                invalidated_at TEXT,
+                UNIQUE(project_id, signature)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_run_contracts_current
+               ON run_contracts(project_id, invalidated_at, id)""",
+            """CREATE TABLE IF NOT EXISTS export_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                run_signature TEXT,
+                file_sha256 TEXT,
+                generated_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'current',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_export_runs_project_kind
+               ON export_runs(project_id, kind, generated_at)""",
+            """CREATE INDEX IF NOT EXISTS idx_period_totals_run_signature
+               ON period_totals(project_id, run_signature)""",
+            """CREATE INDEX IF NOT EXISTS idx_crosscheck_results_run_signature
+               ON crosscheck_results(project_id, run_signature)""",
+            """CREATE INDEX IF NOT EXISTS idx_matches_run_signature
+               ON matches(project_id, run_signature)""",
+            """CREATE INDEX IF NOT EXISTS idx_anomalies_run_signature
+               ON anomalies(project_id, run_signature)""",
+        ],
+    ),
+    (
+        # v9: 统一 Finding/Evidence 保真字段。
+        # 旧库中的运行结果没有可验证签名，升级后只保留为历史，不允许继续
+        # 混入新的当前结果面；人工后来写入的 NULL 行仍可由兼容读取面识别。
+        9,
+        [
+            "ALTER TABLE evidence ADD COLUMN run_signature TEXT",
+            "ALTER TABLE evidence ADD COLUMN finding_id TEXT",
+            "ALTER TABLE anomalies ADD COLUMN finding_id TEXT",
+            "ALTER TABLE anomalies ADD COLUMN fingerprint TEXT",
+            "ALTER TABLE anomalies ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'",
+            "ALTER TABLE anomalies ADD COLUMN detection_mode TEXT NOT NULL DEFAULT 'automated'",
+            "ALTER TABLE anomalies ADD COLUMN raw_values_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE anomalies ADD COLUMN normalized_values_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE anomalies ADD COLUMN impact TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE anomalies ADD COLUMN limitations_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE anomalies ADD COLUMN recommendation TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE anomalies ADD COLUMN suppression_reason TEXT",
+            # v1-v8 旧结果没有运行契约，显式标记为历史失效，避免与新契约
+            # 的 NULL 签名混淆；不删除任何证据或原始业务记录。
+            "UPDATE period_totals SET run_signature='legacy:stale' WHERE run_signature IS NULL",
+            "UPDATE crosscheck_results SET run_signature='legacy:stale' WHERE run_signature IS NULL",
+            "UPDATE matches SET run_signature='legacy:stale' WHERE run_signature IS NULL",
+            "UPDATE anomalies SET run_signature='legacy:stale' WHERE run_signature IS NULL",
+            "CREATE INDEX IF NOT EXISTS idx_anomalies_finding ON anomalies(project_id, finding_id)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_run_signature ON evidence(project_id, run_signature)",
+        ],
+    ),
+    (
+        # v10: 检测覆盖率、权威批次清单与清洗事件。
+        # 这些表记录“是否完整执行/应到资料是否闭合/人工如何提出与处置变更”，
+        # 不把技术覆盖率或输入完整性硬塞进业务异常，也不修改原始文件和明细。
+        10,
+        [
+            """CREATE TABLE IF NOT EXISTS detection_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                run_signature TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                expected_json TEXT NOT NULL DEFAULT '[]',
+                executed_json TEXT NOT NULL DEFAULT '[]',
+                skipped_json TEXT NOT NULL DEFAULT '{}',
+                failed_json TEXT NOT NULL DEFAULT '{}',
+                critical_failed_json TEXT NOT NULL DEFAULT '[]',
+                error_summary TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_current "
+            "ON detection_runs(project_id, run_signature, id)",
+            """CREATE TABLE IF NOT EXISTS import_manifests (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                manifest_key TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                declared_by TEXT NOT NULL DEFAULT '',
+                declared_at TEXT NOT NULL,
+                control_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'not_assessed',
+                note TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL DEFAULT '1'
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_import_manifests_key "
+            "ON import_manifests(project_id, manifest_key)",
+            """CREATE TABLE IF NOT EXISTS import_manifest_entries (
+                id INTEGER PRIMARY KEY,
+                manifest_id INTEGER NOT NULL REFERENCES import_manifests(id) ON DELETE CASCADE,
+                logical_key TEXT NOT NULL,
+                expected_name TEXT,
+                expected_sha256 TEXT,
+                expected_period_no INTEGER,
+                expected_direction TEXT,
+                expected_sheet_name TEXT,
+                required INTEGER NOT NULL DEFAULT 1,
+                received_file_id INTEGER REFERENCES source_files(id),
+                state TEXT NOT NULL DEFAULT 'missing',
+                note TEXT NOT NULL DEFAULT '',
+                source_reference_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(manifest_id, logical_key)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_import_manifest_entries_state "
+            "ON import_manifest_entries(manifest_id, state)",
+            """CREATE TABLE IF NOT EXISTS cleaning_changes (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                run_signature TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject_id INTEGER NOT NULL,
+                field_name TEXT NOT NULL,
+                before_json TEXT,
+                proposed_json TEXT,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                decided_at TEXT,
+                decided_by TEXT,
+                decision_note TEXT,
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                UNIQUE(project_id, event_key)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_cleaning_changes_current "
+            "ON cleaning_changes(project_id, run_signature, status, id)",
+        ],
+    ),
+    (
+        # v11: 覆盖率运行类型。
+        # 异常规则检测与 A/B/C 聚合验证共用可审阅覆盖率结构，但必须按阶段
+        # 分开读取，不能把一次异常检测误当成聚合验证已经完成。
+        11,
+        [
+            "ALTER TABLE detection_runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'anomaly_detection'",
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_kind_current "
+            "ON detection_runs(project_id, run_signature, run_kind, id)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -15,6 +15,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
+from costguard.core.contracts import run_contract
 from costguard.core.engine.money import (
     Decimal,
     NotANumberError,
@@ -386,9 +387,10 @@ def aggregate_project(
 
 def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[ItemAggregate],
                           evidence_id: int | None = None) -> int:
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
     n = 0
     period_ids = sorted({int(pid) for agg in aggs for pid in agg.per_period})
-    with conn:
+    with run_contract._transaction(conn, "persist_period_totals"):
         if period_ids:
             placeholders = ",".join("?" for _ in period_ids)
             # 聚合结果改变后，旧的整体校核结论不能继续作为最新状态展示。
@@ -403,8 +405,9 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                        project_id, period_id, item_key, qty_sum, amount_sum, wavg_price,
                        cross_check_diff, cross_check_status, evidence_id,
                        raw_amount_sum, calculated_amount_sum, calculated_amount_used_sum,
-                       effective_amount_sum, amount_source, amount_status, verification_level)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       effective_amount_sum, amount_source, amount_status, verification_level,
+                       run_signature)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(period_id, item_key) DO UPDATE SET
                          qty_sum=excluded.qty_sum, amount_sum=excluded.amount_sum,
                          wavg_price=excluded.wavg_price,
@@ -419,7 +422,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                          effective_amount_sum=excluded.effective_amount_sum,
                          amount_source=excluded.amount_source,
                          amount_status=excluded.amount_status,
-                         verification_level='insufficient'""",
+                         verification_level='insufficient',
+                         run_signature=excluded.run_signature""",
                     (project_id, pid, agg.item_key,
                      str(pp["qty"]) if pp["qty"] is not None else None,
                      str(pp["effective_amount"]) if pp["effective_amount"] is not None else None,
@@ -431,7 +435,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                       if pp["calculated_amount_used"] is not None else None),
                      (str(pp["effective_amount"])
                       if pp["effective_amount"] is not None else None),
-                     pp["amount_source"], pp["amount_status"], "insufficient"),
+                     pp["amount_source"], pp["amount_status"], "insufficient",
+                     active_contract.signature),
                 )
                 n += 1
     return n

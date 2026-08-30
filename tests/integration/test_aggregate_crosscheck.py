@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_multi_period  # noqa: E402
 
+from costguard.core.anomalies import coverage  # noqa: E402
 from costguard.core.engine import aggregate, crosscheck, settlement_io  # noqa: E402
 
 D = Decimal
@@ -368,6 +369,46 @@ class TestAggregate:
 
 
 class TestCrossCheck:
+    def test_aggregate_validation_coverage_records_control_skip_and_run_kind(self, tmp_path):
+        """A/B 已执行、C 无控制值时必须显式跳过，不能伪装成未覆盖或全量通过。"""
+        info, conn, _period_id = _make_amount_case(tmp_path)
+        try:
+            aggregate.persist_period_totals(
+                conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+            )
+            crosscheck.run_crosscheck(conn, info.project_id, [1], direction="downward")
+            summary = coverage.coverage_summary(
+                conn,
+                info.project_id,
+                run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+            assert summary["run_kind"] == coverage.AGGREGATE_VALIDATION
+            assert summary["status"] == coverage.COMPLETE
+            assert summary["expected_count"] == 3
+            assert summary["executed_count"] == 2
+            assert summary["skipped_count"] == 1
+            assert summary["failed_count"] == 0
+            assert any(key.endswith(":path_c") for key in summary["skipped"])
+        finally:
+            conn.close()
+
+    def test_aggregate_validation_failure_is_recorded(self, tmp_path):
+        """不存在或歧义期次不得没有覆盖率记录。"""
+        info, conn, _period_id = _make_amount_case(tmp_path)
+        try:
+            with pytest.raises(ValueError):
+                crosscheck.run_crosscheck(conn, info.project_id, [999], direction="downward")
+            summary = coverage.coverage_summary(
+                conn,
+                info.project_id,
+                run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+            assert summary["status"] == coverage.FAILED
+            assert summary["expected_count"] == 3
+            assert summary["failed_count"] == 3
+        finally:
+            conn.close()
+
     def test_multi_period_match(self, project_multi):
         """A/B 两条独立路径结果一致（同一文件同网格）。"""
         info, conn, report = project_multi

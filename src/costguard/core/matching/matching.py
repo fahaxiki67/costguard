@@ -23,8 +23,10 @@ from datetime import datetime
 from rapidfuzz import fuzz
 
 from costguard.core.anomalies.rules import _norm_unit
+from costguard.core.contracts import run_contract
 from costguard.core.evidence import audit as audit_log
 from costguard.core.evidence import evidence as evidence_api
+from costguard.core.matching.key_integrity import classify_composite_keys
 
 # 置信度档位
 CONFIRMED = "confirmed"
@@ -88,12 +90,33 @@ def _unscoped_group_key(group_key: str) -> str:
     return group_key
 
 
+def _duplicate_composite_ids(rows: list[sqlite3.Row]) -> set[int]:
+    """找出同一结算期内完整复合键重复的行，供自动匹配门控。
+
+    同一编码在不同期次各出现一次是正常的跨期对照，不属于重复；因此先按
+    ``period_id`` 分侧检查 ``code + unit``。同码异单位仍交给既有“不可比”判定，
+    不会被这个门控误吞。
+    """
+    blocked: set[int] = set()
+    period_rows: dict[int, list[dict]] = {}
+    for row in rows:
+        period_rows.setdefault(int(row["period_id"]), []).append({
+            "id": int(row["id"]),
+            "code": row["code"],
+            "unit": row["unit"],
+        })
+    for side in period_rows.values():
+        integrity = classify_composite_keys(side, [], ("code", "unit"))
+        blocked.update(int(row["id"]) for row in integrity.duplicate_left)
+    return blocked
+
+
 def _match_items_for_direction(
     conn: sqlite3.Connection, project_id: int, direction: str
 ) -> list[MatchGroup]:
     """只在一个明确方向内做五档归组。"""
     rows = conn.execute(
-        """SELECT li.id, li.code, li.name, li.unit, sp.period_no AS pno,
+        """SELECT li.id, li.period_id, li.code, li.name, li.unit, sp.period_no AS pno,
                   COALESCE(sp.direction, 'unknown') AS direction
            FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
@@ -102,11 +125,13 @@ def _match_items_for_direction(
         (project_id, direction),
     ).fetchall()
     aliases = load_aliases(conn, project_id, direction)
+    blocked_duplicate_ids = _duplicate_composite_ids(rows)
+    eligible_rows = [row for row in rows if int(row["id"]) not in blocked_duplicate_ids]
 
     # ---- 逐行归到候选键 ----
     exact: dict[str, list[int]] = {}  # canonical_key -> ids（编码精确）
     name_exact: dict[str, list[int]] = {}
-    for r in rows:
+    for r in eligible_rows:
         name = (r["name"] or "").strip()
         if r["code"]:
             exact.setdefault(r["code"], []).append(r["id"])
@@ -204,6 +229,21 @@ def _match_items_for_direction(
         assigned_ids.update(ids)
 
     # 归组失败且无法通过相似度处理的行 → 待补资料组
+    blocked_rows = [all_rows[i] for i in all_rows if i in blocked_duplicate_ids]
+    if blocked_rows:
+        g = group_of("pending:blocked_by_duplicate")
+        g.item_ids = [r["id"] for r in blocked_rows]
+        g.level = PENDING_DATA
+        g.method = "key_integrity"
+        g.score = 0.0
+        g.notes.append(
+            "复合键（编码+单位）在同一结算期内重复，已阻断自动匹配；请人工拆分或确认"
+        )
+        for r in blocked_rows:
+            g.names.add((r["name"] or "").strip())
+            g.codes.add((r["code"] or "").strip())
+            g.units.add(_norm_unit(r["unit"]))
+        assigned_ids.update(r["id"] for r in blocked_rows)
     orphans = [all_rows[i] for i in all_rows if i not in assigned_ids]
     if orphans:
         g = MatchGroup(group_key="pending:orphan", level=PENDING_DATA, method="none", score=0.0,
@@ -294,14 +334,23 @@ def match_items(
 
 
 def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGroup]) -> int:
-    with conn:
-        conn.execute("DELETE FROM matches WHERE project_id=? AND status='pending'", (project_id,))
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    with run_contract._transaction(conn, "save_matches"):
+        # 当前候选是可重建缓存；人工已处理记录不删除，旧签名记录由当前
+        # 读取面排除并保留作历史。
+        conn.execute(
+            "DELETE FROM matches WHERE project_id=? AND status='pending' AND run_signature=?",
+            (project_id, active_contract.signature),
+        )
         n = 0
         for g in groups:
             conn.execute(
-                """INSERT INTO matches(project_id, group_key, item_ids_json, level, method, score, status)
-                   VALUES (?,?,?,?,?,?,'pending')""",
-                (project_id, g.group_key, json.dumps(g.item_ids), g.level, g.method, g.score),
+                """INSERT INTO matches(
+                       project_id, group_key, item_ids_json, level, method, score,
+                       status, run_signature)
+                   VALUES (?,?,?,?,?,?, 'pending', ?)""",
+                (project_id, g.group_key, json.dumps(g.item_ids), g.level, g.method,
+                 g.score, active_contract.signature),
             )
             n += 1
     return n
@@ -343,15 +392,19 @@ def confirm_match(
             f"match {match_id} spans {sorted(directions)}; direction-isolated confirmation required"
         )
     direction = next(iter(directions))
-    with conn:
+    # 状态、别名、证据和审计必须同一事务提交。任何一环失败都回滚整次人工
+    # 操作，避免“匹配已确认但证据/审计缺失”的不可追溯状态。
+    active_signature = run_contract.current_run_signature(conn, project_id, ensure=True)
+    if row["run_signature"] != active_signature:
+        raise ValueError("该匹配结果已因输入或配置变化失效，请重新运行匹配后再确认")
+    with run_contract._transaction(conn, "confirm_match"):
         conn.execute(
             "UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=? WHERE id=?",
             (actor, reason, CONFIRMED, match_id),
         )
-    if alias_name and row["level"] == SUSPECTED:
-        # 疑似 → 确认后可沉淀为别名（原则 9/14：保存依据与确认记录）
-        canonical = _unscoped_group_key(row["group_key"])
-        with conn:
+        if alias_name and row["level"] == SUSPECTED:
+            # 疑似 → 确认后可沉淀为别名（原则 9/14：保存依据与确认记录）
+            canonical = _unscoped_group_key(row["group_key"])
             conn.execute(
                 """INSERT OR IGNORE INTO item_aliases(project_id, direction, canonical_key,
                    alias_text, mapping_basis, confirmed_by, confirmed_at)
@@ -360,17 +413,24 @@ def confirm_match(
                  f"人工确认 match#{match_id}: {reason}",
                  actor, datetime.now().isoformat(timespec="seconds")),
             )
-    evidence_api.add_evidence(
-        conn, project_id, "match_confirmation",
-        f"匹配组 {row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
-        steps=[{"step": "人工复核", "actor": actor, "reason": reason}],
-        sources=[{"match_id": match_id, "direction": direction, "items": item_ids}],
-    )
-    audit_log.record_audit(
-        conn, project_id, actor, "confirm_match", f"match:{match_id}",
-        {"level": row["level"]},
-        {"level": CONFIRMED, "alias": alias_name, "direction": direction}, reason,
-    )
+        evidence_api.add_evidence(
+            conn, project_id, "match_confirmation",
+            f"匹配组 {row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
+            steps=[{"step": "人工复核", "actor": actor, "reason": reason}],
+            sources=[{"match_id": match_id, "direction": direction, "items": item_ids}],
+            commit=False,
+            run_signature=active_signature,
+        )
+        audit_log.record_audit(
+            conn, project_id, actor, "confirm_match", f"match:{match_id}",
+            {"level": row["level"]},
+            {"level": CONFIRMED, "alias": alias_name, "direction": direction}, reason,
+            commit=False,
+        )
+    # 别名是匹配配置的一部分。确认后立即生成新契约，使后续运行不能误用
+    # 变更前的候选；本次人工记录仍保留在旧签名历史中。
+    if alias_name and row["level"] == SUSPECTED:
+        run_contract.ensure_run_contract(conn, project_id)
 
 
 def override_match(
@@ -386,19 +446,29 @@ def override_match(
         raise audit_log.AuditReasonRequiredError("人工修正匹配必须记录原因（原则 14）")
     if new_level not in LEVEL_SCORES:
         raise ValueError(f"invalid level: {new_level}")
-    row = conn.execute("SELECT level FROM matches WHERE id=? AND project_id=?", (match_id, project_id)).fetchone()
+    row = conn.execute(
+        "SELECT level, run_signature FROM matches WHERE id=? AND project_id=?",
+        (match_id, project_id),
+    ).fetchone()
     if not row:
         raise ValueError(f"match {match_id} not found")
-    with conn:
+    # 同确认操作：业务状态、证据和人工审计必须全成或全回滚。
+    active_signature = run_contract.current_run_signature(conn, project_id, ensure=True)
+    if row["run_signature"] != active_signature:
+        raise ValueError("该匹配结果已因输入或配置变化失效，请重新运行匹配后再修正")
+    with run_contract._transaction(conn, "override_match"):
         conn.execute("UPDATE matches SET level=?, status='reviewed', reviewed_by=?, review_note=? WHERE id=?",
                      (new_level, actor, reason, match_id))
-    evidence_api.add_evidence(
-        conn, project_id, "match_override",
-        f"匹配组 #{match_id} 级别 {row['level']} → {new_level}（{actor}）",
-        steps=[{"step": "人工修正", "reason": reason}],
-        sources=[{"match_id": match_id}],
-    )
-    audit_log.record_audit(
-        conn, project_id, actor, "override_match", f"match:{match_id}",
-        {"level": row["level"]}, {"level": new_level}, reason,
-    )
+        evidence_api.add_evidence(
+            conn, project_id, "match_override",
+            f"匹配组 #{match_id} 级别 {row['level']} → {new_level}（{actor}）",
+            steps=[{"step": "人工修正", "reason": reason}],
+            sources=[{"match_id": match_id}],
+            commit=False,
+            run_signature=active_signature,
+        )
+        audit_log.record_audit(
+            conn, project_id, actor, "override_match", f"match:{match_id}",
+            {"level": row["level"]}, {"level": new_level}, reason,
+            commit=False,
+        )

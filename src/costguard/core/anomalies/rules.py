@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
 from decimal import Decimal
 
 from costguard.core.engine.money import round2
+from costguard.core.evidence.finding import Finding
 from costguard.core.labels import DIRECTION_ZH, direction_label
 
 D = Decimal
@@ -32,16 +32,6 @@ UNIT_ALIASES = {
     "个": {"只", "件"},
     "樘": {"堂", "樘/处"},
 }
-
-
-@dataclass
-class Finding:
-    rule_id: str
-    severity: str
-    subject_type: str
-    subject_id: int
-    message: str
-    details: dict = field(default_factory=dict)
 
 
 def _norm_unit(u: str | None) -> str:

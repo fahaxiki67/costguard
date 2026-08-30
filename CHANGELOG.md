@@ -7,8 +7,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 Release gate follow-up for v0.1.7 remains in progress. The current candidate
 contains the P0 evidence/range gates and the UI review workflow improvements;
 WPS, macOS Excel and Windows Excel real-environment checks, large-project
-performance baselines, Developer ID/notarization and real-case regression are
-still required before a production designation.
+performance baselines, Developer ID/notarization, migration/recovery checks and
+real-case regression are still required before a production designation.
+
+The candidate also adds a signed Run Contract for source files, sheet scope,
+field mappings, calculation inputs, rule configuration, schema and code
+version. Current cross-check, anomaly, matching and Excel/Word export records
+are filtered by that signature; earlier records remain available as history
+and are not silently reused. Findings now carry stable `finding_id` and
+`fingerprint` values, raw/normalized values, confidence, detection mode,
+impact, limitations, recommendation and suppression reason. The repository
+also includes repeatable large-list benchmarking and release-consistency
+checks; measured 1/5/20万-row baselines remain a release gate until executed
+on the target environment.
 
 ## [0.1.7] - 2026-08-30
 

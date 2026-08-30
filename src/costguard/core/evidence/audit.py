@@ -30,12 +30,17 @@ def record_audit(
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
     reason: str,
+    commit: bool = True,
 ) -> int:
-    """记录一次人工修改。reason 为空直接拒绝。"""
+    """记录一次人工修改。reason 为空直接拒绝。
+
+    ``commit=False`` 供需要与业务更新原子提交的人工操作使用；普通调用方
+    仍保持默认的独立事务行为。
+    """
     if not reason or not reason.strip():
         raise AuditReasonRequiredError("人工修改必须记录原因（原则 14）")
     now = datetime.now().isoformat(timespec="seconds")
-    with conn:
+    def _insert() -> int:
         cur = conn.execute(
             """INSERT INTO audit_log(project_id, ts, actor, action, target, before_json, after_json, reason)
                VALUES (?,?,?,?,?,?,?,?)""",
@@ -45,6 +50,10 @@ def record_audit(
              reason.strip()),
         )
         return int(cur.lastrowid)
+    if commit:
+        with conn:
+            return _insert()
+    return _insert()
 
 
 def history_for(conn: sqlite3.Connection, project_id: int, target: str | None = None) -> list[AuditEntry]:

@@ -19,9 +19,11 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from costguard.core.contracts import run_contract
 from costguard.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
 from costguard.core.engine.money import NotANumberError, round2, to_decimal
-from costguard.core.engine.settlement_io import pending_sheet_count
+from costguard.core.parsing import import_manifest
+from costguard.core.reporting import ProjectSummary, build_report_model
 
 D = Decimal
 
@@ -73,6 +75,8 @@ ANOMALY_STATUS_ZH = {
     "supplemented": "已补资料",
     "corrected": "已修正",
     "deferred": "暂不处理",
+    "stale": "已失效（历史）",
+    "superseded": "已被新结果替代",
 }
 
 
@@ -517,8 +521,9 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
 
 def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
     """异常清单 + 待核实事项清单。"""
+    scope, scope_params = run_contract.current_scope(conn, project_id, "a")
     anomaly_rows = conn.execute(
-        """SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
+        f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
                   a.evidence_id, a.message, a.status,
                   COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
                     AS direction
@@ -531,9 +536,9 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
            LEFT JOIN raw_sheets rs
              ON a.subject_type='sheet' AND rs.id=a.subject_id
            LEFT JOIN settlement_periods sp_sheet ON sp_sheet.id=rs.period_id
-           WHERE a.project_id=? ORDER BY CASE a.severity
+           WHERE a.project_id=? AND {scope} ORDER BY CASE a.severity
            WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, a.id""",
-        (project_id,),
+        (project_id, *scope_params),
     ).fetchall()
     sev_zh = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
     ws = wb.create_sheet("异常清单")
@@ -586,11 +591,12 @@ def export_contract_risks(conn: sqlite3.Connection, project_id: int, wb: Workboo
     ws = wb.create_sheet("合同风险清单")
     ws.append(["编号", "级别", "合同文档", "风险说明", "证据ID"])
     _style_header(ws, 1, 5)
+    scope, scope_params = run_contract.current_scope(conn, project_id, "a")
     rows = conn.execute(
-        """SELECT a.id, a.severity, a.message, a.evidence_id, cd.title
+        f"""SELECT a.id, a.severity, a.message, a.evidence_id, cd.title
            FROM anomalies a JOIN contract_docs cd ON cd.id = a.subject_id
-           WHERE a.project_id=? AND a.rule_id='contract_risk'""",
-        (project_id,),
+           WHERE a.project_id=? AND {scope} AND a.rule_id='contract_risk'""",
+        (project_id, *scope_params),
     ).fetchall()
     for i, r in enumerate(rows, start=1):
         sev = {"high": "高", "medium": "中", "low": "低"}.get(r["severity"], r["severity"])
@@ -721,74 +727,49 @@ def _tax_mode_status(conn: sqlite3.Connection, project_id: int) -> str:
     return "含税金额/单价" if "incl_tax" in modes else "不含税金额/单价"
 
 
-def _review_gate_counts(conn: sqlite3.Connection, project_id: int) -> dict[str, int]:
+def _review_gate_counts(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    summary: ProjectSummary | None = None,
+) -> dict[str, int]:
     """集中计算成果页使用的审核完成度闸门，避免不同成果口径漂移。"""
-    source_files = conn.execute(
-        "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (project_id,)
-    ).fetchone()["c"]
-    pending_sheets = pending_sheet_count(conn, project_id)
-    high_unresolved = conn.execute(
-        """SELECT COUNT(*) AS c FROM anomalies
-           WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""",
-        (project_id,),
-    ).fetchone()["c"]
-    open_findings = conn.execute(
-        """SELECT COUNT(*) AS c FROM anomalies
-           WHERE project_id=? AND status IN ('open', 'deferred')""",
-        (project_id,),
-    ).fetchone()["c"]
-    deferred = conn.execute(
-        "SELECT COUNT(*) AS c FROM anomalies WHERE project_id=? AND status='deferred'",
-        (project_id,),
-    ).fetchone()["c"]
-    pending_matches = conn.execute(
-        "SELECT COUNT(*) AS c FROM matches WHERE project_id=? AND status='pending'",
-        (project_id,),
-    ).fetchone()["c"]
-    period_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM settlement_periods WHERE project_id=?", (project_id,)
-    ).fetchone()["c"]
-    checked_count = conn.execute(
-        "SELECT COUNT(*) AS c FROM crosscheck_results WHERE project_id=?", (project_id,)
-    ).fetchone()["c"]
-    insufficient = conn.execute(
-        """SELECT COUNT(*) AS c FROM crosscheck_results
-           WHERE project_id=? AND verification_level='insufficient'""",
-        (project_id,),
-    ).fetchone()["c"]
-    findings = conn.execute(
-        """SELECT COUNT(*) AS c FROM crosscheck_results
-           WHERE project_id=? AND verification_level='findings'""",
-        (project_id,),
-    ).fetchone()["c"]
-    range_unproven = conn.execute(
-        """SELECT COALESCE(SUM(range_unproven_sheets), 0) AS c
-           FROM crosscheck_results WHERE project_id=?""",
-        (project_id,),
-    ).fetchone()["c"]
+    summary = summary or build_report_model(conn, project_id).project_summary
+    levels = summary.verification["levels"]
+    risk = summary.risk
     return {
-        "source_files": int(source_files or 0),
-        "pending_sheets": int(pending_sheets or 0),
-        "high_unresolved": int(high_unresolved or 0),
-        "open_findings": int(open_findings or 0),
-        "deferred": int(deferred or 0),
-        "pending_matches": int(pending_matches or 0),
-        "period_count": int(period_count or 0),
-        "checked_count": int(checked_count or 0),
-        "insufficient": int(insufficient or 0),
-        "findings": int(findings or 0),
-        "range_unproven": int(range_unproven or 0),
+        "source_files": summary.source_files,
+        "pending_sheets": int(summary.pending["sheets"]),
+        "high_unresolved": int(summary.pending["high_risk"]),
+        "open_findings": int(summary.pending["anomalies"]),
+        "deferred": int(risk["status"]["deferred"]),
+        "pending_matches": int(summary.pending["matches"]),
+        "period_count": sum(summary.directions.values()),
+        "checked_count": int(summary.verification["periods_checked"]),
+        "insufficient": int(levels.get("insufficient", 0)),
+        "findings": int(levels.get("findings", 0)),
+        "range_unproven": int(summary.verification["range_unproven_sheets"]),
+        "detection_status": summary.detection_coverage["status"],
+        "aggregate_status": summary.aggregate_coverage["status"],
+        "manifest_status": summary.pending["manifest_status"],
     }
 
 
-def export_cover_page(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+def export_cover_page(
+    conn: sqlite3.Connection,
+    project_id: int,
+    wb: Workbook,
+    *,
+    summary: ProjectSummary | None = None,
+) -> None:
     """生成成果首页，首次打开即可看到范围、状态、限制和使用顺序。"""
     ws = wb.create_sheet("封面与说明")
     project = conn.execute(
         "SELECT name FROM projects WHERE id=?", (project_id,)
     ).fetchone()
     project_name = project["name"] if project else "未命名项目"
-    gates = _review_gate_counts(conn, project_id)
+    signature = run_contract.current_run_signature(conn, project_id)
+    gates = _review_gate_counts(conn, project_id, summary=summary)
     unchecked = max(0, gates["period_count"] - gates["checked_count"])
     if not gates["source_files"]:
         status = "尚未导入资料"
@@ -798,6 +779,9 @@ def export_cover_page(conn: sqlite3.Connection, project_id: int, wb: Workbook) -
         gates["pending_sheets"], gates["high_unresolved"], gates["open_findings"],
         gates["pending_matches"], gates["insufficient"], gates["findings"],
         gates["range_unproven"], unchecked,
+        gates["detection_status"] != "complete",
+        gates["aggregate_status"] != "complete",
+        gates["manifest_status"] in {"incomplete", "mismatch"},
     )):
         status = "审核尚未完成"
     else:
@@ -807,11 +791,14 @@ def export_cover_page(conn: sqlite3.Connection, project_id: int, wb: Workbook) -
     ws.append(["项目名称", project_name])
     ws.append(["生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")])
     ws.append(["成果版本", "v0.1.7 预览候选"])
+    ws.append(["运行签名", signature or "尚未生成（执行校核/异常检测/匹配或导出后生成）"])
     ws.append(["审核状态", status])
     completion = (
         f"待确认工作表 {gates['pending_sheets']} 张；高风险未处理 {gates['high_unresolved']} 项；"
         f"待确认匹配 {gates['pending_matches']} 组；尚未校核 {unchecked} 期；"
-        f"校核不充分 {gates['insufficient']} 期；取数范围未证明 {gates['range_unproven']} 张工作表"
+        f"校核不充分 {gates['insufficient']} 期；取数范围未证明 {gates['range_unproven']} 张工作表；"
+        f"检测覆盖率 {gates['detection_status']}；权威清单 {gates['manifest_status']}"
+        f"；聚合验证覆盖率 {gates['aggregate_status']}"
     )
     if not gates["source_files"]:
         completion = "尚未导入资料；" + completion
@@ -833,55 +820,66 @@ def export_cover_page(conn: sqlite3.Connection, project_id: int, wb: Workbook) -
     _autowidth(ws)
 
 
-def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+def export_management_summary(
+    conn: sqlite3.Connection,
+    project_id: int,
+    wb: Workbook,
+    *,
+    summary: ProjectSummary | None = None,
+) -> None:
     """管理层摘要 sheet：范围、期次与方向、税口径、异常与证据计数。"""
     ws = wb.create_sheet("管理层摘要")
     ws.append(["CostGuard 管理层摘要"])
     ws.cell(row=1, column=1).font = Font(bold=True, size=14)
-    direction_stats: dict[str, dict] = {}
-    for direction in _project_directions(conn, project_id):
-        aggs = aggregate_project(conn, project_id, direction=direction)
-        direction_stats[direction] = {
-            "groups": len(aggs),
-            "total": sum((a.cum_amount for a in aggs if a.cum_amount is not None), D(0)),
-            "ok": sum(1 for a in aggs if a.status == "ok"),
-            "incomplete": sum(1 for a in aggs if a.status == "incomplete"),
-            "incomparable": sum(1 for a in aggs if a.status == "incomparable"),
-        }
-    sev = {"high": 0, "medium": 0, "low": 0}
-    for r in conn.execute("SELECT severity, COUNT(*) c FROM anomalies WHERE project_id=? GROUP BY severity", (project_id,)):
-        sev[r["severity"]] = r["c"]
-    periods = _fetch_periods(conn, project_id)
-    n_up = sum(1 for p in periods if p["direction"] == "upward")
-    n_down = sum(1 for p in periods if p["direction"] == "downward")
-    n_none = len(periods) - n_up - n_down
+    summary = summary or build_report_model(conn, project_id).project_summary
+    n_up = summary.directions.get("upward", 0)
+    n_down = summary.directions.get("downward", 0)
+    n_none = sum(
+        count for direction, count in summary.directions.items()
+        if direction not in {"upward", "downward"}
+    )
     n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
-    n_src = conn.execute("SELECT COUNT(*) c FROM source_files WHERE project_id=?", (project_id,)).fetchone()["c"]
     data = [
         ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")),
         ("—— 统计范围 ——", ""),
-        ("已导入原始文件数", n_src),
-        ("期次数", len(periods)),
+        ("已导入原始文件数", summary.source_files),
+        ("期次数", sum(summary.directions.values())),
         ("其中：对上结算", n_up),
         ("其中：对下结算", n_down),
         ("其中：未标记", n_none),
         ("—— 金额与状态 ——", ""),
     ]
-    for direction, stats in direction_stats.items():
+    for direction, stats in summary.amounts.items():
         label = _business_direction(direction)
         data.extend([
             (f"{label}清单组数", stats["groups"]),
-            (f"{label}累计金额（可用部分）", _num(round2(stats["total"]))),
-            (f"{label}正常清单组", stats["ok"]),
-            (f"{label}待补资料清单组", stats["incomplete"]),
-            (f"{label}不可比清单组", stats["incomparable"]),
+            (f"{label}累计金额（可用部分）",
+             _num(round2(D(stats["amount"]))) if stats["amount"] is not None else "无法确认"),
+            (f"{label}正常清单组", stats["ok_groups"]),
+            (f"{label}待补资料清单组", stats["incomplete_groups"]),
+            (f"{label}不可比清单组", stats["incomparable_groups"]),
         ])
+    levels = summary.verification["levels"]
+    risk = summary.risk
+    manifest = summary.pending
+    coverage = summary.detection_coverage
+    aggregate_coverage = summary.aggregate_coverage
     data.extend([
         ("—— 口径与风险 ——", ""),
         ("金额/单价税口径", _tax_mode_status(conn, project_id)),
-        ("高风险异常数", sev["high"]),
-        ("中风险异常数", sev["medium"]),
-        ("低风险异常数", sev["low"]),
+        ("高风险异常数", risk["severity"]["high"]),
+        ("中风险异常数", risk["severity"]["medium"]),
+        ("低风险异常数", risk["severity"]["low"]),
+        ("检测覆盖率", f"{coverage['status']}（应执行 {coverage['expected_count']}，已执行 {coverage['executed_count']}，"
+         f"跳过 {coverage['skipped_count']}，失败 {coverage['failed_count']}）"),
+        ("聚合验证覆盖率", f"{aggregate_coverage['status']}（应执行 {aggregate_coverage['expected_count']}，"
+         f"已执行 {aggregate_coverage['executed_count']}，跳过 {aggregate_coverage['skipped_count']}，"
+         f"失败 {aggregate_coverage['failed_count']}）"),
+        ("权威批次清单", manifest["manifest_status"]),
+        ("权威清单缺件", manifest["manifest_missing"]),
+        ("校核充分期数", levels.get("sufficient", 0)),
+        ("校核有发现期数", levels.get("findings", 0)),
+        ("校核不充分期数", levels.get("insufficient", 0)),
         ("—— 追溯 ——", ""),
         ("证据记录数", n_ev),
         ("证据索引位置", "本工作簿《证据索引》工作表（evidence ID）"),
@@ -898,12 +896,25 @@ def export_management_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
 
 def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """导出全部报表到一个 xlsx。返回文件路径。"""
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    # 兼容未经过新 API 的即时补充记录；v9 已把真正旧记录标为
+    # legacy:stale，因此不会把历史结果重新激活。
+    run_contract.adopt_unsigned_records(conn, project_id, active_contract.signature)
+    # 评估权威清单可能产生可复核的哈希绑定；确保成果登记使用绑定后的签名。
+    import_manifest.manifest_summary(conn, project_id)
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    report_model = build_report_model(conn, project_id)
+    if report_model.run_signature != active_contract.signature:
+        # 仅在摘要计算期间发生范围变化时重取一次，保证所有导出页与登记
+        # 使用同一个最终运行签名；正常路径不会重复构建。
+        active_contract = run_contract.ensure_run_contract(conn, project_id)
+        report_model = build_report_model(conn, project_id)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     wb.remove(wb.active)
-    export_cover_page(conn, project_id, wb)
-    export_management_summary(conn, project_id, wb)
+    export_cover_page(conn, project_id, wb, summary=report_model.project_summary)
+    export_management_summary(conn, project_id, wb, summary=report_model.project_summary)
     for direction in _project_directions(conn, project_id):
         export_settlement_summary(conn, project_id, wb, direction=direction)
     export_updown_comparison(conn, project_id, wb)
@@ -935,6 +946,14 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"CostGuard审核底稿_{stamp}.xlsx"
     wb.save(path)
+    run_contract.register_export(
+        conn,
+        project_id,
+        "excel_workbook",
+        path,
+        run_signature=active_contract.signature,
+        metadata={"sheet_names": wb.sheetnames, "version": "0.1.7"},
+    )
     return path
 
 
@@ -944,62 +963,60 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     from docx.oxml.ns import qn
     from docx.shared import Pt
 
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    run_contract.adopt_unsigned_records(conn, project_id, active_contract.signature)
+    import_manifest.manifest_summary(conn, project_id)
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    report_model = build_report_model(conn, project_id)
+    if report_model.run_signature != active_contract.signature:
+        active_contract = run_contract.ensure_run_contract(conn, project_id)
+        report_model = build_report_model(conn, project_id)
+    summary = report_model.project_summary
     project = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
     project_name = project["name"] if project else "未命名项目"
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-    direction_stats: dict[str, tuple[int, Decimal | None]] = {}
+    direction_stats: dict[str, tuple[int, Decimal | None]] = {
+        direction: (
+            int(stats["groups"]),
+            D(stats["amount"]) if stats["amount"] is not None else None,
+        )
+        for direction, stats in summary.amounts.items()
+    }
     direction_evidence: dict[str, int | None] = {}
     for direction in _project_directions(conn, project_id):
-        aggs = aggregate_project(conn, project_id, direction=direction)
-        amounts = [a.cum_amount for a in aggs if a.cum_amount is not None]
-        direction_stats[direction] = (
-            len(aggs),
-            sum(amounts, D(0)) if amounts else None,
-        )
         ev = conn.execute(
             """SELECT cr.evidence_id FROM crosscheck_results cr
                JOIN settlement_periods sp ON sp.id=cr.period_id
-               WHERE cr.project_id=? AND COALESCE(sp.direction, 'unknown')=?
+               WHERE cr.project_id=? AND cr.run_signature=?
+                 AND COALESCE(sp.direction, 'unknown')=?
                ORDER BY cr.checked_at DESC, cr.id DESC LIMIT 1""",
-            (project_id, direction),
+            (project_id, active_contract.signature, direction),
         ).fetchone()
         direction_evidence[direction] = int(ev["evidence_id"]) if ev and ev["evidence_id"] else None
-    high = conn.execute(
-        "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND severity='high'", (project_id,)
-    ).fetchone()["c"]
-    high_open = conn.execute(
-        """SELECT COUNT(*) c FROM anomalies
-           WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""", (project_id,)
-    ).fetchone()["c"]
-    supplemented = conn.execute(
-        "SELECT COUNT(*) c FROM anomalies WHERE project_id=? AND status='supplemented'", (project_id,)
-    ).fetchone()["c"]
-    pending_matches = conn.execute(
-        "SELECT COUNT(*) c FROM matches WHERE project_id=? AND status='pending'", (project_id,)
-    ).fetchone()["c"]
-    pending_sheets = pending_sheet_count(conn, project_id)
-    incomparable = 0
-    for direction in direction_stats:
-        incomparable += sum(
-            1 for agg in aggregate_project(conn, project_id, direction=direction)
-            if agg.status == "incomparable"
-        )
+    anomaly_scope, anomaly_params = run_contract.current_scope(conn, project_id, "a")
+    risk = summary.risk
+    high = risk["severity"]["high"]
+    high_open = summary.pending["high_risk"]
+    supplemented = risk.get("status_counts", {}).get("supplemented", 0)
+    pending_matches = summary.pending["matches"]
+    pending_sheets = summary.pending["sheets"]
+    incomparable = sum(stats["incomparable_groups"] for stats in summary.amounts.values())
     periods = _fetch_periods(conn, project_id)
-    n_up = sum(1 for p in periods if p["direction"] == "upward")
-    n_down = sum(1 for p in periods if p["direction"] == "downward")
-    n_none = len(periods) - n_up - n_down
+    n_up = summary.directions.get("upward", 0)
+    n_down = summary.directions.get("downward", 0)
+    n_none = summary.directions.get("unknown", 0)
     n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
-    level_counts = {r["verification_level"]: int(r["c"]) for r in conn.execute(
-        """SELECT verification_level, COUNT(*) c FROM crosscheck_results
-           WHERE project_id=? GROUP BY verification_level""", (project_id,)
-    )}
-    gates = _review_gate_counts(conn, project_id)
+    level_counts = summary.verification["levels"]
+    gates = _review_gate_counts(conn, project_id, summary=summary)
     unchecked = max(0, gates["period_count"] - gates["checked_count"])
     gates_open = any((
         not gates["source_files"], not gates["period_count"],
         pending_sheets, high_open, gates["open_findings"], pending_matches,
         level_counts.get("insufficient", 0), level_counts.get("findings", 0),
         gates["range_unproven"], unchecked,
+        gates["detection_status"] != "complete",
+        gates["aggregate_status"] != "complete",
+        gates["manifest_status"] in {"incomplete", "mismatch"},
     ))
     if not gates["source_files"]:
         result_status = "尚未导入资料"
@@ -1043,6 +1060,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(f"审核范围：已导入文件 {conn.execute('SELECT COUNT(*) c FROM source_files WHERE project_id=?', (project_id,)).fetchone()['c']} 份，"
                       f"期次 {len(periods)} 期（对上结算 {n_up} 期、对下结算 {n_down} 期、未标记 {n_none} 期）")
     doc.add_paragraph(f"生成时间/版本：{generated_at} / v0.1.7 预览候选")
+    doc.add_paragraph(f"运行签名：{active_contract.signature}")
     status_p = doc.add_paragraph(f"成果状态：{result_status}")
     status_p.runs[0].bold = True
 
@@ -1064,6 +1082,8 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         ("校核有发现期数", level_counts.get("findings", 0)),
         ("尚未校核期数", unchecked),
         ("取数范围未证明工作表", gates["range_unproven"]),
+        ("检测覆盖率", gates["detection_status"]),
+        ("聚合验证覆盖率", gates["aggregate_status"]),
         ("暂不处理异常", gates["deferred"]),
     ]
     for label, value in metric_rows:
@@ -1107,10 +1127,12 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
 
     doc.add_heading("Top 风险事项", level=1)
     risks = conn.execute(
-        """SELECT id, rule_id, severity, subject_type, subject_id, evidence_id, message, status
-           FROM anomalies WHERE project_id=? AND severity IN ('high', 'medium')
-           ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id
-           LIMIT 10""", (project_id,)
+        f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
+                  a.evidence_id, a.message, a.status
+           FROM anomalies a WHERE a.project_id=? AND {anomaly_scope}
+             AND a.severity IN ('high', 'medium')
+           ORDER BY CASE a.severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, a.id
+           LIMIT 10""", (project_id, *anomaly_params)
     ).fetchall()
     if risks:
         table = doc.add_table(rows=1, cols=5)
@@ -1148,6 +1170,18 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         pending_lines.append(f"尚未执行双向校核 {unchecked} 期：暂不能形成充分校核结论。")
     if gates["deferred"]:
         pending_lines.append(f"暂不处理异常 {gates['deferred']} 项：保留原状态，不视为已闭合。")
+    if gates["detection_status"] != "complete":
+        pending_lines.append(
+            f"异常检测覆盖率为 {gates['detection_status']}：不能把当前结果解释为全量规则通过。"
+        )
+    if gates["aggregate_status"] != "complete":
+        pending_lines.append(
+            f"聚合验证覆盖率为 {gates['aggregate_status']}：不能把当前 A/B/C 结果解释为全量验证完成。"
+        )
+    if gates["manifest_status"] in {"incomplete", "mismatch"}:
+        pending_lines.append(
+            f"权威批次清单状态为 {gates['manifest_status']}：缺件或口径不符事项需补证。"
+        )
     if not pending_lines:
         pending_lines.append("当前没有登记的待决策事项；仍需按 Evidence ID 完成人工复核和业务审批。")
     for line in pending_lines:
@@ -1162,7 +1196,8 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(
         f"校核门控：已执行 {gates['checked_count']} / {gates['period_count']} 期；"
         f"校核不充分 {gates['insufficient']} 期；校核有发现 {gates['findings']} 期；"
-        f"取数范围未证明 {gates['range_unproven']} 张工作表。"
+        f"取数范围未证明 {gates['range_unproven']} 张工作表；"
+        f"聚合验证覆盖率 {gates['aggregate_status']}。"
     )
     doc.add_paragraph(
         "追溯说明：本 Word 摘要不包含证据入口按钮；正文管理结论均标注 Evidence ID，"
@@ -1178,4 +1213,12 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"CostGuard管理层摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
     doc.save(str(path))
+    run_contract.register_export(
+        conn,
+        project_id,
+        "management_summary_docx",
+        path,
+        run_signature=active_contract.signature,
+        metadata={"version": "0.1.7", "result_status": result_status},
+    )
     return path

@@ -27,19 +27,33 @@ def add_evidence(
     summary: str,
     steps: list[dict[str, Any]] | None = None,
     sources: list[dict[str, Any]] | None = None,
+    commit: bool = True,
+    run_signature: str | None = None,
+    finding_id: str | None = None,
 ) -> int:
-    """写入一条证据。steps=计算过程（有序）；sources=数据来源（文件/Sheet/单元格/原始内容）。"""
+    """写入一条证据。
+
+    ``commit`` 默认保持原有独立写入行为；需要把证据与业务状态、审计日志
+    放进同一个事务的调用方传 ``commit=False``。这避免嵌套 ``with conn`` 在
+    中途提交，导致人工操作失败后留下半条证据链。
+    """
     now = datetime.now().isoformat(timespec="seconds")
-    with conn:
+    def _insert() -> int:
         cur = conn.execute(
-            """INSERT INTO evidence(project_id, kind, summary, steps_json, sources_json, created_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO evidence(
+                   project_id, kind, summary, steps_json, sources_json, created_at,
+                   run_signature, finding_id)
+               VALUES (?,?,?,?,?,?,?,?)""",
             (project_id, kind, summary,
              json.dumps(steps or [], ensure_ascii=False, default=str),
              json.dumps(sources or [], ensure_ascii=False, default=str),
-             now),
+             now, run_signature, finding_id),
         )
         return int(cur.lastrowid)
+    if commit:
+        with conn:
+            return _insert()
+    return _insert()
 
 
 def get_evidence(conn: sqlite3.Connection, evidence_id: int) -> dict | None:
@@ -55,6 +69,8 @@ def get_evidence(conn: sqlite3.Connection, evidence_id: int) -> dict | None:
         "steps": json.loads(row["steps_json"] or "[]"),
         "sources": json.loads(row["sources_json"] or "[]"),
         "created_at": row["created_at"],
+        "run_signature": row["run_signature"] if "run_signature" in row.keys() else None,
+        "finding_id": row["finding_id"] if "finding_id" in row.keys() else None,
     }
 
 

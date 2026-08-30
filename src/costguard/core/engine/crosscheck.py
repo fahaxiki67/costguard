@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
+from costguard.core.anomalies import coverage as detection_coverage
+from costguard.core.contracts import run_contract
 from costguard.core.engine.money import (
     NotANumberError,
     money_mul,
@@ -512,6 +514,100 @@ def make_evidence(project_id: int, res: CheckResult) -> str:
     )
 
 
+_VALIDATION_PATHS = ("path_a", "path_b", "path_c")
+
+
+def _validation_key(period_id: int | None, path: str, *, period_no: int | None = None) -> str:
+    subject = f"period:{period_id}" if period_id is not None else f"period_no:{period_no}"
+    return f"{subject}:{path}"
+
+
+def _expected_validation_keys(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_nos: list[int],
+    direction: str | None,
+) -> list[str]:
+    """先登记本批次应覆盖的 A/B/C 路径，异常时也能留下失败覆盖率。"""
+    expected: list[str] = []
+    for period_no in period_nos:
+        sql = "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?"
+        params: list[object] = [project_id, period_no]
+        if direction is not None:
+            sql += " AND direction=?"
+            params.append(direction)
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            expected.extend(
+                _validation_key(None, path, period_no=int(period_no))
+                for path in _VALIDATION_PATHS
+            )
+            continue
+        for row in rows:
+            expected.extend(
+                _validation_key(int(row["id"]), path)
+                for path in _VALIDATION_PATHS
+            )
+    return list(dict.fromkeys(expected))
+
+
+def _record_validation_coverage(
+    conn: sqlite3.Connection,
+    project_id: int,
+    expected: list[str],
+    results: list[CheckResult],
+    active_contract: run_contract.RunContract,
+    *,
+    period_nos: list[int],
+    direction: str | None,
+    error: BaseException | None = None,
+) -> None:
+    """记录 A/B/C 实际覆盖率；C 无源表控制额时只能明确标记跳过。"""
+    executed: list[str] = []
+    skipped: dict[str, str] = {}
+    for result in results:
+        executed.extend(
+            _validation_key(result.period_id, path)
+            for path in ("path_a", "path_b")
+        )
+        control_key = _validation_key(result.period_id, "path_c")
+        if result.raw_subtotal is None:
+            skipped[control_key] = "原表小计/合计控制值不可用"
+        else:
+            executed.append(control_key)
+
+    expected_set = set(expected)
+    accounted = set(executed) | set(skipped)
+    failure_text = (
+        f"{type(error).__name__}: {error}" if error is not None else "本批次结束时未完成"
+    )
+    failed = {key: failure_text for key in expected_set - accounted}
+    coverage = detection_coverage.coverage_from_values(
+        expected=expected,
+        executed=executed,
+        skipped=skipped,
+        failed=failed,
+        critical_failed=failed,
+    )
+    detection_coverage.record_detection_run(
+        conn,
+        project_id,
+        coverage,
+        run_signature=active_contract.signature,
+        run_kind=detection_coverage.AGGREGATE_VALIDATION,
+        error_summary=failure_text if error is not None else None,
+        metadata={
+            "stage": "A/B/C crosscheck",
+            "period_nos": list(period_nos),
+            "direction": direction,
+            "result_count": len(results),
+            "incomplete_results": [
+                result.period_id for result in results if result.status == "incomplete"
+            ],
+        },
+    )
+
+
 def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[int],
                    direction: str | None = None) -> list[CheckResult]:
     """执行多期校核；差异与结论写入 evidence 表并回填 period_totals。
@@ -519,11 +615,25 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     direction=None 时若某期号对应多个方向，抛 AmbiguousPeriodError。
     证据与 period_totals 回写锁定同一 period_id。
     """
-    results = []
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    expected = _expected_validation_keys(conn, project_id, period_nos, direction)
+    results: list[CheckResult] = []
     now = datetime.now().isoformat(timespec="seconds")
     for pno in period_nos:
-        res = check_period_by_no(conn, project_id, pno, direction=direction)
-        results.append(res)
+        try:
+            res = check_period_by_no(conn, project_id, pno, direction=direction)
+        except Exception as exc:
+            _record_validation_coverage(
+                conn,
+                project_id,
+                expected,
+                results,
+                active_contract,
+                period_nos=period_nos,
+                direction=direction,
+                error=exc,
+            )
+            raise
         dir_label = direction_label(res.direction)
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         if res.status != "match":
@@ -544,10 +654,12 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
         # verification_level，历史消费者也能从此值看出不能按通过解释。
         if res.verification_level == "insufficient" and combined_status == "match":
             combined_status = "insufficient"
-        with conn:
+        with run_contract._transaction(conn, "run_crosscheck"):
             cur = conn.execute(
-                "INSERT INTO evidence(project_id, kind, summary, steps_json, sources_json, created_at)"
-                " VALUES (?,?,?,?,?,?)",
+                """INSERT INTO evidence(
+                       project_id, kind, summary, steps_json, sources_json,
+                       created_at, run_signature)
+                   VALUES (?,?,?,?,?,?,?)""",
                 (project_id, "cross_check",
                  f"第{pno}期{dir_label}双向校核：{status_zh.get(res.status, '待复核')}；"
                  f"{'校核充分' if res.verification_level == 'sufficient' else '校核有发现' if res.verification_level == 'findings' else '校核不充分'}",
@@ -557,14 +669,15 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                                             "diff_ab": str(res.diff_ab),
                                             "control_diff": str(res.control_diff)},
                             ensure_ascii=False, default=str),
-                 json.dumps({"period_id": res.period_id, "period": pno, "direction": res.direction}), now),
+                 json.dumps({"period_id": res.period_id, "period": pno, "direction": res.direction}),
+                 now, active_contract.signature),
             )
             ev_id = cur.lastrowid
             conn.execute(
                 """UPDATE period_totals SET
                    cross_check_status=?, cross_check_diff=?, evidence_id=?,
                    ab_status=?, ab_diff=?, control_status=?, control_diff=?,
-                   verification_level=?
+                   verification_level=?, run_signature=?
                    WHERE period_id=?""",
                 (
                     combined_status,
@@ -575,6 +688,7 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     res.control_status,
                     str(res.control_diff) if res.control_diff is not None else None,
                     res.verification_level,
+                    active_contract.signature,
                     res.period_id,
                 ),
             )
@@ -584,8 +698,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                        path_a_total, path_b_total, raw_subtotal, diff_ab, control_diff,
                        ab_status, control_status, detail_rows, excluded_subtotal_rows,
                        excluded_title_rows, pending_sheets, range_unproven_sheets,
-                       notes_json, evidence_id, checked_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       notes_json, evidence_id, checked_at, run_signature)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(period_id) DO UPDATE SET
                        project_id=excluded.project_id,
                        verification_level=excluded.verification_level,
@@ -604,7 +718,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                        range_unproven_sheets=excluded.range_unproven_sheets,
                        notes_json=excluded.notes_json,
                        evidence_id=excluded.evidence_id,
-                       checked_at=excluded.checked_at""",
+                       checked_at=excluded.checked_at,
+                       run_signature=excluded.run_signature""",
                 (
                     project_id, res.period_id, res.verification_level, combined_status,
                     str(res.path_a_total) if res.path_a_total is not None else None,
@@ -616,6 +731,17 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     res.excluded_subtotal_rows, res.excluded_title_rows,
                     res.pending_sheets, res.range_unproven_sheets,
                     json.dumps(res.notes, ensure_ascii=False), ev_id, now,
+                    active_contract.signature,
                 ),
             )
+        results.append(res)
+    _record_validation_coverage(
+        conn,
+        project_id,
+        expected,
+        results,
+        active_contract,
+        period_nos=period_nos,
+        direction=direction,
+    )
     return results

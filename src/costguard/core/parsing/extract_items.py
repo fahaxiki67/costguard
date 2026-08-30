@@ -157,6 +157,8 @@ def persist_line_items(
     period_id: int,
     sheet_id: int,
     items: list[ItemDraft],
+    *,
+    commit: bool = True,
 ) -> int:
     # 字段来源原本只保存在 line_items 的 JSON 中，无法进入成果工作簿的
     # 证据索引。现在为每一行建立一条真实 Evidence 记录，并把其整数 ID
@@ -174,7 +176,8 @@ def persist_line_items(
     ).fetchone()
     project_id = int(meta["project_id"]) if meta else None
     now = datetime.now().isoformat(timespec="seconds")
-    conn.execute("BEGIN")
+    if commit:
+        conn.execute("BEGIN")
     try:
         rows = []
         for it in items:
@@ -255,9 +258,10 @@ def persist_line_items(
         n = conn.execute(
             "SELECT COUNT(*) FROM line_items WHERE period_id=?", (period_id,)
         ).fetchone()[0]
-        conn.execute("COMMIT")
+        if commit:
+            conn.execute("COMMIT")
         return n
     except Exception:
-        if conn.in_transaction:
+        if commit and conn.in_transaction:
             conn.execute("ROLLBACK")
         raise

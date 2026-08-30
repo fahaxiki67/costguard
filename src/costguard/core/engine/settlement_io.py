@@ -10,6 +10,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from costguard.core.contracts import run_contract
 from costguard.core.models.source_file import import_file
 from costguard.core.parsing import excel_parser, extract_items
 from costguard.core.parsing.header_detect import HeaderDetection, detect_header
@@ -99,8 +100,11 @@ def invalidate_crosscheck_results(
     项目总览当作“最近校核”的结果，避免输入变更后继续显示旧的绿色结论。
     ``period_ids=None`` 表示项目级变更（新增文件、方向或待确认状态变化）。
     """
+    # 首次导入只建立输入，不强行创建一个尚未运行的契约；已有运行结果的
+    # 项目则立即计算新签名并把旧导出标为 stale。
+    run_contract.ensure_if_materialized(conn, project_id)
     ids = sorted({int(pid) for pid in (period_ids or [])})
-    with conn:
+    with run_contract._transaction(conn, "invalidate_crosscheck"):
         if ids:
             placeholders = ",".join("?" for _ in ids)
             cur = conn.execute(
@@ -181,6 +185,8 @@ def ensure_period(
     source_file_id: int | None,
     direction: str = "unknown",
     contract_party: str = "",
+    *,
+    commit: bool = True,
 ) -> int:
     """按 (project_id, period_no, direction) 定位或创建期次。
 
@@ -193,13 +199,18 @@ def ensure_period(
     ).fetchone()
     if row:
         return int(row["id"])
-    with conn:
+    def _insert() -> int:
         cur = conn.execute(
             "INSERT INTO settlement_periods(project_id, period_no, title, source_file_id, direction, contract_party)"
             " VALUES (?,?,?,?,?,?)",
             (project_id, period_no, title, source_file_id, direction, contract_party),
         )
         return int(cur.lastrowid)
+
+    if commit:
+        with run_contract._transaction(conn, "ensure_period"):
+            return _insert()
+    return _insert()
 
 
 def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -342,23 +353,23 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     if not items:
         raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
 
-    audit_log.record_audit(
-        conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
-        {"role": "gated", "needs_review": det.needs_review,
-         "mapping": {"detected": det.col_map}},
-        {"role": "settlement", "confidence": det.confidence,
-         "mapping": {"detected": det.col_map, "confirmed": used_map},
-         "header_range": [header_lo, header_hi], "data_range": list(data_range),
-         "period_no": period_no}, reason)
-    pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
-    if not isinstance(pno, int) or pno < 1:
-        raise ValueError("确认期次必须为正整数")
-    period_id = ensure_period(
-        conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
-                              direction=direction)
-    n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
-    # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
-    with conn:
+    with run_contract._transaction(conn, "confirm_sheet_role_and_extract"):
+        audit_log.record_audit(
+            conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
+            {"role": "gated", "needs_review": det.needs_review,
+             "mapping": {"detected": det.col_map}},
+            {"role": "settlement", "confidence": det.confidence,
+             "mapping": {"detected": det.col_map, "confirmed": used_map},
+             "header_range": [header_lo, header_hi], "data_range": list(data_range),
+             "period_no": period_no}, reason, commit=False)
+        pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
+        if not isinstance(pno, int) or pno < 1:
+            raise ValueError("确认期次必须为正整数")
+        period_id = ensure_period(
+            conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
+            direction=direction, commit=False)
+        n = extract_items.persist_line_items(conn, period_id, sheet_id, items, commit=False)
+        # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
         conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?",
                      (period_id, sheet_id))
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
@@ -379,16 +390,17 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                  "visibility_risk": bool(meta["hidden_rows_json"] and meta["hidden_rows_json"] != "[]")
                                   or bool(meta["hidden_cols_json"] and meta["hidden_cols_json"] != "[]"),
              }, ensure_ascii=False)))
-    evidence_api.add_evidence(
-        conn, project_id, "sheet_role_confirmed",
-        f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
-        steps=[{"step": "人工确认", "actor": actor, "reason": reason,
-                "mapping": {"detected": det.col_map, "confirmed": used_map},
-                "header_range": [header_lo, header_hi], "data_range": list(data_range),
-                "period_no": pno, "confidence": det.confidence}],
-        sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
-    )
-    invalidate_crosscheck_results(conn, project_id)
+        evidence_api.add_evidence(
+            conn, project_id, "sheet_role_confirmed",
+            f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
+            steps=[{"step": "人工确认", "actor": actor, "reason": reason,
+                    "mapping": {"detected": det.col_map, "confirmed": used_map},
+                    "header_range": [header_lo, header_hi], "data_range": list(data_range),
+                    "period_no": pno, "confidence": det.confidence}],
+            sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
+            commit=False,
+        )
+        invalidate_crosscheck_results(conn, project_id)
     return n
 
 
@@ -437,18 +449,20 @@ def confirm_sheet_non_settlement_role(
     if duplicate:
         raise ValueError("该 sheet 的非结算角色已确认，不得重复确认")
 
-    audit_log.record_audit(
-        conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
-        {"role": "gated"}, {"role": confirmed_role}, reason,
-    )
-    evidence_api.add_evidence(
-        conn, project_id, "sheet_role_confirmed",
-        f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
-        steps=[{"step": "人工确认非结算角色", "actor": actor,
-                "role": confirmed_role, "reason": reason}],
-        sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
-    )
-    invalidate_crosscheck_results(conn, project_id)
+    with run_contract._transaction(conn, "confirm_sheet_non_settlement_role"):
+        audit_log.record_audit(
+            conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
+            {"role": "gated"}, {"role": confirmed_role}, reason, commit=False,
+        )
+        evidence_api.add_evidence(
+            conn, project_id, "sheet_role_confirmed",
+            f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
+            steps=[{"step": "人工确认非结算角色", "actor": actor,
+                    "role": confirmed_role, "reason": reason}],
+            sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
+            commit=False,
+        )
+        invalidate_crosscheck_results(conn, project_id)
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -491,18 +505,22 @@ def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
             if value_col is not None and nxt:
                 # 位置记真实值列（可反向定位到原格），不是 col+1
                 kv_pairs.append((label, nxt, row, value_col, f"{t} {nxt}"))
-    for key, value, row, col, quote in kv_pairs[:40]:
-        evidence_api.add_evidence(
-            conn, project_id, "form_field_candidate",
-            f"表单字段候选（待人工确认）：{key} = {value[:60]}",
-            steps=[{"step": "表单路由", "sheet": sheet_name, "status": "待人工确认"}],
-            sources=[{"file_id": file_id, "sheet_id": sheet_id,
-                      "location": f"行{row}列{col}", "quote": quote[:120]}],
+    with run_contract._transaction(conn, "route_form_sheet"):
+        for key, value, row, col, quote in kv_pairs[:40]:
+            evidence_api.add_evidence(
+                conn, project_id, "form_field_candidate",
+                f"表单字段候选（待人工确认）：{key} = {value[:60]}",
+                steps=[{"step": "表单路由", "sheet": sheet_name, "status": "待人工确认"}],
+                sources=[{"file_id": file_id, "sheet_id": sheet_id,
+                          "location": f"行{row}列{col}", "quote": quote[:120]}],
+                commit=False,
+            )
+        audit_log.record_audit(
+            conn, project_id, "system", "route_non_settlement_form", f"sheet:{sheet_id}",
+            None, {"sheet": sheet_name, "n_candidates": len(kv_pairs[:40])},
+            "键值对表单路由：保留原 Sheet，字段候选存证据表待人工复核，未进入结算与合同模型",
+            commit=False,
         )
-    audit_log.record_audit(
-        conn, project_id, "system", "route_non_settlement_form", f"sheet:{sheet_id}",
-        None, {"sheet": sheet_name, "n_candidates": len(kv_pairs[:40])},
-        "键值对表单路由：保留原 Sheet，字段候选存证据表待人工复核，未进入结算与合同模型")
 
 
 def guess_period_no_from_text(text: str) -> int | None:
@@ -531,6 +549,9 @@ def import_settlement_file(
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
     if result.status != "ok":
+        # 文件登记已经发生；即使解析失败，已有项目的旧结果也不能继续作为
+        # 当前输入下的成果。首次导入仍不创建空运行契约。
+        run_contract.ensure_if_materialized(conn, project_id)
         fallback = file_period or next_period_no(conn, project_id, direction)
         return ImportReport(sf.file_id, None, fallback, -1, "failed", message=result.error)
 
@@ -566,7 +587,6 @@ def import_settlement_file(
                        "保留原 Sheet 与单元格；请人工确认后使用通用 evidence 人工复核入口"]))
             form_routed = True
             continue
-        no_quantity_column = det is not None and "quantity" not in det.col_map
         # 语义门控：sheet 名含汇总/核销/台账 → 无论表头多强都需角色确认
         summary_like = bool(SUMMARY_LIKE_PATTERN.search(sheet.sheet_name))
         # needs_review 一律挡（监督第九轮）：歧义/低置信未经人工确认不得写 canonical

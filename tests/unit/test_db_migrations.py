@@ -22,7 +22,9 @@ class TestMigrate:
             "projects", "source_files", "parse_batches", "raw_sheets", "raw_cells",
             "table_headers", "settlement_periods", "line_items", "item_aliases",
             "matches", "period_totals", "anomalies", "evidence", "audit_log",
-            "contract_docs", "contract_facts", "crosscheck_results", "schema_migrations",
+            "contract_docs", "contract_facts", "crosscheck_results", "run_contracts",
+            "export_runs", "detection_runs", "import_manifests", "import_manifest_entries",
+            "cleaning_changes", "schema_migrations",
         ]:
             assert expected in tables, f"missing table {expected}"
         alias_columns = {r[1] for r in conn.execute("PRAGMA table_info(item_aliases)")}
@@ -34,6 +36,22 @@ class TestMigrate:
             "ab_diff", "ab_status", "control_diff", "control_status",
             "verification_level",
         } <= total_columns
+        assert "run_signature" in total_columns
+        result_columns = {r[1] for r in conn.execute("PRAGMA table_info(crosscheck_results)")}
+        assert "run_signature" in result_columns
+        match_columns = {r[1] for r in conn.execute("PRAGMA table_info(matches)")}
+        assert "run_signature" in match_columns
+        anomaly_columns = {r[1] for r in conn.execute("PRAGMA table_info(anomalies)")}
+        assert "run_signature" in anomaly_columns
+        detection_columns = {r[1] for r in conn.execute("PRAGMA table_info(detection_runs)")}
+        assert {
+            "expected_json", "executed_json", "skipped_json", "failed_json",
+            "status", "run_kind",
+        } <= detection_columns
+        manifest_columns = {r[1] for r in conn.execute("PRAGMA table_info(import_manifests)")}
+        assert {"manifest_key", "control_hash", "status", "version"} <= manifest_columns
+        cleaning_columns = {r[1] for r in conn.execute("PRAGMA table_info(cleaning_changes)")}
+        assert {"run_signature", "event_key", "status", "evidence_id", "audit_id"} <= cleaning_columns
         header_columns = {r[1] for r in conn.execute("PRAGMA table_info(table_headers)")}
         assert {"data_range_status", "data_range_method", "data_range_evidence_json"} <= header_columns
         conn.close()

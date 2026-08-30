@@ -221,6 +221,54 @@ class TestHumanReview:
         ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (pid,)).fetchone()["c"]
         assert ev >= 1
 
+    def test_confirm_is_atomic_when_evidence_write_fails(self, db, monkeypatch):
+        """证据写入失败时，匹配状态不得先提交。"""
+        conn, pid, (p1, p2) = db
+        add(conn, p1, "C1", "平整场地")
+        groups = matching_mod.match_items(conn, pid)
+        matching_mod.save_matches(conn, pid, groups)
+        mid = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()["id"]
+
+        def fail_evidence(*_args, **_kwargs):
+            raise RuntimeError("synthetic evidence failure")
+
+        monkeypatch.setattr(matching_mod.evidence_api, "add_evidence", fail_evidence)
+        with pytest.raises(RuntimeError, match="synthetic evidence failure"):
+            matching_mod.confirm_match(conn, pid, mid, "王工", "人工确认同一清单")
+
+        row = conn.execute("SELECT status, level FROM matches WHERE id=?", (mid,)).fetchone()
+        assert row["status"] == "pending"
+        assert row["level"] == matching_mod.CONFIRMED
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM audit_log WHERE project_id=? AND action='confirm_match'",
+            (pid,),
+        ).fetchone()["c"] == 0
+
+    def test_override_is_atomic_when_audit_write_fails(self, db, monkeypatch):
+        """审计写入失败时，人工修正不得留下半条业务状态。"""
+        conn, pid, (p1, _p2) = db
+        add(conn, p1, None, "C25混凝土垫层")
+        groups = matching_mod.match_items(conn, pid)
+        matching_mod.save_matches(conn, pid, groups)
+        mid = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()["id"]
+        before = conn.execute("SELECT level, status FROM matches WHERE id=?", (mid,)).fetchone()
+
+        def fail_audit(*_args, **_kwargs):
+            raise RuntimeError("synthetic audit failure")
+
+        monkeypatch.setattr(matching_mod.audit_log, "record_audit", fail_audit)
+        with pytest.raises(RuntimeError, match="synthetic audit failure"):
+            matching_mod.override_match(
+                conn, pid, mid, matching_mod.INCOMPARABLE, "王工", "强度等级不同"
+            )
+
+        after = conn.execute("SELECT level, status FROM matches WHERE id=?", (mid,)).fetchone()
+        assert tuple(after) == tuple(before)
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE project_id=? AND kind='match_override'",
+            (pid,),
+        ).fetchone()["c"] == 0
+
     def test_override_match(self, db):
         conn, pid, (p1, p2) = db
         add(conn, p1, None, "C25混凝土垫层")

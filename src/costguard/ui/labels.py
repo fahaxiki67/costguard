@@ -81,6 +81,8 @@ ITEM_STATUS_ZH = {
     "supplemented": "已补资料",
     "corrected": "已修正",
     "deferred": "暂不处理",
+    "stale": "已失效（历史）",
+    "superseded": "已被新结果替代",
 }
 
 # 审计动作只在用户可见的处理历史中显示中文；原始 action 仍可通过高级信息追溯。
