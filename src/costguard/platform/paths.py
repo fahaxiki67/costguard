@@ -4,6 +4,7 @@ core/ 代码禁止自行处理平台路径差异，必须经由本模块。
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ def config_dir() -> Path:
     if IS_MACOS:
         base = Path.home() / "Library" / "Application Support"
     elif IS_WINDOWS:
-        base = Path(Path.expandvars(r"%APPDATA%"))
+        base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
     else:
         base = Path.home() / ".config"
     d = base / "CostGuard"
@@ -27,7 +28,7 @@ def config_dir() -> Path:
 def default_workspace_root() -> Path:
     """默认工程工作空间根目录（用户可在 UI 更改）。"""
     if IS_WINDOWS:
-        docs = Path(Path.expandvars(r"%USERPROFILE%")) / "Documents"
+        docs = Path(os.environ.get("USERPROFILE") or Path.home()) / "Documents"
     else:
         docs = Path.home() / "Documents"
     d = docs / "CostGuardProjects"
