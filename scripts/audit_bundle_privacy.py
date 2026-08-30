@@ -172,9 +172,15 @@ def main() -> int:
     parser.add_argument("app", type=Path, help="CostGuard.app 路径")
     args = parser.parse_args()
     app = args.app.resolve()
-    exe = app / "Contents" / "MacOS" / "CostGuard"
-    if not exe.is_file():
-        print(f"FAIL: 找不到主执行文件 {exe}", file=sys.stderr)
+    # 布局按平台自动识别：macOS bundle（Contents/MacOS/...）或 Windows onedir（根下 exe）
+    candidates = [
+        app / "Contents" / "MacOS" / "CostGuard",
+        app / "CostGuard.exe",
+    ]
+    exe = next((c for c in candidates if c.is_file()), None)
+    if exe is None:
+        print(f"FAIL: 找不到主执行文件（尝试过 {[str(c) for c in candidates]}）",
+              file=sys.stderr)
         return 1
 
     repo = Path(os.environ.setdefault("COSTGUARD_REPO", str(Path.cwd()))).resolve()
