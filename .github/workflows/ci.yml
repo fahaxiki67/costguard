@@ -21,7 +21,6 @@ jobs:
         run: .venv/bin/python -m pytest tests/ -v
         env:
           QT_QPA_PLATFORM: offscreen
-          PYTHONIOENCODING: utf-8
 
   test-windows-x64:
     runs-on: windows-latest
@@ -38,7 +37,6 @@ jobs:
         run: uv run python -m pytest tests/ -v
         env:
           QT_QPA_PLATFORM: offscreen
-          PYTHONIOENCODING: utf-8
 
   security-scan:
     runs-on: ubuntu-latest

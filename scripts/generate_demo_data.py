@@ -26,13 +26,6 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
-# Windows 控制台默认 cp1252：打印中文路径/文件名会 UnicodeEncodeError。
-# 脚本与被测进程统一把文本流重配置为 UTF-8（GUI 无输出不受影响）。
-if sys.platform == "win32":
-    for _stream in (sys.stdout, sys.stderr):
-        if _stream is not None and hasattr(_stream, "reconfigure"):
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "examples" / "demo"
 
@@ -517,7 +510,19 @@ def generate(out_dir: Path) -> dict:
     return manifest
 
 
+def force_utf8_stdio() -> None:
+    """CLI 入口专用：Windows 控制台默认 cp1252，中文输出会 UnicodeEncodeError。
+
+    重配置为 UTF-8（errors=replace）保证中文可输出；仅在脚本自身作为命令行
+    入口运行时调用，不做 import 期全局副作用（库内/测试进程不受影响）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(description="生成匿名演示数据（examples/demo）")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="输出目录")
     parser.add_argument("--check", action="store_true",

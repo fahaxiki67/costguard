@@ -188,7 +188,8 @@ class TestExcelExport:
                 time.sleep(attempt - 1)  # 退避 1s / 2s，穿过竞态窗口
             env = dict(os.environ)
             env["__CFBundleIdentifier"] = f"org.costguard.headless.{os.getpid()}.{attempt}"
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240,
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=240,
                                   env=env)
             if proc.returncode == 0:
                 break
@@ -213,7 +214,8 @@ class TestExcelExport:
                 cs = subprocess.run(
                     ["codesign", "--verify", "--deep", "--strict",
                      "/Applications/LibreOffice.app"],
-                    capture_output=True, text=True, timeout=120)
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=120)
                 cs_status = "安装完整性 OK" if cs.returncode == 0 else (
                     f"安装损坏（codesign rc={cs.returncode}: {cs.stdout.strip()[:200]}"
                     f"{cs.stderr.strip()[:200]}）—— 请重装 LibreOffice 或改用专用验证机")

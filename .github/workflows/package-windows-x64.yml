@@ -31,7 +31,6 @@ jobs:
         run: uv run python -m pytest tests/ -v
         env:
           QT_QPA_PLATFORM: offscreen
-          PYTHONIOENCODING: utf-8
 
       - name: Demo data determinism
         run: uv run python scripts/generate_demo_data.py --check

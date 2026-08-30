@@ -21,14 +21,6 @@ from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-# Windows 控制台默认 cp1252：打印中文路径/文件名会 UnicodeEncodeError。
-# 验收执行器在真实 Windows 环境也要能输出中文进度，统一重配置为 UTF-8。
-if sys.platform == "win32":
-    for _stream in (sys.stdout, sys.stderr):
-        if _stream is not None and hasattr(_stream, "reconfigure"):
-            _stream.reconfigure(encoding="utf-8", errors="replace")
-
-
 BASE = Path(__file__).resolve().parents[1] / "local_private_data" / "real_acceptance"
 CORPUS = BASE / "corpus"
 WORK = BASE / "work"
@@ -797,5 +789,17 @@ def main(run_dir: Path | None = None) -> None:
     }, ensure_ascii=False, indent=2))
 
 
+def force_utf8_stdio() -> None:
+    """CLI 入口专用：Windows 控制台默认 cp1252，中文输出会 UnicodeEncodeError。
+
+    重配置为 UTF-8（errors=replace）保证中文可输出；仅在脚本自身作为命令行
+    入口运行时调用，不做 import 期全局副作用（库内/测试进程不受影响）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 if __name__ == "__main__":
+    force_utf8_stdio()
     main()

@@ -305,7 +305,7 @@ class TestInterruptSafety:
         (first / "done" / "T13.json").unlink(missing_ok=True)
         site = first / "验收-T13"
         site.mkdir(exist_ok=True)
-        (site / "interrupted.marker").write_text("现场")
+        (site / "interrupted.marker").write_text("现场", encoding="utf-8")
         # 删除另一个 test 的 marker 模拟两个未完成
         (first / "done" / "T12.json").unlink(missing_ok=True)
 
