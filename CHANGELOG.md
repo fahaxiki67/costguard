@@ -48,9 +48,14 @@ Bugfix release driven by real-world Windows + municipal payment-report feedback
   containing `project.db`. CostGuard remembers its parent workspace thereafter.
 
 ### Testing
-- 230 tests passed, including restart simulation, multi-workspace discovery,
-  idempotent registration, moved-project reopening, and a schema v3 → v5 copy
-  migration that preserved all record counts and imported-file hashes.
+- 254 tests passed, including restart simulation, multi-workspace discovery,
+  idempotent registration, moved-project reopening, a schema v3 → latest copy
+  migration that preserved all record counts and imported-file hashes, and
+  listing guarantees: no WAL/SHM sidecars created on scan, committed data in an
+  active WAL still discovered (via temp-copy read) with source bytes and mtimes
+  untouched, read-only directories still discoverable, corrupted settings.json
+  archived and recovered, symlinked workspace roots deduplicated, and
+  originals paths repaired after a project directory move.
 
 ## [0.1.2] - 2026-08-30
 

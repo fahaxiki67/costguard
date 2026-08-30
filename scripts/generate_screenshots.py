@@ -80,6 +80,10 @@ def main() -> int:
     print("准备演示项目（真实导入+计算）…")
     info = demo_core.provision_demo_project(ws_root)
     # 让主窗口的项目列表读受控工作空间（不触碰用户真实 Documents，截图也不泄露路径）
+    # 项目列表会扫描"已登记工作空间"（settings.json），因此两层都要隔离：
+    # workspace_roots 决定列表扫描范围（不得触到用户真实目录），
+    # workspace_root 决定新建项目默认落点。
+    project_model.workspace_roots = lambda: [ws_root]
     project_model.workspace_root = lambda: ws_root
     win = MainWindow()
     win.setAttribute(Qt.WA_DontShowOnScreen, True)
