@@ -1,11 +1,27 @@
 name: Package Windows x64 (manual)
 
-# 手动触发的 Windows x64 打包流水线（真实 windows runner 全门槛）：
+# Windows x64 打包流水线（真实 windows runner 全门槛）：
 # Python 3.12 → lint → 全量测试 → 演示确定性 → 构建（PyInstaller+便携zip+Inno安装器）
 # → PE 架构校验 → 隐私审计 → 演示全链 E2E → 安装/启动/退出/卸载冒烟 → 敏感扫描
-# → SHA256 → 上传 artifact。不创建 Release、不推送 tag——发布由维护者另行确认执行。
+# → SHA256 → 上传 artifact。
+# 触发：
+# - pull_request（目标 main，限定打包/核心相关路径）：合并前在 PR 上真机执行全部
+#   发布门槛——工作流文件必须存在于 PR 分支即可运行，不受默认分支限制；
+# - workflow_dispatch：合并后复验。不创建 Release、不推送 tag——发布由维护者确认执行。
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/package-windows-x64.yml"
+      - ".github/workflows/ci.yml"
+      - "scripts/build_windows_x64.ps1"
+      - "scripts/windows_smoke.py"
+      - "scripts/generate_demo_data.py"
+      - "scripts/audit_bundle_privacy.py"
+      - "src/costguard/**"
+      - "tests/**"
+      - "pyproject.toml"
   workflow_dispatch:
 
 permissions:
