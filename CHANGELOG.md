@@ -4,6 +4,56 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-30
+
+Windows-compatibility and correctness release for macOS, driven by the
+independent review of v0.1.5 and a real settlement book (229 sheets). No
+business-rule changes; all discipline intact.
+
+### Fixed
+- **C-path control double-count (v0.1.5 known limitation)**: the control
+  value now uses the unique grand-total row (合计/总计/累计). Without a grand
+  row, page-level subtotals sum to the control (pages partition the table);
+  multiple grand rows → not_available with a note; shortfalls report an
+  honest diff, never balanced.
+- **E.6 单位工程汇总表 misrouted as key-value form (26 real sheets)**: a
+  money-header row with numeric rows in the money column now suppresses
+  weak AND strong form routing — all 26 sheets reach role review with
+  evidence candidates for the confirmation dialog. Genuine 封面/扉页 stay
+  forms; the synthetic kv-content page still routes form.
+- **Money-less sheets cannot auto-parse** (表-09-style analysis pages):
+  mappings without amount AND unit_price stay at human confirmation —
+  money-less half-blind rows can no longer enter the settlement model.
+- **表-08 pages with colon-rich feature text** ("1.名称：…2.型号：…" in every
+  row) no longer trigger strong-form blocking on small pages.
+- Subtotal-label matching normalizes internal whitespace and 第N页 prefixes
+  ("小     计" previously escaped detection).
+- Section-title rows (name only, no numbers) are skipped as non-items with
+  the skip reason recorded in the sheet report; tail-note skip reasons
+  likewise.
+
+### Changed
+- Real-data acceptance (private corpus T14–T18 added; originals hash-verified
+  untouched): the standard 229-sheet settlement book now auto-parses 26
+  tables / 1,221 detail rows (1,096 with amounts); the remainder stays
+  honestly gated with per-sheet reasons. Parsed sheet count ≠ settlement
+  period count — periods are assigned per sheet at human confirmation.
+- GUI crosscheck message shows the C control value/status per period and
+  warns prominently when a control difference exists while A/B match.
+- Local acceptance report lists per-file per-sheet status, unique-provenance
+  detail counts, per-period A/B/C control values, gating counts, and states
+  explicitly that A/B share the same extractor (issue #4 tracks true
+  row-set independence).
+- UI: unified professional visual system (theme tokens, button hierarchy,
+  business-language labels, table column strategies, soft severity badges,
+  grouped sheet-confirmation dialog with column hints and auto-detected
+  candidate markers) — display layer only.
+
+### Testing
+- 284 tests green on macOS arm64; final private-corpus acceptance on this
+  exact candidate: 18/18 imported, hashes untouched, E.6 misroutes 0,
+  表-08 form misroutes 0, skip reasons recorded per sheet.
+
 ## [0.1.5] - 2026-08-30
 
 macOS usability release: real settlement books finally import. Same shared
