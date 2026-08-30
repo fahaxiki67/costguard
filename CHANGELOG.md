@@ -4,6 +4,30 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-30
+
+Bugfix release driven by real-world Windows + municipal payment-report feedback
+(issues #1, #2, #3, #6). No engine-semantics changes beyond the fixes below.
+
+### Fixed
+- **#1 Windows crash on startup/test collection**: `paths.py` used the
+  nonexistent `pathlib.Path.expandvars`; `APPDATA`/`USERPROFILE` are now read
+  from the environment with sane fallbacks (no literal `%APPDATA%` junk paths).
+- **#3 grand-total/footnote rows absorbed into detail (7.8× amount inflation)**:
+  "分部分项合计" is now matched atomically as a subtotal label (plus "第…"-
+  prefixed section totals); the "总计" label in the index column is detected by
+  scanning every leading column; consecutive trailing orphan-numeric footnote
+  rows are excluded from detail (originals retained in the fidelity layer).
+- **#6 scanned PDFs failed silently**: a zero-text-layer PDF now raises
+  `NotImplementedError` (surfaced by the runner's expected-limit channel and
+  the GUI) instead of returning ok/0 paragraphs/0 facts.
+- **#6 text-number alert flood**: `text_number_in_value_col` findings now
+  aggregate one per sheet×field with full row lists in details (a real
+  workbook went from 344 findings to 3), raw-value samples retained.
+- **#2 (short-term) dictionary gap**: added 子目号/细目号/子目编码/细目编码 code
+  aliases and 子目名称/细目名称 name aliases; contains-terms deliberately
+  exclude bare 子目/细目 so the 子目名称 column cannot be misclassified.
+
 ## [0.1.2] - 2026-08-30
 
 First runnable DMG preview for macOS Apple Silicon regular users. No Python/uv
