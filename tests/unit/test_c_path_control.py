@@ -108,22 +108,46 @@ def test_multiple_grand_totals_make_control_not_available(tmp_path):
         conn.close()
 
 
-def test_page_subtotal_only_still_flags_open_control(tmp_path):
-    """只有页小计没有合计：C 不可用，且状态不得是干净 match。"""
+def test_page_subtotals_sum_to_control(tmp_path):
+    """无合计级行时，页级小计之和=全表控制值（互斥分页，不与总计混加）。"""
     from costguard.core.engine import crosscheck
 
     src = tmp_path / "page_only.xlsx"
     _make_two_page(src)
     wb = openpyxl.load_workbook(src)
     ws = wb.worksheets[0]
-    # 删除最后的"合计"行
+    # 删除"合计"行，并把"本页小计"改成两行页小计（第1页/第2页）
     ws.delete_rows(ws.max_row)
+    ws.cell(row=ws.max_row + 1, column=3, value="第2页小计")
+    ws.cell(row=ws.max_row, column=7, value=1405.00)
     _finalize(wb, src)
     conn, period_id = _import(src)
     try:
         result = crosscheck.check_period(conn, period_id)
-        assert result.control_status == "not_available"
-        # A/B 仍一致（match），但 C 缺失必须留注，不得伪装全通过
-        assert any("C" in n or "控制" in n for n in result.notes)
+        # 页小计互斥求和 = 3270 + 1405 = 4675 = A：既不翻倍也不虚缺
+        assert result.control_status == "match", (
+            f"页级小计之和应为有效控制值，实际 {result.control_status} diff={result.control_diff}")
+        assert any("小计行之和" in n for n in result.notes)
+    finally:
+        conn.close()
+
+
+def test_partial_page_subtotal_reports_honest_diff(tmp_path):
+    """页小计未覆盖全部明细（缺第2页小计/合计）：控制差额如实报 diff。"""
+    from costguard.core.engine import crosscheck
+
+    src = tmp_path / "single_sub.xlsx"
+    _make_two_page(src)
+    wb = openpyxl.load_workbook(src)
+    ws = wb.worksheets[0]
+    ws.delete_rows(ws.max_row)  # 删"合计"，仅剩一行"本页小计"
+    _finalize(wb, src)
+    conn, period_id = _import(src)
+    try:
+        result = crosscheck.check_period(conn, period_id)
+        # 源表只有第1页小计（3270），未覆盖第2页明细（1405）：
+        # 控制差额 1405 如实呈现为 diff——不调平、不伪装通过
+        assert result.control_status == "diff" and result.control_diff == 1405
+        assert any("无合计级行" in n for n in result.notes)
     finally:
         conn.close()
