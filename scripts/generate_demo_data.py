@@ -26,6 +26,13 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+# Windows 控制台默认 cp1252：打印中文路径/文件名会 UnicodeEncodeError。
+# 脚本与被测进程统一把文本流重配置为 UTF-8（GUI 无输出不受影响）。
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "examples" / "demo"
 
