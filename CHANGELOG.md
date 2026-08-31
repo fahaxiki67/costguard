@@ -47,9 +47,11 @@ Preview release focused on review-gate integrity and safe recovery boundaries.
 
 ### Testing
 - 418 automated tests pass on the release candidate, with Ruff and compile
-  checks passing. WPS, macOS Excel, Windows Excel, large-project performance,
-  signing/notarization, migration recovery and real-case regression remain
-  separate preview-release gates.
+  checks passing. The independent code review conditionally passed for the
+  addressed P0-04, P1-01 and P1-02 scope, with the partial-summary semantic
+  observation documented in the release notes. WPS, macOS Excel, Windows
+  Excel, large-project performance, signing/notarization, migration recovery
+  and real-case regression remain separate preview-release gates.
 
 ## [0.1.7] - 2026-08-30
 
