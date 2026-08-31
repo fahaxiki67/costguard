@@ -244,6 +244,17 @@ class WorkbenchPage(QWidget):
         self.tabs.addTab(self._export_tab(), "成果导出")
         self.refresh_all()
 
+    def _ensure_current_results_for_ui(self, operation: str) -> bool:
+        """UI 读写入口统一执行运行级不可用门控。"""
+        try:
+            run_contract.require_current_results_available(
+                self.conn, self.project.project_id, operation=operation
+            )
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, operation, str(exc))
+            return False
+        return True
+
     def _project_overview(self) -> QWidget:
         """项目审核总览：把当前缺口和唯一下一步动作放在工作台顶部。"""
         box = QWidget()
@@ -1019,13 +1030,19 @@ class WorkbenchPage(QWidget):
         anomaly_id = item.data(Qt.UserRole) if item else None
         if anomaly_id is None:
             return
+        if not self._ensure_current_results_for_ui("异常明细"):
+            self.anomaly_detail_panel.setPlainText("当前结果不可用，不能查看异常明细。")
+            return
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "a"
+        )
         anomaly = self.conn.execute(
-            """SELECT id, rule_id, severity, subject_type, subject_id, evidence_id,
+            f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id, a.evidence_id,
                       message, status, resolved_note, created_at, finding_id, fingerprint,
                       confidence, detection_mode, raw_values_json, normalized_values_json,
                       impact, limitations_json, recommendation, suppression_reason
-               FROM anomalies WHERE id=? AND project_id=?""",
-            (int(anomaly_id), self.project.project_id),
+               FROM anomalies a WHERE a.id=? AND a.project_id=? AND {scope}""",
+            (int(anomaly_id), self.project.project_id, *scope_params),
         ).fetchone()
         if not anomaly:
             self.anomaly_detail_panel.setPlainText("未找到对应问题，可能已重新运行检测。")
@@ -1064,9 +1081,13 @@ class WorkbenchPage(QWidget):
         if anomaly["suppression_reason"]:
             lines.append(f"抑制原因：{normalize_business_text(anomaly['suppression_reason'])}")
         if anomaly["evidence_id"]:
+            evidence_scope, evidence_params = run_contract.current_scope(
+                self.conn, self.project.project_id, "e"
+            )
             evidence = self.conn.execute(
-                "SELECT summary, steps_json, sources_json FROM evidence WHERE id=?",
-                (anomaly["evidence_id"],),
+                f"""SELECT e.summary, e.steps_json, e.sources_json FROM evidence e
+                    WHERE e.id=? AND e.project_id=? AND {evidence_scope}""",
+                (anomaly["evidence_id"], self.project.project_id, *evidence_params),
             ).fetchone()
             if evidence:
                 lines.append(f"Evidence ID：{anomaly['evidence_id']}")
@@ -1111,6 +1132,11 @@ class WorkbenchPage(QWidget):
             QMessageBox.information(self, "处理异常", "请先选择异常")
             return
         aid = int(self.anomaly_table.item(row, 0).text())
+        if not self._ensure_current_results_for_ui("处理异常"):
+            return
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "a"
+        )
         status_map = {
             "verified_no_issue": "已核实无问题",
             "supplemented": "已补资料",
@@ -1132,16 +1158,24 @@ class WorkbenchPage(QWidget):
         from costguard.core.evidence import evidence as evidence_api
 
         old = self.conn.execute(
-            "SELECT status, run_signature, finding_id FROM anomalies WHERE id=? AND project_id=?",
-            (aid, self.project.project_id),
+            f"""SELECT status, run_signature, finding_id FROM anomalies a
+                WHERE a.id=? AND a.project_id=? AND {scope}""",
+            (aid, self.project.project_id, *scope_params),
         ).fetchone()
         if not old:
             QMessageBox.warning(self, "处理异常", "未找到对应问题，请刷新后重试。")
             return
+        signature_clause = "run_signature IS NULL" if old["run_signature"] is None else "run_signature=?"
+        signature_params = () if old["run_signature"] is None else (old["run_signature"],)
         with run_contract._transaction(self.conn, "resolve_anomaly"):
-            self.conn.execute(
-                "UPDATE anomalies SET status=?, resolved_note=? WHERE id=? AND project_id=?",
-                (new_status, dlg.reason(), aid, self.project.project_id))
+            cur = self.conn.execute(
+                f"""UPDATE anomalies SET status=?, resolved_note=?
+                    WHERE id=? AND project_id=? AND {signature_clause}""",
+                (new_status, dlg.reason(), aid, self.project.project_id, *signature_params))
+            if cur.rowcount != 1:
+                raise run_contract.CurrentResultsUnavailableError(
+                    "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
+                )
             evidence_api.add_evidence(
                 self.conn, self.project.project_id, "anomaly_resolution",
                 f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
@@ -1197,6 +1231,8 @@ class WorkbenchPage(QWidget):
         return w
 
     def _run_match(self):
+        if not self._ensure_current_results_for_ui("运行匹配"):
+            return
         groups = matching.match_items(self.conn, self.project.project_id)
         n = matching.save_matches(self.conn, self.project.project_id, groups)
         QMessageBox.information(self, "匹配", f"已生成 {n} 个匹配组，疑似/待复核项请人工确认。")
@@ -1242,9 +1278,15 @@ class WorkbenchPage(QWidget):
         match_id = item.data(Qt.UserRole) if item else None
         if match_id is None:
             return
+        if not self._ensure_current_results_for_ui("匹配明细"):
+            self.match_detail_panel.setPlainText("当前结果不可用，不能查看匹配明细。")
+            return
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "m"
+        )
         match = self.conn.execute(
-            "SELECT * FROM matches WHERE id=? AND project_id=?",
-            (int(match_id), self.project.project_id),
+            f"SELECT m.* FROM matches m WHERE m.id=? AND m.project_id=? AND {scope}",
+            (int(match_id), self.project.project_id, *scope_params),
         ).fetchone()
         if not match:
             self.match_detail_panel.setPlainText("未找到对应匹配组，可能已重新运行匹配。")
@@ -1376,6 +1418,18 @@ class WorkbenchPage(QWidget):
             QMessageBox.information(self, "匹配复核", "请先选择匹配组")
             return
         mid = int(self.match_table.item(row, 0).text())
+        if not self._ensure_current_results_for_ui("确认匹配"):
+            return
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "m"
+        )
+        current = self.conn.execute(
+            f"SELECT id, status, run_signature FROM matches m WHERE m.id=? AND m.project_id=? AND {scope}",
+            (mid, self.project.project_id, *scope_params),
+        ).fetchone()
+        if not current:
+            QMessageBox.warning(self, "匹配复核", "匹配组已不在当前运行范围，请刷新后重试。")
+            return
         dlg = ReasonDialog("人工确认匹配", f"将匹配组 #{mid} 标记为人工已确认？", self)
         if dlg.exec() != QDialog.Accepted:
             return
@@ -1392,13 +1446,21 @@ class WorkbenchPage(QWidget):
         if not selected_rows:
             QMessageBox.information(self, "批量确认匹配", "请先选择一个或多个匹配组")
             return
+        if not self._ensure_current_results_for_ui("批量确认匹配"):
+            return
         ids = [int(self.match_table.item(row, 0).text()) for row in selected_rows]
         placeholders = ",".join("?" for _ in ids)
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "m"
+        )
         candidates = self.conn.execute(
-            f"""SELECT id, level, status FROM matches
-                WHERE project_id=? AND id IN ({placeholders})""",
-            (self.project.project_id, *ids),
+            f"""SELECT m.id, m.level, m.status FROM matches m
+                WHERE m.project_id=? AND m.id IN ({placeholders}) AND {scope}""",
+            (self.project.project_id, *ids, *scope_params),
         ).fetchall()
+        if len(candidates) != len(ids):
+            QMessageBox.warning(self, "批量确认匹配", "所选匹配组已不在当前运行范围，请刷新后重试。")
+            return
         non_exact = [r["id"] for r in candidates if r["level"] != "confirmed" or r["status"] != "pending"]
         if non_exact:
             QMessageBox.warning(
@@ -1412,6 +1474,8 @@ class WorkbenchPage(QWidget):
             self,
         )
         if dlg.exec() != QDialog.Accepted:
+            return
+        if not self._ensure_current_results_for_ui("批量确认匹配"):
             return
         for match_row in candidates:
             matching.confirm_match(
@@ -1427,6 +1491,17 @@ class WorkbenchPage(QWidget):
             QMessageBox.information(self, "匹配复核", "请先选择匹配组")
             return
         mid = int(self.match_table.item(row, 0).text())
+        if not self._ensure_current_results_for_ui("修正匹配"):
+            return
+        scope, scope_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "m"
+        )
+        if not self.conn.execute(
+            f"SELECT 1 FROM matches m WHERE m.id=? AND m.project_id=? AND {scope}",
+            (mid, self.project.project_id, *scope_params),
+        ).fetchone():
+            QMessageBox.warning(self, "匹配复核", "匹配组已不在当前运行范围，请刷新后重试。")
+            return
         dlg = ReasonDialog("修正匹配级别", f"修正匹配组 #{mid} 的置信度级别", self)
         if dlg.exec() != QDialog.Accepted:
             return

@@ -221,6 +221,43 @@ class TestWorkbench:
         assert "当前结果不可用" in wb_page.export_card_values["excel"]["status"].text()
         assert "当前结果不可用" in wb_page.export_card_values["docx"]["status"].text()
 
+    def test_detail_and_batch_action_are_blocked_by_current_run_boundary(
+        self, wb_page, monkeypatch
+    ):
+        """列表之外的详情和批量动作不能绕过不可用边界。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from costguard.core.contracts import run_contract
+        from costguard.core.matching import matching
+
+        groups = matching.match_items(wb_page.conn, wb_page.project.project_id)
+        assert groups
+        matching.save_matches(wb_page.conn, wb_page.project.project_id, groups)
+        wb_page.refresh_matches()
+        assert wb_page.match_table.rowCount() > 0
+        wb_page.match_table.selectRow(0)
+
+        warnings = []
+        monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[1]))
+        run_contract.set_fail_closed_state(
+            wb_page.conn,
+            wb_page.project.project_id,
+            reason="synthetic stale result boundary",
+        )
+        try:
+            wb_page._show_match_detail(0, 0)
+            assert "当前结果不可用" in wb_page.match_detail_panel.toPlainText()
+            wb_page._batch_confirm_matches()
+            assert warnings
+            assert not wb_page.conn.execute(
+                "SELECT 1 FROM matches WHERE project_id=? AND status='confirmed'",
+                (wb_page.project.project_id,),
+            ).fetchone()
+        finally:
+            run_contract.clear_fail_closed_state(
+                wb_page.conn, wb_page.project.project_id
+            )
+
 
 class TestMainWindow:
     def test_two_pages_and_switch(self, app, tmp_path, monkeypatch):

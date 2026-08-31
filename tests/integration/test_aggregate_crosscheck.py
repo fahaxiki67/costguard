@@ -870,7 +870,7 @@ class TestCrossCheck:
 
             project_summary = build_project_summary(conn, info.project_id)
             assert project_summary.verification["periods_checked"] == 0
-            assert project_summary.verification["status"] == "not_started"
+            assert project_summary.verification["status"] == run_contract.FAIL_CLOSED_STATUS
             assert project_summary.aggregate_coverage["status"] == coverage.FAILED
             assert project_summary.statuses["automatic_analysis"] == "failed"
         finally:
@@ -971,7 +971,7 @@ class TestCrossCheck:
             summary = coverage.coverage_summary(
                 conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
             )
-            assert summary["status"] == coverage.NOT_STARTED
+            assert summary["status"] == coverage.UNAVAILABLE
             assert summary["run_id"] is None
         finally:
             conn.set_authorizer(None)
@@ -1205,6 +1205,79 @@ class TestCrossCheck:
             )["available"]
         finally:
             reopened.close()
+
+    def test_contract_switch_commit_failure_hides_old_success(self, project_multi):
+        """输入签名变化但契约切换提交失败时，旧成功不得继续可见。"""
+        from costguard.core.models import project as pm
+
+        info, conn, report = project_multi
+        workspace = Path(info.workspace_path)
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        assert crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0].verification_level == "sufficient"
+        old_signature = run_contract.current_run_signature(conn, info.project_id)
+        with conn:
+            conn.execute(
+                "UPDATE source_files SET original_name=? WHERE project_id=?",
+                ("changed-input.xlsx", info.project_id),
+            )
+
+        def reject_commit(action, arg1, _arg2, _db_name, _trigger_name):
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(reject_commit)
+        try:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [report.period_no], direction=direction
+                )
+        finally:
+            conn.set_authorizer(None)
+
+        assert conn.in_transaction is False
+        state = run_contract.get_fail_closed_state(conn, info.project_id)
+        assert state is not None
+        assert state["status"] == run_contract.FAIL_CLOSED_STATUS
+        assert run_contract.current_run_signature(conn, info.project_id) == old_signature
+        scope, params = run_contract.current_scope(conn, info.project_id, "cr")
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM crosscheck_results cr WHERE cr.project_id=? AND {scope}",
+            (info.project_id, *params),
+        ).fetchone()[0] == 0
+        assert coverage.coverage_summary(
+            conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+        )["fail_closed"] is True
+        summary = build_project_summary(conn, info.project_id)
+        assert summary.run_availability["available"] is False
+        assert summary.statuses["automatic_analysis"] == "failed"
+
+        reopened_info, reopened = pm.open_project(workspace)
+        try:
+            assert not run_contract.current_results_available(
+                reopened, reopened_info.project_id
+            )["available"]
+            reopened_scope, reopened_params = run_contract.current_scope(
+                reopened, reopened_info.project_id, "cr"
+            )
+            assert reopened.execute(
+                f"SELECT COUNT(*) FROM crosscheck_results cr WHERE cr.project_id=? AND {reopened_scope}",
+                (reopened_info.project_id, *reopened_params),
+            ).fetchone()[0] == 0
+        finally:
+            reopened.close()
+        run_contract.clear_fail_closed_state(conn, info.project_id)
 
     def test_successful_rerun_clears_fail_closed_state_and_is_current(self, project_multi):
         """完整成功的新运行提交后才清除边界，并恢复当前读取。"""

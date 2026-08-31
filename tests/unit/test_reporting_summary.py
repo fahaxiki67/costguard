@@ -2,9 +2,13 @@
 
 from pathlib import Path
 
+import pytest
+
+from costguard.core.anomalies import coverage
 from costguard.core.contracts import run_contract
 from costguard.core.models import project as project_model
 from costguard.core.reporting import build_project_summary, build_report_model
+from costguard.core.reporting.summary import _statuses
 
 
 def test_report_model_has_one_shared_summary_and_no_approval_upgrade(tmp_path: Path):
@@ -51,4 +55,97 @@ def test_summary_prioritizes_run_unavailable_over_historical_success(tmp_path: P
         assert summary.aggregate_coverage["status"] != "complete"
     finally:
         run_contract.clear_fail_closed_state(conn, info.project_id)
+        conn.close()
+
+
+def test_summary_never_marks_findings_or_unchecked_periods_complete():
+    complete_coverage = {"status": coverage.COMPLETE}
+    pending = {
+        "sheets": 0,
+        "matches": 0,
+        "anomalies": 0,
+        "manifest_status": "not_available",
+    }
+    risk = {}
+
+    findings = _statuses(
+        {"status": "findings", "periods_unchecked": 0},
+        risk,
+        pending,
+        complete_coverage,
+        complete_coverage,
+        source_files=1,
+        period_count=1,
+    )
+    assert findings["automatic_analysis"] == "partial"
+
+    unchecked = _statuses(
+        {"status": "sufficient", "periods_unchecked": 1},
+        risk,
+        pending,
+        complete_coverage,
+        complete_coverage,
+        source_files=1,
+        period_count=2,
+    )
+    assert unchecked["automatic_analysis"] == "partial"
+
+
+def test_partial_coverage_cannot_clear_pending_fail_closed_state(tmp_path: Path):
+    info = project_model.create_project("部分覆盖清除门控", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        contract = run_contract.ensure_run_contract(conn, info.project_id)
+        run_contract.set_fail_closed_state(conn, info.project_id, reason="partial run")
+        run_id = coverage.record_detection_run(
+            conn,
+            info.project_id,
+            coverage.coverage_from_values(["a", "b"], ["a"]),
+            run_signature=contract.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        run_contract.defer_fail_closed_state_clear(
+            conn,
+            info.project_id,
+            run_signature=contract.signature,
+            coverage_run_id=run_id,
+            coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+    finally:
+        run_contract.clear_fail_closed_state(conn, info.project_id)
+        conn.close()
+
+
+def test_corrupt_fail_closed_sidecar_requires_success_proof_to_clear(tmp_path: Path):
+    info = project_model.create_project("损坏状态清除门控", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        contract = run_contract.ensure_run_contract(conn, info.project_id)
+        run_contract.set_fail_closed_state(conn, info.project_id, reason="corrupt probe")
+        state_path = run_contract.fail_closed_state_path(conn, info.project_id)
+        state_path.write_text("{broken", encoding="utf-8")
+        assert run_contract.get_fail_closed_state(conn, info.project_id)["corrupt"] is True
+        with pytest.raises(RuntimeError, match="完整成功运行证明"):
+            run_contract.clear_fail_closed_state(conn, info.project_id)
+        assert state_path.exists()
+        run_id = coverage.record_detection_run(
+            conn,
+            info.project_id,
+            coverage.coverage_from_values(["a"], ["a"]),
+            run_signature=contract.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        run_contract.clear_fail_closed_state(
+            conn,
+            info.project_id,
+            run_signature=contract.signature,
+            coverage_run_id=run_id,
+            coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        assert not state_path.exists()
+    finally:
+        state = run_contract.get_fail_closed_state(conn, info.project_id)
+        if state is not None and not state.get("corrupt"):
+            run_contract.clear_fail_closed_state(conn, info.project_id)
         conn.close()

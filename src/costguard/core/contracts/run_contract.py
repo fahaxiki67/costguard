@@ -104,7 +104,11 @@ def fail_closed_state_path(conn: sqlite3.Connection, project_id: int) -> Path:
     db_path = _database_path(conn, project_id)
     if db_path is None:
         raise RuntimeError(f"cannot resolve project database path for project {project_id}")
-    return db_path.with_name(f".{db_path.name}.costguard-run-state.json")
+    # 同一 project.db 可能承载多个项目；项目 ID 必须属于状态文件命名空间，
+    # 否则项目 A 的失败会把项目 B 一起锁死，或项目 B 清理时误删 A 的边界。
+    return db_path.with_name(
+        f".{db_path.name}.costguard-run-state-{int(project_id)}.json"
+    )
 
 
 def _state_key(conn: sqlite3.Connection, project_id: int) -> str:
@@ -166,7 +170,7 @@ def _fail_closed_payload(
 
 
 def _invalid_state_payload(project_id: int, error: BaseException) -> dict[str, Any]:
-    return _fail_closed_payload(
+    payload = _fail_closed_payload(
         project_id,
         "运行级不可用状态文件无法读取，当前结果不可用",
         error=error,
@@ -174,6 +178,8 @@ def _invalid_state_payload(project_id: int, error: BaseException) -> dict[str, A
         persistence="sidecar",
         persistence_error=str(error),
     )
+    payload["corrupt"] = True
+    return payload
 
 
 def set_fail_closed_state(
@@ -329,15 +335,74 @@ def _pending_clear_is_committed(
         return False
     if row is None:
         return False
-    return (
-        row["run_signature"] == signature
-        and row["run_kind"] == coverage_run_kind
-        and row["status"] not in {"failed", FAIL_CLOSED_STATUS}
+    if (
+        row["run_signature"] != signature
+        or row["run_kind"] != coverage_run_kind
+        or row["status"] != "complete"
+    ):
+        return False
+    # ``status`` 是持久化字段，不能单独当作证明；同时核对覆盖 JSON，防止
+    # 手工/旧版本写入一个 complete 但实际存在 skip/fail 的伪成功行。
+    expected = set(_loads(row["expected_json"], []))
+    executed = set(_loads(row["executed_json"], []))
+    skipped = _loads(row["skipped_json"], {})
+    failed = _loads(row["failed_json"], {})
+    critical_failed = set(_loads(row["critical_failed_json"], []))
+    return bool(
+        expected
+        and expected.issubset(executed)
+        and not skipped
+        and not failed
+        and not critical_failed
     )
 
 
-def clear_fail_closed_state(conn: sqlite3.Connection, project_id: int) -> None:
-    """仅在完整成功运行提交后清除边界；删除失败会原样抛出并保留边界。"""
+def _coverage_proof_is_valid(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    run_signature: str | None,
+    coverage_run_id: int | None,
+    coverage_run_kind: str | None,
+) -> bool:
+    """验证清除不可用边界所需的当前完整 coverage 证明。"""
+    if not run_signature or coverage_run_id is None or not coverage_run_kind:
+        return False
+    if conn.in_transaction or current_run_signature(conn, project_id) != run_signature:
+        return False
+    try:
+        row = conn.execute(
+            """SELECT run_signature, run_kind, status, expected_json, executed_json,
+                              skipped_json, failed_json, critical_failed_json
+                       FROM detection_runs WHERE id=? AND project_id=?""",
+            (int(coverage_run_id), project_id),
+        ).fetchone()
+    except (TypeError, ValueError, sqlite3.Error):
+        return False
+    if row is None or row["run_signature"] != run_signature:
+        return False
+    if row["run_kind"] != str(coverage_run_kind) or row["status"] != "complete":
+        return False
+    expected = set(_loads(row["expected_json"], []))
+    executed = set(_loads(row["executed_json"], []))
+    return bool(
+        expected
+        and expected.issubset(executed)
+        and not _loads(row["skipped_json"], {})
+        and not _loads(row["failed_json"], {})
+        and not _loads(row["critical_failed_json"], [])
+    )
+
+
+def clear_fail_closed_state(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    run_signature: str | None = None,
+    coverage_run_id: int | None = None,
+    coverage_run_kind: str | None = None,
+) -> None:
+    """仅在安全条件满足后清除边界；损坏侧车必须有成功运行证明。"""
     # 没有边界时清除是幂等操作。先检查状态也兼容 :memory: 或特殊连接：
     # 这类连接无法解析持久化路径，但没有待清除的状态时不应让正常成功
     # 运行凭空失败；已有进程 fallback 时仍会继续走下面的路径并报告限制。
@@ -346,6 +411,17 @@ def clear_fail_closed_state(conn: sqlite3.Connection, project_id: int) -> None:
         return
     if conn.in_transaction:
         raise RuntimeError("外层事务尚未提交，不能清除当前结果不可用边界")
+    proof = _coverage_proof_is_valid(
+        conn,
+        project_id,
+        run_signature=run_signature,
+        coverage_run_id=coverage_run_id,
+        coverage_run_kind=coverage_run_kind,
+    )
+    # 有效侧车保留旧的幂等清理接口兼容性；但损坏/不可验证侧车不能被
+    # 无证明地删除，否则一次文件损坏就会直接暴露历史成功结果。
+    if state.get("corrupt") and not proof:
+        raise RuntimeError("不可验证的运行状态需要完整成功运行证明才能清除")
     path = fail_closed_state_path(conn, project_id)
     # 先完成文件删除，再移除进程内状态。任何异常都会保留进程内状态，且
     # 侧车若仍存在也会继续阻断新连接。
@@ -366,8 +442,15 @@ def current_results_available(
     """返回所有当前成果读取/导出共用的运行级可用性。"""
     state = get_fail_closed_state(conn, project_id)
     if state is not None and _pending_clear_is_committed(conn, project_id, state):
+        pending = state.get(_PENDING_CLEAR_KEY) or {}
         try:
-            clear_fail_closed_state(conn, project_id)
+            clear_fail_closed_state(
+                conn,
+                project_id,
+                run_signature=pending.get("run_signature"),
+                coverage_run_id=pending.get("coverage_run_id"),
+                coverage_run_kind=pending.get("coverage_run_kind"),
+            )
         except Exception:
             # 清除失败时维持不可用边界；读取接口不能把清除异常误降级为可用。
             state = get_fail_closed_state(conn, project_id) or state

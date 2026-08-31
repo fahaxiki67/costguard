@@ -281,6 +281,8 @@ def _statuses(
         coverage["status"] != "complete"
         or aggregate_coverage["status"] != "complete"
         or verification["status"] == "not_started"
+        or verification["status"] in {"findings", "insufficient"}
+        or verification.get("periods_unchecked", 0) > 0
     ):
         automatic = "partial"
     else:

@@ -880,6 +880,24 @@ def _record_invalidation_failure_boundary(
     )
 
 
+def _set_crosscheck_fail_closed(
+    conn: sqlite3.Connection,
+    project_id: int,
+    active_contract: run_contract.RunContract | None,
+    error: BaseException,
+    *,
+    reason: str,
+) -> None:
+    """在任何批次级失败后先建立运行边界，再尝试补充数据库诊断。"""
+    run_contract.set_fail_closed_state(
+        conn,
+        project_id,
+        reason=reason,
+        run_signature=active_contract.signature if active_contract else None,
+        error=error,
+    )
+
+
 def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[int],
                    direction: str | None = None) -> list[CheckResult]:
     """执行多期校核；差异与结论写入 evidence 表并回填 period_totals。
@@ -888,7 +906,23 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     证据与 period_totals 回写锁定同一 period_id。
     """
     had_outer_transaction = conn.in_transaction
-    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    try:
+        active_contract = run_contract.ensure_run_contract(conn, project_id)
+    except Exception as exc:
+        # 契约切换本身发生在预失效之前。若这里的 COMMIT 被拒绝，旧契约和
+        # 旧成功行会因事务回滚而仍在库内；必须先用运行级边界把它们从所有
+        # 当前读取面挡住，不能等到后续失效化阶段才处理。
+        try:
+            _set_crosscheck_fail_closed(
+                conn,
+                project_id,
+                run_contract.get_current_contract(conn, project_id),
+                exc,
+                reason="运行契约切换未能安全提交，数据库不可写，当前结果不可用",
+            )
+        except Exception as boundary_error:
+            raise exc from boundary_error
+        raise
     had_fail_closed_state = run_contract.get_fail_closed_state(conn, project_id) is not None
     expected = _expected_validation_keys(conn, project_id, period_nos, direction)
     # 同一输入签名的重跑不能让上一次成功结果跨过本次失败继续充当当前
@@ -1026,7 +1060,21 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     ),
                 )
         except Exception as exc:
-            batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
+            cleanup_error = None
+            try:
+                batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
+            except Exception as rollback_error:
+                cleanup_error = rollback_error
+            try:
+                _set_crosscheck_fail_closed(
+                    conn,
+                    project_id,
+                    active_contract,
+                    exc,
+                    reason="交叉校验批次未能完成，当前结果不可用",
+                )
+            except Exception as boundary_error:
+                raise exc from boundary_error
             try:
                 _record_validation_coverage(
                     conn,
@@ -1040,6 +1088,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                 )
             except Exception as coverage_exc:
                 raise exc from coverage_exc
+            if cleanup_error is not None:
+                raise exc from cleanup_error
             raise
         results.append(res)
     try:
@@ -1053,7 +1103,21 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             direction=direction,
         )
     except Exception as exc:
-        batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
+        cleanup_error = None
+        try:
+            batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
+        except Exception as rollback_error:
+            cleanup_error = rollback_error
+        try:
+            _set_crosscheck_fail_closed(
+                conn,
+                project_id,
+                active_contract,
+                exc,
+                reason="交叉校验覆盖率未能安全记录，当前结果不可用",
+            )
+        except Exception as boundary_error:
+            raise exc from boundary_error
         try:
             _record_validation_coverage(
                 conn,
@@ -1067,6 +1131,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             )
         except Exception as coverage_exc:
             raise exc from coverage_exc
+        if cleanup_error is not None:
+            raise exc from cleanup_error
         raise
     else:
         try:
@@ -1074,6 +1140,16 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
         except Exception as exc:
             # _transaction 已经负责清理被拒绝的 COMMIT；失败 coverage 必须
             # 在批次事务之外另行登记，避免把提交异常误当成成功完成。
+            try:
+                _set_crosscheck_fail_closed(
+                    conn,
+                    project_id,
+                    active_contract,
+                    exc,
+                    reason="交叉校验批次提交未能完成，当前结果不可用",
+                )
+            except Exception as boundary_error:
+                raise exc from boundary_error
             try:
                 _record_validation_coverage(
                     conn,
@@ -1105,7 +1181,13 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     coverage_run_kind=detection_coverage.AGGREGATE_VALIDATION,
                 )
             else:
-                run_contract.clear_fail_closed_state(conn, project_id)
+                run_contract.clear_fail_closed_state(
+                    conn,
+                    project_id,
+                    run_signature=active_contract.signature,
+                    coverage_run_id=coverage_run_id,
+                    coverage_run_kind=detection_coverage.AGGREGATE_VALIDATION,
+                )
         except Exception as exc:
             try:
                 run_contract.set_fail_closed_state(
