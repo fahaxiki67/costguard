@@ -15,10 +15,9 @@ Excel import → field standardization → quantity/unit-price/amount checks
 > **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.9
 > candidate carries the evidence-gated verification levels, full-list pagination,
 > dual-value audit worksheets and the Jiadun（价盾）rename. Real WPS/Excel environment
-> verification and production signing remain
-> open release gates. See the
-> The v0.1.9 release carries the Jiadun（价盾）rename and compatibility updates on top
-> of the v0.1.8 candidate. See the [release notes](docs/RELEASE_NOTES_v0.1.9.md) and the
+> verification and production signing remain open release gates. The v0.1.9 release
+> carries the Jiadun（价盾）rename and compatibility updates on top of the v0.1.8
+> candidate. See the [release notes](docs/RELEASE_NOTES_v0.1.9.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
