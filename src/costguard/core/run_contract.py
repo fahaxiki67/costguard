@@ -2,6 +2,7 @@
 
 from costguard.core.contracts.run_contract import (  # noqa: F401
     CONTRACT_FORMAT_VERSION,
+    INVALIDATED_RUN_SIGNATURE,
     LEGACY_STALE_SIGNATURE,
     RunContract,
     adopt_unsigned_records,

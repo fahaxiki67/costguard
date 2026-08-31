@@ -565,6 +565,210 @@ def _expected_validation_keys(
     return list(dict.fromkeys(expected))
 
 
+def _requested_period_ids(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_nos: list[int],
+    direction: str | None,
+) -> list[int]:
+    """解析本次校核目标期次；歧义期号不触发旧结果预失效。"""
+    period_ids: list[int] = []
+    for period_no in period_nos:
+        sql = "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?"
+        params: list[object] = [project_id, period_no]
+        if direction is not None:
+            sql += " AND direction=?"
+            params.append(direction)
+        rows = conn.execute(sql, params).fetchall()
+        if direction is None and len(rows) != 1:
+            # 调用方未明确方向时，后续 check_period_by_no 会明确拒绝；在
+            # 拒绝前不改变任何旧成果，保持原有歧义入口的事务语义。
+            return []
+        period_ids.extend(int(row["id"]) for row in rows)
+    return list(dict.fromkeys(period_ids))
+
+
+def _period_total_has_check_state(row: sqlite3.Row) -> bool:
+    """判断 period_totals 是否已经承载过校核状态，而非仅有聚合待校核行。"""
+    return any(
+        (
+            row["evidence_id"] is not None,
+            row["cross_check_status"] not in (None, "pending"),
+            row["cross_check_diff"] is not None,
+            row["ab_status"] not in (None, "pending"),
+            row["ab_diff"] is not None,
+            row["control_status"] not in (None, "not_available"),
+            row["control_diff"] is not None,
+            row["verification_level"] not in (None, "insufficient"),
+        )
+    )
+
+
+def _invalidate_previous_validation(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_nos: list[int],
+    direction: str | None,
+    active_contract: run_contract.RunContract,
+) -> int:
+    """把本次重跑覆盖的旧结果移出当前面，并保留可追溯历史。"""
+    period_ids = _requested_period_ids(conn, project_id, period_nos, direction)
+    if not period_ids:
+        return 0
+    placeholders = ",".join("?" for _ in period_ids)
+    current_signature = active_contract.signature
+    current_scope, current_params = run_contract.current_scope(conn, project_id, "cr")
+    old_results = conn.execute(
+        f"""SELECT cr.id, cr.period_id, cr.evidence_id
+            FROM crosscheck_results cr
+            WHERE cr.project_id=? AND {current_scope}
+              AND cr.period_id IN ({placeholders})""",
+        (project_id, *current_params, *period_ids),
+    ).fetchall()
+    stale_period_ids = {int(row["period_id"]) for row in old_results}
+
+    total_scope, total_params = run_contract.current_scope(conn, project_id, "pt")
+    old_totals = conn.execute(
+        f"""SELECT pt.*
+               FROM period_totals pt
+               WHERE pt.project_id=? AND {total_scope}
+                 AND pt.period_id IN ({placeholders})""",
+        (project_id, *total_params, *period_ids),
+    ).fetchall()
+    stale_period_ids.update(
+        int(row["period_id"])
+        for row in old_totals
+        if _period_total_has_check_state(row)
+    )
+
+    old_detection = conn.execute(
+        """SELECT COUNT(*) AS c FROM detection_runs
+           WHERE project_id=? AND run_signature=? AND run_kind=?""",
+        (
+            project_id,
+            current_signature,
+            detection_coverage.AGGREGATE_VALIDATION,
+        ),
+    ).fetchone()
+    if not stale_period_ids and not int(old_detection["c"] or 0):
+        return 0
+
+    stale_ids = sorted(stale_period_ids)
+    evidence_ids = {
+        int(row["evidence_id"])
+        for row in (*old_results, *old_totals)
+        if int(row["period_id"]) in stale_period_ids and row["evidence_id"] is not None
+    }
+    invalidation_note = "本次校核重跑尚未成功落库，旧结果已移出当前读取面"
+    invalidated_at = datetime.now().isoformat(timespec="seconds")
+    invalidated_signature = run_contract.INVALIDATED_RUN_SIGNATURE
+
+    with run_contract._transaction(conn, "invalidate_previous_validation"):
+        if stale_ids:
+            stale_placeholders = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"""UPDATE crosscheck_results
+                   SET verification_level='insufficient', status='invalidated',
+                       path_a_total=NULL, path_b_total=NULL, raw_subtotal=NULL,
+                       diff_ab=NULL, control_diff=NULL, ab_status='pending',
+                       control_status='not_available', detail_rows=0,
+                       excluded_subtotal_rows=0, excluded_title_rows=0,
+                       pending_sheets=0, range_unproven_sheets=0,
+                       notes_json=?, evidence_id=NULL, checked_at=?, run_signature=?
+                   WHERE project_id=? AND run_signature=?
+                     AND period_id IN ({stale_placeholders})""",
+                (
+                    json.dumps([invalidation_note], ensure_ascii=False),
+                    invalidated_at,
+                    invalidated_signature,
+                    project_id,
+                    current_signature,
+                    *stale_ids,
+                ),
+            )
+            # R1/I4 的故障注入可能拒绝任意 ``UPDATE OF cross_check_status``。
+            # 预失效必须先于新批次提交，并且不能被这种“新批次回写”故障
+            # 提前截断；用完整行值做原子替换，保留 period_totals 的 ID、
+            # 聚合金额和其他字段，只改变校核状态边界。真正的新结果仍在
+            # 后续批次中按原有 UPDATE 写入，因此故障注入仍会在目标阶段触发。
+            total_columns = list(old_totals[0].keys()) if old_totals else []
+            total_column_sql = ", ".join(total_columns)
+            total_value_sql = ", ".join("?" for _ in total_columns)
+            for old_total in old_totals:
+                if int(old_total["period_id"]) not in stale_period_ids:
+                    continue
+                values = {column: old_total[column] for column in total_columns}
+                values.update(
+                    {
+                        "cross_check_status": "invalidated",
+                        "cross_check_diff": None,
+                        "evidence_id": None,
+                        "ab_status": "pending",
+                        "ab_diff": None,
+                        "control_status": "not_available",
+                        "control_diff": None,
+                        "verification_level": "insufficient",
+                        "run_signature": invalidated_signature,
+                    }
+                )
+                conn.execute(
+                    f"INSERT OR REPLACE INTO period_totals ({total_column_sql}) "
+                    f"VALUES ({total_value_sql})",
+                    tuple(values[column] for column in total_columns),
+                )
+
+        for evidence_id in sorted(evidence_ids):
+            evidence_row = conn.execute(
+                """SELECT summary, steps_json, run_signature FROM evidence
+                   WHERE id=? AND project_id=?""",
+                (evidence_id, project_id),
+            ).fetchone()
+            if not evidence_row or evidence_row["run_signature"] != current_signature:
+                continue
+            try:
+                steps = json.loads(evidence_row["steps_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                steps = {"original_steps_json": evidence_row["steps_json"]}
+            if not isinstance(steps, dict):
+                steps = {"original_steps": steps}
+            steps["invalidation"] = {
+                "status": "invalidated",
+                "at": invalidated_at,
+                "reason": invalidation_note,
+                "previous_run_signature": current_signature,
+            }
+            summary = evidence_row["summary"] or ""
+            if not summary.startswith("【已失效】"):
+                summary = f"【已失效】{summary}"
+            conn.execute(
+                """UPDATE evidence
+                   SET summary=?, steps_json=?, run_signature=?
+                   WHERE id=? AND project_id=? AND run_signature=?""",
+                (
+                    summary,
+                    json.dumps(steps, ensure_ascii=False, default=str),
+                    invalidated_signature,
+                    evidence_id,
+                    project_id,
+                    current_signature,
+                ),
+            )
+
+        # 旧 coverage 也必须离开 current_detection_run；否则当新一轮
+        # detection_runs INSERT 被阻断时，旧的 complete 仍会被误读为本轮成功。
+        conn.execute(
+            """UPDATE detection_runs SET run_signature=?
+               WHERE project_id=? AND run_signature=? AND run_kind=?""",
+            (
+                invalidated_signature,
+                project_id,
+                current_signature,
+                detection_coverage.AGGREGATE_VALIDATION,
+            ),
+        )
+    return len(stale_period_ids)
+
+
 def _record_validation_coverage(
     conn: sqlite3.Connection,
     project_id: int,
@@ -635,6 +839,13 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     """
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     expected = _expected_validation_keys(conn, project_id, period_nos, direction)
+    # 同一输入签名的重跑不能让上一次成功结果跨过本次失败继续充当当前
+    # 成果。预失效单独落在批次事务之前，才能在后续 Evidence、coverage 或
+    # COMMIT 失败回滚后继续保留 fail-closed 边界；嵌套调用方事务则由
+    # _transaction 以 savepoint 方式参与其外层事务。
+    _invalidate_previous_validation(
+        conn, project_id, period_nos, direction, active_contract
+    )
     results: list[CheckResult] = []
     now = datetime.now().isoformat(timespec="seconds")
     batch_transaction = run_contract._transaction(conn, "run_crosscheck_batch")
@@ -788,5 +999,25 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             raise exc from coverage_exc
         raise
     else:
-        batch_transaction.__exit__(None, None, None)
+        try:
+            batch_transaction.__exit__(None, None, None)
+        except Exception as exc:
+            # _transaction 已经负责清理被拒绝的 COMMIT；失败 coverage 必须
+            # 在批次事务之外另行登记，避免把提交异常误当成成功完成。
+            try:
+                _record_validation_coverage(
+                    conn,
+                    project_id,
+                    expected,
+                    results,
+                    active_contract,
+                    period_nos=period_nos,
+                    direction=direction,
+                    error=exc,
+                )
+            except Exception as coverage_exc:
+                # 失败 coverage 也无法落库时，保持原始 COMMIT 异常为主因；
+                # from 链保留 coverage 写入失败供调用方排查。
+                raise exc from coverage_exc
+            raise
     return results

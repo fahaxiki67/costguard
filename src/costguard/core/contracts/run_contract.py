@@ -26,6 +26,10 @@ from costguard.core.db import migrations
 from costguard.core.evidence.finding import canonical_json, stable_fingerprint
 
 LEGACY_STALE_SIGNATURE = "legacy:stale"
+# 运行条件不变但本次重跑未形成可用结果时使用的非当前标记。它与旧库迁移
+# 的 ``legacy:stale`` 分开，便于读取面和审计记录区分“历史旧数据”和“本次
+# 校核尝试失效”。两者都不会匹配当前 Run Contract 签名。
+INVALIDATED_RUN_SIGNATURE = "run:invalidated"
 CONTRACT_FORMAT_VERSION = 1
 
 
@@ -61,10 +65,25 @@ def _transaction(conn: sqlite3.Connection, name: str = "run_contract") -> Iterat
     try:
         yield
     except Exception:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.rollback()
         raise
     else:
-        conn.execute("COMMIT")
+        try:
+            # 使用 Connection API 而不是反复执行同一条 SQL。sqlite3 的
+            # 语句缓存可能让后续 ``execute('COMMIT')`` 不再次经过
+            # authorizer；连接 API 会对每次外层提交执行真实提交检查。
+            conn.commit()
+        except Exception as exc:
+            # SQLite 在 authorizer/驱动拒绝 COMMIT 时可能仍保持事务状态。
+            # 先清理连接，再把提交异常原样交给调用方；否则同一连接会继续
+            # 看到未提交的 Evidence、汇总或校核结果。
+            if conn.in_transaction:
+                try:
+                    conn.rollback()
+                except Exception as rollback_exc:
+                    raise exc from rollback_exc
+            raise
 
 
 def _loads(value: Any, fallback: Any) -> Any:
@@ -507,6 +526,12 @@ def current_scope(
     """
     signature = current_run_signature(conn, project_id)
     if signature:
+        if table_alias == "cr":
+            return (
+                f"{table_alias}.run_signature=? AND "
+                f"{table_alias}.status NOT IN ('invalidated', 'stale')",
+                (signature,),
+            )
         return f"{table_alias}.run_signature=?", (signature,)
     return f"{table_alias}.run_signature IS NULL", ()
 
