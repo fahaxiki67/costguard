@@ -9,13 +9,13 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-Release gate follow-up for v0.1.8 remains in progress. The current candidate
+Release gate follow-up for v0.1.9 remains in progress. The current candidate
 contains the P0 evidence/range gates and the UI review workflow improvements;
 WPS, macOS Excel and Windows Excel real-environment checks, large-project
 performance baselines, Developer ID/notarization, migration/recovery checks and
 real-case regression are still required before a production designation.
 
-The candidate also adds a signed Run Contract for source files, sheet scope,
+The current candidate retains the signed Run Contract for source files, sheet scope,
 field mappings, calculation inputs, rule configuration, schema and code
 version. Current cross-check, anomaly, matching and Excel/Word export records
 are filtered by that signature; earlier records remain available as history
@@ -25,6 +25,30 @@ impact, limitations, recommendation and suppression reason. The repository
 also includes repeatable large-list benchmarking and release-consistency
 checks; measured 1/5/20万-row baselines remain a release gate until executed
 on the target environment.
+
+## [0.1.9] - 2026-08-31
+
+Preview repackaging release for the Jiadun（价盾） product rename.
+
+### Changed
+- The distribution, Python package, CLI and macOS application are now named
+  `jiadun` / `Jiadun` / `价盾`; the legacy `costguard` GUI command remains as a
+  migration alias.
+- New projects and exports use the Jiadun naming and paths while legacy
+  CostGuard settings, workspaces, sidecars and historical exports remain
+  readable and are never silently deleted or rewritten.
+- Existing database schema, historical tags, the GitHub repository URL,
+  `costguard-canonical-json-v1` and the `v0.1.8` release assets remain historical
+  compatibility facts.
+- The version is intentionally a preview release. WPS, macOS Excel, Windows
+  Excel, 1万/5万/20万-row performance, migration/recovery, signing and notarization,
+  and real-case regression remain open gates.
+
+### Validation
+- The rename baseline passed the repository's automated test, lint, compile,
+  demo-determinism and release-asset checks before this version bump.
+- This release does not claim formal production readiness or approval of any
+  real project settlement.
 
 ## [0.1.8] - 2026-08-31
 
