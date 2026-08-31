@@ -596,6 +596,10 @@ def _record_validation_coverage(
         f"{type(error).__name__}: {error}" if error is not None else "本批次结束时未完成"
     )
     failed = {key: failure_text for key in expected_set - accounted}
+    if error is not None and expected_set:
+        # 发生业务或覆盖持久化异常时，即使计算已产生结果，也不能把这批次
+        # 的部分执行记录解释为成功；覆盖记录本身可落库时统一标记为失败。
+        failed = {key: failure_text for key in expected_set}
     coverage = detection_coverage.coverage_from_values(
         expected=expected,
         executed=executed,
@@ -633,6 +637,8 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     expected = _expected_validation_keys(conn, project_id, period_nos, direction)
     results: list[CheckResult] = []
     now = datetime.now().isoformat(timespec="seconds")
+    batch_transaction = run_contract._transaction(conn, "run_crosscheck_batch")
+    batch_transaction.__enter__()
     for pno in period_nos:
         try:
             # 计算、状态门控及本期所有业务回写共享同一个错误边界；发生
@@ -739,6 +745,7 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                     ),
                 )
         except Exception as exc:
+            batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
             try:
                 _record_validation_coverage(
                     conn,
@@ -754,13 +761,32 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                 raise exc from coverage_exc
             raise
         results.append(res)
-    _record_validation_coverage(
-        conn,
-        project_id,
-        expected,
-        results,
-        active_contract,
-        period_nos=period_nos,
-        direction=direction,
-    )
+    try:
+        _record_validation_coverage(
+            conn,
+            project_id,
+            expected,
+            results,
+            active_contract,
+            period_nos=period_nos,
+            direction=direction,
+        )
+    except Exception as exc:
+        batch_transaction.__exit__(type(exc), exc, exc.__traceback__)
+        try:
+            _record_validation_coverage(
+                conn,
+                project_id,
+                expected,
+                results,
+                active_contract,
+                period_nos=period_nos,
+                direction=direction,
+                error=exc,
+            )
+        except Exception as coverage_exc:
+            raise exc from coverage_exc
+        raise
+    else:
+        batch_transaction.__exit__(None, None, None)
     return results

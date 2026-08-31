@@ -92,7 +92,7 @@ def extract_items(
         # 有编码但无数值的行（如"缺数量清单行"）不在此列——它们有名称+编码，
         # 数值缺失走待补资料流程；本分支仅针对真实结算书分部标题行
         # （名称非空、编码空、三个数值列全空）。
-        if (not code_src and name_src
+        if (not item.flags["subtotal"] and not code_src and name_src
                 and not any(row_cells.get(f) for f in ("quantity", "unit_price", "amount"))):
             skip_stats["title_rows"] = skip_stats.get("title_rows", 0) + 1
             continue  # 分部/章节标题行：非清单项，直接跳过（原文在保真层可回溯）

@@ -21,44 +21,10 @@ from gb_templates import _finalize  # noqa: E402
 from openpyxl.styles import Font  # noqa: E402
 
 D = Decimal
+_MISSING = object()
 
 
-def _import_with_second_grand_total(tmp_path: Path, invalid_amount):
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
-
-    src = tmp_path / "two_grand_totals.xlsx"
-    _make_two_page(src)
-    wb = openpyxl.load_workbook(src)
-    ws = wb.worksheets[0]
-    row = ws.max_row + 1
-    ws.cell(row=row, column=3, value="合计")
-    ws.cell(row=row, column=7, value=4675.00)
-    _finalize(wb, src)
-
-    info = pm.create_project("C路径无效控制测试", tmp_path / "ws")
-    info, conn = pm.open_project(info.workspace_path)
-    settlement_io.import_settlement_file(
-        conn, info.project_id, Path(info.workspace_path), src, direction="upward"
-    )
-    period_id = conn.execute(
-        "SELECT id FROM settlement_periods LIMIT 1"
-    ).fetchone()["id"]
-    grand_rows = conn.execute(
-        """SELECT id FROM line_items
-           WHERE period_id=? AND json_extract(flags_json, '$.grand_total')=1
-           ORDER BY id""",
-        (period_id,),
-    ).fetchall()
-    assert len(grand_rows) == 2
-    conn.execute(
-        "UPDATE line_items SET amount=? WHERE id=?",
-        (invalid_amount, grand_rows[1]["id"]),
-    )
-    return conn, period_id
-
-
-def _make_two_page(path: Path) -> None:
+def _make_two_page(path: Path, *, second_grand_total_amount=_MISSING) -> None:
     """表-08 真实分页版式：第1页 3 行明细+本页小计，第2页 2 行明细+合计（总计）。"""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -90,6 +56,10 @@ def _make_two_page(path: Path) -> None:
         r += 1
     ws.cell(row=r, column=3, value="合计")
     ws.cell(row=r, column=7, value=4675.00)  # 全表总计 = 3270 + 1405
+    if second_grand_total_amount is not _MISSING:
+        r += 1
+        ws.cell(row=r, column=3, value="合计")
+        ws.cell(row=r, column=7, value=second_grand_total_amount)
     _finalize(wb, path)
 
 
@@ -103,6 +73,21 @@ def _import(path: Path):
         conn, info.project_id, Path(info.workspace_path), path, direction="upward")
     period_id = conn.execute(
         "SELECT id FROM settlement_periods LIMIT 1").fetchone()["id"]
+    return conn, period_id
+
+
+def _import_source_grand_total(tmp_path: Path, amount):
+    """通过源工作簿导入第二条合计行，不在导入后改写 line_items。"""
+    src = tmp_path / "source_grand_total.xlsx"
+    _make_two_page(src, second_grand_total_amount=amount)
+    conn, period_id = _import(src)
+    grand_rows = conn.execute(
+        """SELECT id, amount, flags_json FROM line_items
+           WHERE period_id=? AND json_extract(flags_json, '$.grand_total')=1
+           ORDER BY id""",
+        (period_id,),
+    ).fetchall()
+    assert len(grand_rows) == 2
     return conn, period_id
 
 
@@ -128,14 +113,7 @@ def test_multiple_grand_totals_make_control_not_available(tmp_path):
     from costguard.core.engine import crosscheck
 
     src = tmp_path / "multi_grand.xlsx"
-    _make_two_page(src)
-    # 追加第二个"合计"行，制造控制值不唯一
-    wb = openpyxl.load_workbook(src)
-    ws = wb.worksheets[0]
-    r = ws.max_row + 1
-    ws.cell(row=r, column=3, value="合计")
-    ws.cell(row=r, column=7, value=4675.00)
-    _finalize(wb, src)
+    _make_two_page(src, second_grand_total_amount=D("4675"))
     conn, period_id = _import(src)
     try:
         result = crosscheck.check_period(conn, period_id)
@@ -149,10 +127,11 @@ def test_multiple_grand_totals_make_control_not_available(tmp_path):
 def test_null_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
     from costguard.core.engine import crosscheck
 
-    conn, period_id = _import_with_second_grand_total(tmp_path, None)
+    conn, period_id = _import_source_grand_total(tmp_path, None)
     try:
         result = crosscheck.check_period(conn, period_id)
         assert result.path_a_total == result.path_b_total == D("4675")
+        assert result.control_status != "match"
         assert result.control_status == "not_available"
         assert result.raw_subtotal is None
         assert result.control_diff is None
@@ -164,10 +143,11 @@ def test_null_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
 def test_empty_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
     from costguard.core.engine import crosscheck
 
-    conn, period_id = _import_with_second_grand_total(tmp_path, "")
+    conn, period_id = _import_source_grand_total(tmp_path, "   ")
     try:
         result = crosscheck.check_period(conn, period_id)
         assert result.path_a_total == result.path_b_total == D("4675")
+        assert result.control_status != "match"
         assert result.control_status == "not_available"
         assert result.raw_subtotal is None
         assert result.control_diff is None
@@ -179,10 +159,11 @@ def test_empty_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
 def test_invalid_text_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
     from costguard.core.engine import crosscheck
 
-    conn, period_id = _import_with_second_grand_total(tmp_path, "not-a-number")
+    conn, period_id = _import_source_grand_total(tmp_path, "not-a-number")
     try:
         result = crosscheck.check_period(conn, period_id)
         assert result.path_a_total == result.path_b_total == D("4675")
+        assert result.control_status != "match"
         assert result.control_status == "not_available"
         assert result.raw_subtotal is None
         assert result.control_diff is None

@@ -393,21 +393,82 @@ class TestCrossCheck:
         finally:
             conn.close()
 
-    def test_crosscheck_persistence_failure_rolls_back_business_writes_and_records_coverage(
+    def test_missing_raw_amount_persists_insufficient_state_across_storage_layers(
         self, tmp_path
     ):
-        """交叉校验证据写入失败时，业务结果回滚但失败覆盖率必须可追溯。"""
-        info, conn, _period_id = _make_amount_case(tmp_path, raw_amount="200")
+        """缺失原始合价时各持久化层均不得落成 match/sufficient。"""
+        info, conn, period_id = _make_amount_case(tmp_path)
         try:
             aggs = aggregate.aggregate_project(conn, info.project_id)
             aggregate.persist_period_totals(conn, info.project_id, aggs)
-            period_id = conn.execute(
-                "SELECT id FROM settlement_periods WHERE project_id=?",
+            result = crosscheck.run_crosscheck(
+                conn, info.project_id, [1], direction="downward"
+            )[0]
+            assert result.raw_subtotal is None
+            assert result.control_status == "not_available"
+            assert result.verification_level == "insufficient"
+
+            persisted = conn.execute(
+                """SELECT cross_check_status, verification_level, control_status,
+                          evidence_id
+                   FROM period_totals WHERE period_id=? LIMIT 1""",
+                (period_id,),
+            ).fetchone()
+            assert persisted["cross_check_status"] != "match"
+            assert persisted["cross_check_status"] == "ab_match_control_not_available"
+            assert persisted["verification_level"] == "insufficient"
+            assert persisted["control_status"] == "not_available"
+            assert persisted["evidence_id"] is not None
+
+            stored_result = conn.execute(
+                """SELECT status, verification_level, raw_subtotal, control_status,
+                          evidence_id
+                   FROM crosscheck_results WHERE project_id=? AND period_id=?""",
+                (info.project_id, period_id),
+            ).fetchone()
+            assert stored_result["status"] != "match"
+            assert stored_result["status"] == "ab_match_control_not_available"
+            assert stored_result["verification_level"] == "insufficient"
+            assert stored_result["raw_subtotal"] is None
+            assert stored_result["control_status"] == "not_available"
+            assert stored_result["evidence_id"] == persisted["evidence_id"]
+
+            evidence = conn.execute(
+                """SELECT summary, steps_json FROM evidence
+                   WHERE project_id=? AND kind='cross_check' ORDER BY id DESC LIMIT 1""",
                 (info.project_id,),
-            ).fetchone()["id"]
+            ).fetchone()
+            assert evidence is not None
+            assert "校核不充分" in evidence["summary"]
+            steps = json.loads(evidence["steps_json"])
+            assert steps["verification_level"] == "insufficient"
+            assert steps["control_status"] == "not_available"
+
+            summary = coverage.coverage_summary(
+                conn,
+                info.project_id,
+                run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+            assert summary["status"] == coverage.PARTIAL
+            assert summary["executed_count"] == 2
+            assert summary["skipped_count"] == 1
+            assert summary["failed_count"] == 0
+            assert any(key.endswith(":path_c") for key in summary["skipped"])
+        finally:
+            conn.close()
+
+    def test_detection_coverage_write_failure_rolls_back_crosscheck_business_results(
+        self, tmp_path
+    ):
+        """detection_runs 自身写入失败时不得留下可识别成功的业务结果。"""
+        info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
             before = conn.execute(
                 """SELECT cross_check_status, cross_check_diff, evidence_id,
-                          ab_status, ab_diff, control_status, control_diff
+                          ab_status, ab_diff, control_status, control_diff,
+                          verification_level
                    FROM period_totals WHERE period_id=? LIMIT 1""",
                 (period_id,),
             ).fetchone()
@@ -415,15 +476,15 @@ class TestCrossCheck:
             assert before["evidence_id"] is None
 
             conn.execute(
-                """CREATE TRIGGER block_crosscheck_evidence
-                   BEFORE INSERT ON evidence
-                   WHEN NEW.kind='cross_check'
+                """CREATE TRIGGER block_aggregate_detection_runs
+                   BEFORE INSERT ON detection_runs
+                   WHEN NEW.run_kind='aggregate_validation'
                    BEGIN
-                       SELECT RAISE(ABORT, 'synthetic crosscheck evidence failure');
+                       SELECT RAISE(ABORT, 'synthetic detection coverage failure');
                    END"""
             )
             with pytest.raises(
-                sqlite3.IntegrityError, match="synthetic crosscheck evidence failure"
+                sqlite3.IntegrityError, match="synthetic detection coverage failure"
             ):
                 crosscheck.run_crosscheck(
                     conn, info.project_id, [1], direction="downward"
@@ -431,7 +492,58 @@ class TestCrossCheck:
 
             after = conn.execute(
                 """SELECT cross_check_status, cross_check_diff, evidence_id,
-                          ab_status, ab_diff, control_status, control_diff
+                          ab_status, ab_diff, control_status, control_diff,
+                          verification_level
+                   FROM period_totals WHERE period_id=? LIMIT 1""",
+                (period_id,),
+            ).fetchone()
+            assert dict(after) == dict(before)
+            assert conn.execute(
+                """SELECT COUNT(*) AS c FROM crosscheck_results
+                   WHERE project_id=? AND period_id=?""",
+                (info.project_id, period_id),
+            ).fetchone()["c"] == 0
+            assert conn.execute(
+                """SELECT COUNT(*) AS c FROM evidence
+                   WHERE project_id=? AND kind='cross_check'""",
+                (info.project_id,),
+            ).fetchone()["c"] == 0
+            assert conn.execute(
+                """SELECT COUNT(*) AS c FROM detection_runs
+                   WHERE project_id=? AND run_kind=?""",
+                (info.project_id, coverage.AGGREGATE_VALIDATION),
+            ).fetchone()["c"] == 0
+        finally:
+            conn.execute("DROP TRIGGER IF EXISTS block_aggregate_detection_runs")
+            conn.close()
+
+    def _assert_crosscheck_persistence_failure(
+        self, tmp_path, *, trigger_name, trigger_sql, error_message
+    ):
+        info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
+            before = conn.execute(
+                """SELECT cross_check_status, cross_check_diff, evidence_id,
+                          ab_status, ab_diff, control_status, control_diff,
+                          verification_level
+                   FROM period_totals WHERE period_id=? LIMIT 1""",
+                (period_id,),
+            ).fetchone()
+            assert before["cross_check_status"] == "pending"
+            assert before["evidence_id"] is None
+            conn.execute(trigger_sql)
+
+            with pytest.raises(sqlite3.IntegrityError, match=error_message):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [1], direction="downward"
+                )
+
+            after = conn.execute(
+                """SELECT cross_check_status, cross_check_diff, evidence_id,
+                          ab_status, ab_diff, control_status, control_diff,
+                          verification_level
                    FROM period_totals WHERE period_id=? LIMIT 1""",
                 (period_id,),
             ).fetchone()
@@ -456,23 +568,130 @@ class TestCrossCheck:
             ).fetchone()
             assert run is not None
             assert run["status"] == coverage.FAILED
-            expected = json.loads(run["expected_json"])
-            failed = json.loads(run["failed_json"])
             expected_paths = {
                 f"period:{period_id}:path_a",
                 f"period:{period_id}:path_b",
                 f"period:{period_id}:path_c",
             }
-            assert set(expected) == expected_paths
-            assert set(failed) == expected_paths
-            assert all(
-                key.startswith(f"period:{period_id}:") and ":path_" in key
-                for key in failed
-            )
-            assert "synthetic crosscheck evidence failure" in run["error_summary"]
+            assert set(json.loads(run["expected_json"])) == expected_paths
+            assert set(json.loads(run["failed_json"])) == expected_paths
+            assert error_message in run["error_summary"]
         finally:
-            conn.execute("DROP TRIGGER IF EXISTS block_crosscheck_evidence")
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
             conn.close()
+
+    def test_crosscheck_evidence_failure_after_partial_write_rolls_back_and_records_coverage(
+        self, tmp_path
+    ):
+        """Evidence 已插入后失败时，整期业务写入和覆盖结果均回滚/失败。"""
+        self._assert_crosscheck_persistence_failure(
+            tmp_path,
+            trigger_name="fail_crosscheck_evidence_after_insert",
+            trigger_sql="""CREATE TRIGGER fail_crosscheck_evidence_after_insert
+                AFTER INSERT ON evidence
+                WHEN NEW.kind='cross_check'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic crosscheck evidence failure');
+                END""",
+            error_message="synthetic crosscheck evidence failure",
+        )
+
+    def test_crosscheck_period_totals_failure_after_partial_write_rolls_back_and_records_coverage(
+        self, tmp_path
+    ):
+        """period_totals 已被触发更新后失败时，部分结果不得提交。"""
+        info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
+            conn.execute(
+                f"""CREATE TRIGGER fail_crosscheck_period_totals_after_update
+                    AFTER UPDATE OF cross_check_status ON period_totals
+                    WHEN NEW.period_id={period_id}
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic period_totals failure');
+                    END"""
+            )
+            self._assert_crosscheck_persistence_failure_from_existing_project(
+                conn, info, period_id, "fail_crosscheck_period_totals_after_update",
+                "synthetic period_totals failure",
+            )
+        finally:
+            conn.execute("DROP TRIGGER IF EXISTS fail_crosscheck_period_totals_after_update")
+            conn.close()
+
+    def test_crosscheck_results_failure_after_partial_write_rolls_back_and_records_coverage(
+        self, tmp_path
+    ):
+        """crosscheck_results 已写入前序表后失败时，整期结果不得半成功。"""
+        info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
+            conn.execute(
+                f"""CREATE TRIGGER fail_crosscheck_results_after_insert
+                    AFTER INSERT ON crosscheck_results
+                    WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic crosscheck_results failure');
+                    END"""
+            )
+            self._assert_crosscheck_persistence_failure_from_existing_project(
+                conn, info, period_id, "fail_crosscheck_results_after_insert",
+                "synthetic crosscheck_results failure",
+            )
+        finally:
+            conn.execute("DROP TRIGGER IF EXISTS fail_crosscheck_results_after_insert")
+            conn.close()
+
+    def _assert_crosscheck_persistence_failure_from_existing_project(
+        self, conn, info, period_id, trigger_name, error_message
+    ):
+        before = conn.execute(
+            """SELECT cross_check_status, cross_check_diff, evidence_id,
+                      ab_status, ab_diff, control_status, control_diff,
+                      verification_level
+               FROM period_totals WHERE period_id=? LIMIT 1""",
+            (period_id,),
+        ).fetchone()
+        assert before["cross_check_status"] == "pending"
+        assert before["evidence_id"] is None
+        with pytest.raises(sqlite3.IntegrityError, match=error_message):
+            crosscheck.run_crosscheck(conn, info.project_id, [1], direction="downward")
+        after = conn.execute(
+            """SELECT cross_check_status, cross_check_diff, evidence_id,
+                      ab_status, ab_diff, control_status, control_diff,
+                      verification_level
+               FROM period_totals WHERE period_id=? LIMIT 1""",
+            (period_id,),
+        ).fetchone()
+        assert dict(after) == dict(before)
+        assert conn.execute(
+            """SELECT COUNT(*) AS c FROM crosscheck_results
+               WHERE project_id=? AND period_id=?""",
+            (info.project_id, period_id),
+        ).fetchone()["c"] == 0
+        assert conn.execute(
+            """SELECT COUNT(*) AS c FROM evidence
+               WHERE project_id=? AND kind='cross_check'""",
+            (info.project_id,),
+        ).fetchone()["c"] == 0
+        run = conn.execute(
+            """SELECT status, expected_json, failed_json, error_summary
+               FROM detection_runs
+               WHERE project_id=? AND run_kind=? ORDER BY id DESC LIMIT 1""",
+            (info.project_id, coverage.AGGREGATE_VALIDATION),
+        ).fetchone()
+        assert run is not None
+        assert run["status"] == coverage.FAILED
+        expected_paths = {
+            f"period:{period_id}:path_a",
+            f"period:{period_id}:path_b",
+            f"period:{period_id}:path_c",
+        }
+        assert set(json.loads(run["expected_json"])) == expected_paths
+        assert set(json.loads(run["failed_json"])) == expected_paths
+        assert error_message in run["error_summary"]
 
     def test_aggregate_validation_failure_is_recorded(self, tmp_path):
         """不存在或歧义期次不得没有覆盖率记录。"""
