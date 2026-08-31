@@ -11,9 +11,12 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.6 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. See the
-> [release notes](docs/RELEASE_NOTES_v0.1.6.md) and the
+> **Status: v0.1.8 preview.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. v0.1.8 adds
+> evidence-gated verification levels, full-list pagination and dual-value audit
+> worksheets. Real WPS/Excel environment verification and production signing remain
+> open release gates. See the
+> [release notes](docs/RELEASE_NOTES_v0.1.8.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -33,6 +36,11 @@ Excel import → field standardization → quantity/unit-price/amount checks
   data `不可比` (incomparable) — never auto-filled with 0, never force-balanced.
 - **Human in the loop.** Uncertain matches carry confidence levels and enter a
   review queue; every manual correction is logged with a reason.
+- **Run-scoped results.** Source hashes, sheet scope, mappings, calculation
+  inputs, rule configuration, schema and code version form a signed Run
+  Contract. Results from an older contract remain historical and are not
+  silently reused after inputs change. Findings have stable IDs and preserve
+  raw/normalized values, confidence, impact and limitations.
 
 ## Platform priority
 
@@ -85,6 +93,17 @@ uv sync --python 3.12 --extra dev
 uv run pytest
 uv run ruff check src scripts tests
 ```
+
+The repeatable benchmark and release-document checks are available as:
+
+```bash
+uv run python scripts/performance_benchmark.py --sizes 10000 50000 200000
+uv run python scripts/release_consistency_check.py
+```
+
+The target-machine performance measurements, WPS/Excel checks, signing and
+notarization, recovery tests and real-case regression remain open release
+gates for v0.1.8.
 
 ## License
 

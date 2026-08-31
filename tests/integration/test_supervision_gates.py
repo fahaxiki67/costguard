@@ -176,14 +176,14 @@ class TestDirectionSeparation:
         audit = wb["审核底稿"]
         assert audit.cell(row=1, column=15).value == "方向"
         assert {audit.cell(row=r, column=15).value for r in range(2, audit.max_row + 1)} == {
-            "对上", "对下"
+            "对上结算", "对下结算"
         }
         summary_text = " | ".join(
             str(wb["管理层摘要"].cell(row=r, column=1).value)
             for r in range(1, wb["管理层摘要"].max_row + 1)
         )
-        assert "对上累计金额（可用部分）" in summary_text
-        assert "对下累计金额（可用部分）" in summary_text
+        assert "对上结算累计金额（可用部分）" in summary_text
+        assert "对下结算累计金额（可用部分）" in summary_text
         assert "累计金额合计（可用部分）" not in summary_text
         anomaly = wb["异常清单"]
         assert [anomaly.cell(row=1, column=c).value for c in range(1, 9)] == [
@@ -192,16 +192,21 @@ class TestDirectionSeparation:
         anomaly_directions = {
             anomaly.cell(row=r, column=2).value
             for r in range(2, anomaly.max_row + 1)
-            if anomaly.cell(row=r, column=3).value == "direction_probe"
+            if anomaly.cell(row=r, column=9).value == "direction_probe"
         }
-        assert anomaly_directions == {"对上", "对下"}
+        assert anomaly_directions == {"对上结算", "对下结算"}
+        assert all(
+            anomaly.cell(row=r, column=3).value == "其他审核问题"
+            for r in range(2, anomaly.max_row + 1)
+            if anomaly.cell(row=r, column=9).value == "direction_probe"
+        )
         pending = wb["待核实事项清单"]
         pending_directions = {
             pending.cell(row=r, column=2).value
             for r in range(2, pending.max_row + 1)
-            if pending.cell(row=r, column=3).value == "direction_probe"
+            if pending.cell(row=r, column=6).value == "direction_probe"
         }
-        assert pending_directions == {"对上", "对下"}
+        assert pending_directions == {"对上结算", "对下结算"}
 
 
 class TestSecondPathRecompute:
@@ -218,7 +223,7 @@ class TestSecondPathRecompute:
 
         wb = openpyxl.load_workbook(path, data_only=False)
         ws_detail = wb["审核底稿"]
-        ws_summary = wb["未标记方向结算累计表"]
+        ws_summary = wb["未标记累计表"]
 
         # 第二路径：明细按归组键 Decimal 累计（读回的是写入值，非 DB）。
         # 归组口径必须与累计表一致：code 优先，无码用名称（同码异名属同组）。
@@ -266,7 +271,7 @@ class TestSummaryScope:
 
         ws = openpyxl.load_workbook(buf)["管理层摘要"]
         text = " | ".join(str(ws.cell(row=r, column=1).value) for r in range(1, ws.max_row + 1))
-        for required in ("对上", "对下", "未标记方向", "单价税口径", "证据记录数", "已导入原始文件数"):
+        for required in ("其中：对上结算", "其中：对下结算", "其中：未标记", "单价税口径", "证据记录数", "已导入原始文件数"):
             assert required in text, f"summary missing scope item: {required}"
 
     def test_docx_does_not_claim_traceability_without_entry(self, project):

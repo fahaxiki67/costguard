@@ -10,6 +10,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from costguard.core.contracts import run_contract
 from costguard.core.models.source_file import import_file
 from costguard.core.parsing import excel_parser, extract_items
 from costguard.core.parsing.header_detect import HeaderDetection, detect_header
@@ -44,6 +45,178 @@ _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
 # - sheet 名/document 语义门控：汇总/核销/台账类 sheet 即使强表头也需角色确认；
 # - 无行数护栏（600 行合法大结算必须解析，判断不按大小）。
 SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账|summary|reconciliation|ledger", re.IGNORECASE)
+
+# 待人工确认工作表的唯一口径。已确认“仅作证据”的工作表仍保留在
+# raw_sheets/audit_log/evidence 中，但不应继续阻塞项目校核状态。
+PENDING_SHEETS_SQL = """
+SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_cols, rs.n_rows, sf.original_name,
+       th.col_map_json, th.header_row_lo, th.header_row_hi, th.needs_review,
+       th.data_row_start, th.data_row_end, th.data_range_status, th.data_range_method
+FROM raw_sheets rs
+JOIN parse_batches pb ON pb.id = rs.batch_id
+JOIN source_files sf ON sf.id = pb.file_id
+LEFT JOIN table_headers th ON th.sheet_id = rs.id
+WHERE sf.project_id=? AND rs.period_id IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM audit_log al
+      WHERE al.project_id=sf.project_id
+        AND al.target='sheet:'||rs.id
+        AND al.action='confirm_sheet_non_settlement_role'
+  )
+ORDER BY sf.id, rs.id"""
+
+
+def pending_sheet_count(conn: sqlite3.Connection, project_id: int) -> int:
+    """返回当前真正需要人工处理的工作表数量。
+
+    仅存证角色确认不进入结算模型，但它已经完成了人工决策，不能继续被
+    当作“待确认”计数；所有 UI、校核和导出调用同一函数，避免口径漂移。
+    """
+    row = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM raw_sheets rs
+           JOIN parse_batches pb ON pb.id=rs.batch_id
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND rs.period_id IS NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM audit_log al
+                 WHERE al.project_id=sf.project_id
+                   AND al.target='sheet:'||rs.id
+                   AND al.action='confirm_sheet_non_settlement_role'
+             )""",
+        (project_id,),
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def invalidate_crosscheck_results(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_ids: set[int] | list[int] | tuple[int, ...] | None = None,
+) -> int:
+    """在结算范围或人工门控发生变化后撤销旧的最新校核结果。
+
+    证据历史仍保留在 ``evidence`` 表中；这里只清除可被工作台、导出和
+    项目总览当作“最近校核”的结果，避免输入变更后继续显示旧的绿色结论。
+    ``period_ids=None`` 表示项目级变更（新增文件、方向或待确认状态变化）。
+    """
+    # 首次导入只建立输入，不强行创建一个尚未运行的契约；已有运行结果的
+    # 项目则立即计算新签名并把旧导出标为 stale。
+    run_contract.ensure_if_materialized(conn, project_id)
+    ids = sorted({int(pid) for pid in (period_ids or [])})
+    with run_contract._transaction(conn, "invalidate_crosscheck"):
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            cur = conn.execute(
+                f"DELETE FROM crosscheck_results WHERE project_id=? AND period_id IN ({placeholders})",
+                (project_id, *ids),
+            )
+            conn.execute(
+                f"""UPDATE period_totals
+                   SET cross_check_status='pending', cross_check_diff=NULL,
+                       evidence_id=NULL, ab_status='pending', ab_diff=NULL,
+                       control_status='not_available', control_diff=NULL,
+                       verification_level='insufficient'
+                   WHERE project_id=? AND period_id IN ({placeholders})""",
+                (project_id, *ids),
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM crosscheck_results WHERE project_id=?", (project_id,)
+            )
+            conn.execute(
+                """UPDATE period_totals
+                   SET cross_check_status='pending', cross_check_diff=NULL,
+                       evidence_id=NULL, ab_status='pending', ab_diff=NULL,
+                       control_status='not_available', control_diff=NULL,
+                       verification_level='insufficient'
+                   WHERE project_id=?""",
+                (project_id,),
+            )
+    return int(cur.rowcount if cur.rowcount is not None else 0)
+
+
+def set_project_direction(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_id: int,
+    direction: str,
+    *,
+    actor: str,
+    reason: str,
+) -> int:
+    """原子修改期次方向，并同步失效化、证据和审计。
+
+    UI 只能调用这个核心入口，不能先提交业务字段再补写审计。任何一步
+    失败都会回滚方向、运行契约切换、旧结果失效和证据记录。
+    """
+    from costguard.core.evidence import audit as audit_log
+    from costguard.core.evidence import evidence as evidence_api
+
+    if direction not in {"upward", "downward", "unknown"}:
+        raise ValueError(f"不支持的结算方向: {direction!r}")
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("标记期次方向必须记录原因（原则 14）")
+    period = conn.execute(
+        """SELECT id, period_no, title, direction FROM settlement_periods
+           WHERE id=? AND project_id=?""",
+        (period_id, project_id),
+    ).fetchone()
+    if not period:
+        raise ValueError(f"period {period_id} 不属于 project {project_id}")
+    old_direction = period["direction"] or "unknown"
+    if old_direction == direction:
+        return 0
+    collision = conn.execute(
+        """SELECT id FROM settlement_periods
+           WHERE project_id=? AND period_no=? AND direction=? AND id<>?""",
+        (project_id, period["period_no"], direction, period_id),
+    ).fetchone()
+    if collision:
+        raise sqlite3.IntegrityError(
+            f"第{period['period_no']}期在方向 {direction!r} 已存在期次"
+        )
+
+    before = {
+        "period_id": int(period_id),
+        "period_no": int(period["period_no"]),
+        "title": period["title"],
+        "direction": old_direction,
+    }
+    after = {**before, "direction": direction}
+    with run_contract._transaction(conn, "set_project_direction"):
+        changed = conn.execute(
+            """UPDATE settlement_periods SET direction=?
+               WHERE id=? AND project_id=? AND direction=?""",
+            (direction, period_id, project_id, old_direction),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("期次方向在操作期间发生变化，请刷新后重试")
+        # 方向属于运行范围；契约切换与旧校核结果失效必须处于同一事务。
+        invalidate_crosscheck_results(conn, project_id)
+        signature = run_contract.current_run_signature(conn, project_id)
+        evidence_api.add_evidence(
+            conn,
+            project_id,
+            "direction_change",
+            f"第{period['period_no']}期方向由 {old_direction} 改为 {direction}：{reason.strip()}",
+            steps=[{"step": "人工标记方向", "actor": actor, "reason": reason.strip()}],
+            sources=[{"period_id": int(period_id), "period_no": int(period["period_no"])}],
+            commit=False,
+            run_signature=signature,
+        )
+        audit_log.record_audit(
+            conn,
+            project_id,
+            actor,
+            "set_direction",
+            f"period:{period_id}",
+            before,
+            after,
+            reason,
+            commit=False,
+        )
+    return 1
 
 
 def _cn_to_int(s: str) -> int:
@@ -95,6 +268,8 @@ def ensure_period(
     source_file_id: int | None,
     direction: str = "unknown",
     contract_party: str = "",
+    *,
+    commit: bool = True,
 ) -> int:
     """按 (project_id, period_no, direction) 定位或创建期次。
 
@@ -107,13 +282,18 @@ def ensure_period(
     ).fetchone()
     if row:
         return int(row["id"])
-    with conn:
+    def _insert() -> int:
         cur = conn.execute(
             "INSERT INTO settlement_periods(project_id, period_no, title, source_file_id, direction, contract_party)"
             " VALUES (?,?,?,?,?,?)",
             (project_id, period_no, title, source_file_id, direction, contract_party),
         )
         return int(cur.lastrowid)
+
+    if commit:
+        with run_contract._transaction(conn, "ensure_period"):
+            return _insert()
+    return _insert()
 
 
 def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -184,7 +364,8 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         raise audit_log.AuditReasonRequiredError("人工确认角色必须记录原因（原则 14）")
     cells, merged, n_rows, n_cols = load_sheet_grid(conn, sheet_id)
     meta = conn.execute(
-        """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name
+        """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name,
+                  rs.hidden_rows_json, rs.hidden_cols_json
            FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
            WHERE rs.id=? AND sf.project_id=?""",
@@ -231,11 +412,15 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             raise ValueError(
                 f"确认数据行范围无效：应在表头末行 {header_hi} 之后且不超过 {n_rows}")
         data_range = (data_start, data_end)
+        data_range_status = "confirmed"
+        data_range_method = "manual_confirmation"
     else:
         from costguard.core.parsing.header_detect import data_rows_range
 
         data_range = data_rows_range(
             cells, replace(det, header_row_lo=header_lo, header_row_hi=header_hi), n_rows)
+        data_range_status = "inferred" if data_range[1] >= data_range[0] else "unproven"
+        data_range_method = "last_non_empty_row" if data_range_status == "inferred" else "no_data_rows"
 
     # 幂等/重复确认拒绝：已回写 period_id 的 sheet 视为已完成
     already = conn.execute(
@@ -251,41 +436,54 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     if not items:
         raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
 
-    audit_log.record_audit(
-        conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
-        {"role": "gated", "needs_review": det.needs_review,
-         "mapping": {"detected": det.col_map}},
-        {"role": "settlement", "confidence": det.confidence,
-         "mapping": {"detected": det.col_map, "confirmed": used_map},
-         "header_range": [header_lo, header_hi], "data_range": list(data_range),
-         "period_no": period_no}, reason)
-    pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
-    if not isinstance(pno, int) or pno < 1:
-        raise ValueError("确认期次必须为正整数")
-    period_id = ensure_period(
-        conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
-                              direction=direction)
-    n = extract_items.persist_line_items(conn, period_id, sheet_id, items)
-    # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
-    with conn:
+    with run_contract._transaction(conn, "confirm_sheet_role_and_extract"):
+        audit_log.record_audit(
+            conn, project_id, actor, "confirm_sheet_role", f"sheet:{sheet_id}",
+            {"role": "gated", "needs_review": det.needs_review,
+             "mapping": {"detected": det.col_map}},
+            {"role": "settlement", "confidence": det.confidence,
+             "mapping": {"detected": det.col_map, "confirmed": used_map},
+             "header_range": [header_lo, header_hi], "data_range": list(data_range),
+             "period_no": period_no}, reason, commit=False)
+        pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
+        if not isinstance(pno, int) or pno < 1:
+            raise ValueError("确认期次必须为正整数")
+        period_id = ensure_period(
+            conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
+            direction=direction, commit=False)
+        n = extract_items.persist_line_items(conn, period_id, sheet_id, items, commit=False)
+        # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
         conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?",
                      (period_id, sheet_id))
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
         conn.execute(
             """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
-               col_map_json, confidence, needs_review, data_row_start, data_row_end)
-               VALUES (?,?,?,?,?,0,?,?)""",
+               col_map_json, confidence, needs_review, data_row_start, data_row_end,
+               data_range_status, data_range_method, data_range_evidence_json)
+               VALUES (?,?,?,?,?,0,?,?,?,?,?)""",
             (sheet_id, header_lo, header_hi, json.dumps(used_map), det.confidence,
-             data_range[0], data_range[1]))
-    evidence_api.add_evidence(
-        conn, project_id, "sheet_role_confirmed",
-        f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
-        steps=[{"step": "人工确认", "actor": actor, "reason": reason,
-                "mapping": {"detected": det.col_map, "confirmed": used_map},
-                "header_range": [header_lo, header_hi], "data_range": list(data_range),
-                "period_no": pno, "confidence": det.confidence}],
-        sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
-    )
+             data_range[0], data_range[1], data_range_status, data_range_method,
+             json.dumps({
+                 "method": data_range_method,
+                 "header_range": [header_lo, header_hi],
+                 "data_range": list(data_range),
+                 "actor": actor,
+                 "hidden_rows": json.loads(meta["hidden_rows_json"] or "[]"),
+                 "hidden_cols": json.loads(meta["hidden_cols_json"] or "[]"),
+                 "visibility_risk": bool(meta["hidden_rows_json"] and meta["hidden_rows_json"] != "[]")
+                                  or bool(meta["hidden_cols_json"] and meta["hidden_cols_json"] != "[]"),
+             }, ensure_ascii=False)))
+        evidence_api.add_evidence(
+            conn, project_id, "sheet_role_confirmed",
+            f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
+            steps=[{"step": "人工确认", "actor": actor, "reason": reason,
+                    "mapping": {"detected": det.col_map, "confirmed": used_map},
+                    "header_range": [header_lo, header_hi], "data_range": list(data_range),
+                    "period_no": pno, "confidence": det.confidence}],
+            sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
+            commit=False,
+        )
+        invalidate_crosscheck_results(conn, project_id)
     return n
 
 
@@ -334,17 +532,20 @@ def confirm_sheet_non_settlement_role(
     if duplicate:
         raise ValueError("该 sheet 的非结算角色已确认，不得重复确认")
 
-    audit_log.record_audit(
-        conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
-        {"role": "gated"}, {"role": confirmed_role}, reason,
-    )
-    evidence_api.add_evidence(
-        conn, project_id, "sheet_role_confirmed",
-        f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
-        steps=[{"step": "人工确认非结算角色", "actor": actor,
-                "role": confirmed_role, "reason": reason}],
-        sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
-    )
+    with run_contract._transaction(conn, "confirm_sheet_non_settlement_role"):
+        audit_log.record_audit(
+            conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
+            {"role": "gated"}, {"role": confirmed_role}, reason, commit=False,
+        )
+        evidence_api.add_evidence(
+            conn, project_id, "sheet_role_confirmed",
+            f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
+            steps=[{"step": "人工确认非结算角色", "actor": actor,
+                    "role": confirmed_role, "reason": reason}],
+            sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
+            commit=False,
+        )
+        invalidate_crosscheck_results(conn, project_id)
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -387,18 +588,22 @@ def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
             if value_col is not None and nxt:
                 # 位置记真实值列（可反向定位到原格），不是 col+1
                 kv_pairs.append((label, nxt, row, value_col, f"{t} {nxt}"))
-    for key, value, row, col, quote in kv_pairs[:40]:
-        evidence_api.add_evidence(
-            conn, project_id, "form_field_candidate",
-            f"表单字段候选（待人工确认）：{key} = {value[:60]}",
-            steps=[{"step": "表单路由", "sheet": sheet_name, "status": "待人工确认"}],
-            sources=[{"file_id": file_id, "sheet_id": sheet_id,
-                      "location": f"行{row}列{col}", "quote": quote[:120]}],
+    with run_contract._transaction(conn, "route_form_sheet"):
+        for key, value, row, col, quote in kv_pairs[:40]:
+            evidence_api.add_evidence(
+                conn, project_id, "form_field_candidate",
+                f"表单字段候选（待人工确认）：{key} = {value[:60]}",
+                steps=[{"step": "表单路由", "sheet": sheet_name, "status": "待人工确认"}],
+                sources=[{"file_id": file_id, "sheet_id": sheet_id,
+                          "location": f"行{row}列{col}", "quote": quote[:120]}],
+                commit=False,
+            )
+        audit_log.record_audit(
+            conn, project_id, "system", "route_non_settlement_form", f"sheet:{sheet_id}",
+            None, {"sheet": sheet_name, "n_candidates": len(kv_pairs[:40])},
+            "键值对表单路由：保留原 Sheet，字段候选存证据表待人工复核，未进入结算与合同模型",
+            commit=False,
         )
-    audit_log.record_audit(
-        conn, project_id, "system", "route_non_settlement_form", f"sheet:{sheet_id}",
-        None, {"sheet": sheet_name, "n_candidates": len(kv_pairs[:40])},
-        "键值对表单路由：保留原 Sheet，字段候选存证据表待人工复核，未进入结算与合同模型")
 
 
 def guess_period_no_from_text(text: str) -> int | None:
@@ -427,6 +632,9 @@ def import_settlement_file(
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
     if result.status != "ok":
+        # 文件登记已经发生；即使解析失败，已有项目的旧结果也不能继续作为
+        # 当前输入下的成果。首次导入仍不创建空运行契约。
+        run_contract.ensure_if_materialized(conn, project_id)
         fallback = file_period or next_period_no(conn, project_id, direction)
         return ImportReport(sf.file_id, None, fallback, -1, "failed", message=result.error)
 
@@ -462,7 +670,6 @@ def import_settlement_file(
                        "保留原 Sheet 与单元格；请人工确认后使用通用 evidence 人工复核入口"]))
             form_routed = True
             continue
-        no_quantity_column = det is not None and "quantity" not in det.col_map
         # 语义门控：sheet 名含汇总/核销/台账 → 无论表头多强都需角色确认
         summary_like = bool(SUMMARY_LIKE_PATTERN.search(sheet.sheet_name))
         # needs_review 一律挡（监督第九轮）：歧义/低置信未经人工确认不得写 canonical
@@ -483,10 +690,39 @@ def import_settlement_file(
             role_gated = True
             continue
         if det is None:
-            report.sheets.append(SheetReport(sheet.sheet_name, "no_header"))
+            # 无法识别表头的 Sheet 仍属于待人工确认，不应被整体报告静默归为
+            # “导入失败”或让项目状态看起来像没有待处理事项。
+            report.sheets.append(SheetReport(
+                sheet.sheet_name, "no_header",
+                notes=["未识别到可靠表头，保留原始网格，需人工指定角色、表头和字段映射"],
+            ))
+            role_gated = True
             continue
+        # 固化本次抽取实际使用的数据范围。旧实现只在校核时临时调用
+        # data_rows_range，无法证明“导入时看到的范围”和“校核时回读的范围”
+        # 一致；现在把推断方法与证据一并落库，后续可检测原始网格是否变化。
+        from costguard.core.parsing.header_detect import data_rows_range
+
+        detected_data_range = data_rows_range(cells, det, n_rows)
+        range_start, range_end = detected_data_range
+        has_data_range = range_end >= range_start
+        stored_start = range_start if has_data_range else None
+        stored_end = range_end if has_data_range else None
+        range_status = "inferred" if has_data_range else "unproven"
+        range_method = "last_non_empty_row" if has_data_range else "no_data_rows"
+        range_evidence = {
+            "method": range_method,
+            "header_range": [det.header_row_lo, det.header_row_hi],
+            "data_range": [stored_start, stored_end],
+            "max_row": n_rows,
+            "basis": "表头之后最后一个非空行",
+            "hidden_rows": list(sheet.hidden_rows),
+            "hidden_cols": list(sheet.hidden_cols),
+            "visibility_risk": bool(sheet.hidden_rows or sheet.hidden_cols),
+        }
         skip_stats: dict = {}
-        items = extract_items.extract_items(cells, merged, det, n_rows, stats=skip_stats)
+        items = extract_items.extract_items(
+            cells, merged, det, n_rows, data_range=detected_data_range, stats=skip_stats)
         skip_notes = []
         if skip_stats.get("title_rows"):
             skip_notes.append(
@@ -522,9 +758,13 @@ def import_settlement_file(
             conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
             conn.execute(
                 """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
-                   confidence, needs_review) VALUES (?,?,?,?,?,?)""",
+                   confidence, needs_review, data_row_start, data_row_end,
+                   data_range_status, data_range_method, data_range_evidence_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (sheet_id, det.header_row_lo, det.header_row_hi,
-                 json.dumps(det.col_map), det.confidence, int(det.needs_review)),
+                 json.dumps(det.col_map), det.confidence, int(det.needs_review),
+                 stored_start, stored_end, range_status, range_method,
+                 json.dumps(range_evidence, ensure_ascii=False)),
             )
         period_ids.add(period_id)
 
@@ -564,4 +804,8 @@ def import_settlement_file(
     else:
         report.status = "failed"
         report.message = "no sheets parsed"
+    if parsed_any or role_gated or form_routed:
+        # 新导入既可能新增明细，也可能只新增待确认工作表；两者都会改变
+        # 项目级校核前提，因此旧的最新结果必须重新计算。
+        invalidate_crosscheck_results(conn, project_id)
     return report

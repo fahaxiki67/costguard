@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — CostGuard 架构设计
 
-> 状态：Phase 0 基线。架构变更须新增 ADR。
+> 当前实现参考：v0.1.8 预览候选。架构变更须新增 ADR。
 
 ## 1. 总体形态
 
@@ -18,8 +18,8 @@
 │   ├─ engine/      结算汇总、累计、双向校核（Decimal）    │
 │   ├─ matching/    清单匹配、别名库、置信度分级           │
 │   ├─ anomalies/   异常检测规则引擎（23+ 规则）           │
-│   ├─ evidence/    证据链、审计日志                       │
-│   ├─ contracts/   合同条款结构化提取                    │
+│   ├─ evidence/    证据链、统一 Finding、审计日志         │
+│   ├─ contracts/   合同条款与运行契约                    │
 │   └─ export/      Excel/Word/PPT 成果导出              │
 ├─────────────────────────────────────────────────────┤
 │  platform/      平台差异隔离层（路径/字体/权限/打包）     │
@@ -81,16 +81,33 @@ line_items(id, period_id, sheet_id, code, name, feature, unit,
 item_aliases(id, project_id, canonical_key, alias_text, mapping_basis,
              confirmed_by, confirmed_at)                       -- 别名/映射库
 matches(id, project_id, group_key, item_ids, level, -- 5档置信度
-        method, score, status, reviewed_by, review_note)
+        method, score, status, reviewed_by, review_note, run_signature)
 period_totals(period_id, item_key, qty_sum, amount_sum, wavg_price,
-              cross_check_diff, cross_check_status)
+              cross_check_diff, cross_check_status, run_signature)
 anomalies(id, project_id, rule_id, severity, subject_type, subject_id,
-          evidence_id, message, status, resolved_note)
+          evidence_id, message, status, resolved_note, run_signature,
+          finding_id, fingerprint, confidence, detection_mode,
+          raw_values_json, normalized_values_json, impact, limitations_json,
+          recommendation, suppression_reason)
 evidence(id, project_id, kind, summary, steps_json, sources_json,
-         created_at)                                            -- 证据链
+          created_at, run_signature, finding_id)                  -- 证据链
 audit_log(id, project_id, ts, actor, action, target, before_json,
           after_json, reason)                                   -- 人工修改日志
 contract_docs / contract_facts(...)                             -- Phase 6
+run_contracts(project_id, signature, components_json, created_at,
+              invalidated_at)                                   -- 运行契约
+export_runs(project_id, kind, path, run_signature, file_sha256,
+            generated_at, status, metadata_json)                 -- 成果登记
+detection_runs(project_id, run_signature, run_kind, status,
+               expected_json, executed_json, skipped_json,
+               failed_json, critical_failed_json, metadata_json)  -- 检测/聚合覆盖率
+import_manifests(project_id, manifest_key, control_hash, status)  -- 权威应到清单
+import_manifest_entries(manifest_id, logical_key, expected_sha256,
+                         expected_period_no, expected_direction,
+                         received_file_id, state)                -- 到件状态
+cleaning_changes(project_id, run_signature, event_key, subject_id,
+                 before_json, proposed_json, status, reason,
+                 evidence_id, audit_id)                           -- 清洗事件
 schema_migrations(version, applied_at)
 ```
 
@@ -99,6 +116,24 @@ schema_migrations(version, applied_at)
 任何差异、异常、风险、结论都持有 `evidence_id`。证据记录：
 `结论 → 计算过程(steps_json) → 使用的数据 → 数据来源(文件+Sheet+单元格) → 原始文件(stored_path) → 原始位置`。
 UI 中点击 Evidence ID 可展开全链路。人工修改写入 `audit_log`，同样生成证据。
+
+### 运行契约（Run Contract）
+
+一次校核、异常检测、匹配或成果导出必须明确它使用的输入和配置。运行契约把
+源文件 SHA-256、工作表及取数范围、字段映射、期次方向、合同事实、明细输入、
+规则配置、Schema 版本和代码版本规范化后生成运行签名。签名变化时，旧结果和
+导出登记保留为历史并标记失效，当前读取面只使用新签名；导出文件本身不因失效
+而被删除。
+
+统一 Finding 保留稳定的 `finding_id` 和 `fingerprint`，同时记录置信度、检测
+方式、原始值、标准化值、影响、限制、建议和抑制原因。重复运行可以据此识别同
+一问题，人工处理仍需通过 `audit_log` 和 Evidence ID 回查。
+
+检测规则和 A/B/C 聚合验证共用 `detection_runs` 表，但由 `run_kind` 分开读取。
+覆盖率明确列出预期、执行、跳过和失败项；技术失败不写成低级业务异常，覆盖不
+完整时所有成果通道保持待复核门控。权威批次清单不从已收到文件反向生成，复合
+键重复先于匹配被阻断，清洗建议也只进入 Evidence/Audit 事件，不直接改写原始
+明细。
 
 ## 5. 解析两段式（ADR-008）
 

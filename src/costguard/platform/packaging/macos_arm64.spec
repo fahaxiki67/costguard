@@ -48,6 +48,14 @@ a = Analysis(
     noarchive=False,
 )
 
+# editable 安装会生成含本机仓库路径的 ``direct_url.json``。该文件只描述
+# 开发环境安装来源，应用运行不依赖它；排除后保留包的 ``METADATA``，使
+# importlib.metadata 仍可读取 CostGuard 版本，同时避免把构建机路径带入 DMG。
+a.datas = [
+    entry for entry in a.datas
+    if Path(str(entry[0])).name != "direct_url.json"
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

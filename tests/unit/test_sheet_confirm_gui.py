@@ -86,6 +86,10 @@ class TestSheetConfirmDialog:
         dlg._on_select(0)
         assert "无表头" in dlg.sheet_list.item(0).text()
         assert all(sp.value() == 0 for sp in dlg._col_spins.values())
+        assert dlg.preview_table.rowCount() > 0 and dlg.preview_table.columnCount() > 0
+        dlg.preview_field_combo.setCurrentIndex(1)  # 名称
+        dlg._preview_column_clicked(1)  # 点击预览第 2 列
+        assert dlg._col_spins["name"].value() == 2
 
         # needs_review（有自动识别候选）类页面：预填候选列映射与表头行
         sheet_id = conn.execute(
@@ -107,6 +111,7 @@ class TestSheetConfirmDialog:
         assert dlg._col_spins["quantity"].value() == 4
         assert dlg._col_spins["amount"].value() == 6
         assert dlg.hdr_lo.value() == 2 and dlg.hdr_hi.value() == 2
+        assert "示例：" in dlg._col_hints["name"].text()
         conn.close()
 
     def test_validation_rules(self, qapp, quiet_boxes, gated_project):

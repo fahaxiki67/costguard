@@ -4,12 +4,56 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+Release gate follow-up for v0.1.8 remains in progress. The current candidate
+contains the P0 evidence/range gates and the UI review workflow improvements;
+WPS, macOS Excel and Windows Excel real-environment checks, large-project
+performance baselines, Developer ID/notarization, migration/recovery checks and
+real-case regression are still required before a production designation.
+
+The candidate also adds a signed Run Contract for source files, sheet scope,
+field mappings, calculation inputs, rule configuration, schema and code
+version. Current cross-check, anomaly, matching and Excel/Word export records
+are filtered by that signature; earlier records remain available as history
+and are not silently reused. Findings now carry stable `finding_id` and
+`fingerprint` values, raw/normalized values, confidence, detection mode,
+impact, limitations, recommendation and suppression reason. The repository
+also includes repeatable large-list benchmarking and release-consistency
+checks; measured 1/5/20万-row baselines remain a release gate until executed
+on the target environment.
+
+## [0.1.8] - 2026-08-31
+
+Preview release focused on review-gate integrity and safe recovery boundaries.
+
+### Fixed
+- Future database schema versions now fail closed instead of being opened and
+  down-written by an older program.
+- Direction changes, alias-backed match confirmation and batch confirmation use
+  atomic core transactions with current-run rechecks.
+- Failed or partial cross-check runs invalidate stale current results and cannot
+  clear the project fail-closed boundary without a complete current A/B/C
+  coverage proof.
+- Manifest arrival checks now include parsed batch status, Sheet, period,
+  direction and header semantics; missing `period_totals` rows and export
+  registration failures are explicit failures.
+
+### Testing
+- 414 automated tests pass on the release candidate, with Ruff and compile
+  checks passing. WPS, macOS Excel, Windows Excel, large-project performance,
+  signing/notarization, migration recovery and real-case regression remain
+  separate preview-release gates.
+
 ## [0.1.7] - 2026-08-30
 
 Productization pass (P0): no silent truncation, honest verification levels,
 dual-value audit worksheet, business-language UI.
 
 ### Added
+- 项目首页卡片、工作台审核总览、下一步建议、异常问题中心、左右对照匹配
+  复核、工作表样例映射和导出完成度提示，统一按证据门控展示。
+- Excel 审核底稿新增《封面与说明》页、冻结表头、筛选、打印重复表头、差异
+  条件提示和 Evidence ID 工作簿内跳转；Word 摘要新增首屏项目状态、关键指标、
+  Top 风险、待决策/待补资料和范围限制。
 - 清单明细分页：500/页 + 首页/上一页/下一页/末页 + "共 N 条 / 当前显示
   X-Y 条"；>2500 行回归证明全部数据可翻页到达，导出继续读取完整数据集。
 - 三档校核级别（逐期）：校核充分（A=B 且 C 控制可用且一致 且无待人工

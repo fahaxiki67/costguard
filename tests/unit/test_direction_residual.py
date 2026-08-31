@@ -78,12 +78,12 @@ class TestBlock1DiffSheets:
         assert rows, "单价差异表不得为空（单价必须来自可追溯原始 unit_price）"
         # up第2期(12) 只允许与 up第1期(10) 比较
         assert any(
-            r["方向"] == "对上" and r["本期值"] == Decimal("12") and r["上期值"] == Decimal("10")
+            r["方向"] == "对上结算" and r["本期值"] == Decimal("12") and r["上期值"] == Decimal("10")
             for r in rows
         ), f"缺少 up 第2期 vs up 第1期的单价比较行: {rows}"
         # down 第1期是 down 方向首期：仅作展示（标注"首期"），不得产生比较行；
         # 跨方向串表的定义 = 对下方向出现非空上期值或差异公式
-        down_rows = [r for r in rows if r["方向"] == "对下"]
+        down_rows = [r for r in rows if r["方向"] == "对下结算"]
         assert all(r["上期值"] is None and r["差异"] is None for r in down_rows), \
             f"对下方向出现比较行（串表）: {down_rows}"
         assert all("首期" in str(r.get("差异率", "")) for r in down_rows)
@@ -97,14 +97,14 @@ class TestBlock1DiffSheets:
         qty_rows = _grid_rows(wb["工程量差异表"])
         amt_rows = _grid_rows(wb["金额差异表"])
         assert any(
-            r["方向"] == "对上" and r["本期值"] == Decimal("10") and r["上期值"] == Decimal("10")
+            r["方向"] == "对上结算" and r["本期值"] == Decimal("10") and r["上期值"] == Decimal("10")
             for r in qty_rows
         ), f"工程量差异表缺 up 比较行: {qty_rows}"
         assert any(
-            r["方向"] == "对上" and r["本期值"] == Decimal("120") and r["上期值"] == Decimal("100")
+            r["方向"] == "对上结算" and r["本期值"] == Decimal("120") and r["上期值"] == Decimal("100")
             for r in amt_rows
         ), f"金额差异表缺 up 比较行: {amt_rows}"
-        assert not any(r["方向"] == "对下" for r in qty_rows + amt_rows if r.get("差异") not in (None, ""))
+        assert not any(r["方向"] == "对下结算" for r in qty_rows + amt_rows if r.get("差异") not in (None, ""))
 
     def test_multi_price_in_period_marked_not_averaged(self, db):
         """同期同组多个不同单价 → 标记不可比/待复核，不得平均掩盖。"""
@@ -145,7 +145,7 @@ class TestBlock2SetDirection:
                 target_row = r
         assert target_row is not None
         page.period_table.selectRow(target_row)
-        page.dir_combo.setCurrentIndex(page.dir_combo.findText("downward"))
+        page.dir_combo.setCurrentIndex(page.dir_combo.findData("downward"))
 
         class FakeDlg:
             def __init__(self, *a, **k):
@@ -172,6 +172,29 @@ class TestBlock2SetDirection:
         entries = audit_log.history_for(conn, pid)
         assert not any(e.action == "set_direction" for e in entries), "拒绝时不得写审计"
 
+    def test_core_set_direction_rolls_back_when_audit_fails(self, db, monkeypatch):
+        """方向核心写入必须与审计保持同一事务。"""
+        from costguard.core.engine import settlement_io
+        from costguard.core.evidence import audit as audit_log
+
+        conn, pid = db
+        period_id = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+
+        def fail_audit(*_args, **_kwargs):
+            raise RuntimeError("synthetic direction audit failure")
+
+        monkeypatch.setattr(audit_log, "record_audit", fail_audit)
+        with pytest.raises(RuntimeError, match="synthetic direction audit failure"):
+            settlement_io.set_project_direction(
+                conn, pid, period_id, "downward", actor="tester", reason="测试方向原子性"
+            )
+        assert conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"] == "upward"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='set_direction'"
+        ).fetchone()[0] == 0
+
     def test_set_direction_success_non_conflicting(self, db, monkeypatch):
         """非冲突标记：只改选中行（按 period_id），同期号另一方向不受影响。"""
         from PySide6.QtWidgets import QApplication
@@ -190,7 +213,7 @@ class TestBlock2SetDirection:
         target_row = next(r for r in range(page.period_table.rowCount())
                           if page.period_table.item(r, 1).text() == "up1")
         page.period_table.selectRow(target_row)
-        page.dir_combo.setCurrentIndex(page.dir_combo.findText("downward"))
+        page.dir_combo.setCurrentIndex(page.dir_combo.findData("downward"))
 
         class FakeDlg:
             def __init__(self, *a, **k):

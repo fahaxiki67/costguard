@@ -35,16 +35,17 @@ def provision_demo_project(workspace: Path | None = None) -> project_model.Proje
     root = Path(workspace) if workspace else project_model.workspace_root()
 
     info: project_model.ProjectInfo | None = None
-    last_error: Exception | None = None
     for i in range(1, _MAX_NAME_ATTEMPTS + 1):
         name = DEMO_PROJECT_BASE_NAME if i == 1 else f"{DEMO_PROJECT_BASE_NAME}-{i}"
         try:
             info = project_model.create_project(name, root)
             break
         except project_model.ProjectError as exc:
-            last_error = exc
+            # 目录重名属于可预期的业务分支；技术细节不直接进入普通界面。
+            if "already exists" not in str(exc):
+                break
     if info is None:
-        raise DemoProvisionError(f"无法创建演示项目：{last_error}")
+        raise DemoProvisionError("无法创建演示项目，请更换工作空间或项目名称后重试")
 
     _info, conn = project_model.open_project(Path(info.workspace_path))
     try:
@@ -62,8 +63,8 @@ def provision_demo_project(workspace: Path | None = None) -> project_model.Proje
                     contract_extract.import_contract(conn, info.project_id, pdir, src)
                 else:
                     failures.append(f"{entry['file_name']}: 未知演示数据类型 {entry['data_type']}")
-            except Exception as exc:  # noqa: BLE001 — 逐文件兜底，失败不中断其余演示文件
-                failures.append(f"{entry['file_name']}: {exc}")
+            except Exception:  # noqa: BLE001 — 逐文件兜底，失败不中断其余演示文件
+                failures.append(f"{entry['file_name']}：导入失败，请检查演示资源完整性")
         if failures:
             raise DemoProvisionError("演示数据导入部分失败：\n" + "\n".join(failures))
         _assert_periods_seeded(conn, info.project_id)
