@@ -785,7 +785,7 @@ def run_benchmark(
     report: dict[str, Any] = {
         "schema_version": 1,
         "benchmark": "CostGuard synthetic performance benchmark",
-        "benchmark_version": "0.1.7",
+        "benchmark_version": run_contract._app_version(),
         "generated_at": _now(),
         "status": "running",
         "environment": {

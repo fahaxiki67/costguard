@@ -1629,8 +1629,7 @@ class TestCrossCheck:
                    WHERE sp.project_id=? AND li.flags_json NOT LIKE '%"subtotal": true%' LIMIT 1)""",
                 (info.project_id,),
             )
-        # 校核只回写已形成的聚合结果；先保存本次修改后的聚合底稿，
-        # 同时验证 period_totals 缺行时会 fail-closed，而不是静默补行。
+        # 校核只回写已形成的聚合结果；先保存本次修改后的聚合底稿。
         aggregate.persist_period_totals(
             conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
         )

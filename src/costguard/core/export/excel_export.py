@@ -38,6 +38,8 @@ def _save_registered_artifact(
 ) -> Path:
     """先写同目录临时文件，再替换正式文件并登记；登记失败不留孤儿成品。"""
     path = Path(path)
+    if path.exists():
+        raise FileExistsError(f"导出目标已存在，拒绝覆盖：{path}")
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -804,6 +806,7 @@ def export_cover_page(
     ).fetchone()
     project_name = project["name"] if project else "未命名项目"
     signature = run_contract.current_run_signature(conn, project_id)
+    app_version = run_contract._app_version()
     gates = _review_gate_counts(conn, project_id, summary=summary)
     unchecked = max(0, gates["period_count"] - gates["checked_count"])
     if not gates["source_files"]:
@@ -825,7 +828,7 @@ def export_cover_page(
     ws.cell(row=1, column=1).font = Font(bold=True, size=18)
     ws.append(["项目名称", project_name])
     ws.append(["生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")])
-    ws.append(["成果版本", "v0.1.7 预览候选"])
+    ws.append(["成果版本", f"v{app_version} 预览候选"])
     ws.append(["运行签名", signature or "尚未生成（执行校核/异常检测/匹配或导出后生成）"])
     ws.append(["审核状态", status])
     completion = (
@@ -937,6 +940,7 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
         conn, project_id, operation="Excel 审核底稿导出"
     )
     active_contract = run_contract.ensure_run_contract(conn, project_id)
+    app_version = run_contract._app_version()
     # 兼容未经过新 API 的即时补充记录；v9 已把真正旧记录标为
     # legacy:stale，因此不会把历史结果重新激活。
     run_contract.adopt_unsigned_records(conn, project_id, active_contract.signature)
@@ -1000,7 +1004,7 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
             "excel_workbook",
             final_path,
             run_signature=active_contract.signature,
-            metadata={"sheet_names": wb.sheetnames, "version": "0.1.7"},
+            metadata={"sheet_names": wb.sheetnames, "version": app_version},
         ),
     )
 
@@ -1017,6 +1021,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     from docx.shared import Pt
 
     active_contract = run_contract.ensure_run_contract(conn, project_id)
+    app_version = run_contract._app_version()
     run_contract.adopt_unsigned_records(conn, project_id, active_contract.signature)
     import_manifest.manifest_summary(conn, project_id)
     active_contract = run_contract.ensure_run_contract(conn, project_id)
@@ -1112,7 +1117,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(f"项目名称：{project_name}")
     doc.add_paragraph(f"审核范围：已导入文件 {conn.execute('SELECT COUNT(*) c FROM source_files WHERE project_id=?', (project_id,)).fetchone()['c']} 份，"
                       f"期次 {len(periods)} 期（对上结算 {n_up} 期、对下结算 {n_down} 期、未标记 {n_none} 期）")
-    doc.add_paragraph(f"生成时间/版本：{generated_at} / v0.1.7 预览候选")
+    doc.add_paragraph(f"生成时间/版本：{generated_at} / v{app_version} 预览候选")
     doc.add_paragraph(f"运行签名：{active_contract.signature}")
     status_p = doc.add_paragraph(f"成果状态：{result_status}")
     status_p.runs[0].bold = True
@@ -1280,6 +1285,6 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
             "management_summary_docx",
             final_path,
             run_signature=active_contract.signature,
-            metadata={"version": "0.1.7", "result_status": result_status},
+            metadata={"version": app_version, "result_status": result_status},
         ),
     )

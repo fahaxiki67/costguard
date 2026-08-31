@@ -4,7 +4,7 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-Release gate follow-up for v0.1.7 remains in progress. The current candidate
+Release gate follow-up for v0.1.8 remains in progress. The current candidate
 contains the P0 evidence/range gates and the UI review workflow improvements;
 WPS, macOS Excel and Windows Excel real-environment checks, large-project
 performance baselines, Developer ID/notarization, migration/recovery checks and
@@ -20,6 +20,28 @@ impact, limitations, recommendation and suppression reason. The repository
 also includes repeatable large-list benchmarking and release-consistency
 checks; measured 1/5/20万-row baselines remain a release gate until executed
 on the target environment.
+
+## [0.1.8] - 2026-08-31
+
+Preview release focused on review-gate integrity and safe recovery boundaries.
+
+### Fixed
+- Future database schema versions now fail closed instead of being opened and
+  down-written by an older program.
+- Direction changes, alias-backed match confirmation and batch confirmation use
+  atomic core transactions with current-run rechecks.
+- Failed or partial cross-check runs invalidate stale current results and cannot
+  clear the project fail-closed boundary without a complete current A/B/C
+  coverage proof.
+- Manifest arrival checks now include parsed batch status, Sheet, period,
+  direction and header semantics; missing `period_totals` rows and export
+  registration failures are explicit failures.
+
+### Testing
+- 414 automated tests pass on the release candidate, with Ruff and compile
+  checks passing. WPS, macOS Excel, Windows Excel, large-project performance,
+  signing/notarization, migration recovery and real-case regression remain
+  separate preview-release gates.
 
 ## [0.1.7] - 2026-08-30
 

@@ -13,13 +13,12 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DOC_FILES = (
+BASE_DOC_FILES = (
     Path("README.md"),
     Path("README_zh-CN.md"),
     Path("ARCHITECTURE.md"),
     Path("ROADMAP.md"),
     Path("CHANGELOG.md"),
-    Path("docs/RELEASE_NOTES_v0.1.7.md"),
 )
 
 
@@ -57,8 +56,12 @@ def check_release_consistency(
         if not same:
             issues.append(f"源码版本 {version!r} 与期望版本 {expected!r} 不一致")
 
+    release_note_relative = (
+        Path(f"docs/RELEASE_NOTES_v{expected}.md") if expected is not None else None
+    )
+    doc_files = BASE_DOC_FILES + ((release_note_relative,) if release_note_relative else ())
     loaded: dict[Path, str] = {}
-    for relative in DOC_FILES:
+    for relative in doc_files:
         path = root / relative
         try:
             text = path.read_text(encoding="utf-8")
@@ -75,10 +78,11 @@ def check_release_consistency(
     markers = {
         Path("README.md"): ("preview", "production"),
         Path("README_zh-CN.md"): ("预览候选", "正式生产版"),
-        Path("docs/RELEASE_NOTES_v0.1.7.md"): ("预览候选", "生产"),
-        Path("ROADMAP.md"): ("v0.1.7 生产门槛", "- [ ]"),
-        Path("CHANGELOG.md"): ("v0.1.7", "production"),
+        Path("ROADMAP.md"): (f"v{expected} 生产门槛", "- [ ]"),
+        Path("CHANGELOG.md"): (f"[{expected}]", "production"),
     }
+    if release_note_relative:
+        markers[release_note_relative] = ("预览候选", "生产")
     for relative, required in markers.items():
         text = loaded.get(relative, "")
         missing = [marker for marker in required if marker not in text]
@@ -87,7 +91,7 @@ def check_release_consistency(
         if missing:
             issues.append(f"{relative} 缺少状态标识: {', '.join(missing)}")
 
-    release_note = loaded.get(Path("docs/RELEASE_NOTES_v0.1.7.md"), "")
+    release_note = loaded.get(release_note_relative, "") if release_note_relative else ""
     gate_terms = (
         ("WPS", ("WPS",)),
         ("macOS Excel", ("macOS Excel",)),
