@@ -31,6 +31,7 @@ LEGACY_STALE_SIGNATURE = "legacy:stale"
 # 校核尝试失效”。两者都不会匹配当前 Run Contract 签名。
 INVALIDATED_RUN_SIGNATURE = "run:invalidated"
 CONTRACT_FORMAT_VERSION = 1
+_TRANSACTION_COMMIT_FAILURE_ATTR = "_costguard_transaction_commit_failure"
 
 
 def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
@@ -44,6 +45,11 @@ def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _is_transaction_commit_failure(error: BaseException) -> bool:
+    """判断异常是否来自外层事务的 COMMIT，而不是事务体内的写入。"""
+    return bool(getattr(error, _TRANSACTION_COMMIT_FAILURE_ATTR, False))
 
 
 @contextmanager
@@ -75,6 +81,13 @@ def _transaction(conn: sqlite3.Connection, name: str = "run_contract") -> Iterat
             # authorizer；连接 API 会对每次外层提交执行真实提交检查。
             conn.commit()
         except Exception as exc:
+            # 保留原始异常类型和消息，同时给需要安全重放完整事务的调用方
+            # 一个不依赖异常文本的内部判别信号。事务体内的 DML 异常不会
+            # 经过这里，因此不会被误当作一次性 COMMIT 故障。
+            try:
+                setattr(exc, _TRANSACTION_COMMIT_FAILURE_ATTR, True)
+            except (AttributeError, TypeError):
+                pass
             # SQLite 在 authorizer/驱动拒绝 COMMIT 时可能仍保持事务状态。
             # 先清理连接，再把提交异常原样交给调用方；否则同一连接会继续
             # 看到未提交的 Evidence、汇总或校核结果。

@@ -663,110 +663,127 @@ def _invalidate_previous_validation(
     invalidated_at = datetime.now().isoformat(timespec="seconds")
     invalidated_signature = run_contract.INVALIDATED_RUN_SIGNATURE
 
-    with run_contract._transaction(conn, "invalidate_previous_validation"):
-        if stale_ids:
-            stale_placeholders = ",".join("?" for _ in stale_ids)
-            conn.execute(
-                f"""UPDATE crosscheck_results
-                   SET verification_level='insufficient', status='invalidated',
-                       path_a_total=NULL, path_b_total=NULL, raw_subtotal=NULL,
-                       diff_ab=NULL, control_diff=NULL, ab_status='pending',
-                       control_status='not_available', detail_rows=0,
-                       excluded_subtotal_rows=0, excluded_title_rows=0,
-                       pending_sheets=0, range_unproven_sheets=0,
-                       notes_json=?, evidence_id=NULL, checked_at=?, run_signature=?
-                   WHERE project_id=? AND run_signature=?
-                     AND period_id IN ({stale_placeholders})""",
-                (
-                    json.dumps([invalidation_note], ensure_ascii=False),
-                    invalidated_at,
-                    invalidated_signature,
-                    project_id,
-                    current_signature,
-                    *stale_ids,
-                ),
-            )
-            # R1/I4 的故障注入可能拒绝任意 ``UPDATE OF cross_check_status``。
-            # 预失效必须先于新批次提交，并且不能被这种“新批次回写”故障
-            # 提前截断；用完整行值做原子替换，保留 period_totals 的 ID、
-            # 聚合金额和其他字段，只改变校核状态边界。真正的新结果仍在
-            # 后续批次中按原有 UPDATE 写入，因此故障注入仍会在目标阶段触发。
-            total_columns = list(old_totals[0].keys()) if old_totals else []
-            total_column_sql = ", ".join(total_columns)
-            total_value_sql = ", ".join("?" for _ in total_columns)
-            for old_total in old_totals:
-                if int(old_total["period_id"]) not in stale_period_ids:
-                    continue
-                values = {column: old_total[column] for column in total_columns}
-                values.update(
-                    {
-                        "cross_check_status": "invalidated",
-                        "cross_check_diff": None,
-                        "evidence_id": None,
-                        "ab_status": "pending",
-                        "ab_diff": None,
-                        "control_status": "not_available",
-                        "control_diff": None,
-                        "verification_level": "insufficient",
-                        "run_signature": invalidated_signature,
-                    }
-                )
+    def _write_invalidation() -> None:
+        with run_contract._transaction(conn, "invalidate_previous_validation"):
+            if stale_ids:
+                stale_placeholders = ",".join("?" for _ in stale_ids)
                 conn.execute(
-                    f"INSERT OR REPLACE INTO period_totals ({total_column_sql}) "
-                    f"VALUES ({total_value_sql})",
-                    tuple(values[column] for column in total_columns),
+                    f"""UPDATE crosscheck_results
+                       SET verification_level='insufficient', status='invalidated',
+                           path_a_total=NULL, path_b_total=NULL, raw_subtotal=NULL,
+                           diff_ab=NULL, control_diff=NULL, ab_status='pending',
+                           control_status='not_available', detail_rows=0,
+                           excluded_subtotal_rows=0, excluded_title_rows=0,
+                           pending_sheets=0, range_unproven_sheets=0,
+                           notes_json=?, evidence_id=NULL, checked_at=?, run_signature=?
+                       WHERE project_id=? AND run_signature=?
+                         AND period_id IN ({stale_placeholders})""",
+                    (
+                        json.dumps([invalidation_note], ensure_ascii=False),
+                        invalidated_at,
+                        invalidated_signature,
+                        project_id,
+                        current_signature,
+                        *stale_ids,
+                    ),
+                )
+                # R1/I4 的故障注入可能拒绝任意 ``UPDATE OF cross_check_status``。
+                # 预失效必须先于新批次提交，并且不能被这种“新批次回写”故障
+                # 提前截断；用完整行值做原子替换，保留 period_totals 的 ID、
+                # 聚合金额和其他字段，只改变校核状态边界。真正的新结果仍在
+                # 后续批次中按原有 UPDATE 写入，因此故障注入仍会在目标阶段触发。
+                total_columns = list(old_totals[0].keys()) if old_totals else []
+                total_column_sql = ", ".join(total_columns)
+                total_value_sql = ", ".join("?" for _ in total_columns)
+                for old_total in old_totals:
+                    if int(old_total["period_id"]) not in stale_period_ids:
+                        continue
+                    values = {column: old_total[column] for column in total_columns}
+                    values.update(
+                        {
+                            "cross_check_status": "invalidated",
+                            "cross_check_diff": None,
+                            "evidence_id": None,
+                            "ab_status": "pending",
+                            "ab_diff": None,
+                            "control_status": "not_available",
+                            "control_diff": None,
+                            "verification_level": "insufficient",
+                            "run_signature": invalidated_signature,
+                        }
+                    )
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO period_totals ({total_column_sql}) "
+                        f"VALUES ({total_value_sql})",
+                        tuple(values[column] for column in total_columns),
+                    )
+
+            for evidence_id in sorted(evidence_ids):
+                evidence_row = conn.execute(
+                    """SELECT summary, steps_json, run_signature FROM evidence
+                       WHERE id=? AND project_id=?""",
+                    (evidence_id, project_id),
+                ).fetchone()
+                if not evidence_row or evidence_row["run_signature"] != current_signature:
+                    continue
+                try:
+                    steps = json.loads(evidence_row["steps_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    steps = {"original_steps_json": evidence_row["steps_json"]}
+                if not isinstance(steps, dict):
+                    steps = {"original_steps": steps}
+                steps["invalidation"] = {
+                    "status": "invalidated",
+                    "at": invalidated_at,
+                    "reason": invalidation_note,
+                    "previous_run_signature": current_signature,
+                }
+                summary = evidence_row["summary"] or ""
+                if not summary.startswith("【已失效】"):
+                    summary = f"【已失效】{summary}"
+                conn.execute(
+                    """UPDATE evidence
+                       SET summary=?, steps_json=?, run_signature=?
+                       WHERE id=? AND project_id=? AND run_signature=?""",
+                    (
+                        summary,
+                        json.dumps(steps, ensure_ascii=False, default=str),
+                        invalidated_signature,
+                        evidence_id,
+                        project_id,
+                        current_signature,
+                    ),
                 )
 
-        for evidence_id in sorted(evidence_ids):
-            evidence_row = conn.execute(
-                """SELECT summary, steps_json, run_signature FROM evidence
-                   WHERE id=? AND project_id=?""",
-                (evidence_id, project_id),
-            ).fetchone()
-            if not evidence_row or evidence_row["run_signature"] != current_signature:
-                continue
-            try:
-                steps = json.loads(evidence_row["steps_json"] or "{}")
-            except (TypeError, json.JSONDecodeError):
-                steps = {"original_steps_json": evidence_row["steps_json"]}
-            if not isinstance(steps, dict):
-                steps = {"original_steps": steps}
-            steps["invalidation"] = {
-                "status": "invalidated",
-                "at": invalidated_at,
-                "reason": invalidation_note,
-                "previous_run_signature": current_signature,
-            }
-            summary = evidence_row["summary"] or ""
-            if not summary.startswith("【已失效】"):
-                summary = f"【已失效】{summary}"
+            # 旧 coverage 也必须离开 current_detection_run；否则当新一轮
+            # detection_runs INSERT 被阻断时，旧的 complete 仍会被误读为本轮成功。
             conn.execute(
-                """UPDATE evidence
-                   SET summary=?, steps_json=?, run_signature=?
-                   WHERE id=? AND project_id=? AND run_signature=?""",
+                """UPDATE detection_runs SET run_signature=?
+                   WHERE project_id=? AND run_signature=? AND run_kind=?""",
                 (
-                    summary,
-                    json.dumps(steps, ensure_ascii=False, default=str),
                     invalidated_signature,
-                    evidence_id,
                     project_id,
                     current_signature,
+                    detection_coverage.AGGREGATE_VALIDATION,
                 ),
             )
 
-        # 旧 coverage 也必须离开 current_detection_run；否则当新一轮
-        # detection_runs INSERT 被阻断时，旧的 complete 仍会被误读为本轮成功。
-        conn.execute(
-            """UPDATE detection_runs SET run_signature=?
-               WHERE project_id=? AND run_signature=? AND run_kind=?""",
-            (
-                invalidated_signature,
-                project_id,
-                current_signature,
-                detection_coverage.AGGREGATE_VALIDATION,
-            ),
-        )
-    return len(stale_period_ids)
+    # authorizer/驱动的一次性 COMMIT 拒绝会回滚整个失效化事务。仅对事务
+    # 助手明确标记的外层 COMMIT 失败重放一次完整写事务；业务 DML 异常、
+    # SAVEPOINT 释放异常和持续拒绝均不重试，保持原始异常和回滚边界。
+    for attempt in range(2):
+        try:
+            _write_invalidation()
+        except Exception as exc:
+            if (
+                attempt == 0
+                and not conn.in_transaction
+                and run_contract._is_transaction_commit_failure(exc)
+            ):
+                continue
+            raise
+        return len(stale_period_ids)
+    raise AssertionError("invalidation retry loop exhausted without a result")
 
 
 def _record_validation_coverage(

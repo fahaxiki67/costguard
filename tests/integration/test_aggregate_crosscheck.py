@@ -14,6 +14,7 @@ from generator import make_multi_period  # noqa: E402
 from costguard.core.anomalies import coverage  # noqa: E402
 from costguard.core.contracts import run_contract  # noqa: E402
 from costguard.core.engine import aggregate, crosscheck, settlement_io  # noqa: E402
+from costguard.core.reporting import build_project_summary  # noqa: E402
 
 D = Decimal
 
@@ -780,6 +781,277 @@ class TestCrossCheck:
             )["status"] == coverage.FAILED
         finally:
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
+    def test_invalidation_commit_retries_then_failed_coverage_hides_old_success(
+        self, project_multi
+    ):
+        """失效化 COMMIT 一次性拒绝后重试，后续失败 coverage 不能复活旧成功。"""
+        info, conn, report = project_multi
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        assert crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0].verification_level == "sufficient"
+        signature = run_contract.current_run_signature(conn, info.project_id)
+        conn.execute(
+            """CREATE TRIGGER block_r3_success_coverage
+               BEFORE INSERT ON detection_runs
+               WHEN NEW.run_kind='aggregate_validation' AND NEW.error_summary IS NULL
+               BEGIN
+                   SELECT RAISE(ABORT, 'synthetic R3 success coverage failure');
+               END"""
+        )
+        commit_count = 0
+
+        def reject_first_commit(action, arg1, _arg2, _db_name, _trigger_name):
+            nonlocal commit_count
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+                commit_count += 1
+                if commit_count == 1:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(reject_first_commit)
+        try:
+            with pytest.raises(
+                sqlite3.IntegrityError, match="synthetic R3 success coverage failure"
+            ):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [report.period_no], direction=direction
+                )
+
+            # 失效化第一次提交被拒、第二次提交成功；失败 coverage 随后在
+            # 独立事务中成功落库，因此会再产生一次 COMMIT。
+            assert commit_count == 3
+            assert conn.in_transaction is False
+            current_result_scope, current_result_params = run_contract.current_scope(
+                conn, info.project_id, "cr"
+            )
+            assert conn.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND {current_result_scope}",
+                (info.project_id, *current_result_params),
+            ).fetchone()["c"] == 0
+            current_total_scope, current_total_params = run_contract.current_scope(
+                conn, info.project_id, "pt"
+            )
+            assert conn.execute(
+                f"SELECT COUNT(*) AS c FROM period_totals pt "
+                f"WHERE pt.project_id=? AND pt.period_id=? AND {current_total_scope}",
+                (info.project_id, period_id, *current_total_params),
+            ).fetchone()["c"] == 0
+            stale_result = conn.execute(
+                "SELECT status, verification_level, run_signature, evidence_id "
+                "FROM crosscheck_results WHERE project_id=? AND period_id=?",
+                (info.project_id, period_id),
+            ).fetchone()
+            assert stale_result["status"] == "invalidated"
+            assert stale_result["verification_level"] == "insufficient"
+            assert stale_result["run_signature"] != signature
+            assert stale_result["evidence_id"] is None
+            stale_evidence = conn.execute(
+                "SELECT summary, steps_json, run_signature FROM evidence "
+                "WHERE project_id=? AND kind='cross_check' ORDER BY id DESC LIMIT 1",
+                (info.project_id,),
+            ).fetchone()
+            assert stale_evidence["summary"].startswith("【已失效】")
+            assert json.loads(stale_evidence["steps_json"])["invalidation"]["status"] == (
+                "invalidated"
+            )
+            assert stale_evidence["run_signature"] != signature
+
+            project_summary = build_project_summary(conn, info.project_id)
+            assert project_summary.verification["periods_checked"] == 0
+            assert project_summary.verification["status"] == "not_started"
+            assert project_summary.aggregate_coverage["status"] == coverage.FAILED
+            assert project_summary.statuses["automatic_analysis"] == "failed"
+        finally:
+            conn.set_authorizer(None)
+            conn.execute("DROP TRIGGER IF EXISTS block_r3_success_coverage")
+
+        from costguard.core.models import project as pm
+
+        _reopened, reopened = pm.open_project(Path(info.workspace_path))
+        try:
+            reopened_result_scope, reopened_result_params = run_contract.current_scope(
+                reopened, info.project_id, "cr"
+            )
+            assert reopened.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND cr.period_id=? AND {reopened_result_scope}",
+                (info.project_id, period_id, *reopened_result_params),
+            ).fetchone()["c"] == 0
+            reopened_total_scope, reopened_total_params = run_contract.current_scope(
+                reopened, info.project_id, "pt"
+            )
+            assert reopened.execute(
+                f"SELECT COUNT(*) AS c FROM period_totals pt "
+                f"WHERE pt.project_id=? AND pt.period_id=? AND {reopened_total_scope}",
+                (info.project_id, period_id, *reopened_total_params),
+            ).fetchone()["c"] == 0
+            reopened_summary = build_project_summary(reopened, info.project_id)
+            assert reopened_summary.verification["periods_checked"] == 0
+            assert reopened_summary.aggregate_coverage["status"] == coverage.FAILED
+        finally:
+            reopened.close()
+
+    def test_invalidation_recovery_keeps_fail_closed_when_failure_coverage_unwritable(
+        self, project_multi
+    ):
+        """失效化已重试成功但 FAILED coverage 不可写时，旧成功仍不能复活。"""
+        info, conn, report = project_multi
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        assert crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0].verification_level == "sufficient"
+        signature = run_contract.current_run_signature(conn, info.project_id)
+        conn.execute(
+            """CREATE TRIGGER block_r3_all_coverage
+               BEFORE INSERT ON detection_runs
+               WHEN NEW.run_kind='aggregate_validation'
+               BEGIN
+                   SELECT RAISE(ABORT, 'synthetic R3 all coverage failure');
+               END"""
+        )
+        commit_count = 0
+
+        def reject_first_commit(action, arg1, _arg2, _db_name, _trigger_name):
+            nonlocal commit_count
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+                commit_count += 1
+                if commit_count == 1:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(reject_first_commit)
+        try:
+            with pytest.raises(
+                sqlite3.IntegrityError, match="synthetic R3 all coverage failure"
+            ):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [report.period_no], direction=direction
+                )
+            # 失效化第一次提交被拒、第二次提交成功；coverage 的两次 INSERT
+            # 都在写入阶段被 trigger 拒绝，因此不会再产生 COMMIT。
+            assert commit_count == 2
+            assert conn.in_transaction is False
+            current_scope, scope_params = run_contract.current_scope(
+                conn, info.project_id, "cr"
+            )
+            assert conn.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND {current_scope}",
+                (info.project_id, *scope_params),
+            ).fetchone()["c"] == 0
+            stale_result = conn.execute(
+                "SELECT status, verification_level, run_signature FROM crosscheck_results "
+                "WHERE project_id=? AND period_id=?",
+                (info.project_id, period_id),
+            ).fetchone()
+            assert stale_result["status"] == "invalidated"
+            assert stale_result["verification_level"] == "insufficient"
+            assert stale_result["run_signature"] != signature
+            summary = coverage.coverage_summary(
+                conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+            )
+            assert summary["status"] == coverage.NOT_STARTED
+            assert summary["run_id"] is None
+        finally:
+            conn.set_authorizer(None)
+            conn.execute("DROP TRIGGER IF EXISTS block_r3_all_coverage")
+
+    def test_persistent_invalidation_commit_rejection_is_explicit_physical_boundary(
+        self, project_multi
+    ):
+        """持续拒绝所有提交时只中止本次运行，不伪造失效标记或新成功。"""
+        from costguard.core.models import project as pm
+
+        info, conn, report = project_multi
+        workspace = Path(info.workspace_path)
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        first = crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0]
+        old_evidence = conn.execute(
+            "SELECT id FROM evidence WHERE project_id=? AND kind='cross_check' "
+            "ORDER BY id DESC LIMIT 1",
+            (info.project_id,),
+        ).fetchone()["id"]
+        commit_count = 0
+
+        def reject_every_commit(action, arg1, _arg2, _db_name, _trigger_name):
+            nonlocal commit_count
+            if action == sqlite3.SQLITE_TRANSACTION and arg1 == "COMMIT":
+                commit_count += 1
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(reject_every_commit)
+        try:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [report.period_no], direction=direction
+                )
+            # 持续拒绝时两次完整失效化事务均回滚；实现不进入后续业务/coverage
+            # 提交，也不把一次失败调用伪造成新的结果。
+            assert commit_count == 2
+            assert conn.in_transaction is False
+            assert conn.execute(
+                "SELECT COUNT(*) AS c FROM evidence WHERE project_id=? AND kind='cross_check'",
+                (info.project_id,),
+            ).fetchone()["c"] == 1
+            result = conn.execute(
+                "SELECT status, verification_level, evidence_id FROM crosscheck_results "
+                "WHERE project_id=? AND period_id=?",
+                (info.project_id, period_id),
+            ).fetchone()
+            assert result["status"] == first.status
+            assert result["verification_level"] == first.verification_level
+            assert result["evidence_id"] == old_evidence
+        finally:
+            conn.set_authorizer(None)
+
+        # 这是数据库写通道持续不可用时的物理边界：本次调用已经抛出，
+        # 没有返回旧结果作为本次结果；但没有任何持久化失败标志可供
+        # current_scope 在新连接中识别时，既有成功只能原样保留。
+        _reopened, reopened = pm.open_project(workspace)
+        try:
+            reopened_scope, reopened_params = run_contract.current_scope(
+                reopened, info.project_id, "cr"
+            )
+            assert reopened.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND cr.period_id=? AND {reopened_scope}",
+                (info.project_id, period_id, *reopened_params),
+            ).fetchone()["c"] == 1
+        finally:
+            reopened.close()
 
     def _assert_crosscheck_persistence_failure(
         self, tmp_path, *, trigger_name, trigger_sql, error_message
