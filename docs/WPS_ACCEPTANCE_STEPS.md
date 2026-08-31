@@ -1,4 +1,7 @@
-# WPS 人工验收记录与后续步骤
+# Jiadun（价盾）WPS 人工验收记录与后续步骤
+
+> 本文记录的是 2026-08-29 的历史验收。记录中的 `CostGuard演示` 是当时使用的旧路径，
+> 按历史事实保留；现行产品名称为 Jiadun（价盾），更名不会删除该目录中的原始资料。
 
 > 状态：**WPS 验收通过（人工，2026-08-29）**。
 > 该结论仅对应下列合成最小样例，不代表 R05–R07 最新私有真实资料导出已经完成 WPS 验收。
@@ -14,7 +17,7 @@
 - `local_private_data/wps_acceptance/WPS验收-最小底稿.xlsx`
 - `local_private_data/wps_acceptance/WPS验收-最小摘要.docx`
 
-已同时复制到 `~/Desktop/CostGuard演示/`。
+已同时复制到历史路径 `~/Desktop/CostGuard演示/`。
 
 ## LibreOffice 重算预期值（人工打开 WPS 后逐项比对）
 

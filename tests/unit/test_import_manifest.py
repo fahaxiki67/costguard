@@ -4,9 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from costguard.core.contracts import run_contract
-from costguard.core.models import project as project_model
-from costguard.core.parsing.import_manifest import (
+from jiadun.core.contracts import run_contract
+from jiadun.core.models import project as project_model
+from jiadun.core.parsing.import_manifest import (
     ManifestEntrySpec,
     assess_manifest,
     bind_manifest_entry,

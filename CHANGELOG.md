@@ -1,6 +1,11 @@
-# Changelog
+# Changelog — Jiadun（价盾）
 
 All notable changes. Format based on Keep a Changelog; versioning: SemVer.
+
+> Naming note: the current product name is Jiadun（价盾）. Historical v0.x commands,
+> package paths, project paths and release assets keep their original `CostGuard`
+> spelling so that published facts remain traceable; they are not evidence that the
+> remote assets have been renamed.
 
 ## [Unreleased]
 
@@ -46,7 +51,7 @@ Preview release focused on review-gate integrity and safe recovery boundaries.
   registration failures are explicit failures.
 
 ### Testing
-- 418 automated tests pass on the release candidate, with Ruff and compile
+- 427 automated tests pass on the release candidate, with Ruff and compile
   checks passing. The independent code review conditionally passed for the
   addressed P0-04, P1-01 and P1-02 scope, with the partial-summary semantic
   observation documented in the release notes. WPS, macOS Excel, Windows
@@ -200,7 +205,7 @@ isolated, originals read-only, evidence chain and human-review gates intact).
 - This defect hid projects from the list; it did not delete `project.db` or the
   imported read-only copies. If a workspace was created with v0.1.2 and is not
   listed after upgrading, use **打开项目目录…** once and select the directory
-  containing `project.db`. CostGuard remembers its parent workspace thereafter.
+  containing `project.db`. The app remembers its parent workspace thereafter.
 
 ### Testing
 - 254 tests passed, including restart simulation, multi-workspace discovery,
@@ -242,7 +247,7 @@ required; ships with a fully synthetic anonymous demo corpus.
 
 ### Added
 - **macOS arm64 DMG build** (`scripts/build_macos_arm64.sh` +
-  `src/costguard/platform/packaging/macos_arm64.spec`): PyInstaller onedir app
+  historical path `src/costguard/platform/packaging/macos_arm64.spec`): PyInstaller onedir app
   (arm64-native, ad-hoc signed, NOT notarized), DMG with Applications symlink,
   built-in 三分钟上手 RTF and 匿名演示数据 folder, mount smoke test, SHA-256
   output; every gate exits non-zero on failure. Minimum macOS 15.0 (measured
@@ -357,7 +362,7 @@ is not included in this release.
   as current validation.
 - Sheet-level anomalies now retain their settlement direction in the desktop UI,
   matching the Excel anomaly export.
-- Direct `costguard` startup now creates the real main window and remains in the
+- Direct historical `costguard` startup now creates the real main window and remains in the
   Qt event loop on macOS arm64.
 - The WPS acceptance generator now writes to the repository-local ignored workspace
   instead of a developer-specific `.zcode` path.

@@ -48,8 +48,8 @@ def _import_project(
     single_detail: bool = False,
     missing_detail_amount: bool = False,
 ):
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("复核闸门", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -92,7 +92,7 @@ def test_automatic_import_persists_range_evidence(tmp_path):
 
 
 def test_unproven_range_blocks_green_even_when_a_b_c_match(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     _info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -111,7 +111,7 @@ def test_unproven_range_blocks_green_even_when_a_b_c_match(tmp_path):
 
 
 def test_missing_raw_amount_cannot_be_sufficient_when_control_matches(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     _info, conn, _report, period_id = _import_project(
         tmp_path, single_detail=True, missing_detail_amount=True
@@ -141,7 +141,7 @@ def test_missing_raw_amount_cannot_be_sufficient_when_control_matches(tmp_path):
 ])
 def test_hidden_visibility_blocks_inferred_range(tmp_path, column, value):
     """自动推断不能把隐藏行/列当作已证明完整；必须人工确认范围。"""
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     _info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -156,7 +156,7 @@ def test_hidden_visibility_blocks_inferred_range(tmp_path, column, value):
 
 def test_persisted_overall_status_is_not_match_when_range_unproven(tmp_path):
     """旧 period_totals 读取面也不能把证据不足写成整体 match。"""
-    from costguard.core.engine import aggregate, crosscheck
+    from jiadun.core.engine import aggregate, crosscheck
 
     info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -179,7 +179,7 @@ def test_persisted_overall_status_is_not_match_when_range_unproven(tmp_path):
 
 
 def test_confirmed_non_settlement_sheet_is_not_pending(tmp_path):
-    from costguard.core.engine import crosscheck, settlement_io
+    from jiadun.core.engine import crosscheck, settlement_io
 
     info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -213,8 +213,8 @@ def test_confirmed_non_settlement_sheet_is_not_pending(tmp_path):
 
 
 def test_crosscheck_result_survives_reopen(tmp_path):
-    from costguard.core.engine import aggregate, crosscheck
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import aggregate, crosscheck
+    from jiadun.core.models import project as pm
 
     info, conn, _report, period_id = _import_project(tmp_path)
     workspace = Path(info.workspace_path)
@@ -258,7 +258,7 @@ def test_crosscheck_result_survives_reopen(tmp_path):
 
 
 def test_period_totals_carries_run_verification_level(tmp_path):
-    from costguard.core.engine import aggregate, crosscheck
+    from jiadun.core.engine import aggregate, crosscheck
 
     info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -282,7 +282,7 @@ def test_period_totals_carries_run_verification_level(tmp_path):
 
 
 def test_multiple_grand_totals_make_control_unavailable(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     _info, conn, _report, period_id = _import_project(tmp_path, two_grand_totals=True)
     try:
@@ -295,7 +295,7 @@ def test_multiple_grand_totals_make_control_unavailable(tmp_path):
 
 
 def test_reaggregate_invalidates_persisted_crosscheck_result(tmp_path):
-    from costguard.core.engine import aggregate, crosscheck
+    from jiadun.core.engine import aggregate, crosscheck
 
     info, conn, _report, period_id = _import_project(tmp_path)
     try:
@@ -318,8 +318,8 @@ def test_reaggregate_invalidates_persisted_crosscheck_result(tmp_path):
 
 
 def test_empty_match_reason_does_not_partially_write(tmp_path):
-    from costguard.core.evidence.audit import AuditReasonRequiredError
-    from costguard.core.matching import matching
+    from jiadun.core.evidence.audit import AuditReasonRequiredError
+    from jiadun.core.matching import matching
 
     info, conn, _report, _period_id = _import_project(tmp_path)
     try:
@@ -345,8 +345,8 @@ def test_empty_match_reason_does_not_partially_write(tmp_path):
 
 
 def test_business_fallbacks_hide_unknown_codes():
-    from costguard.core.anomalies.rules import _dir_label
-    from costguard.ui.labels import rule_zh
+    from jiadun.core.anomalies.rules import _dir_label
+    from jiadun.ui.labels import rule_zh
 
     assert _dir_label("upward") == "[对上结算] "
     assert _dir_label("downward") == "[对下结算] "

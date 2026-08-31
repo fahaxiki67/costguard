@@ -1,4 +1,4 @@
-# ARCHITECTURE.md — CostGuard 架构设计
+# ARCHITECTURE.md — Jiadun（价盾）架构设计
 
 > 当前实现参考：v0.1.8 预览候选。架构变更须新增 ADR。
 
@@ -47,8 +47,8 @@
 
 软件自身数据与用户工程数据严格分离：
 
-- **软件配置**：`platform.paths.config_dir()`（macOS: `~/Library/Application Support/CostGuard`；Windows: `%APPDATA%\CostGuard`）
-- **默认工作空间根**：`~/Documents/CostGuardProjects/`（用户可在 UI 中更改）
+- **软件配置**：`platform.paths.config_dir()`（macOS: `~/Library/Application Support/Jiadun`；Windows: `%APPDATA%\Jiadun`）
+- **默认工作空间根**：`~/Documents/JiadunProjects/`（用户可在 UI 中更改）
 - **项目目录**（每个工程项目一个文件夹，用户可见、可备份、可移动）：
 
 ```
@@ -58,6 +58,14 @@
 ├── exports/            # 导出成果
 └── backups/            # Migration 前自动备份
 ```
+
+### 产品改名与兼容
+
+当前产品名称为 **Jiadun（价盾）**，机器可读的命令和 Python 包名为 `jiadun`。
+新建项目使用 `Jiadun` 配置目录和 `JiadunProjects` 工作空间根目录。历史版本
+使用的 `CostGuard` 配置、项目目录和工作空间路径仍属于兼容资料；改名或升级不得
+删除、覆盖或伪造这些旧路径中的原始文件。GitHub 仓库地址、已有 v0.x tag、Release
+和远端资产仍沿用历史 `CostGuard` 名称，旧结果和历史路径必须可追溯。
 
 ## 4. 数据模型概要（project.db）
 

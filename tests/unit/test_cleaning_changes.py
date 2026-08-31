@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from costguard.core.cleaning.changes import decide_change, list_changes, propose_change
-from costguard.core.models import project as project_model
+from jiadun.core.cleaning.changes import decide_change, list_changes, propose_change
+from jiadun.core.models import project as project_model
 
 
 def test_cleaning_change_lifecycle_keeps_business_value_untouched(tmp_path: Path):

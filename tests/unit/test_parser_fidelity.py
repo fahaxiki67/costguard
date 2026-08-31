@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_clean, make_messy, make_multi_period  # noqa: E402
 
-from costguard.core.parsing import excel_parser  # noqa: E402
+from jiadun.core.parsing import excel_parser  # noqa: E402
 
 
 @pytest.fixture(scope="module")

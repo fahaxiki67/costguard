@@ -1,7 +1,7 @@
 name: Package macOS arm64 (manual)
 
 # 手动触发的 macOS Apple Silicon 打包流水线：
-# Python 3.12 → lint → 全量测试 → 构建 CostGuard.app/DMG → SHA256SUMS
+# Python 3.12 → lint → 全量测试 → 构建 Jiadun.app/DMG → SHA256SUMS
 # → 敏感信息扫描（CI 层）→ 上传 Actions artifact。
 # 不创建 Release、不推送 tag——发布动作由维护者本地另行执行并确认。
 
@@ -56,7 +56,7 @@ jobs:
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CostGuard-macos-arm64-dmg
+          name: Jiadun-macos-arm64-dmg
           path: |
             dist/*.dmg
             dist/SHA256SUMS.txt

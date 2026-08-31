@@ -24,14 +24,14 @@ def app():
 @pytest.fixture()
 def wb_page(tmp_path, app):
     """创建项目并打开工作台页。"""
-    from costguard.core.models import project as pm
-    from costguard.ui.workbench import WorkbenchPage
+    from jiadun.core.models import project as pm
+    from jiadun.ui.workbench import WorkbenchPage
 
     info = pm.create_project("UI测试项目", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
     src = tmp_path / "multi.xlsx"
     make_multi_period(src, periods=2)
-    from costguard.core.engine import settlement_io
+    from jiadun.core.engine import settlement_io
 
     settlement_io.import_settlement_file(conn, info.project_id, Path(info.workspace_path), src)
     page = WorkbenchPage(conn, info, info.workspace_path, on_back=lambda: None)
@@ -81,7 +81,7 @@ class TestWorkbench:
         assert "Evidence ID" in evidence_text and "Sheet：" in evidence_text
 
     def test_anomaly_run_and_display(self, wb_page):
-        from costguard.core.anomalies import engine
+        from jiadun.core.anomalies import engine
 
         findings = engine.run_anomalies(wb_page.conn, wb_page.project.project_id)
         wb_page.refresh_anomalies()
@@ -90,7 +90,7 @@ class TestWorkbench:
 
     def test_evidence_renderer_keeps_pretranslated_direction(self):
         """异常证据已写入中文方向时，渲染器不得二次转换成未标记。"""
-        from costguard.ui.workbench import _evidence_entry_text
+        from jiadun.ui.workbench import _evidence_entry_text
 
         rendered = _evidence_entry_text(
             {"direction": "对上结算", "file": "第1期.xlsx"}, source=True
@@ -100,7 +100,7 @@ class TestWorkbench:
 
     def test_anomaly_detail_handles_legacy_dict_evidence_and_localizes_history(self, wb_page):
         """旧版 steps/sources 为对象时，问题中心仍能打开详情且不泄露动作代码。"""
-        from costguard.core.evidence import evidence as evidence_api
+        from jiadun.core.evidence import evidence as evidence_api
 
         evidence_id = evidence_api.add_evidence(
             wb_page.conn,
@@ -167,7 +167,7 @@ class TestWorkbench:
         assert table.item(probe_rows[0], 1).text() == "对上结算"
 
     def test_match_run_and_levels_zh(self, wb_page):
-        from costguard.core.matching import matching
+        from jiadun.core.matching import matching
 
         groups = matching.match_items(wb_page.conn, wb_page.project.project_id)
         matching.save_matches(wb_page.conn, wb_page.project.project_id, groups)
@@ -182,7 +182,7 @@ class TestWorkbench:
         """空原因拒绝接受； QMessageBox 打桩避免 offscreen 模态阻塞。"""
         from PySide6.QtWidgets import QDialog, QMessageBox
 
-        from costguard.ui.workbench import ReasonDialog
+        from jiadun.ui.workbench import ReasonDialog
 
         warned = []
         monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(1))
@@ -198,14 +198,14 @@ class TestWorkbench:
 
     def test_export_via_ui(self, wb_page, tmp_path):
         # 导出按钮逻辑直接调用（避免 QMessageBox 阻塞）
-        from costguard.core.export import excel_export
+        from jiadun.core.export import excel_export
 
         path = excel_export.export_workbook(
             wb_page.conn, wb_page.project.project_id, Path(wb_page.project_dir) / "exports")
         assert path.exists()
 
     def test_fail_closed_state_is_visible_in_workbench_and_export_cards(self, wb_page):
-        from costguard.core.contracts import run_contract
+        from jiadun.core.contracts import run_contract
 
         run_contract.set_fail_closed_state(
             wb_page.conn,
@@ -227,8 +227,8 @@ class TestWorkbench:
         """列表之外的详情和批量动作不能绕过不可用边界。"""
         from PySide6.QtWidgets import QMessageBox
 
-        from costguard.core.contracts import run_contract
-        from costguard.core.matching import matching
+        from jiadun.core.contracts import run_contract
+        from jiadun.core.matching import matching
 
         groups = matching.match_items(wb_page.conn, wb_page.project.project_id)
         assert groups
@@ -256,8 +256,8 @@ class TestWorkbench:
 
 class TestMainWindow:
     def test_two_pages_and_switch(self, app, tmp_path, monkeypatch):
-        from costguard.core.models import project as pm
-        from costguard.ui.main_window import PAGE_PROJECTS, PAGE_WORKBENCH, MainWindow
+        from jiadun.core.models import project as pm
+        from jiadun.ui.main_window import PAGE_PROJECTS, PAGE_WORKBENCH, MainWindow
 
         monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
         monkeypatch.setattr(
@@ -281,8 +281,8 @@ class TestMainWindow:
 
     def test_reopen_replaces_workbench(self, app, tmp_path, monkeypatch):
         """二次打开项目：旧工作台页被替换，连接被关闭，不泄漏。"""
-        from costguard.core.models import project as pm
-        from costguard.ui.main_window import PAGE_WORKBENCH, MainWindow
+        from jiadun.core.models import project as pm
+        from jiadun.ui.main_window import PAGE_WORKBENCH, MainWindow
 
         monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
         monkeypatch.setattr(
@@ -302,8 +302,8 @@ class TestMainWindow:
     ):
         from PySide6.QtWidgets import QDialog
 
-        from costguard.core.models import project as pm
-        from costguard.ui import main_window
+        from jiadun.core.models import project as pm
+        from jiadun.ui import main_window
 
         settings_file = tmp_path / "settings.json"
         default_root = tmp_path / "default"

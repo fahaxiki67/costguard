@@ -28,10 +28,13 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = REPO_ROOT / "examples" / "demo"
+sys.path.insert(0, str(REPO_ROOT / "src"))
+from jiadun import branding  # noqa: E402
 
 SEED = 20260830
 FIXED_TIME = (2026, 1, 1, 0, 0, 0)
 FIXED_DATETIME = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+DEMO_CREATOR = f"{branding.PRODUCT_DISPLAY_NAME}（{branding.PRODUCT_NAME}）合成演示数据生成器"
 
 # 表格样式（演示文件要求：清晰表头、边框、合理列宽）
 _HEADER_FONT = Font(bold=True)
@@ -212,8 +215,8 @@ def build_upward(path: Path) -> None:
                       [None, "合计", None, None, None, None, 57240.00, None]],
         blank_after=[2],
     )
-    wb.properties.creator = "CostGuard 合成演示数据生成器"
-    wb.properties.lastModifiedBy = "CostGuard 合成演示数据生成器"
+    wb.properties.creator = DEMO_CREATOR
+    wb.properties.lastModifiedBy = DEMO_CREATOR
     wb.properties.created = FIXED_DATETIME
     wb.properties.modified = FIXED_DATETIME
     wb.save(path)
@@ -274,8 +277,8 @@ def build_downward(path: Path) -> None:
                       [None, "合计", None, None, None, None, round(subtotal, 2), None]],
         blank_after=[],
     )
-    wb.properties.creator = "CostGuard 合成演示数据生成器"
-    wb.properties.lastModifiedBy = "CostGuard 合成演示数据生成器"
+    wb.properties.creator = DEMO_CREATOR
+    wb.properties.lastModifiedBy = DEMO_CREATOR
     wb.properties.created = FIXED_DATETIME
     wb.properties.modified = FIXED_DATETIME
     wb.save(path)
@@ -301,7 +304,7 @@ def build_downward_append(path: Path) -> None:
     )
 
     # 人材机汇总型表：Sheet 名含"汇总"→ 语义门控，导入后进入"待人工角色确认"。
-    # 这是刻意的演示：展示 CostGuard 不猜测、不给权限就写入正式清单。
+    # 这是刻意的演示：展示价盾不猜测、不给权限就写入正式清单。
     ws = wb.create_sheet("人材机汇总")
     ws.cell(row=1, column=1, value="人材机汇总表（合成演示，导入后需人工确认角色）").font = _TITLE_FONT
     headers = ["序号", "名称", "单位", "数量", "单价", "金额"]
@@ -318,8 +321,8 @@ def build_downward_append(path: Path) -> None:
     for letter, width in {"A": 8, "B": 20, "C": 9, "D": 12, "E": 12, "F": 14}.items():
         ws.column_dimensions[letter].width = width
 
-    wb.properties.creator = "CostGuard 合成演示数据生成器"
-    wb.properties.lastModifiedBy = "CostGuard 合成演示数据生成器"
+    wb.properties.creator = DEMO_CREATOR
+    wb.properties.lastModifiedBy = DEMO_CREATOR
     wb.properties.created = FIXED_DATETIME
     wb.properties.modified = FIXED_DATETIME
     wb.save(path)
@@ -360,8 +363,8 @@ def build_contract(path: Path) -> None:
         else:
             doc.add_paragraph(text)
     props = doc.core_properties
-    props.author = "CostGuard 合成演示数据生成器"
-    props.last_modified_by = "CostGuard 合成演示数据生成器"
+    props.author = DEMO_CREATOR
+    props.last_modified_by = DEMO_CREATOR
     props.created = FIXED_DATETIME
     props.modified = FIXED_DATETIME
     doc.save(path)

@@ -64,8 +64,8 @@ def _make_two_page(path: Path, *, second_grand_total_amount=_MISSING) -> None:
 
 
 def _import(path: Path):
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("C路径测试", path.parent)
     info, conn = pm.open_project(info.workspace_path)
@@ -92,7 +92,7 @@ def _import_source_grand_total(tmp_path: Path, amount):
 
 
 def test_c_control_uses_grand_total_not_page_subtotal(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     src = tmp_path / "two_page.xlsx"
     _make_two_page(src)
@@ -110,7 +110,7 @@ def test_c_control_uses_grand_total_not_page_subtotal(tmp_path):
 
 def test_multiple_grand_totals_make_control_not_available(tmp_path):
     """两个合计级行（如两页各一个"合计"）→ 控制值不唯一，not_available。"""
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     src = tmp_path / "multi_grand.xlsx"
     _make_two_page(src, second_grand_total_amount=D("4675"))
@@ -125,7 +125,7 @@ def test_multiple_grand_totals_make_control_not_available(tmp_path):
 
 
 def test_null_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     conn, period_id = _import_source_grand_total(tmp_path, None)
     try:
@@ -141,7 +141,7 @@ def test_null_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
 
 
 def test_empty_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     conn, period_id = _import_source_grand_total(tmp_path, "   ")
     try:
@@ -157,7 +157,7 @@ def test_empty_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
 
 
 def test_invalid_text_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     conn, period_id = _import_source_grand_total(tmp_path, "not-a-number")
     try:
@@ -174,7 +174,7 @@ def test_invalid_text_grand_total_does_not_fallback_to_page_subtotal(tmp_path):
 
 def test_page_subtotals_sum_to_control(tmp_path):
     """无合计级行时，页级小计之和=全表控制值（互斥分页，不与总计混加）。"""
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     src = tmp_path / "page_only.xlsx"
     _make_two_page(src)
@@ -198,7 +198,7 @@ def test_page_subtotals_sum_to_control(tmp_path):
 
 def test_partial_page_subtotal_reports_honest_diff(tmp_path):
     """页小计未覆盖全部明细（缺第2页小计/合计）：控制差额如实报 diff。"""
-    from costguard.core.engine import crosscheck
+    from jiadun.core.engine import crosscheck
 
     src = tmp_path / "single_sub.xlsx"
     _make_two_page(src)

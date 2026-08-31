@@ -16,10 +16,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from costguard.core.anomalies.rules import rule_duplicates  # noqa: E402
-from costguard.core.db import migrations  # noqa: E402
-from costguard.core.engine.settlement_io import ensure_period, next_period_no  # noqa: E402
-from costguard.core.export.excel_export import export_diff_sheets  # noqa: E402
+from jiadun.core.anomalies.rules import rule_duplicates  # noqa: E402
+from jiadun.core.db import migrations  # noqa: E402
+from jiadun.core.engine.settlement_io import ensure_period, next_period_no  # noqa: E402
+from jiadun.core.export.excel_export import export_diff_sheets  # noqa: E402
 
 
 @pytest.fixture()
@@ -128,9 +128,9 @@ class TestBlock2SetDirection:
         """同期号 up/down 两行，只改选中行；audit subject 按 period_id。"""
         from PySide6.QtWidgets import QApplication
 
-        from costguard.core.evidence import audit as audit_log
-        from costguard.core.models.project import ProjectInfo
-        from costguard.ui.workbench import WorkbenchPage
+        from jiadun.core.evidence import audit as audit_log
+        from jiadun.core.models.project import ProjectInfo
+        from jiadun.ui.workbench import WorkbenchPage
 
         _app = QApplication.instance() or QApplication([])
         conn, pid = db
@@ -157,7 +157,7 @@ class TestBlock2SetDirection:
             def reason(self):
                 return "改方向测试"
 
-        monkeypatch.setattr("costguard.ui.workbench.ReasonDialog", FakeDlg)
+        monkeypatch.setattr("jiadun.ui.workbench.ReasonDialog", FakeDlg)
         warnings = []
         from PySide6.QtWidgets import QMessageBox
 
@@ -174,8 +174,8 @@ class TestBlock2SetDirection:
 
     def test_core_set_direction_rolls_back_when_audit_fails(self, db, monkeypatch):
         """方向核心写入必须与审计保持同一事务。"""
-        from costguard.core.engine import settlement_io
-        from costguard.core.evidence import audit as audit_log
+        from jiadun.core.engine import settlement_io
+        from jiadun.core.evidence import audit as audit_log
 
         conn, pid = db
         period_id = ensure_period(conn, pid, 1, "up1", None, direction="upward")
@@ -199,9 +199,9 @@ class TestBlock2SetDirection:
         """非冲突标记：只改选中行（按 period_id），同期号另一方向不受影响。"""
         from PySide6.QtWidgets import QApplication
 
-        from costguard.core.evidence import audit as audit_log
-        from costguard.core.models.project import ProjectInfo
-        from costguard.ui.workbench import WorkbenchPage
+        from jiadun.core.evidence import audit as audit_log
+        from jiadun.core.models.project import ProjectInfo
+        from jiadun.ui.workbench import WorkbenchPage
 
         _app = QApplication.instance() or QApplication([])
         conn, pid = db
@@ -225,7 +225,7 @@ class TestBlock2SetDirection:
             def reason(self):
                 return "改方向测试"
 
-        monkeypatch.setattr("costguard.ui.workbench.ReasonDialog", FakeDlg)
+        monkeypatch.setattr("jiadun.ui.workbench.ReasonDialog", FakeDlg)
         # 先移走 down 第1期的期号（改为 down 第5期），使 up1→downward 不撞车
         with conn:
             conn.execute("UPDATE settlement_periods SET period_no=5 WHERE id=?", (down1,))
@@ -265,7 +265,7 @@ class TestBlock3NextPeriodNo:
         """导入兜底路径（无期号文件名+无 sheet 期号）必须按导入方向递增。"""
         import openpyxl
 
-        from costguard.core.engine import settlement_io
+        from jiadun.core.engine import settlement_io
         conn, pid = db
         wb = openpyxl.Workbook()
         ws = wb.active

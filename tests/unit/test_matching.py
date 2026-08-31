@@ -2,10 +2,10 @@
 
 import pytest
 
-from costguard.core.contracts import run_contract
-from costguard.core.db import migrations
-from costguard.core.evidence import audit as audit_log
-from costguard.core.matching import matching as matching_mod
+from jiadun.core.contracts import run_contract
+from jiadun.core.db import migrations
+from jiadun.core.evidence import audit as audit_log
+from jiadun.core.matching import matching as matching_mod
 
 
 @pytest.fixture()

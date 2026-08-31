@@ -11,7 +11,7 @@
   "files": [
     {
       "file_name": "演示-对上结算-第1至3期.xlsx",
-      "sha256": "523e2878528050da83f2899ea7864986da8b6bf9fc708fa8a085c0bf78e73583",
+      "sha256": "defbd6e65d0ccf3fb071bb845c410156c14c23635c929f8b93cd56a0ad2eab29",
       "data_type": "xlsx",
       "direction": "upward",
       "periods": [
@@ -74,7 +74,7 @@
     },
     {
       "file_name": "演示-对下结算-第1至3期.xlsx",
-      "sha256": "b2ef15368ee040b34149e8b56a2c5dd7d72aa207d928c89d3d4bc2d6d341dc73",
+      "sha256": "af3dda93118ee3b09c00f1f7c7ec2c89b349932efd351ddf743406928fd88872",
       "data_type": "xlsx",
       "direction": "downward",
       "periods": [
@@ -106,7 +106,7 @@
     },
     {
       "file_name": "演示-对下结算-附表.xlsx",
-      "sha256": "fab2c9e2277954a96e20bd5ce08776b34e51cd2c053af9b45f6cb0d1f9a72f33",
+      "sha256": "da901b96c3b45e80cde5bcdbec35eb23dd27aa47419c0e54fb26e8117d966894",
       "data_type": "xlsx",
       "direction": "downward",
       "periods": [
@@ -127,7 +127,7 @@
     },
     {
       "file_name": "演示-合同摘录-合成.docx",
-      "sha256": "c60c61ceaf71e01dca615b50becfa0231c584148d04942b33b7921a6f54a9c91",
+      "sha256": "9602fc5ccf7aa883192a3fd8afb7c5417912b16799c0b6a4e057ae52f61e9d5a",
       "data_type": "docx",
       "direction": "contract",
       "periods": [],

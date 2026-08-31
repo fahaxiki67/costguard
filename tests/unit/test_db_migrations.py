@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from costguard.core.db import migrations
+from jiadun.core.db import migrations
 
 
 def _tmp_db(tmp_path: Path) -> Path:
@@ -230,7 +230,7 @@ class TestLegacyUpgrade:
 
     def test_v1_database_upgrades_to_latest_with_data(self, tmp_path):
         """旧库兼容：v1 结构 + 已有数据 → migrate 到最新，数据保留。"""
-        from costguard.core.db import migrations as m
+        from jiadun.core.db import migrations as m
 
         db = tmp_path / "legacy.db"
         # 手工只应用 v1

@@ -8,9 +8,22 @@ from __future__ import annotations
 
 import pytest
 
-from costguard.core.models import project as project_model
+from jiadun.core.models import project as project_model
 
 
 @pytest.fixture(autouse=True)
 def _isolate_global_settings(tmp_path, monkeypatch):
     monkeypatch.setattr(project_model, "_SETTINGS_FILE", tmp_path / "settings.json")
+    # legacy: 测试默认不应读取本机真实 CostGuard 设置；兼容回退由专门测试
+    # 显式注入临时 legacy 文件验证。
+    monkeypatch.setattr(
+        project_model.platform_paths,
+        "legacy_settings_file",
+        lambda: tmp_path / "legacy-settings.json",
+    )
+    # legacy: 隔离本机既有 CostGuardProjects，避免只读发现污染路径断言。
+    monkeypatch.setattr(
+        project_model.platform_paths,
+        "legacy_workspace_root",
+        lambda: tmp_path / "CostGuardProjects",
+    )

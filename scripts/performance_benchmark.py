@@ -1,4 +1,4 @@
-"""CostGuard 大项目性能基准（仅使用合成数据）。
+"""Jiadun 大项目性能基准（仅使用合成数据）。
 
 本脚本驱动现有的真实导入、分页/搜索、异常检测、匹配、双向校核和 Excel
 导出链路，记录每个阶段的墙钟耗时、Python 峰值分配和进程 RSS 高水位，输出
@@ -59,8 +59,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if SRC_ROOT.is_dir() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from costguard.core.acceptance import build_acceptance_bundle  # noqa: E402
-from costguard.core.contracts import run_contract  # noqa: E402
+from jiadun.core.acceptance import build_acceptance_bundle  # noqa: E402
+from jiadun.core.contracts import run_contract  # noqa: E402
 
 DEFAULT_SIZES = (10_000, 50_000, 200_000)
 MAX_SIZE = 1_000_000
@@ -73,7 +73,7 @@ MARKDOWN_NAME = "performance_benchmark.md"
 def default_output_dir() -> Path:
     """返回默认报告目录；不落在仓库、``local_private_data`` 或用户项目内。"""
 
-    return Path(tempfile.gettempdir()) / "costguard-performance-benchmark"
+    return Path(tempfile.gettempdir()) / "jiadun-performance-benchmark"
 
 
 def _now() -> str:
@@ -86,7 +86,7 @@ def _emit(message: str, progress: Callable[[str], None] | None = None) -> None:
     if progress is not None:
         progress(message)
         return
-    print(f"[CostGuard性能基准] {message}", flush=True)
+    print(f"[价盾性能基准] {message}", flush=True)
 
 
 def _rss_mb() -> float | None:
@@ -293,7 +293,7 @@ def _generate_workbook(
         ])
     # 唯一合计级控制值，便于 C 路径正常参与；不添加本页小计以免重复控制。
     ws.append([None, "合计", None, None, None, None, subtotal, None])
-    wb.properties.creator = "CostGuard synthetic performance benchmark"
+    wb.properties.creator = "Jiadun（价盾） synthetic performance benchmark"
     wb.save(path)
     return {
         "direction": direction,
@@ -328,7 +328,7 @@ def _generate_inputs(
 def _open_project(work_dir: Path, total_rows: int):
     """创建隔离项目，并将项目模型 settings 重定向到本次合成工作目录。"""
 
-    from costguard.core.models import project as project_model
+    from jiadun.core.models import project as project_model
 
     # project_model 会持久登记工作空间；基准运行不应触碰用户设置文件。
     project_model._SETTINGS_FILE = work_dir / "settings.json"
@@ -435,13 +435,13 @@ def _run_size(
         record["input"] = generation
 
         # ---- 隔离项目 + 导入 ----
-        from costguard.core.models import project as project_model
+        from jiadun.core.models import project as project_model
 
         old_settings_file = project_model._SETTINGS_FILE
 
         def import_operation() -> dict[str, Any]:
             nonlocal conn
-            from costguard.core.engine import settlement_io
+            from jiadun.core.engine import settlement_io
 
             info, conn = _open_project(size_work, total_rows)
             reports = []
@@ -529,7 +529,7 @@ def _run_size(
 
         # ---- 异常检测 ----
         def anomaly_operation() -> dict[str, Any]:
-            from costguard.core.anomalies import engine as anomaly_engine
+            from jiadun.core.anomalies import engine as anomaly_engine
 
             findings = anomaly_engine.run_anomalies(conn, project_id)
             by_severity = Counter(f.severity for f in findings)
@@ -548,7 +548,7 @@ def _run_size(
 
         # ---- 匹配 ----
         def matching_operation() -> dict[str, Any]:
-            from costguard.core.matching import matching
+            from jiadun.core.matching import matching
 
             groups = matching.match_items(conn, project_id)
             by_level = Counter(group.level for group in groups)
@@ -569,7 +569,7 @@ def _run_size(
 
         # ---- 聚合 + A/B/C 双向校核 ----
         def crosscheck_operation() -> dict[str, Any]:
-            from costguard.core.engine import aggregate, crosscheck
+            from jiadun.core.engine import aggregate, crosscheck
 
             # persist_period_totals 会使对应期次的旧校核结果失效。先完成两个方向
             # 的聚合/持久化，再运行 A/B/C，避免第二个方向的持久化清掉第一个方向
@@ -614,7 +614,7 @@ def _run_size(
             )
         else:
             def export_operation() -> dict[str, Any]:
-                from costguard.core.export import excel_export
+                from jiadun.core.export import excel_export
 
                 export_dir = Path(conn.execute(
                     "SELECT workspace_path FROM projects WHERE id=?", (project_id,)
@@ -654,7 +654,7 @@ def _run_size(
                 pass
         if old_settings_file is not None:
             try:
-                from costguard.core.models import project as project_model
+                from jiadun.core.models import project as project_model
 
                 project_model._SETTINGS_FILE = old_settings_file
             except Exception:
@@ -689,7 +689,7 @@ def _write_reports(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path
         encoding="utf-8",
     )
     lines = [
-        "# CostGuard 大项目性能基准",
+        "# 价盾（Jiadun）大项目性能基准",
         "",
         f"- 生成时间：{report.get('generated_at', '未记录')}",
         f"- 基准状态：{_summary_status(report.get('status', '未记录'))}",
@@ -750,7 +750,7 @@ def _write_reports(report: dict[str, Any], output_dir: Path) -> tuple[Path, Path
     lines.extend([
         "## 解释与限制",
         "",
-        "- 耗时包含当前阶段调用的真实 CostGuard 管线；Python 峰值由 `tracemalloc` 记录，RSS 是进程级高水位，二者口径不同。",
+        "- 耗时包含当前阶段调用的真实价盾管线；Python 峰值由 `tracemalloc` 记录，RSS 是进程级高水位，二者口径不同。",
         "- “匹配计算”只测候选分组，不把大批待复核候选写入 `matches` 表，也不把候选解释为人工确认。",
         "- 双向校核报告保留 A/B/C 路径和校核级别；合成资料的结果只用于容量/耗时观察，不构成任何业务结论。",
         "- 本报告不能替代 WPS、macOS Excel、Windows Excel 真机打开/重算/保存/重开验证，也不能替代真实案例回归。",
@@ -784,7 +784,7 @@ def run_benchmark(
     report_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, Any] = {
         "schema_version": 1,
-        "benchmark": "CostGuard synthetic performance benchmark",
+        "benchmark": "Jiadun synthetic performance benchmark",
         "benchmark_version": run_contract._app_version(),
         "generated_at": _now(),
         "status": "running",
@@ -884,7 +884,7 @@ def run_benchmark(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="用合成数据测量 CostGuard 1万/5万/20万行导入、分页搜索、异常、匹配、校核和 Excel 导出性能。"
+        description="用合成数据测量价盾 1万/5万/20万行导入、分页搜索、异常、匹配、校核和 Excel 导出性能。"
     )
     parser.add_argument(
         "--sizes",

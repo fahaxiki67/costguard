@@ -1,7 +1,7 @@
 # ADR-009: 采用 Apache License 2.0
 状态: Accepted | 日期: 2026-08-30
 ## 决策
-CostGuard 首次公开发布采用 **Apache License 2.0**。仓库根目录提供完整
+Jiadun（价盾）首次公开发布采用 **Apache License 2.0**。仓库根目录提供完整
 `LICENSE`，项目元数据使用 SPDX 标识 `Apache-2.0`。
 
 此前“首次只建私有仓库、许可证暂缓”的决定已被用户“先发布可用 V1、后续持续

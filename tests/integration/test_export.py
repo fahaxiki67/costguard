@@ -9,16 +9,16 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_messy, make_multi_period  # noqa: E402
 
-from costguard.core.anomalies import engine  # noqa: E402
-from costguard.core.contracts import run_contract  # noqa: E402
-from costguard.core.engine import settlement_io  # noqa: E402
-from costguard.core.engine.money import round2  # noqa: E402
-from costguard.core.export import excel_export  # noqa: E402
+from jiadun.core.anomalies import engine  # noqa: E402
+from jiadun.core.contracts import run_contract  # noqa: E402
+from jiadun.core.engine import settlement_io  # noqa: E402
+from jiadun.core.engine.money import round2  # noqa: E402
+from jiadun.core.export import excel_export  # noqa: E402
 
 
 @pytest.fixture()
 def full_project(tmp_path):
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("导出-全流程", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -53,8 +53,8 @@ class TestExcelExport:
         with pytest.raises(run_contract.CurrentResultsUnavailableError, match="当前结果不可用"):
             exporter(conn, info.project_id, exports)
 
-        assert not list(exports.glob("CostGuard审核底稿_*.xlsx"))
-        assert not list(exports.glob("CostGuard管理层摘要_*.docx"))
+        assert not list(exports.glob("价盾审核底稿_*.xlsx"))
+        assert not list(exports.glob("价盾管理层摘要_*.docx"))
         assert all(
             item["status"] != "current"
             for item in run_contract.export_status(conn, info.project_id, export_kind)
@@ -80,9 +80,9 @@ class TestExcelExport:
             exporter(conn, info.project_id, exports)
 
         patterns = (
-            "CostGuard审核底稿_*.xlsx"
+            "价盾审核底稿_*.xlsx"
             if export_kind == "excel_workbook"
-            else "CostGuard管理层摘要_*.docx"
+            else "价盾管理层摘要_*.docx"
         )
         assert not list(exports.glob(patterns))
         assert not list(exports.glob(".*.tmp"))
@@ -242,7 +242,7 @@ class TestExcelExport:
 
                 time.sleep(attempt - 1)  # 退避 1s / 2s，穿过竞态窗口
             env = dict(os.environ)
-            env["__CFBundleIdentifier"] = f"org.costguard.headless.{os.getpid()}.{attempt}"
+            env["__CFBundleIdentifier"] = f"org.jiadun.headless.{os.getpid()}.{attempt}"
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240,
                                   env=env)
             if proc.returncode == 0:
@@ -426,7 +426,7 @@ class TestExcelExport:
         import docx as docx_lib
 
         doc = docx_lib.Document(str(path))
-        assert "CostGuard 管理层摘要" in doc.paragraphs[0].text
+        assert "价盾 管理层摘要" in doc.paragraphs[0].text
         text = "\n".join(p.text for p in doc.paragraphs)
         assert "合成测试数据" not in text, "通用成果不得把真实资料误写成合成数据"
         assert "人工复核" in text and "业务审批" in text

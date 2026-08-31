@@ -8,7 +8,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from costguard.core.engine.money import (
+from jiadun.core.engine.money import (
     NotANumberError,
     diff,
     money_add,

@@ -8,13 +8,13 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_messy, make_multi_period  # noqa: E402
 
-from costguard.core.anomalies import engine  # noqa: E402
-from costguard.core.engine import settlement_io  # noqa: E402
+from jiadun.core.anomalies import engine  # noqa: E402
+from jiadun.core.engine import settlement_io  # noqa: E402
 
 
 @pytest.fixture()
 def project_messy(tmp_path):
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("异常-messy", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -28,7 +28,7 @@ def project_messy(tmp_path):
 
 @pytest.fixture()
 def project_multi(tmp_path):
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("异常-multi", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))

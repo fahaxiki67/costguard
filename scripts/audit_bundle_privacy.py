@@ -32,7 +32,7 @@ from pathlib import Path
 def _identity_patterns() -> dict[str, bytes]:
     user = os.environ.get("USER") or ""
     home = os.environ.get("HOME") or ""
-    repo = os.environ.get("COSTGUARD_REPO", "")
+    repo = os.environ.get("JIADUN_REPO") or os.environ.get("COSTGUARD_REPO", "")
     base: dict[str, bytes] = {
         "local_private_data": b"local_private_data",
     }
@@ -161,15 +161,28 @@ def _upstream_allowlisted(hit: dict, repo_name: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="安装包隐私审计")
-    parser.add_argument("app", type=Path, help="CostGuard.app 路径")
+    parser.add_argument("app", type=Path, help="Jiadun.app 路径")
     args = parser.parse_args()
     app = args.app.resolve()
-    exe = app / "Contents" / "MacOS" / "CostGuard"
-    if not exe.is_file():
-        print(f"FAIL: 找不到主执行文件 {exe}", file=sys.stderr)
+    executable_candidates = (
+        app / "Contents" / "MacOS" / "Jiadun",
+        app / "Contents" / "MacOS" / "CostGuard",
+    )
+    exe = next((candidate for candidate in executable_candidates if candidate.is_file()), None)
+    if exe is None:
+        print(
+            "FAIL: 找不到主执行文件（期望 Contents/MacOS/Jiadun；"
+            "旧版兼容 Contents/MacOS/CostGuard）",
+            file=sys.stderr,
+        )
         return 1
 
-    repo = Path(os.environ.setdefault("COSTGUARD_REPO", str(Path.cwd()))).resolve()
+    current_repo = os.environ.get("JIADUN_REPO")
+    legacy_repo = os.environ.get("COSTGUARD_REPO")
+    if current_repo and legacy_repo and Path(current_repo).resolve() != Path(legacy_repo).resolve():
+        print("FAIL: JIADUN_REPO 与 COSTGUARD_REPO 不一致，拒绝审计", file=sys.stderr)
+        return 1
+    repo = Path(os.environ.setdefault("JIADUN_REPO", current_repo or legacy_repo or str(Path.cwd()))).resolve()
     repo_name = repo.name
     patterns = _identity_patterns()
     if len(patterns["binary"]) <= 1:

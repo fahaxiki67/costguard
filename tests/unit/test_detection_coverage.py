@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
-from costguard.core.anomalies import coverage, engine, rules
-from costguard.core.models import project as project_model
+from jiadun.core.anomalies import coverage, engine, rules
+from jiadun.core.models import project as project_model
 
 
 def _project(tmp_path: Path):

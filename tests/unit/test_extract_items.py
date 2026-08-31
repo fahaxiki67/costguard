@@ -7,8 +7,8 @@
 """
 from __future__ import annotations
 
-from costguard.core.parsing.extract_items import extract_items
-from costguard.core.parsing.header_detect import HeaderDetection, is_subtotal_row
+from jiadun.core.parsing.extract_items import extract_items
+from jiadun.core.parsing.header_detect import HeaderDetection, is_subtotal_row
 
 DET = HeaderDetection(
     sheet_index=0,

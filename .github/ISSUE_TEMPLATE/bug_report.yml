@@ -10,7 +10,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: CostGuard 版本
+      label: 价盾版本
       placeholder: v0.1.0 / commit SHA
     validations:
       required: true

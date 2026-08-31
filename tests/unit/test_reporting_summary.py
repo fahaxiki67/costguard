@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from costguard.core.anomalies import coverage
-from costguard.core.contracts import run_contract
-from costguard.core.models import project as project_model
-from costguard.core.reporting import build_project_summary, build_report_model
-from costguard.core.reporting.summary import _statuses
+from jiadun.core.anomalies import coverage
+from jiadun.core.contracts import run_contract
+from jiadun.core.models import project as project_model
+from jiadun.core.reporting import build_project_summary, build_report_model
+from jiadun.core.reporting.summary import _statuses
 
 
 def test_report_model_has_one_shared_summary_and_no_approval_upgrade(tmp_path: Path):

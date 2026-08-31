@@ -21,8 +21,8 @@ from gb_templates import make_e6_summary, make_table_08  # noqa: E402
 
 
 def _import(tmp_path: Path, make, fname: str):
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("国标表式测试", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -71,7 +71,7 @@ class TestTable08:
     def test_crosscheck_ab_match_on_table08(self, tmp_path):
         conn, rep = _import(tmp_path, make_table_08, "t08b.xlsx")
         try:
-            from costguard.core.engine import crosscheck
+            from jiadun.core.engine import crosscheck
 
             period_id = conn.execute(
                 "SELECT id FROM settlement_periods LIMIT 1").fetchone()["id"]

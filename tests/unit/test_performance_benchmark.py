@@ -4,7 +4,7 @@ from pathlib import Path
 
 from scripts import performance_benchmark as benchmark
 
-from costguard.core.acceptance import GOLDEN_VECTOR_SHA256, canonical_bundle_hash
+from jiadun.core.acceptance import GOLDEN_VECTOR_SHA256, canonical_bundle_hash
 
 
 def test_benchmark_writes_unique_run_bundle_without_overwrite(tmp_path: Path):
@@ -20,6 +20,8 @@ def test_benchmark_writes_unique_run_bundle_without_overwrite(tmp_path: Path):
     assert first["acceptance_bundle"]["integrity"]["bundle_sha256"] == canonical_bundle_hash(
         first["acceptance_bundle"]
     )
+    assert first["acceptance_bundle"]["runtime"]["product_id"] == "jiadun"
+    assert first["acceptance_bundle"]["runtime"]["product_name"] == "价盾"
     assert first["acceptance_bundle"]["runtime"]["schema_version"] >= 10
     assert first["acceptance_bundle"]["truth"]["metrics"]["precision"] is None
     golden = first["acceptance_bundle"]["golden_vector"]

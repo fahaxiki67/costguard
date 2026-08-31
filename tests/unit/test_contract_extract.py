@@ -2,8 +2,8 @@
 
 import pytest
 
-from costguard.core.contracts import docx_parser, extract
-from costguard.core.db import migrations
+from jiadun.core.contracts import docx_parser, extract
+from jiadun.core.db import migrations
 
 SAMPLE_CONTRACT = """
 工程分包合同

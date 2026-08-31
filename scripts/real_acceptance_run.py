@@ -114,11 +114,15 @@ def _safe_support_limit(value: object) -> str:
     return _safe_report_note(text, max_chars=120)
 
 
-def costguard_version() -> str:
-    try:
-        return version("costguard")
-    except PackageNotFoundError:
-        return "source-checkout"
+def jiadun_version() -> str:
+    # 旧版验收现场可能只带有 costguard dist-info。读取回退不改变当前
+    # 报告身份，只保证改名后的报告仍能记录可追溯的软件版本。
+    for distribution in ("jiadun", "costguard"):
+        try:
+            return version(distribution)
+        except PackageNotFoundError:
+            continue
+    return "source-checkout"
 
 
 def sha256_of(path: Path) -> str:
@@ -167,7 +171,7 @@ def record_acceptance_controls(
     conn, project_id: int, controls: dict | None
 ) -> list[dict]:
     """把已人工确认的源表差异/桥接写入证据链，差异保持 open 待复核。"""
-    from costguard.core.evidence import evidence as evidence_api
+    from jiadun.core.evidence import evidence as evidence_api
 
     recorded: list[dict] = []
     for bridge in (controls or {}).get("bridges", []):
@@ -219,10 +223,10 @@ def write_acceptance_report(report: dict) -> Path:
     """生成仅含验收状态与证据位置的本地报告，不复制私有原文。"""
     results = report["per_file"]
     lines = [
-        "# CostGuard 本地真实资料验收报告",
+        "# 价盾（Jiadun）本地真实资料验收报告",
         "",
         f"- 生成时间：{report['generated_at']}",
-        f"- 软件版本：CostGuard {report['environment']['costguard_version']}",
+        f"- 软件版本：价盾（Jiadun） {report['environment']['jiadun_version']}",
         f"- 测试环境：{report['environment']['system']} "
         f"{report['environment']['machine']}，Python {report['environment']['python']}",
         f"- 测试副本数量：{len(results)}",
@@ -387,8 +391,8 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
         "source_evidence_status": evidence_status,
     }
 
-    from costguard.core.models import project as pm
-    from costguard.core.models.source_file import SourceFileError, import_file
+    from jiadun.core.models import project as pm
+    from jiadun.core.models.source_file import SourceFileError, import_file
 
     # 中断安全：旧现场一律保留，重试目录带序号（验收-<tid>、_r2、_r3…）
     target = project_parent / f"验收-{test_id}"
@@ -417,7 +421,7 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
 
         # ---- 结算解析（xlsx/xls/csv）----
         if sf.file_type in ("xlsx", "xls", "csv"):
-            from costguard.core.engine import settlement_io
+            from jiadun.core.engine import settlement_io
             try:
                 report = settlement_io.import_settlement_file(
                     conn, info.project_id, pdir, copy)
@@ -550,7 +554,7 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                 rec["settlement_parse"]["status"] = "ok_after_manual_confirmation"
 
             # ---- Decimal 复算（独立路径 1：清洗后明细累计）----
-            from costguard.core.engine import aggregate, crosscheck
+            from jiadun.core.engine import aggregate, crosscheck
             try:
                 directions = [
                     r["direction"] or "unknown"
@@ -637,8 +641,8 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                 rec["dual_path_check"] = {"error": f"{type(exc).__name__}: {exc}"}
 
             # ---- 异常 + 匹配 ----
-            from costguard.core.anomalies import engine as anomaly_engine
-            from costguard.core.matching import matching
+            from jiadun.core.anomalies import engine as anomaly_engine
+            from jiadun.core.matching import matching
             anomaly_engine.run_anomalies(conn, info.project_id)
             controls_recorded = record_acceptance_controls(
                 conn, info.project_id, acceptance_controls
@@ -668,7 +672,7 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
             }
 
             # ---- 导出（Excel 审核底稿 + Word 管理层摘要）----
-            from costguard.core.export import excel_export
+            from jiadun.core.export import excel_export
             try:
                 xlsx = excel_export.export_workbook(conn, info.project_id, pdir / "exports")
                 rec["export"] = {"xlsx": xlsx.name}
@@ -698,8 +702,8 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
 
         # ---- 合同/文本解析（docx/pdf/txt）----
         if sf.file_type in ("docx", "pdf", "txt"):
-            from costguard.core.contracts import docx_parser
-            from costguard.core.contracts import extract as contract_extract
+            from jiadun.core.contracts import docx_parser
+            from jiadun.core.contracts import extract as contract_extract
             try:
                 paras = docx_parser.parse_contract(stored, sf.file_type)
                 facts = contract_extract.extract_facts(paras)
@@ -956,11 +960,15 @@ def main(run_dir: Path | None = None) -> None:
     post = verify_corpus(records_raw)
     modified = [r["test_id"] for r in post if r["hash_before"] != r["sha256"]]
 
+    version_value = jiadun_version()
     report = {
         "generated_at": now.isoformat(timespec="seconds"),
         "run_dir": str(run_dir),
         "environment": {
-            "costguard_version": costguard_version(),
+            "jiadun_version": version_value,
+            # 旧验收结果读取器仍查找 costguard_version；保留为只读兼容别名，
+            # 新报告正文和主字段统一使用 jiadun_version。
+            "costguard_version": version_value,
             "system": platform.system(),
             "release": platform.release(),
             "machine": platform.machine(),

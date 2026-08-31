@@ -91,6 +91,18 @@ def check_release_consistency(
         if missing:
             issues.append(f"{relative} 缺少状态标识: {', '.join(missing)}")
 
+    # 品牌迁移后的当前文档必须能明确识别为 Jiadun/价盾。历史发布物名称
+    # 仍允许在兼容说明中出现 CostGuard，因此这里只检查新品牌是否存在，
+    # 不做不安全的全局旧名禁用。
+    missing_brand = [
+        str(relative)
+        for relative, text in loaded.items()
+        if not any(token in text for token in ("Jiadun", "价盾", "jiadun"))
+    ]
+    _check(checks, "current_brand_present", not missing_brand, f"missing={missing_brand}")
+    if missing_brand:
+        issues.append(f"当前文档缺少 Jiadun/价盾 品牌标识: {', '.join(missing_brand)}")
+
     release_note = loaded.get(release_note_relative, "") if release_note_relative else ""
     gate_terms = (
         ("WPS", ("WPS",)),
@@ -117,7 +129,7 @@ def check_release_consistency(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="检查 CostGuard 发布版本与文档一致性")
+    parser = argparse.ArgumentParser(description="检查 Jiadun 发布版本与文档一致性")
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="仓库根目录")
     parser.add_argument("--version", dest="expected_version", help="期望版本；默认读取 pyproject.toml")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")

@@ -11,17 +11,17 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_multi_period  # noqa: E402
 
-from costguard.core.anomalies import coverage  # noqa: E402
-from costguard.core.contracts import run_contract  # noqa: E402
-from costguard.core.engine import aggregate, crosscheck, settlement_io  # noqa: E402
-from costguard.core.reporting import build_project_summary  # noqa: E402
+from jiadun.core.anomalies import coverage  # noqa: E402
+from jiadun.core.contracts import run_contract  # noqa: E402
+from jiadun.core.engine import aggregate, crosscheck, settlement_io  # noqa: E402
+from jiadun.core.reporting import build_project_summary  # noqa: E402
 
 D = Decimal
 
 
 def _make_amount_case(tmp_path, raw_amount=None):
     """构造含原始网格的最小结算项目，允许原始合价缺失或与公式不一致。"""
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("金额计算反例", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -80,7 +80,7 @@ def _make_amount_case(tmp_path, raw_amount=None):
 
 @pytest.fixture()
 def project_multi(tmp_path):
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("累计-多期", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -319,7 +319,7 @@ class TestAggregate:
 
     def test_confirmed_amount_only_item_is_complete_without_quantity(self, tmp_path):
         """名称+金额型计价不虚构数量，金额累计仍应是完整状态。"""
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info = pm.create_project("金额型计价", tmp_path / "ws")
         info, conn = pm.open_project(Path(info.workspace_path))
@@ -523,7 +523,7 @@ class TestCrossCheck:
         self, project_multi
     ):
         """已有成功重跑失败时，旧结果只能保留为历史，不能继续作为当前成功。"""
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info, conn, report = project_multi
         workspace = Path(info.workspace_path)
@@ -881,7 +881,7 @@ class TestCrossCheck:
             conn.set_authorizer(None)
             conn.execute("DROP TRIGGER IF EXISTS block_r3_success_coverage")
 
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         _reopened, reopened = pm.open_project(Path(info.workspace_path))
         try:
@@ -985,7 +985,7 @@ class TestCrossCheck:
         self, project_multi
     ):
         """持续拒绝所有提交时必须进入可读取的运行级不可用边界。"""
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info, conn, report = project_multi
         workspace = Path(info.workspace_path)
@@ -1096,7 +1096,7 @@ class TestCrossCheck:
         self, project_multi, failure_target
     ):
         """失效化四类 DML 失败时，原始异常保留且旧成功不进入当前读取面。"""
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info, conn, report = project_multi
         workspace = Path(info.workspace_path)
@@ -1212,7 +1212,7 @@ class TestCrossCheck:
 
     def test_contract_switch_commit_failure_hides_old_success(self, project_multi):
         """输入签名变化但契约切换提交失败时，旧成功不得继续可见。"""
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info, conn, report = project_multi
         workspace = Path(info.workspace_path)

@@ -1,12 +1,16 @@
-# CostGuard v0.1.2 — macOS DMG 预览（未公证）
+# Jiadun（价盾）v0.1.2 — macOS DMG 预览（未公证，历史版本）
+
+> 兼容说明：本文记录 v0.1.2 当时的发布内容，当时产品名称为 CostGuard；现行产品名称
+> 为 Jiadun（价盾）。下列历史安装物、应用名称和路径按已发布事实保留，不表示远端资产
+> 已经改名。
 
 面向 macOS Apple Silicon 普通用户的第一个可双击安装的预览版。
 
 ## 本次新增
 
-- **CostGuard-0.1.2-macos-arm64.dmg**：双击挂载 → 把 CostGuard.app 拖入
-  Applications → 启动。**不需要安装 Python、uv 或任何开发环境。**
-  - DMG 内含：CostGuard.app、Applications 快捷方式、
+- **历史发布资产 `CostGuard-0.1.2-macos-arm64.dmg`**：双击挂载 → 把历史应用
+  `CostGuard.app` 拖入 Applications → 启动。**不需要安装 Python、uv 或任何开发环境。**
+  - DMG 内含历史应用 `CostGuard.app`、Applications 快捷方式、
     「三分钟上手（先读我）」说明、「匿名演示数据」文件夹。
   - 最低系统：macOS 15.0（随打包的 PySide6 6.11 二进制实测确定）。
   - arm64 原生构建（`lipo` 校验），不混通用二进制。
@@ -29,7 +33,7 @@
 
 - 当前 DMG 为 **ad-hoc 本地签名**，**未经 Apple 公证**。
 - 首次启动时 macOS 可能提示"无法验证开发者"：在"应用程序"文件夹
-  **右键 CostGuard → 打开 → 打开**，只需一次。不同系统设置下提示形态不同，
+  **右键 CostGuard → 打开 → 打开**，只需一次（历史应用名称）。不同系统设置下提示形态不同，
   **不能承诺完全不出现 Gatekeeper 提示**。
 - Developer ID 签名与公证需要 Apple 开发者账号与证书，属后续版本工作；
   签名材料只从本机钥匙串或 GitHub Secrets 读取，绝不入库。
@@ -46,7 +50,7 @@
 
 ## 升级与数据安全
 
-- 项目资料保存在用户本机 `~/Documents/CostGuardProjects/`，与软件分离；
+- 项目资料保存在用户本机的历史路径 `~/Documents/CostGuardProjects/`，与软件分离；
   覆盖安装/删除 App 不影响项目资料。
 - 软件不做后台静默更新；新版本提示由用户自行决定。
 

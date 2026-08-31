@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
-from costguard.ui import labels, theme
+from jiadun.ui import labels, theme
 
 
 def test_theme_tokens_present():
@@ -38,7 +38,7 @@ def test_apply_theme_smoke(qt_app=None):
 
 def test_rule_zh_covers_all_rules_in_engine():
     """anomalies 引擎里出现的每个 rule_id 都必须有中文映射（防漏）。"""
-    from costguard.core.anomalies import rules as anomaly_rules
+    from jiadun.core.anomalies import rules as anomaly_rules
 
     src = (anomaly_rules.__file__ and open(anomaly_rules.__file__, encoding="utf-8").read()) or ""
     ids = set(re.findall(r'"([a-z][a-z0-9_]+_[a-z0-9_]+)"', src))

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# CostGuard macOS Apple Silicon 安装包构建（可重复、失败即非零退出）。
+# Jiadun macOS Apple Silicon 安装包构建（可重复、失败即非零退出）。
 #
-# 产物：dist/CostGuard-<version>-macos-arm64.dmg
-#   - CostGuard.app（PyInstaller onedir，ad-hoc 签名，arm64 原生）
+# 产物：dist/Jiadun-<version>-macos-arm64.dmg
+#   - Jiadun.app（PyInstaller onedir，ad-hoc 签名，arm64 原生）
 #   - Applications 快捷方式（拖入安装）
 #   - 三分钟上手（先读我）.rtf
 #   - 匿名演示数据/（examples/demo 合成数据副本）
@@ -83,30 +83,31 @@ PY
 )"
 [[ -n "$MINOS_MEASURED" ]] || fail "最低 macOS 版本实测失败"
 log "版本 ${VERSION}；实测最低 macOS ${MINOS_MEASURED}（取 PySide6 二进制 minos 最大值）"
-export COSTGUARD_VERSION="$VERSION"
-export COSTGUARD_MIN_MACOS="$MINOS_MEASURED"
+export JIADUN_VERSION="$VERSION"
+export JIADUN_MIN_MACOS="$MINOS_MEASURED"
+BUNDLE_ID="$(uv run python -c 'from jiadun import branding; print(branding.BUNDLE_IDENTIFIER)')"
 
 # ---- 6. 应用图标 ----
-if [[ ! -f src/costguard/resources/icon.icns ]]; then
+if [[ ! -f src/jiadun/resources/icon.icns ]]; then
   log "生成应用图标"
   uv run python scripts/generate_icon.py || fail "图标生成失败"
 fi
 
 # ---- 7. PyInstaller 构建 ----
-log "PyInstaller 构建 CostGuard.app"
+log "PyInstaller 构建 Jiadun.app"
 uv run pyinstaller --noconfirm --clean --distpath dist --workpath build \
-  src/costguard/platform/packaging/macos_arm64.spec || fail "PyInstaller 构建失败"
-APP="dist/CostGuard.app"
+  src/jiadun/platform/packaging/macos_arm64.spec || fail "PyInstaller 构建失败"
+APP="dist/Jiadun.app"
 [[ -d "$APP" ]] || fail "未找到 $APP"
 
 # ---- 8. 架构校验 ----
-ARCHS="$(lipo -archs "$APP/Contents/MacOS/CostGuard")"
+ARCHS="$(lipo -archs "$APP/Contents/MacOS/Jiadun")"
 echo "  主执行文件架构：$ARCHS"
 [[ "$ARCHS" == *arm64* ]] || fail "主执行文件不含 arm64：$ARCHS"
 [[ "$ARCHS" != *x86_64* ]] || fail "混入 x86_64（本脚本仅产 arm64 原生包）：$ARCHS"
 /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" | grep -qx "$VERSION" || \
   fail "Info.plist 版本与 pyproject 不一致"
-/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" | grep -qx "io.github.fahaxiki67.costguard" || \
+/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" | grep -qx "$BUNDLE_ID" || \
   fail "Bundle Identifier 不正确"
 
 # ---- 9. codesign（ad-hoc）+ 自检 ----
@@ -123,7 +124,7 @@ uv run python scripts/audit_bundle_privacy.py "$APP" || fail "隐私审计未通
 log "组装 DMG 内容"
 STAGING="build/dmg-staging"
 mkdir -p "$STAGING"
-cp -R "$APP" "$STAGING/CostGuard.app"
+cp -R "$APP" "$STAGING/Jiadun.app"
 ln -s /Applications "$STAGING/Applications"
 mkdir -p "$STAGING/匿名演示数据"
 cp examples/demo/*.xlsx examples/demo/*.docx \
@@ -132,10 +133,10 @@ cp examples/demo/*.xlsx examples/demo/*.docx \
 uv run python scripts/make_dmg_readme.py --out "$STAGING" || fail "三分钟上手文档生成失败"
 ls "$STAGING" | sed 's/^/  - /'
 
-DMG="dist/CostGuard-${VERSION}-macos-arm64.dmg"
+DMG="dist/Jiadun-${VERSION}-macos-arm64.dmg"
 [[ -e "$DMG" ]] && rm -f "$DMG"
 log "hdiutil 打包 $DMG"
-hdiutil create -volname "CostGuard" -srcfolder "$STAGING" -format UDZO -ov "$DMG" >/dev/null || \
+hdiutil create -volname "Jiadun" -srcfolder "$STAGING" -format UDZO -ov "$DMG" >/dev/null || \
   fail "hdiutil 创建失败"
 
 # ---- 12. DMG 挂载自检 ----
@@ -144,12 +145,12 @@ MP="build/dmg-mount"
 mkdir -p "$MP"
 hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MP" >/dev/null || fail "DMG 挂载失败"
 OK=1
-[[ -d "$MP/CostGuard.app" ]] || { echo "缺少 CostGuard.app"; OK=0; }
+[[ -d "$MP/Jiadun.app" ]] || { echo "缺少 Jiadun.app"; OK=0; }
 [[ -L "$MP/Applications" ]] || { echo "缺少 Applications 快捷方式"; OK=0; }
 [[ -f "$MP/三分钟上手（先读我）.rtf" ]] || { echo "缺少三分钟上手文档"; OK=0; }
 [[ -d "$MP/匿名演示数据" ]] || { echo "缺少匿名演示数据目录"; OK=0; }
 [[ "$(ls "$MP/匿名演示数据" | wc -l | tr -d ' ')" -ge 7 ]] || { echo "演示数据不完整"; OK=0; }
-codesign --verify --deep --strict "$MP/CostGuard.app" || { echo "DMG 内 app 签名校验失败"; OK=0; }
+codesign --verify --deep --strict "$MP/Jiadun.app" || { echo "DMG 内 app 签名校验失败"; OK=0; }
 hdiutil detach "$MP" -quiet >/dev/null 2>&1 || true
 [[ $OK -eq 1 ]] || fail "DMG 内容自检失败"
 

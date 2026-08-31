@@ -1,4 +1,4 @@
-# Contributing to CostGuard
+# Contributing to Jiadun（价盾）
 
 ## Ground rules (enforced)
 1. Read `AGENTS.md` first — its principles override any code convenience.

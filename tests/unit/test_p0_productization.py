@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def _bulk_project(tmp_path: Path, n_items: int):
     """直接批量插入 n_items 明细（绕过 UI），构造大表项目。"""
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("大表项目", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -53,7 +53,7 @@ class TestP01ItemsPagination:
         from PySide6.QtWidgets import QApplication
 
         _app = QApplication.instance() or QApplication([])
-        from costguard.ui.workbench import WorkbenchPage
+        from jiadun.ui.workbench import WorkbenchPage
 
         info, conn, pid = _bulk_project(tmp_path, 2500)
         page = WorkbenchPage(conn, info, info.workspace_path, on_back=lambda: None)
@@ -104,8 +104,8 @@ class TestP02VerificationLevel:
 
     def _seed(self, tmp_path, *, amount=None, grand="合计", subtotal_rows=True,
               pending_sheets=0):
-        from costguard.core.engine import settlement_io
-        from costguard.core.models import project as pm
+        from jiadun.core.engine import settlement_io
+        from jiadun.core.models import project as pm
 
         info = pm.create_project("校核级别", tmp_path / "ws")
         info, conn = pm.open_project(info.workspace_path)
@@ -152,7 +152,7 @@ class TestP02VerificationLevel:
         return conn, period_id
 
     def test_full_match_is_sufficient(self, tmp_path):
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         conn, period_id = self._seed(tmp_path, amount=2610.00, grand="合计")
         try:
@@ -169,7 +169,7 @@ class TestP02VerificationLevel:
         前提说明：页级小计之和是合法控制值（PR#13 已定语义），
         故 C 不可用仅当小计/合计行完全缺失。
         """
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         conn, period_id = self._seed(tmp_path, grand=None, subtotal_rows=False)
         try:
@@ -181,7 +181,7 @@ class TestP02VerificationLevel:
             conn.close()
 
     def test_control_diff_is_findings(self, tmp_path):
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         conn, period_id = self._seed(tmp_path, amount=9999.00, grand="合计")
         try:
@@ -193,7 +193,7 @@ class TestP02VerificationLevel:
 
     def test_pending_sheets_block_green(self, tmp_path):
         """存在待人工工作表 → 不得校核充分（P0-5）。"""
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         conn, period_id = self._seed(tmp_path, amount=2610.00, grand="合计",
                                      pending_sheets=1)
@@ -206,7 +206,7 @@ class TestP02VerificationLevel:
 
     def test_counts_exposed_for_display(self, tmp_path):
         """三行数指标：参与累计明细 / 排除小计 / 排除标题说明行。"""
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         conn, period_id = self._seed(tmp_path, amount=2610.00, grand="合计",
                                      subtotal_rows=True)
@@ -223,7 +223,7 @@ class TestP04BusinessLanguage:
     """P0-4：业务界面中文化。"""
 
     def test_direction_labels_full_business_words(self):
-        from costguard.ui.labels import DIRECTION_ZH
+        from jiadun.ui.labels import DIRECTION_ZH
 
         assert DIRECTION_ZH["upward"] == "对上结算"
         assert DIRECTION_ZH["downward"] == "对下结算"
@@ -233,7 +233,7 @@ class TestP04BusinessLanguage:
         from PySide6.QtWidgets import QApplication, QPushButton
 
         _app = QApplication.instance() or QApplication([])
-        from costguard.ui.workbench import ReasonDialog
+        from jiadun.ui.workbench import ReasonDialog
 
         dlg = ReasonDialog("处理异常", "将异常标记为已处理")
         texts = [b.text() for b in dlg.findChildren(QPushButton)]
@@ -249,8 +249,8 @@ class TestP04BusinessLanguage:
         from PySide6.QtWidgets import QApplication
 
         _app = QApplication.instance() or QApplication([])
-        from costguard.core.models import project as pm
-        from costguard.ui.main_window import MainWindow
+        from jiadun.core.models import project as pm
+        from jiadun.ui.main_window import MainWindow
 
         ws = tmp_path / "ws"
         info = pm.create_project("中文化检查", ws)

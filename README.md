@@ -1,8 +1,8 @@
-# CostGuard
+# Jiadun（价盾）
 
 **Engineering Cost & Compliance Intelligence Workbench** (工程经营合规智能工作台)
 
-CostGuard is a local-first desktop application for construction cost engineers and
+Jiadun（价盾） is a local-first desktop application for construction cost engineers and
 contract/compliance staff. Its first public workflow is:
 
 ```
@@ -23,7 +23,7 @@ Excel import → field standardization → quantity/unit-price/amount checks
 
 ![异常检测](examples/screenshots/05-异常检测.png)
 
-## Why CostGuard
+## Why Jiadun（价盾）
 
 - **Accuracy over automation rate.** Deterministic math (quantities × unit price ×
   amounts, tax, cumulative totals) is always computed by the program with exact
@@ -54,9 +54,9 @@ Python 3.12 · PySide6 · SQLite · openpyxl/xlrd · pandas · rapidfuzz · pdfp
 
 ## Install on macOS Apple Silicon (regular users)
 
-Download `CostGuard-<version>-macos-arm64.dmg` from
+Download `Jiadun-<version>-macos-arm64.dmg` from the existing repository's
 [Releases](https://github.com/fahaxiki67/costguard/releases), open it, drag
-**CostGuard.app** into **Applications**, and launch. No Python, uv or terminal
+**Jiadun.app** into **Applications**, and launch. No Python, uv or terminal
 required. The build is **ad-hoc signed and NOT notarized**: on first launch macOS
 may ask you to right-click the app and choose **Open** — this is expected and
 documented in the [quick start](docs/QUICKSTART_zh-CN.md). Verify downloads with
@@ -71,16 +71,19 @@ differences → anomalies → Excel/Word export — with fully synthetic demo da
 More screenshots: [examples/screenshots/](examples/screenshots/) ·
 完整图文步骤（中文）：[三分钟上手](docs/QUICKSTART_zh-CN.md) ·
 Screenshots are generated from the real running app by
-`scripts/generate_screenshots.py` and can be reproduced locally.
+`scripts/generate_screenshots.py` and can be reproduced locally in the same
+controlled environment for visual layout and pixel-content comparison. Cross-system
+PNG encoding, QuickLook metadata, and font rendering are not promised to have the
+same byte-level SHA-256; the export previews use macOS QuickLook.
 
 ## Run from source
 
 ```bash
 brew install uv
-git clone https://github.com/fahaxiki67/costguard.git
-cd costguard
+git clone https://github.com/fahaxiki67/costguard.git jiadun
+cd jiadun
 uv sync --python 3.12
-uv run costguard
+uv run jiadun
 ```
 
 In the app: create a project → import Excel files → mark periods as upstream or
@@ -104,6 +107,30 @@ uv run python scripts/release_consistency_check.py
 The target-machine performance measurements, WPS/Excel checks, signing and
 notarization, recovery tests and real-case regression remain open release
 gates for v0.1.8.
+
+## Rename and compatibility
+
+The current product name is **Jiadun（价盾）**. The machine-readable command and
+package name are `jiadun`, and new builds use `Jiadun-<version>-macos-arm64.dmg`
+and `Jiadun.app`. The GitHub repository continues to use its existing URL,
+`https://github.com/fahaxiki67/costguard`; the explicit `jiadun` clone directory
+above keeps the local checkout name independent from that historical repository
+address.
+
+The old `costguard` GUI command remains only as a migration compatibility alias;
+new scripts and documentation must use `jiadun`.
+
+The Python import namespace is now `jiadun.*`. The old `costguard.*` namespace is
+not shadowed by a duplicate compatibility package, because two module trees could
+split database/evidence objects; external scripts must migrate their imports.
+
+Existing v0.x tags, releases and remote assets retain their historical
+`CostGuard` names. In particular, a previously published `CostGuard-...` asset
+must not be treated as if the remote file had been renamed. Existing project
+directories and paths using `CostGuard` are compatibility data; renaming the
+product does not delete original files or project data. Follow the migration or
+project-open instructions for any legacy location and keep the old directory
+available until that migration has been checked.
 
 ## License
 

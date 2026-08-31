@@ -15,8 +15,8 @@ import openpyxl
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAN_DIRS = [
-    REPO_ROOT / "src" / "costguard" / "ui",
-    REPO_ROOT / "src" / "costguard" / "core" / "export",
+    REPO_ROOT / "src" / "jiadun" / "ui",
+    REPO_ROOT / "src" / "jiadun" / "core" / "export",
 ]
 # 允许的完整业务词（含这些子串不算暴露）
 BUSINESS_WORDS = ("对上结算", "对下结算", "未标记", "对上累计", "对下累计")
@@ -43,7 +43,7 @@ def test_no_short_direction_literals_in_ui_and_export():
 
 
 def test_no_raw_key_list_additems_in_ui():
-    for f in (REPO_ROOT / "src" / "costguard" / "ui").rglob("*.py"):
+    for f in (REPO_ROOT / "src" / "jiadun" / "ui").rglob("*.py"):
         src = f.read_text(encoding="utf-8")
         assert 'addItems(["", "upward", "downward"])' not in src, (
             f"{f} 仍在用原始键列表做显示项（应 addItem(中文, userData)）")
@@ -55,9 +55,9 @@ def test_workbench_direction_combo_uses_userdata(qtapp=None):
     _app = QApplication.instance() or QApplication([])
     import tempfile
 
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
-    from costguard.ui.workbench import WorkbenchPage
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
+    from jiadun.ui.workbench import WorkbenchPage
 
     ws = Path(tempfile.mkdtemp(prefix="cg-scan-")) / "ws"
     info = pm.create_project("扫描组合", ws)
@@ -86,18 +86,18 @@ def test_exported_workbook_business_language_only(tmp_path):
     """导出工作簿：方向/规则/对象/状态列全部业务中文；内部代码仅在规则代码列。"""
     import re as _re
 
-    from costguard.core.engine import settlement_io
-    from costguard.core.export import excel_export
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.export import excel_export
+    from jiadun.core.models import project as pm
 
     demo = REPO_ROOT / "examples" / "demo"
-    ws = tmp_path / "CostGuardProjects"
+    ws = tmp_path / "JiadunProjects"
     info = pm.create_project("语言扫描导出", ws)
     info, conn = pm.open_project(Path(info.workspace_path))
     settlement_io.import_settlement_file(
         conn, info.project_id, Path(info.workspace_path),
         demo / "演示-对下结算-附表.xlsx", direction="downward")
-    from costguard.core.anomalies import engine as anomaly_engine
+    from jiadun.core.anomalies import engine as anomaly_engine
 
     anomaly_engine.run_anomalies(conn, info.project_id)
     out = excel_export.export_workbook(conn, info.project_id, Path(info.workspace_path) / "exports")

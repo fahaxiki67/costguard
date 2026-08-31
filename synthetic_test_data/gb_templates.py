@@ -22,7 +22,7 @@ _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
 
 def _finalize(wb, path: Path) -> None:
-    wb.properties.creator = "CostGuard 国标表式合成生成器"
+    wb.properties.creator = "Jiadun 国标表式合成生成器"
     wb.properties.created = wb.properties.modified = __import__(
         "datetime").datetime(2026, 1, 1)
     wb.save(path)
@@ -32,7 +32,9 @@ def make_table_08(path: Path) -> None:
     """表-08：三层表头 + 分部标题行 + 明细 + 小计/合计。返回 (明细行数, 小计行数)。"""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    ws = wb.create_sheet("F.1 分部分项工程和单价措施项目清单与计价表(表-08)【合成单位工程】")
+    # Excel/WPS 工作表名上限为 31 个字符；保留表号、业务语义和合成标记，
+    # 避免测试夹具自身制造兼容性警告。
+    ws = wb.create_sheet("F.1 表-08 分部分项清单（合成单位工程）")
     ws.cell(row=1, column=1, value="分部分项工程和单价措施项目清单与计价表").font = Font(bold=True)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
     ws.cell(row=2, column=1, value="工程名称：合成市政道路工程")
@@ -84,7 +86,8 @@ def make_e6_summary(path: Path) -> None:
     """表-07-1 单位工程竣工结算汇总表：三列资金汇总 + 尾部签字行。"""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    ws = wb.create_sheet("E.6 单位工程竣工结算汇总表(表-07-1)一般计税【合成单位工程】")
+    # 同样遵守 31 字符限制，表号和“竣工结算汇总”语义保持不变。
+    ws = wb.create_sheet("E.6 表-07-1 竣工结算汇总（合成单位工程）")
     ws.cell(row=1, column=1, value="单位工程竣工结算汇总表").font = Font(bold=True)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
     ws.cell(row=2, column=1, value="（适用于一般计税方法）")

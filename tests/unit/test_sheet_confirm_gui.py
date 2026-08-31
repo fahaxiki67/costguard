@@ -22,7 +22,7 @@ DEMO_DIR = REPO_ROOT / "examples" / "demo"
 
 class TestSubtotalPageWords:
     def test_page_subtotal_words_flagged(self):
-        from costguard.core.parsing.header_detect import is_subtotal_row
+        from jiadun.core.parsing.header_detect import is_subtotal_row
 
         for text in ("本页小计", "本页合计", "小计", "分部小计"):
             assert is_subtotal_row(text, ""), f"「{text}」应被识别为小计行"
@@ -59,8 +59,8 @@ def qapp():
 @pytest.fixture()
 def gated_project(tmp_path):
     """导入附表文件，制造一个被角色门控的「人材机汇总」工作表。"""
-    from costguard.core.engine import settlement_io
-    from costguard.core.models import project as pm
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("确认对话框测试", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
@@ -72,7 +72,7 @@ def gated_project(tmp_path):
 
 class TestSheetConfirmDialog:
     def _dialog(self, conn, pid):
-        from costguard.ui.workbench import SheetConfirmDialog
+        from jiadun.ui.workbench import SheetConfirmDialog
 
         return SheetConfirmDialog(conn, pid)
 

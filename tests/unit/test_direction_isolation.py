@@ -8,9 +8,9 @@ import json
 
 import pytest
 
-from costguard.core.db import migrations
-from costguard.core.engine import crosscheck
-from costguard.core.engine.settlement_io import ensure_period
+from jiadun.core.db import migrations
+from jiadun.core.engine import crosscheck
+from jiadun.core.engine.settlement_io import ensure_period
 
 
 @pytest.fixture()

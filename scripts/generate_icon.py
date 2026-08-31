@@ -1,4 +1,4 @@
-"""生成 CostGuard 应用图标（src/costguard/resources/icon.icns）。
+"""生成 Jiadun 应用图标（src/jiadun/resources/icon.icns）。
 
 用 PySide6 离屏渲染 1024×1024 母版（纯几何图形，无文字/无字体依赖），
 sips/iconutil 生成 macOS iconset。重新运行输出字节一致（同机确定性）。
@@ -15,7 +15,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OUT_ICNS = REPO_ROOT / "src" / "costguard" / "resources" / "icon.icns"
+OUT_ICNS = REPO_ROOT / "src" / "jiadun" / "resources" / "icon.icns"
 
 ICONSET_SIZES = [16, 32, 128, 256, 512]
 
@@ -92,7 +92,7 @@ def main() -> int:
             return 1
     png = _render_master(1024)
     with tempfile.TemporaryDirectory() as td:
-        iconset = Path(td) / "CostGuard.iconset"
+        iconset = Path(td) / "Jiadun.iconset"
         iconset.mkdir()
         master = Path(td) / "master.png"
         master.write_bytes(png)

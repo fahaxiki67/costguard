@@ -17,14 +17,14 @@ from pathlib import Path
 import openpyxl
 import pytest
 
-from costguard.core.engine.money import money_mul
-from costguard.core.export import excel_export
-from costguard.core.models import project as pm
+from jiadun.core.engine.money import money_mul
+from jiadun.core.export import excel_export
+from jiadun.core.models import project as pm
 
 
 @pytest.fixture()
 def exported(tmp_path):
-    from costguard.core.engine import settlement_io
+    from jiadun.core.engine import settlement_io
 
     info = pm.create_project("双值底稿", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))

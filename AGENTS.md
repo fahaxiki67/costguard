@@ -1,4 +1,4 @@
-# AGENTS.md — CostGuard 开发代理与协作者必须遵守的规则
+# AGENTS.md — Jiadun（价盾）开发代理与协作者必须遵守的规则
 
 > 本文件长期保留项目的最高优先级原则。任何代码变更、重构、依赖引入、文档修改
 > 都必须先对照本文件检查是否违反以下原则。冲突时以本文件为准。
@@ -41,8 +41,8 @@
 
 - 平台顺序固定：P0 = macOS Apple Silicon (arm64)；P1 = Windows x64；P2 = 待定。
 - 禁止分别开发两个独立软件：共享核心引擎 + 共享数据模型 + 共享测试 + 共享 UI + 平台专用打包/适配层。
-- 核心业务代码（`src/costguard/core/`）必须平台无关，不得 import 平台私有 API；
-  平台差异只能进入 `src/costguard/platform/`。
+- 核心业务代码（`src/jiadun/core/`）必须平台无关，不得 import 平台私有 API；
+  平台差异只能进入 `src/jiadun/platform/`。
 - 不得因为 Windows 后续需求阻碍 Mac 主版本推进；也不得为炫酷 UI 引入过重 Web 服务架构。
 
 ## 五、开发方法
@@ -71,7 +71,14 @@
 
 - 升级策略：提示发现新版本 → 用户查看 Release → 用户主动决定升级；
   不得后台静默下载/执行新程序。
-- 发布物：`CostGuard-x.y.z-macos-arm64.dmg`、`CostGuard-x.y.z-windows-x64.exe`
+- 发布物：`Jiadun-x.y.z-macos-arm64.dmg`、`Jiadun-x.y.z-windows-x64.exe`
   与 `SHA256SUMS.txt`；版本遵循 SemVer。
 - 源码采用 Apache License 2.0（见 `docs/adr/ADR-009`）；真实工程资料和
   `local_private_data/` 不属于开源内容，永远不得提交或发布。
+
+## 产品改名与兼容边界
+
+当前产品名称为 **Jiadun（价盾）**，机器可读的命令和 Python 包名为 `jiadun`。
+现行 macOS 应用名称为 `Jiadun.app`。GitHub 仓库地址、已有 v0.x tag、Release、
+远端资产和历史项目目录仍沿用 `CostGuard` 名称；这些历史事实不得伪造为已经改名。
+更名或升级不得删除、覆盖或移动原始资料；旧路径在迁移或重新打开并完成核验前必须保留。

@@ -109,7 +109,7 @@ def generate(out_dir: Path) -> tuple[Path, Path]:
     import docx as docx_lib
 
     doc = docx_lib.Document()
-    doc.add_heading("CostGuard WPS 验收-最小摘要", level=0)
+    doc.add_heading("价盾 WPS 验收-最小摘要", level=0)
     doc.add_paragraph("本文件由程序生成，仅用于验证 WPS 打开、中文显示与数字格式，"
                       "不含任何真实业务数据。")
     doc.add_paragraph("验收要点：标题可见、段落中文正常、不乱码。")

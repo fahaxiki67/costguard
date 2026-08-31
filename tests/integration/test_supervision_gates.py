@@ -17,14 +17,14 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_messy, make_multi_period  # noqa: E402
 
-from costguard.core.anomalies import engine  # noqa: E402
-from costguard.core.engine import settlement_io  # noqa: E402
-from costguard.core.export import excel_export  # noqa: E402
+from jiadun.core.anomalies import engine  # noqa: E402
+from jiadun.core.engine import settlement_io  # noqa: E402
+from jiadun.core.export import excel_export  # noqa: E402
 
 
 @pytest.fixture()
 def project(tmp_path):
-    from costguard.core.models import project as pm
+    from jiadun.core.models import project as pm
 
     info = pm.create_project("监督门槛", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))

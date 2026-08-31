@@ -1,7 +1,14 @@
-# ROADMAP.md — CostGuard 开发路线图
+# ROADMAP.md — Jiadun（价盾）开发路线图
 
 > 平台顺序固定：P0 macOS Apple Silicon → P1 Windows x64 → P2 待定。
 > 每个 Phase 完成：设计 → 实现 → 单元测试 → 集成测试 → Review → 修复 → 回归 → 文档。
+
+## 产品名称与兼容边界
+
+当前产品名称为 **Jiadun（价盾）**，机器可读的命令和 Python 包名为 `jiadun`。
+GitHub 仓库地址、已有 v0.x tag、Release、远端资产和历史项目目录仍保留
+`CostGuard` 名称，作为可追溯的兼容事实；更名和升级不得删除或覆盖原始资料。
+后续构建物统一采用 `Jiadun-<version>-macos-arm64.dmg`、`Jiadun.app` 等现行名称。
 
 ## 状态图例
 ✅ 完成 | 🔨 进行中 | ⬜ 未开始

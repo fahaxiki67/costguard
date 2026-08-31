@@ -3,10 +3,12 @@
 import json
 from pathlib import Path
 
-from costguard.core.anomalies import coverage
-from costguard.core.contracts import run_contract
-from costguard.core.evidence.finding import Finding
-from costguard.core.models import project as project_model
+import pytest
+
+from jiadun.core.anomalies import coverage
+from jiadun.core.contracts import run_contract
+from jiadun.core.evidence.finding import Finding
+from jiadun.core.models import project as project_model
 
 
 def _project(tmp_path: Path):
@@ -23,6 +25,8 @@ def test_run_contract_is_stable_and_changes_when_scope_changes(tmp_path):
         assert same.signature == first.signature
         assert same.contract_id == first.contract_id
         assert first.components["schema_version"] >= 9
+        assert first.components["product_id"] == "jiadun"
+        assert first.components["product_name"] == "价盾"
         assert first.components["rules"]["rule_ids"]
         assert run_contract.current_run_signature(conn, info.project_id) == first.signature
 
@@ -88,10 +92,12 @@ def test_fail_closed_state_persists_across_connections_and_clears_safely(tmp_pat
         assert state["status"] == run_contract.FAIL_CLOSED_STATUS
         assert state["persisted"] is True
         assert state["persistence"] == "sidecar"
+        assert state_path.name == f".jiadun-run-state-{info.project_id}.json"
         assert state_path.is_file()
         assert not run_contract.current_results_available(conn, info.project_id)["available"]
     finally:
         conn.close()
+
 
     _reopened, reopened = project_model.open_project(Path(info.workspace_path))
     try:
@@ -117,6 +123,38 @@ def test_fail_closed_state_persists_across_connections_and_clears_safely(tmp_pat
         assert not state_path.exists()
     finally:
         reopened.close()
+
+
+def test_legacy_fail_closed_sidecar_is_read_only_and_never_deleted(tmp_path, monkeypatch):
+    """价盾双读旧侧车，但完整恢复也不得自动删除 legacy 文件。"""
+    info, conn = _project(tmp_path)
+    try:
+        state = run_contract.set_fail_closed_state(conn, info.project_id, reason="旧侧车样本")
+        current_path = run_contract.fail_closed_state_path(conn, info.project_id)
+        legacy_path = run_contract.legacy_fail_closed_state_paths(conn, info.project_id)[0]
+        legacy_path.write_bytes(current_path.read_bytes())
+        current_path.unlink()
+
+        loaded = run_contract.get_fail_closed_state(conn, info.project_id)
+        assert loaded is not None
+        assert loaded["_legacy_sidecar"] is True
+        assert loaded["_sidecar_path"] == str(legacy_path)
+
+        # 证明函数在这里仅用于隔离“legacy 不可删除”分支；实际业务仍必须
+        # 通过真实 coverage proof 才能恢复。
+        monkeypatch.setattr(run_contract, "_coverage_proof_is_valid", lambda *_a, **_k: True)
+        with pytest.raises(RuntimeError, match="legacy"):
+            run_contract.clear_fail_closed_state(
+                conn,
+                info.project_id,
+                run_signature="legacy-signature",
+                coverage_run_id=1,
+                coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+        assert legacy_path.is_file()
+        assert state["status"] == run_contract.FAIL_CLOSED_STATUS
+    finally:
+        conn.close()
 
 
 def test_fail_closed_state_reports_process_only_fallback_when_sidecar_is_unwritable(
@@ -151,7 +189,7 @@ def test_fail_closed_state_reports_process_only_fallback_when_sidecar_is_unwrita
 
 def test_compatibility_import_uses_the_implementation_module_object():
     """兼容入口与实际模块必须共享属性，故障注入不能打到分叉引用。"""
-    import costguard.core.run_contract as compatibility
+    import jiadun.core.run_contract as compatibility
 
     assert compatibility is run_contract
 

@@ -13,9 +13,9 @@ from pathlib import Path
 
 import pytest
 
-from costguard.core.db import migrations
-from costguard.core.engine import settlement_io
-from costguard.core.models import project as pm
+from jiadun.core.db import migrations
+from jiadun.core.engine import settlement_io
+from jiadun.core.models import project as pm
 
 
 def _wb_sheet(ws, header_row, rows, header):
@@ -201,7 +201,7 @@ class TestGate:
         assert ev and "待人工" in ev[0]["summary"]
         src = json.loads(ev[0]["sources_json"])[0]
         assert src["sheet_id"] and src["confidence"] is not None
-        from costguard.core.evidence import audit as audit_log
+        from jiadun.core.evidence import audit as audit_log
 
         assert any("role" in e.action or "角色" in e.reason
                    for e in audit_log.history_for(conn, pid))
@@ -321,7 +321,7 @@ class TestRound9Semantics:
             conn, pid, sheet_id, actor="复核人",
             reason="经人工核对该 sheet 为结算清单")
         assert _counts(conn)["line_items"] == 2
-        from costguard.core.evidence import audit as audit_log
+        from jiadun.core.evidence import audit as audit_log
 
         assert any(e.action == "confirm_sheet_role"
                    for e in audit_log.history_for(conn, pid))
@@ -330,7 +330,7 @@ class TestRound9Semantics:
         conn, pid, report = _import(db, make_ledger_named_sheet)
         sheet_id = conn.execute(
             "SELECT id FROM raw_sheets WHERE sheet_name='合同台账'").fetchone()["id"]
-        from costguard.core.evidence import audit as audit_log
+        from jiadun.core.evidence import audit as audit_log
 
         with pytest.raises(audit_log.AuditReasonRequiredError):
             settlement_io.confirm_sheet_role_and_extract(
@@ -406,7 +406,7 @@ class TestExplicitColMapConfirmation:
         assert [r["amount"] for r in rows] == ["4650", "24250"], \
             f"金额必须取人工选择的列6: {[tuple(r) for r in rows]}"
         # 审计 old/new mapping
-        from costguard.core.evidence import audit as audit_log
+        from jiadun.core.evidence import audit as audit_log
 
         entries = [e for e in audit_log.history_for(conn, pid)
                    if e.action == "confirm_sheet_role"]
@@ -556,7 +556,7 @@ class TestRealScenarioManualConfirmation:
         ).fetchone()
         assert tuple(header) == (4, 5, 6, 6)
 
-        from costguard.core.engine import crosscheck
+        from jiadun.core.engine import crosscheck
 
         checked = crosscheck.check_period(conn, period["id"])
         assert checked.status == "match"

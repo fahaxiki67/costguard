@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from costguard.core.db import migrations
-from costguard.core.models import project as project_model
-from costguard.core.models import source_file
+from jiadun.core.db import migrations
+from jiadun.core.models import project as project_model
+from jiadun.core.models import source_file
 
 
 def _file_state(path: Path) -> tuple[int, int, str]:
@@ -205,7 +205,7 @@ class TestProject:
 
         import openpyxl
 
-        from costguard.core.models import source_file
+        from jiadun.core.models import source_file
 
         info = project_model.create_project("移动后副本恢复", ws)
         pdir = Path(info.workspace_path)
@@ -322,7 +322,7 @@ class TestSchemaCopyMigration:
     """
 
     def _build_v3_database(self, db, pdir) -> None:
-        from costguard.core.db import migrations
+        from jiadun.core.db import migrations
 
         conn = sqlite3.connect(db)
         conn.execute("PRAGMA foreign_keys=OFF")
@@ -375,7 +375,7 @@ class TestSchemaCopyMigration:
             conn.close()
 
     def test_v3_database_upgrades_to_latest_with_data_intact(self, tmp_path):
-        from costguard.core.db import migrations
+        from jiadun.core.db import migrations
 
         pdir = tmp_path / "旧版项目"
         (pdir / "originals").mkdir(parents=True)

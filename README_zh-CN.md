@@ -1,4 +1,4 @@
-# CostGuard — 工程经营合规智能工作台
+# Jiadun（价盾）— 工程经营合规智能工作台
 
 面向工程造价、经营合规、合同、结算、考核和管理汇报的**本地单机**智能工作台。
 
@@ -62,10 +62,10 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 
 ### 普通用户（macOS Apple Silicon，推荐）
 
-1. 从 [Releases](https://github.com/fahaxiki67/costguard/releases) 下载
-   `CostGuard-<版本号>-macos-arm64.dmg`，可用 `SHA256SUMS.txt` 校验。
-2. 双击打开 DMG，把 **CostGuard.app** 拖入 **Applications**。
-3. 从"应用程序"启动。**当前版本未做 Apple 公证**：首次打开如提示"无法验证开发者"，
+1. 从仍沿用历史仓库地址的 [Releases](https://github.com/fahaxiki67/costguard/releases) 下载
+   `Jiadun-<版本号>-macos-arm64.dmg`，可用 `SHA256SUMS.txt` 校验。
+2. 双击打开 DMG，把 **Jiadun.app** 拖入 **Applications**。
+3. 从"应用程序"启动价盾。**当前版本未做 Apple 公证**：首次打开如提示"无法验证开发者"，
    在应用程序文件夹**右键 → 打开**即可（详见[三分钟上手](docs/QUICKSTART_zh-CN.md)）。
 4. 点击 **「体验匿名演示」**，三分钟走完
    导入 → 标准化 → Decimal 金额校核 → 同义匹配 → 对上对下差异 → 异常检测 →
@@ -75,16 +75,18 @@ Excel 导入 → 清单字段标准化 → 工程量/单价/总价校核 → 同
 
 更多截图见 [examples/screenshots/](examples/screenshots/)，图文步骤见
 **[三分钟上手 QUICKSTART_zh-CN](docs/QUICKSTART_zh-CN.md)**。
-截图由 `scripts/generate_screenshots.py` 驱动真实运行的程序生成，可在本地复现。
+截图由 `scripts/generate_screenshots.py` 驱动真实运行的程序生成，可在相同受控环境
+复现视觉布局和像素内容；跨系统 PNG 编码、QuickLook 元数据和字体渲染不承诺字节级
+SHA-256 一致，导出预览依赖 macOS QuickLook。
 
 ### 开发者（源码运行）
 
 ```bash
 brew install uv
-git clone https://github.com/fahaxiki67/costguard.git
-cd costguard
+git clone https://github.com/fahaxiki67/costguard.git jiadun
+cd jiadun
 uv sync --python 3.12
-uv run costguard
+uv run jiadun
 ```
 
 第一次使用：
@@ -109,6 +111,23 @@ uv run ruff check src scripts tests
 - 软件自身配置与工程数据严格分离，升级不影响项目资料。
 - 数据库结构带版本号，升级迁移前自动备份、失败可回滚。
 - 真实工程资料禁止进入代码仓库（`local_private_data/` 已隔离）。
+
+## 更名与兼容
+
+本产品现行名称为 `Jiadun`，中文名为「价盾」；机器可读的命令和 Python 包名为
+`jiadun`。GitHub 仓库仍沿用原地址
+`https://github.com/fahaxiki67/costguard`，已有 v0.x tag、Release 和远端资产也
+保留历史 `CostGuard` 名称；例如已发布的 `CostGuard-...` 文件不会被伪称为已经改名。
+
+旧版 `costguard` 图形命令暂作为迁移兼容别名保留；新脚本和文档统一使用 `jiadun`。
+
+Python 导入命名空间现为 `jiadun.*`。不再提供会造成两套模块树分叉的
+`costguard.*` 镜像包；外部脚本需要迁移导入路径，项目数据库、Evidence 和历史
+结果不受此命名空间调整影响。
+
+现有使用 `CostGuard` 的项目目录和路径属于兼容资料。更名或升级不会删除原始文件和
+项目资料；旧目录在迁移或重新打开并完成核验前应保留。新版本新建项目使用独立的新路径
+`~/Documents/JiadunProjects/<项目名>/`，具体迁移或打开方式以当前程序提示和后续发布说明为准。
 
 ## 运行契约与问题证据
 
@@ -161,7 +180,7 @@ Office 环境、签名公证、迁移恢复和真实案例回归仍属于 v0.1.8
 
 ## 开源许可证与参与方式
 
-- CostGuard 使用 [Apache License 2.0](LICENSE)。
+- Jiadun（价盾）使用 [Apache License 2.0](LICENSE)。
 - 欢迎提交 Issue、复现样例、规则建议和 Pull Request；优先处理带匿名化样例和可重复验收标准的问题。
 - 真实合同、结算表、企业数据、个人信息和账号凭证不得上传到公开 Issue、PR 或仓库。
 

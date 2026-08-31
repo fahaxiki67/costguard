@@ -8,7 +8,9 @@
 3) steps.compute 必须反映真实计算（有 groups/checks/复算结果），不得用
    解析成功代替。
 """
+import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -93,6 +95,81 @@ def _make_simple(src: Path) -> None:
     wb.save(src)
 
 
+def _git_test(root: Path, *args: str) -> None:
+    """执行临时 Git 仓库命令，不读取或修改当前工作仓库。"""
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+def _expected_head_diff_hash(root: Path) -> str:
+    raw = subprocess.run(
+        ["git", "diff", "HEAD", "--binary", "--", ".", ":!local_private_data"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(raw).hexdigest()
+
+
+def test_acceptance_bundle_hash_covers_staged_unstaged_and_mixed_changes(tmp_path):
+    """运行包的 tracked diff 必须覆盖三种工作树状态且排除私密目录。"""
+    from jiadun.core.acceptance import bundle
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    (repo / "other.txt").write_text("base\n", encoding="utf-8")
+    private = repo / "local_private_data"
+    private.mkdir()
+    (private / "secret.txt").write_text("secret-base\n", encoding="utf-8")
+    _git_test(repo, "init", "-q")
+    _git_test(repo, "add", ".")
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Jiadun Test",
+            "-c",
+            "user.email=jiadun-test@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    tracked = repo / "tracked.txt"
+    other = repo / "other.txt"
+    secret = private / "secret.txt"
+
+    # 仅暂存：旧实现 git diff（不带 HEAD）会错误返回空 patch。
+    tracked.write_text("staged\n", encoding="utf-8")
+    secret.write_text("secret-staged\n", encoding="utf-8")
+    _git_test(repo, "add", "tracked.txt", "local_private_data/secret.txt")
+    assert bundle._tracked_diff_hash(repo) == _expected_head_diff_hash(repo)
+    assert "local_private_data" not in subprocess.run(
+        ["git", "diff", "HEAD", "--binary", "--", ".", ":!local_private_data"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    # 仅未暂存：混合状态前先把索引恢复到 HEAD，保留工作区内容。
+    _git_test(repo, "reset", "-q", "HEAD")
+    tracked.write_text("unstaged\n", encoding="utf-8")
+    secret.write_text("secret-unstaged\n", encoding="utf-8")
+    assert bundle._tracked_diff_hash(repo) == _expected_head_diff_hash(repo)
+
+    # 混合状态：一个文件已暂存，另一个仅在工作区修改，同时仍不能泄露私密目录。
+    tracked.write_text("mixed-staged\n", encoding="utf-8")
+    other.write_text("mixed-unstaged\n", encoding="utf-8")
+    secret.write_text("secret-mixed\n", encoding="utf-8")
+    _git_test(repo, "add", "tracked.txt", "local_private_data/secret.txt")
+    assert bundle._tracked_diff_hash(repo) == _expected_head_diff_hash(repo)
+
+
 def test_decimal_warning_forces_with_findings() -> None:
     """Decimal 复算警告必须阻止无条件 passed，即使其他门槛全绿。"""
     import scripts.real_acceptance_run as runner
@@ -174,8 +251,8 @@ class TestFormRouting:
         - 事实候选进既有 contract_facts（含原文、单元格位置、证据ID、待人工状态）；
         - 审计留痕。
         """
-        from costguard.core.engine import settlement_io
-        from costguard.core.models import project as pm
+        from jiadun.core.engine import settlement_io
+        from jiadun.core.models import project as pm
 
         src = tmp_path / "form.xlsx"
         _make_form_workbook(src)
@@ -242,12 +319,12 @@ class TestFormRouting:
                     f"证据位置不可反向定位: {src['location']}"
 
             # 回归：表单导入不得产生虚假合同风险
-            from costguard.core.contracts import extract as contract_extract
+            from jiadun.core.contracts import extract as contract_extract
 
             assert contract_extract.contract_risks(conn, info.project_id) == []
 
             # 审计留痕
-            from costguard.core.evidence import audit as audit_log
+            from jiadun.core.evidence import audit as audit_log
 
             entries = audit_log.history_for(conn, info.project_id)
             assert any("form" in e.action or "表单" in e.reason for e in entries)
@@ -256,8 +333,8 @@ class TestFormRouting:
 
     def test_form_like_detection_hint(self, tmp_path):
         """键值对表单结构必须给出可恢复诊断提示（而非裸 no_header）。"""
-        from costguard.core.parsing.excel_parser import parse_file
-        from costguard.core.parsing.header_detect import detect_form_like
+        from jiadun.core.parsing.excel_parser import parse_file
+        from jiadun.core.parsing.header_detect import detect_form_like
 
         src = tmp_path / "form.xlsx"
         _make_form_workbook(src)
@@ -355,8 +432,8 @@ class TestComputeTruthfulness:
         """steps.compute 必须反映真实计算：groups 与 checks 全部失败时 compute=False
         （不得用解析成功代替）。"""
         runner, base = runner_env
-        from costguard.core.engine import aggregate as agg_mod
-        from costguard.core.engine import crosscheck as cc_mod
+        from jiadun.core.engine import aggregate as agg_mod
+        from jiadun.core.engine import crosscheck as cc_mod
 
         def boom(*a, **k):
             raise RuntimeError("computation broken")
@@ -507,7 +584,7 @@ class TestAcceptanceControls:
         self, runner_env, tmp_path
     ):
         runner, _ = runner_env
-        from costguard.core.models import project as pm
+        from jiadun.core.models import project as pm
 
         info = pm.create_project("控制值记录", tmp_path / "workspace")
         info, conn = pm.open_project(Path(info.workspace_path))

@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from costguard.core.anomalies import engine, rules
-from costguard.core.db import migrations
+from jiadun.core.anomalies import engine, rules
+from jiadun.core.db import migrations
 
 D = 0
 

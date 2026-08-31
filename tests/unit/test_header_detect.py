@@ -6,8 +6,8 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 
 from generator import make_clean, make_messy  # noqa: E402
 
-from costguard.core.parsing.excel_parser import parse_file  # noqa: E402
-from costguard.core.parsing.header_detect import (  # noqa: E402
+from jiadun.core.parsing.excel_parser import parse_file  # noqa: E402
+from jiadun.core.parsing.header_detect import (  # noqa: E402
     FIELD_DICT,
     detect_header,
     is_subtotal_row,

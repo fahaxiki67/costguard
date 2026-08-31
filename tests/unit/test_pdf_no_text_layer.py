@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from costguard.core.contracts.docx_parser import parse_contract
+from jiadun.core.contracts.docx_parser import parse_contract
 
 # 最小合法单页空白 PDF（无内容流、无文本层）
 MINIMAL_BLANK_PDF = (

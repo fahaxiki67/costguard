@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from costguard.core import demo as demo_core
-from costguard.platform import resources as platform_resources
+from jiadun.core import demo as demo_core
+from jiadun.platform import resources as platform_resources
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,9 +27,9 @@ def test_bundled_demo_dir_resolves_to_repo_examples_in_dev_mode() -> None:
 
 
 def test_provision_demo_project_end_to_end(tmp_path: Path) -> None:
-    from costguard.core.models import project as project_model
+    from jiadun.core.models import project as project_model
 
-    ws = tmp_path / "CostGuardProjects"
+    ws = tmp_path / "JiadunProjects"
     info = demo_core.provision_demo_project(ws)
     assert info.name == "匿名演示项目"
     assert (Path(info.workspace_path) / "project.db").is_file()
@@ -84,15 +84,15 @@ def test_main_window_smoke_demo_entry_and_privacy(
     """离屏冒烟：演示入口按钮存在；项目列表只显示项目名（路径仅进 tooltip）。
 
     工作空间根被 monkeypatch 到临时目录——绝不触碰用户真实
-    ~/Documents/CostGuardProjects。
+    ~/Documents/JiadunProjects。
     """
     _qapp()
     from PySide6.QtWidgets import QPushButton
 
-    from costguard.core.models import project as project_model
-    from costguard.ui.main_window import MainWindow
+    from jiadun.core.models import project as project_model
+    from jiadun.ui.main_window import MainWindow
 
-    ws = tmp_path / "CostGuardProjects"
+    ws = tmp_path / "JiadunProjects"
     ws.mkdir(parents=True)
     monkeypatch.setattr(project_model, "_SETTINGS_FILE", tmp_path / "settings.json")
     monkeypatch.setattr(

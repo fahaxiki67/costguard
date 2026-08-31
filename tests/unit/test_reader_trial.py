@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from costguard.core.parsing.reader_trial import (
+from jiadun.core.parsing.reader_trial import (
     ReaderSnapshot,
     SheetSnapshot,
     run_isolated_reader_trial,

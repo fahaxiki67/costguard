@@ -14,6 +14,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -108,16 +109,27 @@ def test_demo_content_has_no_sensitive_snippets() -> None:
             assert snippet not in data, f"{name} 含敏感片段 {snippet!r}"
 
 
+def test_demo_office_metadata_uses_current_brand() -> None:
+    """演示文件属性也必须显示价盾，避免打开属性页仍暴露旧品牌。"""
+    for name in DEMO_FILES:
+        if not name.endswith((".xlsx", ".docx")):
+            continue
+        with zipfile.ZipFile(DEMO_DIR / name) as archive:
+            core = archive.read("docProps/core.xml").decode("utf-8")
+        assert "CostGuard" not in core, f"{name} 的 Office 属性仍含旧品牌"
+        assert "价盾" in core, f"{name} 的 Office 属性缺少当前品牌"
+
+
 class TestDemoPipeline:
     """演示数据 → 导入 → 校核/异常/匹配 → 合同 → 导出 的端到端行为锁定。"""
 
     @pytest.fixture(scope="class")
     def imported(self, tmp_path_factory):
-        from costguard.core.contracts import extract as contract_extract
-        from costguard.core.engine import settlement_io
-        from costguard.core.models import project as project_model
+        from jiadun.core.contracts import extract as contract_extract
+        from jiadun.core.engine import settlement_io
+        from jiadun.core.models import project as project_model
 
-        root = tmp_path_factory.mktemp("demo_ws") / "CostGuardProjects"
+        root = tmp_path_factory.mktemp("demo_ws") / "JiadunProjects"
         info = project_model.create_project("匿名演示项目", root)
         info, conn = project_model.open_project(info.workspace_path)
         pdir = Path(info.workspace_path)
@@ -235,7 +247,7 @@ class TestDemoPipeline:
         assert ev >= 1, "门控 Sheet 必须留有人工确认入口（evidence 候选）"
 
     def test_anomaly_rules_match_manifest(self, imported, manifest: dict) -> None:
-        from costguard.core.anomalies import engine as anomaly_engine
+        from jiadun.core.anomalies import engine as anomaly_engine
 
         info, conn, _ = imported
         findings = anomaly_engine.run_anomalies(conn, info.project_id)
@@ -249,7 +261,7 @@ class TestDemoPipeline:
             f"\n 多出: {sorted(observed - expected)}")
 
     def test_matching_levels_present(self, imported) -> None:
-        from costguard.core.matching import matching
+        from jiadun.core.matching import matching
 
         info, conn, _ = imported
         groups = matching.match_items(conn, info.project_id)
@@ -273,7 +285,7 @@ class TestDemoPipeline:
             assert r["location"], f"{r['fact_key']} 缺少位置信息"
 
     def test_export_workbook_and_summary(self, imported) -> None:
-        from costguard.core.export import excel_export
+        from jiadun.core.export import excel_export
 
         info, conn, pdir = imported
         xlsx = excel_export.export_workbook(conn, info.project_id, pdir / "exports")
