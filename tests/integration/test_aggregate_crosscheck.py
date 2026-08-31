@@ -1341,6 +1341,61 @@ class TestCrossCheck:
             (info.project_id, *params, info.project_id, report.period_no),
         ).fetchone()[0] == 0
 
+    def test_project_run_coordinates_mixed_directions_and_partial_direction_rerun_isolated(
+        self, project_multi
+    ):
+        """混合方向项目由一次协调运行形成全覆盖，局部方向重跑撤下其他方向旧结果。"""
+        info, conn, _report = project_multi
+        with conn:
+            period_rows = conn.execute(
+                """SELECT id, period_no FROM settlement_periods
+                   WHERE project_id=? ORDER BY id""",
+                (info.project_id,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id=?",
+                (period_rows[0]["id"],),
+            )
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE id=?",
+                (period_rows[1]["id"],),
+            )
+        aggregate.persist_period_totals(
+            conn,
+            info.project_id,
+            aggregate.aggregate_project(
+                conn, info.project_id, include_all_directions=True
+            ),
+        )
+
+        run_contract.set_fail_closed_state(
+            conn, info.project_id, reason="mixed direction recovery"
+        )
+        results = crosscheck.run_crosscheck_project(conn, info.project_id)
+        assert len(results) == len(period_rows)
+        assert run_contract.get_fail_closed_state(conn, info.project_id) is None
+        assert coverage.coverage_summary(
+            conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+        )["status"] == coverage.COMPLETE
+        assert run_contract.current_results_available(conn, info.project_id)["available"]
+
+        partial = crosscheck.run_crosscheck(
+            conn, info.project_id, [1], direction="upward"
+        )
+        assert len(partial) == 1
+        summary = build_project_summary(conn, info.project_id)
+        assert summary.verification["periods_checked"] == 1
+        assert summary.verification["periods_unchecked"] == len(period_rows) - 1
+        assert summary.aggregate_coverage["status"] == coverage.FAILED
+        scope, scope_params = run_contract.current_scope(conn, info.project_id, "cr")
+        current_rows = conn.execute(
+            f"""SELECT COUNT(*) FROM crosscheck_results cr
+                WHERE cr.project_id=? AND {scope}""",
+            (info.project_id, *scope_params),
+        ).fetchone()[0]
+        assert current_rows == 1
+
+
     def test_missing_period_total_fails_closed_instead_of_succeeding(self, tmp_path):
         """关键 period_totals 回写缺行时不能产生完整校核结果。"""
         info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")

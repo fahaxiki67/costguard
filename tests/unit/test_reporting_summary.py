@@ -1,5 +1,6 @@
 """统一摘要模型测试。"""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,79 @@ def test_partial_coverage_cannot_clear_pending_fail_closed_state(tmp_path: Path)
             coverage_run_kind=coverage.AGGREGATE_VALIDATION,
         )
         assert not run_contract.current_results_available(conn, info.project_id)["available"]
+    finally:
+        conn.close()
+
+
+def test_declarative_complete_coverage_cannot_clear_without_business_results(tmp_path: Path):
+    """项目有期次时，形状正确的 coverage 不能替代真实 A/B/C 结果。"""
+    info = project_model.create_project("声明式覆盖不能清除", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        with conn:
+            conn.executemany(
+                """INSERT INTO settlement_periods(project_id, period_no, title, direction)
+                   VALUES (?, ?, ?, ?)""",
+                [
+                    (info.project_id, 1, "第1期", "upward"),
+                    (info.project_id, 2, "第2期", "downward"),
+                ],
+            )
+        contract = run_contract.ensure_run_contract(conn, info.project_id)
+        run_contract.set_fail_closed_state(conn, info.project_id, reason="proof binding")
+        expected = list(
+            run_contract._aggregate_expected_coverage_keys(conn, info.project_id)
+        )
+        with pytest.raises(ValueError, match="只能由 run_crosscheck"):
+            coverage.record_detection_run(
+                conn,
+                info.project_id,
+                coverage.coverage_from_values(expected, expected),
+                run_signature=contract.signature,
+                run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+        with conn:
+            cursor = conn.execute(
+                """INSERT INTO detection_runs(
+                       project_id, run_signature, run_kind, started_at, completed_at,
+                       status, expected_json, executed_json, skipped_json, failed_json,
+                       critical_failed_json, error_summary, metadata_json)
+                   VALUES (?, ?, ?, '2026', '2026', 'complete', ?, ?, '{}', '{}', '[]', NULL, '{}')""",
+                (
+                    info.project_id,
+                    contract.signature,
+                    coverage.AGGREGATE_VALIDATION,
+                    json.dumps(expected),
+                    json.dumps(expected),
+                ),
+            )
+        run_id = int(cursor.lastrowid)
+
+        with pytest.raises(RuntimeError, match="完整成功运行证明"):
+            run_contract.clear_fail_closed_state(
+                conn,
+                info.project_id,
+                run_signature=contract.signature,
+                coverage_run_id=run_id,
+                coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+    finally:
+        conn.close()
+
+
+def test_fail_closed_recovery_kind_is_fixed(tmp_path: Path):
+    info = project_model.create_project("固定恢复依据", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        with pytest.raises(ValueError, match="只能由 aggregate_validation"):
+            run_contract.set_fail_closed_state(
+                conn,
+                info.project_id,
+                reason="invalid recovery kind",
+                recovery_run_kind=coverage.ANOMALY_DETECTION,
+            )
+        assert run_contract.get_fail_closed_state(conn, info.project_id) is None
     finally:
         conn.close()
 

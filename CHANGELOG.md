@@ -33,12 +33,20 @@ Preview release focused on review-gate integrity and safe recovery boundaries.
 - Failed or partial cross-check runs invalidate stale current results and cannot
   clear the project fail-closed boundary without a complete current A/B/C
   coverage proof.
+- Project-level cross-checks coordinate periods across both directions,
+  including identical period numbers; a partial direction rerun invalidates
+  the project-wide current view until the complete project run is repeated.
+- Aggregate coverage proofs are bound to the actual project periods,
+  cross-check evidence and persisted period totals, and ordinary public
+  detection runs cannot self-declare the aggregate validation kind.
+- Batch match confirmation checks the live row again in the final conditional
+  update, so a concurrent or trigger-side state change rolls back the batch.
 - Manifest arrival checks now include parsed batch status, Sheet, period,
   direction and header semantics; missing `period_totals` rows and export
   registration failures are explicit failures.
 
 ### Testing
-- 414 automated tests pass on the release candidate, with Ruff and compile
+- 418 automated tests pass on the release candidate, with Ruff and compile
   checks passing. WPS, macOS Excel, Windows Excel, large-project performance,
   signing/notarization, migration recovery and real-case regression remain
   separate preview-release gates.

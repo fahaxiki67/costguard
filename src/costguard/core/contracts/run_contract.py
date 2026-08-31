@@ -45,6 +45,18 @@ _FAIL_CLOSED_STATES: dict[str, dict[str, Any]] = {}
 _FAIL_CLOSED_LOCK = threading.RLock()
 
 
+def _validate_recovery_run_kind(value: str | None) -> str:
+    """固定当前成果的恢复依据，不允许调用方改成其他运行类型。"""
+    if value is None:
+        return DEFAULT_RECOVERY_RUN_KIND
+    normalized = str(value)
+    if normalized != DEFAULT_RECOVERY_RUN_KIND:
+        raise ValueError(
+            "当前运行级不可用边界只能由 aggregate_validation 成功运行解除"
+        )
+    return DEFAULT_RECOVERY_RUN_KIND
+
+
 class CurrentResultsUnavailableError(RuntimeError):
     """当前运行结果不可用，调用方不得继续生成或登记当前成果。"""
 
@@ -152,6 +164,7 @@ def _fail_closed_payload(
     persistence_error: str | None = None,
     recovery_run_kind: str = DEFAULT_RECOVERY_RUN_KIND,
 ) -> dict[str, Any]:
+    recovery_run_kind = _validate_recovery_run_kind(recovery_run_kind)
     limitations = []
     if not persisted:
         limitations.append(
@@ -197,6 +210,7 @@ def set_fail_closed_state(
     recovery_run_kind: str = DEFAULT_RECOVERY_RUN_KIND,
 ) -> dict[str, Any]:
     """设置运行级不可用边界，优先写项目侧车，失败时保留进程内边界。"""
+    recovery_run_kind = _validate_recovery_run_kind(recovery_run_kind)
     path: Path | None
     try:
         path = fail_closed_state_path(conn, project_id)
@@ -292,6 +306,7 @@ def defer_fail_closed_state_clear(
     coverage_run_kind: str,
 ) -> None:
     """把边界清除延后到调用方外层事务真正提交之后。"""
+    coverage_run_kind = _validate_recovery_run_kind(coverage_run_kind)
     state = get_fail_closed_state(conn, project_id)
     if state is None:
         return
@@ -341,9 +356,7 @@ def _pending_clear_is_committed(
         run_signature=signature,
         coverage_run_id=coverage_run_id,
         coverage_run_kind=coverage_run_kind,
-        required_run_kind=str(
-            state.get("recovery_run_kind") or DEFAULT_RECOVERY_RUN_KIND
-        ),
+        required_run_kind=DEFAULT_RECOVERY_RUN_KIND,
     )
 
 
@@ -394,7 +407,8 @@ def _coverage_proof_is_valid(
         row = conn.execute(
             """SELECT id, run_signature, run_kind, status, completed_at,
                               expected_json, executed_json,
-                              skipped_json, failed_json, critical_failed_json
+                              skipped_json, failed_json, critical_failed_json,
+                              metadata_json
                        FROM detection_runs WHERE id=? AND project_id=?""",
             (int(coverage_run_id), project_id),
         ).fetchone()
@@ -440,8 +454,70 @@ def _coverage_proof_is_valid(
     ):
         return False
     required_expected = _aggregate_expected_coverage_keys(conn, project_id)
-    if required_expected is not None:
-        return tuple(expected) == required_expected
+    if required_expected is None:
+        # 空项目没有业务期次，保留初始化阶段的通用覆盖率兼容性。
+        return True
+    if tuple(expected) != required_expected:
+        return False
+
+    # 项目一旦存在期次，coverage 不能只凭调用方声明的 JSON 形状清除边界。
+    # 它必须由 run_crosscheck 产生，并且能和当前签名下的校核结果、期间汇总
+    # 行及对应证据逐期勾稽；否则“完整 coverage”可能在没有任何业务结果时
+    # 直接打开旧成果。
+    metadata = _strict_json_mapping(row["metadata_json"])
+    if metadata is None or metadata.get("producer") != "run_crosscheck":
+        return False
+    required_period_ids = [
+        int(key.split(":")[1]) for key in required_expected[::3]
+    ]
+    metadata_period_ids = metadata.get("period_ids")
+    if (
+        not isinstance(metadata_period_ids, list)
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in metadata_period_ids)
+        or sorted(metadata_period_ids) != sorted(required_period_ids)
+        or metadata.get("result_count") != len(required_period_ids)
+    ):
+        return False
+    placeholders = ",".join("?" for _ in required_period_ids)
+    result_rows = conn.execute(
+        f"""SELECT period_id, evidence_id, checked_at, status
+               FROM crosscheck_results
+               WHERE project_id=? AND run_signature=?
+                 AND period_id IN ({placeholders})""",
+        (project_id, run_signature, *required_period_ids),
+    ).fetchall()
+    if len(result_rows) != len(required_period_ids):
+        return False
+    result_by_period = {int(result["period_id"]): result for result in result_rows}
+    if set(result_by_period) != set(required_period_ids):
+        return False
+    for period_id in required_period_ids:
+        result = result_by_period[period_id]
+        if not result["evidence_id"] or not result["checked_at"] or result["status"] == "invalidated":
+            return False
+        evidence = conn.execute(
+            """SELECT 1 FROM evidence
+               WHERE id=? AND project_id=? AND kind='cross_check'
+                 AND run_signature=?""",
+            (result["evidence_id"], project_id, run_signature),
+        ).fetchone()
+        if evidence is None:
+            return False
+        total_counts = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN run_signature=? THEN 1 ELSE 0 END) AS current_count,
+                      SUM(CASE WHEN run_signature=? AND evidence_id=? THEN 1 ELSE 0 END)
+                         AS linked_count
+               FROM period_totals
+               WHERE project_id=? AND period_id=?""",
+            (run_signature, run_signature, result["evidence_id"], project_id, period_id),
+        ).fetchone()
+        if (
+            int(total_counts["total"] or 0) == 0
+            or int(total_counts["current_count"] or 0) != int(total_counts["total"] or 0)
+            or int(total_counts["linked_count"] or 0) == 0
+        ):
+            return False
     return True
 
 
@@ -462,18 +538,22 @@ def clear_fail_closed_state(
         return
     if conn.in_transaction:
         raise RuntimeError("外层事务尚未提交，不能清除当前结果不可用边界")
-    required_run_kind = str(
-        state.get("recovery_run_kind") or DEFAULT_RECOVERY_RUN_KIND
-    )
-    if coverage_run_kind is None or str(coverage_run_kind) != required_run_kind:
+    try:
+        stored_run_kind = _validate_recovery_run_kind(
+            state.get("recovery_run_kind")
+        )
+        supplied_run_kind = _validate_recovery_run_kind(coverage_run_kind)
+    except ValueError as error:
+        raise RuntimeError("运行级不可用状态的恢复依据非法，继续保持不可用") from error
+    if supplied_run_kind != stored_run_kind:
         raise RuntimeError("清除运行级不可用边界需要匹配边界类型的完整成功运行证明")
     proof = _coverage_proof_is_valid(
         conn,
         project_id,
         run_signature=run_signature,
         coverage_run_id=coverage_run_id,
-        coverage_run_kind=coverage_run_kind,
-        required_run_kind=required_run_kind,
+        coverage_run_kind=supplied_run_kind,
+        required_run_kind=DEFAULT_RECOVERY_RUN_KIND,
     )
     if not proof:
         raise RuntimeError("清除运行级不可用边界需要当前完整成功运行证明")
