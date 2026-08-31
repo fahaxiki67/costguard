@@ -501,31 +501,22 @@ class WorkbenchPage(QWidget):
         self.refresh_export_status()
 
     def _run_crosscheck(self):
-        # 方向隔离：按方向分组逐期校核；同方向内期号唯一，无歧义
-        from costguard.core.engine.crosscheck import AmbiguousPeriodError
-
-        rows = self.conn.execute(
-            "SELECT period_no, direction FROM settlement_periods WHERE project_id=?",
-            (self.project.project_id,),
-        ).fetchall()
+        # 项目级一次性协调所有方向，避免各方向分别形成 3/3 coverage 后
+        # 永远无法满足项目级完整证明；核心入口按 period_id 锁定同期异向期次。
         results = []
         errors = []
-        for direction in sorted({r["direction"] for r in rows}):
-            pnos = sorted(r["period_no"] for r in rows if r["direction"] == direction)
-            try:
-                results.extend(crosscheck.run_crosscheck(self.conn, self.project.project_id, pnos, direction=direction))
-            except AmbiguousPeriodError:
-                errors.append("当前期次存在方向歧义，请先标记方向")
-            except Exception as exc:  # noqa: BLE001 — 核心层保留原始异常，UI 负责明确提示
-                availability = run_contract.current_results_available(
-                    self.conn, self.project.project_id
-                )
-                if not availability["available"]:
-                    errors.append(f"数据库不可写，当前结果不可用：{exc}")
-                    # 同一批次前面方向的返回值也不能在运行级边界下继续显示。
-                    results = []
-                else:
-                    raise
+        try:
+            results = crosscheck.run_crosscheck_project(
+                self.conn, self.project.project_id
+            )
+        except Exception as exc:  # noqa: BLE001 — 核心层保留原始异常，UI 负责明确提示
+            availability = run_contract.current_results_available(
+                self.conn, self.project.project_id
+            )
+            if not availability["available"]:
+                errors.append(f"数据库不可写，当前结果不可用：{exc}")
+            else:
+                raise
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                     "insufficient": "校核不充分"}

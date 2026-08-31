@@ -146,7 +146,7 @@ class TestCrosscheckPeriodLocking:
         assert up.status == "match" and down.status == "match"
 
     def test_period_totals_writeback_locks_period_id(self, mixed):
-        """歧义期号必须明确拒绝；按方向分别校核后，回写必须挂在各自期次上。"""
+        """歧义期号必须明确拒绝；项目级校核回写必须挂在各自期次上。"""
         conn, pid, up_id, down_id = mixed
         # 未声明 direction → 明确拒绝（不静默混算）
         with pytest.raises(crosscheck.AmbiguousPeriodError):
@@ -158,8 +158,7 @@ class TestCrosscheckPeriodLocking:
                     "INSERT INTO period_totals(project_id, period_id, item_key, amount_sum)"
                     " VALUES (?,?,?,?)", (pid, target, "code:K1",
                                           "100" if target == up_id else "200"))
-        crosscheck.run_crosscheck(conn, pid, [1], direction="upward")
-        crosscheck.run_crosscheck(conn, pid, [1], direction="downward")
+        crosscheck.run_crosscheck_project(conn, pid)
         rows = conn.execute(
             """SELECT pt.cross_check_status, pt.evidence_id, sp.direction FROM period_totals pt
                JOIN settlement_periods sp ON sp.id = pt.period_id WHERE pt.project_id=?""",

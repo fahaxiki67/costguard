@@ -369,6 +369,56 @@ class TestHumanReview:
         assert current["status"] == "pending"
         assert current["level"] == matching_mod.SUSPECTED
 
+    def test_confirm_matches_rejects_transactional_status_change(self, db):
+        """批量确认的每一项最终写入必须重新满足完全匹配/待确认条件。"""
+        conn, pid, (p1, p2) = db
+        add(conn, p1, "C1", "平整场地")
+        add(conn, p2, "C1", "平整场地")
+        add(conn, p1, "C2", "挖沟槽土方")
+        add(conn, p2, "C2", "挖沟槽土方")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM matches WHERE project_id=? ORDER BY id", (pid,)
+            ).fetchall()
+        ]
+        assert len(ids) >= 2
+        first_id, second_id = ids[:2]
+        trigger_name = "mutate_batch_confirmation_candidate"
+        with conn:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            conn.execute(
+                f"""CREATE TRIGGER {trigger_name}
+                    AFTER UPDATE OF status ON matches
+                    WHEN NEW.id={first_id} AND NEW.status='confirmed'
+                    BEGIN
+                        UPDATE matches SET level='suspected'
+                        WHERE id={second_id};
+                    END"""
+            )
+        try:
+            with pytest.raises(ValueError, match="待确认的完全匹配"):
+                matching_mod.confirm_matches(
+                    conn, pid, [first_id, second_id], "user", "事务内状态竞态测试"
+                )
+            rows = conn.execute(
+                "SELECT id, level, status FROM matches WHERE id IN (?, ?) ORDER BY id",
+                (first_id, second_id),
+            ).fetchall()
+            assert [(row["level"], row["status"]) for row in rows] == [
+                (matching_mod.CONFIRMED, "pending"),
+                (matching_mod.CONFIRMED, "pending"),
+            ]
+            assert conn.execute(
+                "SELECT COUNT(*) FROM evidence WHERE project_id=?", (pid,)
+            ).fetchone()[0] == 0
+            assert conn.execute(
+                "SELECT COUNT(*) FROM audit_log WHERE project_id=?", (pid,)
+            ).fetchone()[0] == 0
+        finally:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
     def test_override_match(self, db):
         conn, pid, (p1, p2) = db
         add(conn, p1, None, "C25混凝土垫层")
