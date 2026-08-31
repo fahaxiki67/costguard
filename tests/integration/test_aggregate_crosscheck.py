@@ -1277,7 +1277,6 @@ class TestCrossCheck:
             ).fetchone()[0] == 0
         finally:
             reopened.close()
-        run_contract.clear_fail_closed_state(conn, info.project_id)
 
     def test_successful_rerun_clears_fail_closed_state_and_is_current(self, project_multi):
         """完整成功的新运行提交后才清除边界，并恢复当前读取。"""

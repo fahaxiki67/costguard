@@ -2,6 +2,7 @@
 
 import pytest
 
+from costguard.core.contracts import run_contract
 from costguard.core.db import migrations
 from costguard.core.evidence import audit as audit_log
 from costguard.core.matching import matching as matching_mod
@@ -205,6 +206,29 @@ class TestHumanReview:
         mid = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()["id"]
         with pytest.raises(audit_log.AuditReasonRequiredError):
             matching_mod.confirm_match(conn, pid, mid, "测试员", reason="")
+
+    def test_human_mutations_are_blocked_by_run_fail_closed_state(self, db):
+        """核心人工 API 不能依赖 UI 入口检查来绕过运行级边界。"""
+        conn, pid, (p1, p2) = db
+        add(conn, p1, "C1", "平整场地")
+        add(conn, p2, "C1", "平整场地")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        mid = conn.execute("SELECT id FROM matches WHERE project_id=? LIMIT 1", (pid,)).fetchone()["id"]
+        run_contract.set_fail_closed_state(conn, pid, reason="synthetic unavailable boundary")
+
+        with pytest.raises(run_contract.CurrentResultsUnavailableError):
+            matching_mod.confirm_match(conn, pid, mid, "测试员", "当前结果不可用时不得确认")
+        with pytest.raises(run_contract.CurrentResultsUnavailableError):
+            matching_mod.override_match(
+                conn, pid, mid, matching_mod.INCOMPARABLE, "测试员", "当前结果不可用时不得修正"
+            )
+
+        row = conn.execute("SELECT status, level FROM matches WHERE id=?", (mid,)).fetchone()
+        assert row["status"] == "pending"
+        assert row["level"] == matching_mod.CONFIRMED
+        assert conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE project_id=?", (pid,)
+        ).fetchone()["c"] == 0
 
     def test_confirm_records_audit_and_evidence(self, db):
         conn, pid, (p1, p2) = db

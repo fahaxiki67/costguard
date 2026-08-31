@@ -358,6 +358,17 @@ def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGr
 
 # ---- 人工复核 API ----
 
+
+def _current_match_row(
+    conn: sqlite3.Connection, project_id: int, match_id: int
+) -> sqlite3.Row | None:
+    """只读取当前运行契约下的匹配行，禁止人工 API 触碰历史候选。"""
+    scope, scope_params = run_contract.current_scope(conn, project_id, "m")
+    return conn.execute(
+        f"SELECT m.* FROM matches m WHERE m.id=? AND m.project_id=? AND {scope}",
+        (match_id, project_id, *scope_params),
+    ).fetchone()
+
 def confirm_match(
     conn: sqlite3.Connection,
     project_id: int,
@@ -371,40 +382,54 @@ def confirm_match(
     # UI 已有必填门控，核心 API 也必须保持同一边界，避免空原因导致部分写入。
     if not reason or not reason.strip():
         raise audit_log.AuditReasonRequiredError("人工确认匹配必须记录原因（原则 14）")
-    row = conn.execute("SELECT * FROM matches WHERE id=? AND project_id=?", (match_id, project_id)).fetchone()
+    run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
+    row = _current_match_row(conn, project_id, match_id)
     if not row:
         raise ValueError(f"match {match_id} not found")
-    item_ids = json.loads(row["item_ids_json"])
-    if not item_ids:
-        raise ValueError(f"match {match_id} has no line items")
-    placeholders = ",".join("?" for _ in item_ids)
-    directions = {
-        r["direction"] or "unknown"
-        for r in conn.execute(
-            f"""SELECT DISTINCT COALESCE(sp.direction, 'unknown') AS direction
-                FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
-                WHERE li.id IN ({placeholders})""",  # noqa: S608 - placeholders only
-            item_ids,
-        ).fetchall()
-    }
-    if len(directions) != 1:
-        raise ValueError(
-            f"match {match_id} spans {sorted(directions)}; direction-isolated confirmation required"
-        )
-    direction = next(iter(directions))
     # 状态、别名、证据和审计必须同一事务提交。任何一环失败都回滚整次人工
     # 操作，避免“匹配已确认但证据/审计缺失”的不可追溯状态。
     active_signature = run_contract.current_run_signature(conn, project_id, ensure=True)
     if row["run_signature"] != active_signature:
         raise ValueError("该匹配结果已因输入或配置变化失效，请重新运行匹配后再确认")
     with run_contract._transaction(conn, "confirm_match"):
-        conn.execute(
-            "UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=? WHERE id=?",
-            (actor, reason, CONFIRMED, match_id),
+        # UI 对话框或调用方外层事务期间可能发生运行级失效；实际写入前
+        # 必须再次检查可用性、当前 scope 和签名，不能复用入口时的快照。
+        run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
+        live_row = _current_match_row(conn, project_id, match_id)
+        if not live_row or live_row["run_signature"] != active_signature:
+            raise run_contract.CurrentResultsUnavailableError(
+                "确认匹配不可用：匹配结果已不在当前运行范围，请刷新后重试。"
+            )
+        item_ids = json.loads(live_row["item_ids_json"])
+        if not item_ids:
+            raise ValueError(f"match {match_id} has no line items")
+        placeholders = ",".join("?" for _ in item_ids)
+        directions = {
+            r["direction"] or "unknown"
+            for r in conn.execute(
+                f"""SELECT DISTINCT COALESCE(sp.direction, 'unknown') AS direction
+                    FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
+                    WHERE li.id IN ({placeholders})""",  # noqa: S608 - placeholders only
+                item_ids,
+            ).fetchall()
+        }
+        if len(directions) != 1:
+            raise ValueError(
+                f"match {match_id} spans {sorted(directions)}; direction-isolated confirmation required"
+            )
+        direction = next(iter(directions))
+        cur = conn.execute(
+            """UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=?
+               WHERE id=? AND project_id=? AND run_signature=?""",
+            (actor, reason, CONFIRMED, match_id, project_id, active_signature),
         )
-        if alias_name and row["level"] == SUSPECTED:
+        if cur.rowcount != 1:
+            raise run_contract.CurrentResultsUnavailableError(
+                "确认匹配不可用：匹配结果已发生变化，请刷新后重试。"
+            )
+        if alias_name and live_row["level"] == SUSPECTED:
             # 疑似 → 确认后可沉淀为别名（原则 9/14：保存依据与确认记录）
-            canonical = _unscoped_group_key(row["group_key"])
+            canonical = _unscoped_group_key(live_row["group_key"])
             conn.execute(
                 """INSERT OR IGNORE INTO item_aliases(project_id, direction, canonical_key,
                    alias_text, mapping_basis, confirmed_by, confirmed_at)
@@ -415,7 +440,7 @@ def confirm_match(
             )
         evidence_api.add_evidence(
             conn, project_id, "match_confirmation",
-            f"匹配组 {row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
+            f"匹配组 {live_row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
             steps=[{"step": "人工复核", "actor": actor, "reason": reason}],
             sources=[{"match_id": match_id, "direction": direction, "items": item_ids}],
             commit=False,
@@ -423,13 +448,13 @@ def confirm_match(
         )
         audit_log.record_audit(
             conn, project_id, actor, "confirm_match", f"match:{match_id}",
-            {"level": row["level"]},
+            {"level": live_row["level"]},
             {"level": CONFIRMED, "alias": alias_name, "direction": direction}, reason,
             commit=False,
         )
     # 别名是匹配配置的一部分。确认后立即生成新契约，使后续运行不能误用
     # 变更前的候选；本次人工记录仍保留在旧签名历史中。
-    if alias_name and row["level"] == SUSPECTED:
+    if alias_name and live_row["level"] == SUSPECTED:
         run_contract.ensure_run_contract(conn, project_id)
 
 
@@ -446,10 +471,8 @@ def override_match(
         raise audit_log.AuditReasonRequiredError("人工修正匹配必须记录原因（原则 14）")
     if new_level not in LEVEL_SCORES:
         raise ValueError(f"invalid level: {new_level}")
-    row = conn.execute(
-        "SELECT level, run_signature FROM matches WHERE id=? AND project_id=?",
-        (match_id, project_id),
-    ).fetchone()
+    run_contract.require_current_results_available(conn, project_id, operation="修正匹配")
+    row = _current_match_row(conn, project_id, match_id)
     if not row:
         raise ValueError(f"match {match_id} not found")
     # 同确认操作：业务状态、证据和人工审计必须全成或全回滚。
@@ -457,11 +480,24 @@ def override_match(
     if row["run_signature"] != active_signature:
         raise ValueError("该匹配结果已因输入或配置变化失效，请重新运行匹配后再修正")
     with run_contract._transaction(conn, "override_match"):
-        conn.execute("UPDATE matches SET level=?, status='reviewed', reviewed_by=?, review_note=? WHERE id=?",
-                     (new_level, actor, reason, match_id))
+        run_contract.require_current_results_available(conn, project_id, operation="修正匹配")
+        live_row = _current_match_row(conn, project_id, match_id)
+        if not live_row or live_row["run_signature"] != active_signature:
+            raise run_contract.CurrentResultsUnavailableError(
+                "修正匹配不可用：匹配结果已不在当前运行范围，请刷新后重试。"
+            )
+        cur = conn.execute(
+            """UPDATE matches SET level=?, status='reviewed', reviewed_by=?, review_note=?
+               WHERE id=? AND project_id=? AND run_signature=?""",
+            (new_level, actor, reason, match_id, project_id, active_signature),
+        )
+        if cur.rowcount != 1:
+            raise run_contract.CurrentResultsUnavailableError(
+                "修正匹配不可用：匹配结果已发生变化，请刷新后重试。"
+            )
         evidence_api.add_evidence(
             conn, project_id, "match_override",
-            f"匹配组 #{match_id} 级别 {row['level']} → {new_level}（{actor}）",
+            f"匹配组 #{match_id} 级别 {live_row['level']} → {new_level}（{actor}）",
             steps=[{"step": "人工修正", "reason": reason}],
             sources=[{"match_id": match_id}],
             commit=False,
@@ -469,6 +505,6 @@ def override_match(
         )
         audit_log.record_audit(
             conn, project_id, actor, "override_match", f"match:{match_id}",
-            {"level": row["level"]}, {"level": new_level}, reason,
+            {"level": live_row["level"]}, {"level": new_level}, reason,
             commit=False,
         )

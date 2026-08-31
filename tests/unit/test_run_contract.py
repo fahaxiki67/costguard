@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+from costguard.core.anomalies import coverage
 from costguard.core.contracts import run_contract
 from costguard.core.evidence.finding import Finding
 from costguard.core.models import project as project_model
@@ -75,11 +76,12 @@ def test_fail_closed_state_persists_across_connections_and_clears_safely(tmp_pat
     info, conn = _project(tmp_path)
     state_path = None
     try:
+        active = run_contract.ensure_run_contract(conn, info.project_id)
         state = run_contract.set_fail_closed_state(
             conn,
             info.project_id,
             reason="synthetic database commit failure",
-            run_signature="synthetic-signature",
+            run_signature=active.signature,
         )
         state_path = run_contract.fail_closed_state_path(conn, info.project_id)
 
@@ -97,7 +99,20 @@ def test_fail_closed_state_persists_across_connections_and_clears_safely(tmp_pat
         assert availability["available"] is False
         assert availability["status"] == run_contract.FAIL_CLOSED_STATUS
         assert availability["persisted"] is True
-        run_contract.clear_fail_closed_state(reopened, info.project_id)
+        run_id = coverage.record_detection_run(
+            reopened,
+            info.project_id,
+            coverage.coverage_from_values(["clear-proof"], ["clear-proof"]),
+            run_signature=active.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        run_contract.clear_fail_closed_state(
+            reopened,
+            info.project_id,
+            run_signature=active.signature,
+            coverage_run_id=run_id,
+            coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+        )
         assert run_contract.current_results_available(reopened, info.project_id)["available"]
         assert not state_path.exists()
     finally:
@@ -131,7 +146,6 @@ def test_fail_closed_state_reports_process_only_fallback_when_sidecar_is_unwrita
         finally:
             reopened.close()
     finally:
-        run_contract.clear_fail_closed_state(conn, info.project_id)
         conn.close()
 
 

@@ -565,6 +565,31 @@ def _expected_validation_keys(
     return list(dict.fromkeys(expected))
 
 
+def _validate_period_selection(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_nos: list[int],
+    direction: str | None,
+) -> None:
+    """在任何失效化/失败边界前验证期次入口参数。"""
+    for period_no in period_nos:
+        sql = "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?"
+        params: list[object] = [project_id, period_no]
+        if direction is not None:
+            sql += " AND direction=?"
+            params.append(direction)
+        rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            raise ValueError(
+                f"period {period_no} (direction={direction}) not found in project {project_id}"
+            )
+        if len(rows) != 1:
+            raise AmbiguousPeriodError(
+                f"period_no {period_no} has {len(rows)} periods with different directions;"
+                " call with explicit direction"
+            )
+
+
 def _requested_period_ids(
     conn: sqlite3.Connection,
     project_id: int,
@@ -905,6 +930,38 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     direction=None 时若某期号对应多个方向，抛 AmbiguousPeriodError。
     证据与 period_totals 回写锁定同一 period_id。
     """
+    # 参数歧义属于调用方输入错误，不应先失效化旧结果再把它记录成数据库
+    # 故障；先完成选择验证，避免一次错误入口永久留下运行级不可用状态。
+    # 但验证失败本身仍须留下 FAILED coverage，便于审阅者知道本次入口没有
+    # 覆盖任何期次，不能被误读成“没有运行记录所以没有问题”。
+    try:
+        _validate_period_selection(conn, project_id, period_nos, direction)
+    except (AmbiguousPeriodError, ValueError) as validation_error:
+        active_contract: run_contract.RunContract | None = None
+        try:
+            active_contract = run_contract.ensure_run_contract(conn, project_id)
+            expected = _expected_validation_keys(conn, project_id, period_nos, direction)
+            _record_validation_coverage(
+                conn,
+                project_id,
+                expected,
+                [],
+                active_contract,
+                period_nos=period_nos,
+                direction=direction,
+                error=validation_error,
+            )
+        except Exception as coverage_error:
+            if active_contract is not None:
+                _set_crosscheck_fail_closed(
+                    conn,
+                    project_id,
+                    active_contract,
+                    coverage_error,
+                    reason="校核入口参数失败且覆盖率无法记录，当前结果不可用",
+                )
+            raise validation_error from coverage_error
+        raise
     had_outer_transaction = conn.in_transaction
     try:
         active_contract = run_contract.ensure_run_contract(conn, project_id)

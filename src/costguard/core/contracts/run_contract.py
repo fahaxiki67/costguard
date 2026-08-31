@@ -324,36 +324,14 @@ def _pending_clear_is_committed(
         signature = str(pending["run_signature"])
         coverage_run_id = int(pending["coverage_run_id"])
         coverage_run_kind = str(pending["coverage_run_kind"])
-        if current_run_signature(conn, project_id) != signature:
-            return False
-        row = conn.execute(
-            """SELECT run_signature, run_kind, status FROM detection_runs
-               WHERE id=? AND project_id=?""",
-            (coverage_run_id, project_id),
-        ).fetchone()
-    except (KeyError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, TypeError, ValueError):
         return False
-    if row is None:
-        return False
-    if (
-        row["run_signature"] != signature
-        or row["run_kind"] != coverage_run_kind
-        or row["status"] != "complete"
-    ):
-        return False
-    # ``status`` 是持久化字段，不能单独当作证明；同时核对覆盖 JSON，防止
-    # 手工/旧版本写入一个 complete 但实际存在 skip/fail 的伪成功行。
-    expected = set(_loads(row["expected_json"], []))
-    executed = set(_loads(row["executed_json"], []))
-    skipped = _loads(row["skipped_json"], {})
-    failed = _loads(row["failed_json"], {})
-    critical_failed = set(_loads(row["critical_failed_json"], []))
-    return bool(
-        expected
-        and expected.issubset(executed)
-        and not skipped
-        and not failed
-        and not critical_failed
+    return _coverage_proof_is_valid(
+        conn,
+        project_id,
+        run_signature=signature,
+        coverage_run_id=coverage_run_id,
+        coverage_run_kind=coverage_run_kind,
     )
 
 
@@ -372,7 +350,8 @@ def _coverage_proof_is_valid(
         return False
     try:
         row = conn.execute(
-            """SELECT run_signature, run_kind, status, expected_json, executed_json,
+            """SELECT id, run_signature, run_kind, status, completed_at,
+                              expected_json, executed_json,
                               skipped_json, failed_json, critical_failed_json
                        FROM detection_runs WHERE id=? AND project_id=?""",
             (int(coverage_run_id), project_id),
@@ -381,16 +360,41 @@ def _coverage_proof_is_valid(
         return False
     if row is None or row["run_signature"] != run_signature:
         return False
-    if row["run_kind"] != str(coverage_run_kind) or row["status"] != "complete":
+    if (
+        int(row["id"]) != int(coverage_run_id)
+        or row["run_kind"] != str(coverage_run_kind)
+        or row["status"] != "complete"
+        or not row["completed_at"]
+    ):
         return False
-    expected = set(_loads(row["expected_json"], []))
-    executed = set(_loads(row["executed_json"], []))
-    return bool(
-        expected
-        and expected.issubset(executed)
-        and not _loads(row["skipped_json"], {})
-        and not _loads(row["failed_json"], {})
-        and not _loads(row["critical_failed_json"], [])
+    # 证明必须来自当前 run_kind/signature 下最新的一行；旧的 complete 行
+    # 不能在更新的 failed/partial 行之后重新打开历史结果。
+    latest = conn.execute(
+        """SELECT id FROM detection_runs
+           WHERE project_id=? AND run_signature=? AND run_kind=?
+           ORDER BY id DESC LIMIT 1""",
+        (project_id, run_signature, str(coverage_run_kind)),
+    ).fetchone()
+    if latest is None or int(latest["id"]) != int(coverage_run_id):
+        return False
+
+    expected = _strict_json_list(row["expected_json"], allow_empty=False)
+    executed = _strict_json_list(row["executed_json"], allow_empty=False)
+    skipped = _strict_json_mapping(row["skipped_json"])
+    failed = _strict_json_mapping(row["failed_json"])
+    critical_failed = _strict_json_list(row["critical_failed_json"], allow_empty=True)
+    if expected is None or executed is None or skipped is None or failed is None:
+        return False
+    if critical_failed is None:
+        return False
+    # 集合相等之外还检查重复项，避免重复 executed 键被错误解释为完整证明。
+    return (
+        len(expected) == len(set(expected))
+        and len(executed) == len(set(executed))
+        and set(expected) == set(executed)
+        and not skipped
+        and not failed
+        and not critical_failed
     )
 
 
@@ -402,7 +406,7 @@ def clear_fail_closed_state(
     coverage_run_id: int | None = None,
     coverage_run_kind: str | None = None,
 ) -> None:
-    """仅在安全条件满足后清除边界；损坏侧车必须有成功运行证明。"""
+    """仅在当前完整成功 coverage 证明存在时清除边界。"""
     # 没有边界时清除是幂等操作。先检查状态也兼容 :memory: 或特殊连接：
     # 这类连接无法解析持久化路径，但没有待清除的状态时不应让正常成功
     # 运行凭空失败；已有进程 fallback 时仍会继续走下面的路径并报告限制。
@@ -418,10 +422,8 @@ def clear_fail_closed_state(
         coverage_run_id=coverage_run_id,
         coverage_run_kind=coverage_run_kind,
     )
-    # 有效侧车保留旧的幂等清理接口兼容性；但损坏/不可验证侧车不能被
-    # 无证明地删除，否则一次文件损坏就会直接暴露历史成功结果。
-    if state.get("corrupt") and not proof:
-        raise RuntimeError("不可验证的运行状态需要完整成功运行证明才能清除")
+    if not proof:
+        raise RuntimeError("清除运行级不可用边界需要当前完整成功运行证明")
     path = fail_closed_state_path(conn, project_id)
     # 先完成文件删除，再移除进程内状态。任何异常都会保留进程内状态，且
     # 侧车若仍存在也会继续阻断新连接。
@@ -551,6 +553,36 @@ def _loads(value: Any, fallback: Any) -> Any:
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return fallback
+
+
+def _strict_json_list(value: Any, *, allow_empty: bool) -> tuple[str, ...] | None:
+    """读取 coverage proof 的字符串列表，不把坏 JSON 降级为空列表。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, list) or (not allow_empty and not decoded):
+        return None
+    if any(not isinstance(item, str) or not item.strip() for item in decoded):
+        return None
+    return tuple(decoded)
+
+
+def _strict_json_mapping(value: Any) -> dict[str, Any] | None:
+    """读取 coverage proof 的对象字段；类型错误必须使证明失效。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    if any(not isinstance(key, str) for key in decoded):
+        return None
+    return decoded
 
 
 def _app_version() -> str:

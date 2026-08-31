@@ -244,19 +244,14 @@ class TestWorkbench:
             wb_page.project.project_id,
             reason="synthetic stale result boundary",
         )
-        try:
-            wb_page._show_match_detail(0, 0)
-            assert "当前结果不可用" in wb_page.match_detail_panel.toPlainText()
-            wb_page._batch_confirm_matches()
-            assert warnings
-            assert not wb_page.conn.execute(
-                "SELECT 1 FROM matches WHERE project_id=? AND status='confirmed'",
-                (wb_page.project.project_id,),
-            ).fetchone()
-        finally:
-            run_contract.clear_fail_closed_state(
-                wb_page.conn, wb_page.project.project_id
-            )
+        wb_page._show_match_detail(0, 0)
+        assert "当前结果不可用" in wb_page.match_detail_panel.toPlainText()
+        wb_page._batch_confirm_matches()
+        assert warnings
+        assert not wb_page.conn.execute(
+            "SELECT 1 FROM matches WHERE project_id=? AND status='confirmed'",
+            (wb_page.project.project_id,),
+        ).fetchone()
 
 
 class TestMainWindow:

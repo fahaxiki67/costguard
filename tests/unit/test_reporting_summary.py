@@ -54,7 +54,6 @@ def test_summary_prioritizes_run_unavailable_over_historical_success(tmp_path: P
         assert summary.aggregate_coverage["fail_closed"] is True
         assert summary.aggregate_coverage["status"] != "complete"
     finally:
-        run_contract.clear_fail_closed_state(conn, info.project_id)
         conn.close()
 
 
@@ -113,7 +112,91 @@ def test_partial_coverage_cannot_clear_pending_fail_closed_state(tmp_path: Path)
         )
         assert not run_contract.current_results_available(conn, info.project_id)["available"]
     finally:
-        run_contract.clear_fail_closed_state(conn, info.project_id)
+        conn.close()
+
+
+def test_complete_coverage_clears_pending_state_after_outer_commit(tmp_path: Path):
+    """完整成功覆盖应在外层提交后清除 pending，不得因字段读取崩溃。"""
+    info = project_model.create_project("完整覆盖清除门控", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        contract = run_contract.ensure_run_contract(conn, info.project_id)
+        run_contract.set_fail_closed_state(
+            conn, info.project_id, run_signature=contract.signature, reason="pending success"
+        )
+        run_id = coverage.record_detection_run(
+            conn,
+            info.project_id,
+            coverage.coverage_from_values(["a", "b"], ["a", "b"]),
+            run_signature=contract.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        run_contract.defer_fail_closed_state_clear(
+            conn,
+            info.project_id,
+            run_signature=contract.signature,
+            coverage_run_id=run_id,
+            coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+
+        availability = run_contract.current_results_available(conn, info.project_id)
+
+        assert availability["available"] is True
+        assert run_contract.get_fail_closed_state(conn, info.project_id) is None
+        assert not run_contract.fail_closed_state_path(conn, info.project_id).exists()
+    finally:
+        conn.close()
+
+
+def test_clear_requires_strict_current_latest_complete_proof(tmp_path: Path):
+    """无证明、伪造额外执行项和旧 complete 行均不能解除边界。"""
+    info = project_model.create_project("严格覆盖证明", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    try:
+        contract = run_contract.ensure_run_contract(conn, info.project_id)
+        run_contract.set_fail_closed_state(
+            conn, info.project_id, run_signature=contract.signature, reason="proof probe"
+        )
+        first_id = coverage.record_detection_run(
+            conn,
+            info.project_id,
+            coverage.coverage_from_values(["a"], ["a"]),
+            run_signature=contract.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        conn.execute(
+            "UPDATE detection_runs SET executed_json=? WHERE id=?",
+            ('["a", "forged"]', first_id),
+        )
+        with pytest.raises(RuntimeError, match="完整成功运行证明"):
+            run_contract.clear_fail_closed_state(conn, info.project_id)
+        with pytest.raises(RuntimeError, match="完整成功运行证明"):
+            run_contract.clear_fail_closed_state(
+                conn,
+                info.project_id,
+                run_signature=contract.signature,
+                coverage_run_id=first_id,
+                coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+
+        second_id = coverage.record_detection_run(
+            conn,
+            info.project_id,
+            coverage.coverage_from_values(["a"], []),
+            run_signature=contract.signature,
+            run_kind=coverage.AGGREGATE_VALIDATION,
+        )
+        assert second_id > first_id
+        with pytest.raises(RuntimeError, match="完整成功运行证明"):
+            run_contract.clear_fail_closed_state(
+                conn,
+                info.project_id,
+                run_signature=contract.signature,
+                coverage_run_id=first_id,
+                coverage_run_kind=coverage.AGGREGATE_VALIDATION,
+            )
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+    finally:
         conn.close()
 
 
@@ -145,7 +228,4 @@ def test_corrupt_fail_closed_sidecar_requires_success_proof_to_clear(tmp_path: P
         )
         assert not state_path.exists()
     finally:
-        state = run_contract.get_fail_closed_state(conn, info.project_id)
-        if state is not None and not state.get("corrupt"):
-            run_contract.clear_fail_closed_state(conn, info.project_id)
         conn.close()

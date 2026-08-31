@@ -1134,9 +1134,6 @@ class WorkbenchPage(QWidget):
         aid = int(self.anomaly_table.item(row, 0).text())
         if not self._ensure_current_results_for_ui("处理异常"):
             return
-        scope, scope_params = run_contract.current_scope(
-            self.conn, self.project.project_id, "a"
-        )
         status_map = {
             "verified_no_issue": "已核实无问题",
             "supplemented": "已补资料",
@@ -1157,37 +1154,50 @@ class WorkbenchPage(QWidget):
         from costguard.core.evidence import audit as audit_log
         from costguard.core.evidence import evidence as evidence_api
 
-        old = self.conn.execute(
-            f"""SELECT status, run_signature, finding_id FROM anomalies a
-                WHERE a.id=? AND a.project_id=? AND {scope}""",
-            (aid, self.project.project_id, *scope_params),
-        ).fetchone()
-        if not old:
-            QMessageBox.warning(self, "处理异常", "未找到对应问题，请刷新后重试。")
-            return
-        signature_clause = "run_signature IS NULL" if old["run_signature"] is None else "run_signature=?"
-        signature_params = () if old["run_signature"] is None else (old["run_signature"],)
-        with run_contract._transaction(self.conn, "resolve_anomaly"):
-            cur = self.conn.execute(
-                f"""UPDATE anomalies SET status=?, resolved_note=?
-                    WHERE id=? AND project_id=? AND {signature_clause}""",
-                (new_status, dlg.reason(), aid, self.project.project_id, *signature_params))
-            if cur.rowcount != 1:
-                raise run_contract.CurrentResultsUnavailableError(
-                    "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
+        try:
+            # 重新在实际写入事务内取 current scope。对话框停留期间若运行级
+            # 状态失效，不能继续使用对话框打开前捕获的范围。
+            with run_contract._transaction(self.conn, "resolve_anomaly"):
+                run_contract.require_current_results_available(
+                    self.conn, self.project.project_id, operation="处理异常"
                 )
-            evidence_api.add_evidence(
-                self.conn, self.project.project_id, "anomaly_resolution",
-                f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
-                steps=[{"step": "人工处理", "status": new_status, "reason": dlg.reason()}],
-                sources=[{"anomaly_id": aid}],
-                commit=False,
-                run_signature=old["run_signature"],
-                finding_id=old["finding_id"],
-            )
-            audit_log.record_audit(
-                self.conn, self.project.project_id, "user", "resolve_anomaly", f"anomaly:{aid}",
-                {"status": old["status"]}, {"status": new_status}, dlg.reason(), commit=False)
+                scope, scope_params = run_contract.current_scope(
+                    self.conn, self.project.project_id, "a"
+                )
+                old = self.conn.execute(
+                    f"""SELECT status, run_signature, finding_id FROM anomalies a
+                        WHERE a.id=? AND a.project_id=? AND {scope}""",
+                    (aid, self.project.project_id, *scope_params),
+                ).fetchone()
+                if not old:
+                    raise run_contract.CurrentResultsUnavailableError(
+                        "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
+                    )
+                signature_clause = "run_signature IS NULL" if old["run_signature"] is None else "run_signature=?"
+                signature_params = () if old["run_signature"] is None else (old["run_signature"],)
+                cur = self.conn.execute(
+                    f"""UPDATE anomalies SET status=?, resolved_note=?
+                        WHERE id=? AND project_id=? AND {signature_clause}""",
+                    (new_status, dlg.reason(), aid, self.project.project_id, *signature_params))
+                if cur.rowcount != 1:
+                    raise run_contract.CurrentResultsUnavailableError(
+                        "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
+                    )
+                evidence_api.add_evidence(
+                    self.conn, self.project.project_id, "anomaly_resolution",
+                    f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
+                    steps=[{"step": "人工处理", "status": new_status, "reason": dlg.reason()}],
+                    sources=[{"anomaly_id": aid}],
+                    commit=False,
+                    run_signature=old["run_signature"],
+                    finding_id=old["finding_id"],
+                )
+                audit_log.record_audit(
+                    self.conn, self.project.project_id, "user", "resolve_anomaly", f"anomaly:{aid}",
+                    {"status": old["status"]}, {"status": new_status}, dlg.reason(), commit=False)
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "处理异常", str(exc))
+            return
         self.refresh_anomalies()
         self.refresh_overview()
         self.refresh_export_status()
@@ -1433,9 +1443,15 @@ class WorkbenchPage(QWidget):
         dlg = ReasonDialog("人工确认匹配", f"将匹配组 #{mid} 标记为人工已确认？", self)
         if dlg.exec() != QDialog.Accepted:
             return
+        if not self._ensure_current_results_for_ui("确认匹配"):
+            return
         # 匹配对象的业务展示文本不是用户输入的别名，不能误写入别名库；
         # 如需沉淀别名，应在后续的专门字段中明确填写并记录依据。
-        matching.confirm_match(self.conn, self.project.project_id, mid, "user", dlg.reason())
+        try:
+            matching.confirm_match(self.conn, self.project.project_id, mid, "user", dlg.reason())
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "确认匹配", str(exc))
+            return
         self.refresh_matches()
         self.refresh_overview()
         self.refresh_export_status()
@@ -1477,10 +1493,20 @@ class WorkbenchPage(QWidget):
             return
         if not self._ensure_current_results_for_ui("批量确认匹配"):
             return
-        for match_row in candidates:
-            matching.confirm_match(
-                self.conn, self.project.project_id, int(match_row["id"]), "user", dlg.reason()
-            )
+        try:
+            # 外层事务把多项确认作为一个原子动作；即使运行状态在某一项
+            # 之后失效，也不能留下前半批次已经确认的记录。
+            with run_contract._transaction(self.conn, "batch_confirm_matches"):
+                run_contract.require_current_results_available(
+                    self.conn, self.project.project_id, operation="批量确认匹配"
+                )
+                for match_row in candidates:
+                    matching.confirm_match(
+                        self.conn, self.project.project_id, int(match_row["id"]), "user", dlg.reason()
+                    )
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "批量确认匹配", str(exc))
+            return
         self.refresh_matches()
         self.refresh_overview()
         self.refresh_export_status()
@@ -1511,7 +1537,15 @@ class WorkbenchPage(QWidget):
             return
         choices = list(LEVEL_ZH.keys())
         new_level = choices[levels_zh.index(level)]
-        matching.override_match(self.conn, self.project.project_id, mid, new_level, "user", dlg.reason())
+        if not self._ensure_current_results_for_ui("修正匹配"):
+            return
+        try:
+            matching.override_match(
+                self.conn, self.project.project_id, mid, new_level, "user", dlg.reason()
+            )
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "修正匹配", str(exc))
+            return
         self.refresh_matches()
         self.refresh_overview()
         self.refresh_export_status()
