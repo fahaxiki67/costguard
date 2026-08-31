@@ -579,32 +579,27 @@ class WorkbenchPage(QWidget):
             return
         import sqlite3 as _sq
 
-        from costguard.core.evidence import audit as audit_log
-
-        with self.conn:
-            # 按 period_id 精确更新：同 period_no 的另一方向不受影响
-            try:
-                cur = self.conn.execute(
-                    "UPDATE settlement_periods SET direction=? WHERE id=?",
-                    (direction, period_id))
-            except _sq.IntegrityError:
-                # 目标方向同期号已有期次（v3 唯一约束）：友好拒绝，不做部分更新
-                QMessageBox.warning(
-                    self, "标记方向",
-                    f"第 {pno} 期在「{dir_zh}」方向已存在期次，无法重复标记。\n"
-                    "如需合并，请先人工核清两期数据。")
-                return
-            if cur.rowcount != 1:
-                QMessageBox.warning(
-                    self,
-                    "标记方向",
-                    "期次方向未更新，请刷新后检查期次记录。",
-                )
-                return
-        audit_log.record_audit(
-            self.conn, self.project.project_id, "user", "set_direction", f"period:{period_id}",
-            None, {"direction": direction, "period_no": pno}, dlg.reason())
-        settlement_io.invalidate_crosscheck_results(self.conn, self.project.project_id)
+        # 方向更新、运行契约切换、旧结果失效、证据和审计由核心入口在同一
+        # 事务内完成；UI 不再先提交方向再补写审计。
+        try:
+            settlement_io.set_project_direction(
+                self.conn,
+                self.project.project_id,
+                int(period_id),
+                direction,
+                actor="user",
+                reason=dlg.reason(),
+            )
+        except _sq.IntegrityError:
+            # 目标方向同期号已有期次（v3 唯一约束）：友好拒绝，不做部分更新
+            QMessageBox.warning(
+                self, "标记方向",
+                f"第 {pno} 期在「{dir_zh}」方向已存在期次，无法重复标记。\n"
+                "如需合并，请先人工核清两期数据。")
+            return
+        except (ValueError, RuntimeError, run_contract.CurrentResultsUnavailableError) as exc:
+            QMessageBox.warning(self, "标记方向", str(exc))
+            return
         self.refresh_all()
 
     # ---------- 清单明细 ----------
@@ -1494,17 +1489,16 @@ class WorkbenchPage(QWidget):
         if not self._ensure_current_results_for_ui("批量确认匹配"):
             return
         try:
-            # 外层事务把多项确认作为一个原子动作；即使运行状态在某一项
-            # 之后失效，也不能留下前半批次已经确认的记录。
-            with run_contract._transaction(self.conn, "batch_confirm_matches"):
-                run_contract.require_current_results_available(
-                    self.conn, self.project.project_id, operation="批量确认匹配"
-                )
-                for match_row in candidates:
-                    matching.confirm_match(
-                        self.conn, self.project.project_id, int(match_row["id"]), "user", dlg.reason()
-                    )
-        except run_contract.CurrentResultsUnavailableError as exc:
+            # 核心批量 API 会在对话框返回后重新读取每个 ID 的 level/status；
+            # 因此此处的候选列表只用于对话框展示，不具备写入授权。
+            matching.confirm_matches(
+                self.conn,
+                self.project.project_id,
+                [int(match_row["id"]) for match_row in candidates],
+                "user",
+                dlg.reason(),
+            )
+        except (run_contract.CurrentResultsUnavailableError, ValueError) as exc:
             QMessageBox.warning(self, "批量确认匹配", str(exc))
             return
         self.refresh_matches()

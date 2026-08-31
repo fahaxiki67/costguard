@@ -576,6 +576,23 @@ def migrate(db_path: Path, backups_dir: Path | None = None, log: Callable[[str],
     try:
         ver = current_version(conn)
         target = LATEST_SCHEMA_VERSION
+        # 旧程序不得打开或降写未来数据库。除了 schema_migrations 主版本外，
+        # projects.schema_version 也是冗余的结构标记；任一处超过当前支持
+        # 版本都说明本程序无法证明字段/约束语义，必须在任何写入前失败关闭。
+        project_version_row = conn.execute(
+            "SELECT MAX(schema_version) AS v FROM projects"
+            " WHERE EXISTS (SELECT 1 FROM sqlite_master"
+            "               WHERE type='table' AND name='projects')"
+        ).fetchone() if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'"
+        ).fetchone() else None
+        project_version = int(project_version_row["v"] or 0) if project_version_row else 0
+        if ver > target or project_version > target:
+            future = max(ver, project_version)
+            raise MigrationError(
+                f"检测到未来 schema {future}（当前程序最多支持 {target}），"
+                "拒绝打开或降写该数据库"
+            )
         if ver >= target:
             # 版本已是最新时仍修正项目表中的冗余版本标记。
             conn.execute("BEGIN")

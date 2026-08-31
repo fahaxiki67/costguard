@@ -172,6 +172,29 @@ class TestBlock2SetDirection:
         entries = audit_log.history_for(conn, pid)
         assert not any(e.action == "set_direction" for e in entries), "拒绝时不得写审计"
 
+    def test_core_set_direction_rolls_back_when_audit_fails(self, db, monkeypatch):
+        """方向核心写入必须与审计保持同一事务。"""
+        from costguard.core.engine import settlement_io
+        from costguard.core.evidence import audit as audit_log
+
+        conn, pid = db
+        period_id = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+
+        def fail_audit(*_args, **_kwargs):
+            raise RuntimeError("synthetic direction audit failure")
+
+        monkeypatch.setattr(audit_log, "record_audit", fail_audit)
+        with pytest.raises(RuntimeError, match="synthetic direction audit failure"):
+            settlement_io.set_project_direction(
+                conn, pid, period_id, "downward", actor="tester", reason="测试方向原子性"
+            )
+        assert conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"] == "upward"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action='set_direction'"
+        ).fetchone()[0] == 0
+
     def test_set_direction_success_non_conflicting(self, db, monkeypatch):
         """非冲突标记：只改选中行（按 period_id），同期号另一方向不受影响。"""
         from PySide6.QtWidgets import QApplication

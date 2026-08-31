@@ -542,24 +542,31 @@ def _expected_validation_keys(
     period_nos: list[int],
     direction: str | None,
 ) -> list[str]:
-    """先登记本批次应覆盖的 A/B/C 路径，异常时也能留下失败覆盖率。"""
+    """按当前项目/方向重建本次范围应覆盖的 A/B/C 路径。
+
+    ``period_nos`` 只是调用方请求重跑的子集，不能被用来缩小完整性证明的
+    expected 集合；方向参数仍是合法的业务隔离范围。
+    """
     expected: list[str] = []
-    for period_no in period_nos:
-        sql = "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?"
-        params: list[object] = [project_id, period_no]
-        if direction is not None:
-            sql += " AND direction=?"
-            params.append(direction)
-        rows = conn.execute(sql, params).fetchall()
-        if not rows:
+    sql = "SELECT id FROM settlement_periods WHERE project_id=?"
+    params: list[object] = [project_id]
+    if direction is not None:
+        sql += " AND direction=?"
+        params.append(direction)
+    rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+    for row in rows:
+        expected.extend(
+            _validation_key(int(row["id"]), path)
+            for path in _VALIDATION_PATHS
+        )
+    # 仅在项目没有任何期次时保留请求期号作为失败事实，避免入口错误被静默
+    # 丢掉；有项目期次时，错误期号不应替代真实项目范围。
+    if not rows and not conn.execute(
+        "SELECT 1 FROM settlement_periods WHERE project_id=? LIMIT 1", (project_id,)
+    ).fetchone():
+        for period_no in period_nos:
             expected.extend(
                 _validation_key(None, path, period_no=int(period_no))
-                for path in _VALIDATION_PATHS
-            )
-            continue
-        for row in rows:
-            expected.extend(
-                _validation_key(int(row["id"]), path)
                 for path in _VALIDATION_PATHS
             )
     return list(dict.fromkeys(expected))
@@ -636,8 +643,20 @@ def _invalidate_previous_validation(
     direction: str | None,
     active_contract: run_contract.RunContract,
 ) -> int:
-    """把本次重跑覆盖的旧结果移出当前面，并保留可追溯历史。"""
-    period_ids = _requested_period_ids(conn, project_id, period_nos, direction)
+    """把当前项目/方向的旧结果移出当前面，并保留可追溯历史。
+
+    即使调用方只请求其中一期，也必须先撤下该业务范围内其余期次的旧
+    current 结果；否则局部重跑会和旧成功结果拼成假完整状态。
+    """
+    sql = "SELECT id FROM settlement_periods WHERE project_id=?"
+    params: list[object] = [project_id]
+    if direction is not None:
+        sql += " AND direction=?"
+        params.append(direction)
+    period_ids = [
+        int(row["id"])
+        for row in conn.execute(sql + " ORDER BY id", params).fetchall()
+    ]
     if not period_ids:
         return 0
     placeholders = ",".join("?" for _ in period_ids)
@@ -851,7 +870,9 @@ def _record_validation_coverage(
         executed=executed,
         skipped=skipped,
         failed=failed,
-        critical_failed=failed,
+        # ``critical_failed`` 是键序列；不能把 ``failed`` 映射直接传入，
+        # 否则空映射会被覆盖率解析器当成一个名为 ``{}`` 的未声明键。
+        critical_failed=list(failed),
     )
     return detection_coverage.record_detection_run(
         conn,
@@ -1055,12 +1076,12 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                      now, active_contract.signature),
                 )
                 ev_id = cur.lastrowid
-                conn.execute(
+                totals_cur = conn.execute(
                     """UPDATE period_totals SET
                        cross_check_status=?, cross_check_diff=?, evidence_id=?,
                        ab_status=?, ab_diff=?, control_status=?, control_diff=?,
                        verification_level=?, run_signature=?
-                       WHERE period_id=?""",
+                       WHERE project_id=? AND period_id=?""",
                     (
                         combined_status,
                         str(combined_diff) if combined_diff is not None else None,
@@ -1071,9 +1092,15 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                         str(res.control_diff) if res.control_diff is not None else None,
                         res.verification_level,
                         active_contract.signature,
+                        project_id,
                         res.period_id,
                     ),
                 )
+                if int(totals_cur.rowcount or 0) < 1:
+                    raise RuntimeError(
+                        f"period_totals 缺少当前项目第{pno}期可回写行，"
+                        "校核结果未形成完整持久化"
+                    )
                 conn.execute(
                     """INSERT INTO crosscheck_results(
                            project_id, period_id, verification_level, status,

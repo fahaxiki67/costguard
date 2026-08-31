@@ -61,6 +61,38 @@ class TestMigrate:
         migrations.migrate(db, tmp_path / "backups")
         assert migrations.migrate(db, tmp_path / "backups") == migrations.LATEST_SCHEMA_VERSION
 
+    def test_future_schema_is_rejected_without_downgrading_project_marker(self, tmp_path):
+        """当前程序不得打开未来库，也不得把项目版本标记降写。"""
+        db = _tmp_db(tmp_path)
+        migrations.migrate(db, tmp_path / "backups")
+        conn = migrations.connect(db)
+        try:
+            with conn:
+                project_id = conn.execute(
+                    "INSERT INTO projects(name, schema_version, workspace_path, created_at) "
+                    "VALUES ('未来库', ?, '/future', '2026')",
+                    (migrations.LATEST_SCHEMA_VERSION,),
+                ).lastrowid
+                future_version = migrations.LATEST_SCHEMA_VERSION + 1
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, '2026')",
+                    (future_version,),
+                )
+        finally:
+            conn.close()
+
+        with pytest.raises(migrations.MigrationError, match="未来 schema"):
+            migrations.migrate(db, tmp_path / "backups")
+
+        check = migrations.connect(db)
+        try:
+            assert migrations.current_version(check) == future_version
+            assert check.execute(
+                "SELECT schema_version FROM projects WHERE id=?", (project_id,)
+            ).fetchone()[0] == migrations.LATEST_SCHEMA_VERSION
+        finally:
+            check.close()
+
     def test_backup_created_before_first_migration(self, tmp_path):
         db = _tmp_db(tmp_path)
         migrations.migrate(db, tmp_path / "backups")

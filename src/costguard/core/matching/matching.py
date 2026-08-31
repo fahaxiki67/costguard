@@ -334,8 +334,10 @@ def match_items(
 
 
 def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGroup]) -> int:
+    run_contract.require_current_results_available(conn, project_id, operation="保存匹配候选")
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     with run_contract._transaction(conn, "save_matches"):
+        run_contract.require_current_results_available(conn, project_id, operation="保存匹配候选")
         # 当前候选是可重建缓存；人工已处理记录不删除，旧签名记录由当前
         # 读取面排除并保留作历史。
         conn.execute(
@@ -438,6 +440,9 @@ def confirm_match(
                  f"人工确认 match#{match_id}: {reason}",
                  actor, datetime.now().isoformat(timespec="seconds")),
             )
+            # 别名是运行范围的一部分。契约刷新必须发生在同一个外层事务
+            # 内，失败时连同匹配、别名、Evidence 和 Audit 一并回滚。
+            run_contract.ensure_run_contract(conn, project_id)
         evidence_api.add_evidence(
             conn, project_id, "match_confirmation",
             f"匹配组 {live_row['group_key']} 由 {actor} 确认为{CONFIRMED}：{reason}",
@@ -452,10 +457,45 @@ def confirm_match(
             {"level": CONFIRMED, "alias": alias_name, "direction": direction}, reason,
             commit=False,
         )
-    # 别名是匹配配置的一部分。确认后立即生成新契约，使后续运行不能误用
-    # 变更前的候选；本次人工记录仍保留在旧签名历史中。
-    if alias_name and live_row["level"] == SUSPECTED:
-        run_contract.ensure_run_contract(conn, project_id)
+
+
+def confirm_matches(
+    conn: sqlite3.Connection,
+    project_id: int,
+    match_ids: list[int] | tuple[int, ...],
+    actor: str,
+    reason: str,
+) -> int:
+    """原子批量确认完全匹配候选，并在核心层重读每个状态。
+
+    批量操作只允许 ``confirmed + pending`` 候选；对话框之前取得的 UI
+    快照不具备写入资格，任何期间变化都会让整批回滚。
+    """
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("批量确认匹配必须记录原因（原则 14）")
+    ids = [int(match_id) for match_id in match_ids]
+    if not ids:
+        raise ValueError("批量确认至少需要一个匹配组")
+    if len(ids) != len(set(ids)):
+        raise ValueError("批量确认的匹配组不得重复")
+    run_contract.require_current_results_available(conn, project_id, operation="批量确认匹配")
+    run_contract.ensure_run_contract(conn, project_id)
+    with run_contract._transaction(conn, "confirm_matches"):
+        run_contract.require_current_results_available(conn, project_id, operation="批量确认匹配")
+        for match_id in ids:
+            row = _current_match_row(conn, project_id, match_id)
+            if not row:
+                raise run_contract.CurrentResultsUnavailableError(
+                    "批量确认不可用：匹配组已不在当前运行范围，请刷新后重试。"
+                )
+            if row["level"] != CONFIRMED or row["status"] != "pending":
+                raise ValueError(
+                    f"匹配组 {match_id} 已发生变化；批量确认仅允许待确认的完全匹配"
+                )
+        # 复用单项核心事务实现；嵌套 savepoint 保证任一项失败时整批回滚。
+        for match_id in ids:
+            confirm_match(conn, project_id, match_id, actor, reason)
+    return len(ids)
 
 
 def override_match(

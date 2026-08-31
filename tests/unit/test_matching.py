@@ -293,6 +293,82 @@ class TestHumanReview:
             (pid,),
         ).fetchone()["c"] == 0
 
+    def test_confirm_alias_is_atomic_when_contract_refresh_fails(self, db, monkeypatch):
+        """别名确认的契约刷新失败时，match/alias/evidence/audit 均回滚。"""
+        conn, pid, (p1, p2) = db
+        add(conn, p1, None, "C25混凝土垫层")
+        add(conn, p2, None, "C25砼垫层")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        row = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()
+        with conn:
+            conn.execute(
+                "UPDATE matches SET level=? WHERE id=?", (matching_mod.SUSPECTED, row["id"])
+            )
+
+        real_ensure = matching_mod.run_contract.ensure_run_contract
+        calls = 0
+
+        def fail_on_refresh(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                raise RuntimeError("synthetic contract refresh failure")
+            return real_ensure(*args, **kwargs)
+
+        monkeypatch.setattr(matching_mod.run_contract, "ensure_run_contract", fail_on_refresh)
+        with pytest.raises(RuntimeError, match="synthetic contract refresh failure"):
+            matching_mod.confirm_match(
+                conn, pid, row["id"], "王工", "别名依据", alias_name="C25砼垫层"
+            )
+
+        current = conn.execute(
+            "SELECT status, level FROM matches WHERE id=?", (row["id"],)
+        ).fetchone()
+        assert current["status"] == "pending"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM item_aliases WHERE project_id=?", (pid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE project_id=?", (pid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE project_id=? AND action='confirm_match'",
+            (pid,),
+        ).fetchone()[0] == 0
+
+    def test_save_matches_is_blocked_by_run_fail_closed_state(self, db):
+        conn, pid, (p1, p2) = db
+        add(conn, p1, "C1", "平整场地")
+        add(conn, p2, "C1", "平整场地")
+        run_contract.set_fail_closed_state(conn, pid, reason="synthetic unavailable boundary")
+
+        with pytest.raises(run_contract.CurrentResultsUnavailableError):
+            matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM matches WHERE project_id=?", (pid,)
+        ).fetchone()[0] == 0
+
+    def test_confirm_matches_rechecks_level_and_status_after_ui_snapshot(self, db):
+        """批量确认不得信任对话框打开前取得的候选快照。"""
+        conn, pid, (p1, p2) = db
+        add(conn, p1, "C1", "平整场地")
+        add(conn, p2, "C1", "平整场地")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        row = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()
+        with conn:
+            conn.execute(
+                "UPDATE matches SET level=? WHERE id=?",
+                (matching_mod.SUSPECTED, row["id"]),
+            )
+
+        with pytest.raises(ValueError, match="待确认的完全匹配"):
+            matching_mod.confirm_matches(conn, pid, [row["id"]], "user", "批量确认依据")
+        current = conn.execute(
+            "SELECT status, level FROM matches WHERE id=?", (row["id"],)
+        ).fetchone()
+        assert current["status"] == "pending"
+        assert current["level"] == matching_mod.SUSPECTED
+
     def test_override_match(self, db):
         conn, pid, (p1, p2) = db
         add(conn, p1, None, "C25混凝土垫层")

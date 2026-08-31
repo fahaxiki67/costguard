@@ -38,6 +38,9 @@ _TRANSACTION_COMMIT_FAILURE_ATTR = "_costguard_transaction_commit_failure"
 FAIL_CLOSED_STATUS = "unavailable"
 _FAIL_CLOSED_FORMAT_VERSION = 1
 _PENDING_CLEAR_KEY = "pending_clear"
+# 当前项目结果的 fail-closed 边界只能由聚合校核覆盖证明解除。不要从调用方
+# 传入的任意字符串推断解除依据；侧车中会保存本次边界的恢复运行类型。
+DEFAULT_RECOVERY_RUN_KIND = "aggregate_validation"
 _FAIL_CLOSED_STATES: dict[str, dict[str, Any]] = {}
 _FAIL_CLOSED_LOCK = threading.RLock()
 
@@ -147,6 +150,7 @@ def _fail_closed_payload(
     persisted: bool,
     persistence: str,
     persistence_error: str | None = None,
+    recovery_run_kind: str = DEFAULT_RECOVERY_RUN_KIND,
 ) -> dict[str, Any]:
     limitations = []
     if not persisted:
@@ -157,6 +161,7 @@ def _fail_closed_payload(
         "format_version": _FAIL_CLOSED_FORMAT_VERSION,
         "project_id": int(project_id),
         "status": FAIL_CLOSED_STATUS,
+        "recovery_run_kind": str(recovery_run_kind),
         "reason": str(reason),
         "run_signature": run_signature,
         "error_type": type(error).__name__ if error is not None else None,
@@ -189,6 +194,7 @@ def set_fail_closed_state(
     reason: str,
     run_signature: str | None = None,
     error: BaseException | None = None,
+    recovery_run_kind: str = DEFAULT_RECOVERY_RUN_KIND,
 ) -> dict[str, Any]:
     """设置运行级不可用边界，优先写项目侧车，失败时保留进程内边界。"""
     path: Path | None
@@ -203,6 +209,7 @@ def set_fail_closed_state(
             persisted=False,
             persistence="process",
             persistence_error=str(path_error),
+            recovery_run_kind=recovery_run_kind,
         )
         with _FAIL_CLOSED_LOCK:
             _FAIL_CLOSED_STATES[_state_key(conn, project_id)] = payload
@@ -215,6 +222,7 @@ def set_fail_closed_state(
         error=error,
         persisted=True,
         persistence="sidecar",
+        recovery_run_kind=recovery_run_kind,
     )
     key = _state_key(conn, project_id)
     try:
@@ -228,6 +236,7 @@ def set_fail_closed_state(
             persisted=False,
             persistence="process",
             persistence_error=str(persistence_error),
+            recovery_run_kind=recovery_run_kind,
         )
         with _FAIL_CLOSED_LOCK:
             _FAIL_CLOSED_STATES[key] = payload
@@ -332,6 +341,33 @@ def _pending_clear_is_committed(
         run_signature=signature,
         coverage_run_id=coverage_run_id,
         coverage_run_kind=coverage_run_kind,
+        required_run_kind=str(
+            state.get("recovery_run_kind") or DEFAULT_RECOVERY_RUN_KIND
+        ),
+    )
+
+
+def _aggregate_expected_coverage_keys(
+    conn: sqlite3.Connection, project_id: int
+) -> tuple[str, ...] | None:
+    """从当前项目期次事实重建聚合校核的必需 A/B/C 键。
+
+    没有任何期次的空项目没有可证明的业务覆盖范围；保留初始化流程的兼容
+    性，但一旦项目存在期次，就不再接受调用方自定义的覆盖范围。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    return tuple(
+        f"period:{int(row['id'])}:{path}"
+        for row in rows
+        for path in ("path_a", "path_b", "path_c")
     )
 
 
@@ -342,9 +378,15 @@ def _coverage_proof_is_valid(
     run_signature: str | None,
     coverage_run_id: int | None,
     coverage_run_kind: str | None,
+    required_run_kind: str = DEFAULT_RECOVERY_RUN_KIND,
 ) -> bool:
     """验证清除不可用边界所需的当前完整 coverage 证明。"""
-    if not run_signature or coverage_run_id is None or not coverage_run_kind:
+    if (
+        not run_signature
+        or coverage_run_id is None
+        or not coverage_run_kind
+        or str(coverage_run_kind) != str(required_run_kind)
+    ):
         return False
     if conn.in_transaction or current_run_signature(conn, project_id) != run_signature:
         return False
@@ -388,14 +430,19 @@ def _coverage_proof_is_valid(
     if critical_failed is None:
         return False
     # 集合相等之外还检查重复项，避免重复 executed 键被错误解释为完整证明。
-    return (
+    if not (
         len(expected) == len(set(expected))
         and len(executed) == len(set(executed))
         and set(expected) == set(executed)
         and not skipped
         and not failed
         and not critical_failed
-    )
+    ):
+        return False
+    required_expected = _aggregate_expected_coverage_keys(conn, project_id)
+    if required_expected is not None:
+        return tuple(expected) == required_expected
+    return True
 
 
 def clear_fail_closed_state(
@@ -415,12 +462,18 @@ def clear_fail_closed_state(
         return
     if conn.in_transaction:
         raise RuntimeError("外层事务尚未提交，不能清除当前结果不可用边界")
+    required_run_kind = str(
+        state.get("recovery_run_kind") or DEFAULT_RECOVERY_RUN_KIND
+    )
+    if coverage_run_kind is None or str(coverage_run_kind) != required_run_kind:
+        raise RuntimeError("清除运行级不可用边界需要匹配边界类型的完整成功运行证明")
     proof = _coverage_proof_is_valid(
         conn,
         project_id,
         run_signature=run_signature,
         coverage_run_id=coverage_run_id,
         coverage_run_kind=coverage_run_kind,
+        required_run_kind=required_run_kind,
     )
     if not proof:
         raise RuntimeError("清除运行级不可用边界需要当前完整成功运行证明")

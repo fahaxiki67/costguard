@@ -60,6 +60,33 @@ class TestExcelExport:
             for item in run_contract.export_status(conn, info.project_id, export_kind)
         )
 
+    @pytest.mark.parametrize("export_kind", ["excel_workbook", "management_summary_docx"])
+    def test_export_registration_failure_leaves_no_unregistered_artifact(
+        self, full_project, export_kind, monkeypatch
+    ):
+        """登记失败时，本次新文件也必须被隔离，不能留下未登记成品。"""
+        info, conn, exports = full_project
+
+        def fail_register(*_args, **_kwargs):
+            raise RuntimeError("synthetic export registration failure")
+
+        monkeypatch.setattr(run_contract, "register_export", fail_register)
+        exporter = (
+            excel_export.export_workbook
+            if export_kind == "excel_workbook"
+            else excel_export.export_management_summary_docx
+        )
+        with pytest.raises(RuntimeError, match="synthetic export registration failure"):
+            exporter(conn, info.project_id, exports)
+
+        patterns = (
+            "CostGuard审核底稿_*.xlsx"
+            if export_kind == "excel_workbook"
+            else "CostGuard管理层摘要_*.docx"
+        )
+        assert not list(exports.glob(patterns))
+        assert not list(exports.glob(".*.tmp"))
+
     def test_amount_only_recompute_is_visible_in_period_and_comparison_outputs(
         self, tmp_path
     ):

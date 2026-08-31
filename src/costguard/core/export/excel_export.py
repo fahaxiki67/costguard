@@ -8,8 +8,11 @@ WPS 兼容纪律：
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -26,6 +29,38 @@ from costguard.core.parsing import import_manifest
 from costguard.core.reporting import ProjectSummary, build_report_model
 
 D = Decimal
+
+
+def _save_registered_artifact(
+    path: Path,
+    save: Callable[[Path], None],
+    register: Callable[[Path], None],
+) -> Path:
+    """先写同目录临时文件，再替换正式文件并登记；登记失败不留孤儿成品。"""
+    path = Path(path)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(fd)
+    temp_path: Path | None = Path(temp_name)
+    try:
+        save(temp_path)
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            register(path)
+        except Exception:
+            # 该文件刚由本次调用创建且登记未成功，删除它避免用户误把未
+            # 登记文件当作当前成果；历史同类文件不受影响。
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return path
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 HEADER_FILL = PatternFill("solid", fgColor="DDEBF7")
 HEADER_FONT = Font(bold=True)
@@ -951,21 +986,23 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcOnSave = True
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = out_dir / f"CostGuard审核底稿_{stamp}.xlsx"
     run_contract.require_current_results_available(
         conn, project_id, operation="Excel 审核底稿导出"
     )
-    wb.save(path)
-    run_contract.register_export(
-        conn,
-        project_id,
-        "excel_workbook",
+    return _save_registered_artifact(
         path,
-        run_signature=active_contract.signature,
-        metadata={"sheet_names": wb.sheetnames, "version": "0.1.7"},
+        lambda temp_path: wb.save(temp_path),
+        lambda final_path: run_contract.register_export(
+            conn,
+            project_id,
+            "excel_workbook",
+            final_path,
+            run_signature=active_contract.signature,
+            metadata={"sheet_names": wb.sheetnames, "version": "0.1.7"},
+        ),
     )
-    return path
 
 
 def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
@@ -1230,17 +1267,19 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         conn, project_id, operation="Word 管理层摘要导出"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"CostGuard管理层摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    path = out_dir / f"CostGuard管理层摘要_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.docx"
     run_contract.require_current_results_available(
         conn, project_id, operation="Word 管理层摘要导出"
     )
-    doc.save(str(path))
-    run_contract.register_export(
-        conn,
-        project_id,
-        "management_summary_docx",
+    return _save_registered_artifact(
         path,
-        run_signature=active_contract.signature,
-        metadata={"version": "0.1.7", "result_status": result_status},
+        lambda temp_path: doc.save(str(temp_path)),
+        lambda final_path: run_contract.register_export(
+            conn,
+            project_id,
+            "management_summary_docx",
+            final_path,
+            run_signature=active_contract.signature,
+            metadata={"version": "0.1.7", "result_status": result_status},
+        ),
     )
-    return path

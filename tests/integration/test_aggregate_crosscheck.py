@@ -537,8 +537,12 @@ class TestCrossCheck:
         aggregate.persist_period_totals(
             conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
         )
+        period_nos = [row["period_no"] for row in conn.execute(
+            "SELECT period_no FROM settlement_periods WHERE project_id=? ORDER BY period_no",
+            (info.project_id,),
+        ).fetchall()]
         first = crosscheck.run_crosscheck(
-            conn, info.project_id, [report.period_no], direction=direction
+            conn, info.project_id, period_nos, direction=direction
         )[0]
         signature = run_contract.current_run_signature(conn, info.project_id)
         assert first.status == "match"
@@ -1291,6 +1295,10 @@ class TestCrossCheck:
         aggregate.persist_period_totals(
             conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
         )
+        period_nos = [row["period_no"] for row in conn.execute(
+            "SELECT period_no FROM settlement_periods WHERE project_id=? ORDER BY period_no",
+            (info.project_id,),
+        ).fetchall()]
         first = crosscheck.run_crosscheck(
             conn, info.project_id, [report.period_no], direction=direction
         )[0]
@@ -1301,7 +1309,7 @@ class TestCrossCheck:
         assert not run_contract.current_results_available(conn, info.project_id)["available"]
 
         result = crosscheck.run_crosscheck(
-            conn, info.project_id, [report.period_no], direction=direction
+            conn, info.project_id, period_nos, direction=direction
         )[0]
         assert result.verification_level == "sufficient"
         assert run_contract.get_fail_closed_state(conn, info.project_id) is None
@@ -1309,6 +1317,49 @@ class TestCrossCheck:
         assert coverage.coverage_summary(
             conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
         )["status"] == coverage.COMPLETE
+
+    def test_partial_rerun_invalidates_unrequested_current_periods(self, project_multi):
+        """只重跑一期不得继续把其他期次的旧结果显示为当前结果。"""
+        info, conn, report = project_multi
+        period_nos = [row["period_no"] for row in conn.execute(
+            "SELECT period_no FROM settlement_periods WHERE project_id=? ORDER BY period_no",
+            (info.project_id,),
+        ).fetchall()]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        crosscheck.run_crosscheck(conn, info.project_id, period_nos)
+        crosscheck.run_crosscheck(conn, info.project_id, [report.period_no])
+        summary = build_project_summary(conn, info.project_id)
+        assert summary.verification["periods_unchecked"] == len(period_nos) - 1
+        assert summary.aggregate_coverage["status"] == coverage.FAILED
+        scope, params = run_contract.current_scope(conn, info.project_id, "cr")
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM crosscheck_results cr WHERE cr.project_id=? AND {scope} "
+            "AND cr.period_id != (SELECT id FROM settlement_periods "
+            "WHERE project_id=? AND period_no=?)",
+            (info.project_id, *params, info.project_id, report.period_no),
+        ).fetchone()[0] == 0
+
+    def test_missing_period_total_fails_closed_instead_of_succeeding(self, tmp_path):
+        """关键 period_totals 回写缺行时不能产生完整校核结果。"""
+        info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggregate.persist_period_totals(
+                conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+            )
+            with conn:
+                conn.execute("DELETE FROM period_totals WHERE period_id=?", (period_id,))
+            with pytest.raises(RuntimeError, match="period_totals"):
+                crosscheck.run_crosscheck(conn, info.project_id, [1], direction="downward")
+            assert conn.execute(
+                "SELECT COUNT(*) FROM crosscheck_results WHERE project_id=?", (info.project_id,)
+            ).fetchone()[0] == 0
+            assert coverage.coverage_summary(
+                conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+            )["status"] == coverage.FAILED
+        finally:
+            conn.close()
 
     def test_fail_closed_state_remains_when_success_cleanup_fails(
         self, project_multi, monkeypatch
@@ -1578,6 +1629,11 @@ class TestCrossCheck:
                    WHERE sp.project_id=? AND li.flags_json NOT LIKE '%"subtotal": true%' LIMIT 1)""",
                 (info.project_id,),
             )
+        # 校核只回写已形成的聚合结果；先保存本次修改后的聚合底稿，
+        # 同时验证 period_totals 缺行时会 fail-closed，而不是静默补行。
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
         results = crosscheck.run_crosscheck(conn, info.project_id, [report.period_no])
         assert results[0].status == "diff"
         assert results[0].diff_ab != 0

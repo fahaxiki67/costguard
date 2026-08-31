@@ -213,12 +213,17 @@ def test_confirmed_non_settlement_sheet_is_not_pending(tmp_path):
 
 
 def test_crosscheck_result_survives_reopen(tmp_path):
-    from costguard.core.engine import crosscheck
+    from costguard.core.engine import aggregate, crosscheck
     from costguard.core.models import project as pm
 
     info, conn, _report, period_id = _import_project(tmp_path)
     workspace = Path(info.workspace_path)
     try:
+        aggregate.persist_period_totals(
+            conn,
+            info.project_id,
+            aggregate.aggregate_project(conn, info.project_id, direction="upward"),
+        )
         result = crosscheck.run_crosscheck(
             conn, info.project_id, [1], direction="upward"
         )[0]
@@ -294,6 +299,11 @@ def test_reaggregate_invalidates_persisted_crosscheck_result(tmp_path):
 
     info, conn, _report, period_id = _import_project(tmp_path)
     try:
+        aggregate.persist_period_totals(
+            conn,
+            info.project_id,
+            aggregate.aggregate_project(conn, info.project_id, direction="upward"),
+        )
         crosscheck.run_crosscheck(conn, info.project_id, [1], direction="upward")
         assert conn.execute(
             "SELECT COUNT(*) c FROM crosscheck_results WHERE period_id=?", (period_id,)

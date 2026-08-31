@@ -135,7 +135,67 @@ def _source_rows(conn: sqlite3.Connection, project_id: int) -> list[sqlite3.Row]
     ).fetchall()
 
 
-def _entry_state(entry: sqlite3.Row, source_rows: list[sqlite3.Row]) -> tuple[str, int | None, str]:
+def _semantic_state(
+    conn: sqlite3.Connection,
+    entry: sqlite3.Row,
+    file_id: int,
+) -> tuple[str, str]:
+    """验证清单声明的期次、方向、Sheet 与解析事实，而非只验文件身份。"""
+    expected_period = entry["expected_period_no"]
+    expected_direction = (entry["expected_direction"] or "").strip() or None
+    expected_sheet = (entry["expected_sheet_name"] or "").strip() or None
+    if expected_period is None and expected_direction is None and expected_sheet is None:
+        return "present", "文件身份已按权威绑定确认到件"
+
+    facts = conn.execute(
+        """SELECT rs.id AS sheet_id, rs.sheet_name, rs.period_id,
+                         pb.status AS batch_status, th.id AS header_id,
+                         th.needs_review, sp.period_no, sp.direction
+                  FROM raw_sheets rs
+                  JOIN parse_batches pb ON pb.id=rs.batch_id
+                  LEFT JOIN table_headers th ON th.sheet_id=rs.id
+                  LEFT JOIN settlement_periods sp ON sp.id=rs.period_id
+                 WHERE pb.file_id=?
+                 ORDER BY rs.id""",
+        (file_id,),
+    ).fetchall()
+    if not facts:
+        return "mismatch", "文件已到件，但没有可核对的解析工作表事实"
+
+    candidates = list(facts)
+    if expected_sheet is not None:
+        candidates = [row for row in candidates if row["sheet_name"] == expected_sheet]
+        if not candidates:
+            return "mismatch", f"实际 Sheet 与清单不符：要求「{expected_sheet}」"
+    if expected_period is not None:
+        candidates = [row for row in candidates if row["period_no"] == int(expected_period)]
+        if not candidates:
+            return "mismatch", f"实际期次与清单不符：要求第{expected_period}期"
+    if expected_direction is not None:
+        candidates = [
+            row for row in candidates
+            if (row["direction"] or "unknown") == expected_direction
+        ]
+        if not candidates:
+            return "mismatch", f"实际方向与清单不符：要求「{expected_direction}」"
+    if len(candidates) != 1:
+        return "ambiguous", "清单语义对应多个解析工作表，未自动选择"
+    fact = candidates[0]
+    if fact["batch_status"] != "ok":
+        return "mismatch", f"解析批次状态为 {fact['batch_status']!r}，不能证明清单语义"
+    if expected_period is not None or expected_direction is not None:
+        if fact["period_id"] is None:
+            return "mismatch", "工作表尚未绑定结算期次，不能证明期次/方向"
+    if fact["header_id"] is None or fact["needs_review"]:
+        return "mismatch", "工作表表头不存在或仍待人工复核，不能证明清单语义"
+    return "present", "文件身份及期次、方向、Sheet、表头语义均已核对"
+
+
+def _entry_state(
+    conn: sqlite3.Connection,
+    entry: sqlite3.Row,
+    source_rows: list[sqlite3.Row],
+) -> tuple[str, int | None, str]:
     """仅按显式哈希或人工绑定判断到件，不以文件名自动替代权威绑定。"""
     expected_sha = (entry["expected_sha256"] or "").strip().lower() or None
     expected_name = (entry["expected_name"] or "").strip() or None
@@ -149,13 +209,15 @@ def _entry_state(entry: sqlite3.Row, source_rows: list[sqlite3.Row]) -> tuple[st
             return "mismatch", int(row["id"]), "已绑定文件 SHA-256 与权威清单不符"
         if expected_name and row["original_name"] != expected_name:
             return "mismatch", int(row["id"]), "已绑定文件名与权威清单不符"
-        return "present", int(row["id"]), "已按人工绑定确认到件"
+        state, note = _semantic_state(conn, entry, int(row["id"]))
+        return state, int(row["id"]), note
     if expected_sha:
         matches = [row for row in source_rows if (row["sha256"] or "").lower() == expected_sha]
         if len(matches) == 1:
             if expected_name and matches[0]["original_name"] != expected_name:
                 return "mismatch", int(matches[0]["id"]), "SHA-256 命中但文件名与清单不符"
-            return "present", int(matches[0]["id"]), "按权威 SHA-256 唯一命中"
+            state, note = _semantic_state(conn, entry, int(matches[0]["id"]))
+            return state, int(matches[0]["id"]), note
         if len(matches) > 1:
             return "ambiguous", None, "同一权威 SHA-256 对应多个收到文件"
         same_name = [row for row in source_rows if expected_name and row["original_name"] == expected_name]
@@ -201,7 +263,7 @@ def assess_manifest(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
     binding_changed = False
     with run_contract._transaction(conn, "assess_manifest"):
         for entry in entries:
-            state, file_id, note = _entry_state(entry, source_rows)
+            state, file_id, note = _entry_state(conn, entry, source_rows)
             if file_id != entry["received_file_id"]:
                 binding_changed = True
             conn.execute(

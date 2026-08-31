@@ -136,6 +136,89 @@ def invalidate_crosscheck_results(
     return int(cur.rowcount if cur.rowcount is not None else 0)
 
 
+def set_project_direction(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_id: int,
+    direction: str,
+    *,
+    actor: str,
+    reason: str,
+) -> int:
+    """原子修改期次方向，并同步失效化、证据和审计。
+
+    UI 只能调用这个核心入口，不能先提交业务字段再补写审计。任何一步
+    失败都会回滚方向、运行契约切换、旧结果失效和证据记录。
+    """
+    from costguard.core.evidence import audit as audit_log
+    from costguard.core.evidence import evidence as evidence_api
+
+    if direction not in {"upward", "downward", "unknown"}:
+        raise ValueError(f"不支持的结算方向: {direction!r}")
+    if not reason or not reason.strip():
+        raise audit_log.AuditReasonRequiredError("标记期次方向必须记录原因（原则 14）")
+    period = conn.execute(
+        """SELECT id, period_no, title, direction FROM settlement_periods
+           WHERE id=? AND project_id=?""",
+        (period_id, project_id),
+    ).fetchone()
+    if not period:
+        raise ValueError(f"period {period_id} 不属于 project {project_id}")
+    old_direction = period["direction"] or "unknown"
+    if old_direction == direction:
+        return 0
+    collision = conn.execute(
+        """SELECT id FROM settlement_periods
+           WHERE project_id=? AND period_no=? AND direction=? AND id<>?""",
+        (project_id, period["period_no"], direction, period_id),
+    ).fetchone()
+    if collision:
+        raise sqlite3.IntegrityError(
+            f"第{period['period_no']}期在方向 {direction!r} 已存在期次"
+        )
+
+    before = {
+        "period_id": int(period_id),
+        "period_no": int(period["period_no"]),
+        "title": period["title"],
+        "direction": old_direction,
+    }
+    after = {**before, "direction": direction}
+    with run_contract._transaction(conn, "set_project_direction"):
+        changed = conn.execute(
+            """UPDATE settlement_periods SET direction=?
+               WHERE id=? AND project_id=? AND direction=?""",
+            (direction, period_id, project_id, old_direction),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("期次方向在操作期间发生变化，请刷新后重试")
+        # 方向属于运行范围；契约切换与旧校核结果失效必须处于同一事务。
+        invalidate_crosscheck_results(conn, project_id)
+        signature = run_contract.current_run_signature(conn, project_id)
+        evidence_api.add_evidence(
+            conn,
+            project_id,
+            "direction_change",
+            f"第{period['period_no']}期方向由 {old_direction} 改为 {direction}：{reason.strip()}",
+            steps=[{"step": "人工标记方向", "actor": actor, "reason": reason.strip()}],
+            sources=[{"period_id": int(period_id), "period_no": int(period["period_no"])}],
+            commit=False,
+            run_signature=signature,
+        )
+        audit_log.record_audit(
+            conn,
+            project_id,
+            actor,
+            "set_direction",
+            f"period:{period_id}",
+            before,
+            after,
+            reason,
+            commit=False,
+        )
+    return 1
+
+
 def _cn_to_int(s: str) -> int:
     digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
     if s.isdigit():

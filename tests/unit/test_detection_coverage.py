@@ -25,6 +25,23 @@ def test_skipped_rule_is_partial_not_complete():
     ).status == coverage.PARTIAL
 
 
+def test_unexpected_coverage_values_are_failed_not_filtered():
+    """producer 层收到额外键时必须保留事实并失败关闭，不能过滤后 complete。"""
+    value = coverage.coverage_from_values(
+        expected=["a"],
+        executed=["a", "unexpected"],
+        skipped={"unexpected": "错误阶段"},
+        failed={"unexpected": "错误阶段"},
+        critical_failed=["unexpected"],
+    )
+    assert "unexpected" in value.executed
+    assert "unexpected" in value.skipped
+    assert "unexpected" in value.failed
+    assert "unexpected" in value.critical_failed
+    assert value.status == coverage.FAILED
+    assert coverage.coverage_from_values(expected=[], executed=["unexpected"]).status == coverage.FAILED
+
+
 def test_critical_failure_cannot_appear_complete():
     value = coverage.DetectionCoverage(
         expected=("rule-a",), executed=("rule-a",), critical_failed=("rule-a",)

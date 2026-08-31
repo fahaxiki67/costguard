@@ -1,6 +1,7 @@
 """权威批次清单与到件状态测试。"""
 
 import hashlib
+import json
 from pathlib import Path
 
 from costguard.core.contracts import run_contract
@@ -113,4 +114,51 @@ def test_new_manifest_invalidates_existing_run_scope(tmp_path):
     assert conn.execute(
         "SELECT invalidated_at FROM run_contracts WHERE signature=?", (first.signature,)
     ).fetchone()[0] is not None
+    conn.close()
+
+
+def test_manifest_requires_period_direction_and_sheet_semantics(tmp_path):
+    """同文件同 SHA 但错期次、方向、Sheet 时不得被算作 complete。"""
+    info, conn = _project(tmp_path)
+    file_id = _source(conn, info.project_id, "实际来源.xlsx", b"semantic-source")
+    period_id = conn.execute(
+        "INSERT INTO settlement_periods(project_id, period_no, title, direction) "
+        "VALUES (?, 2, '第2期', 'downward')", (info.project_id,)
+    ).lastrowid
+    batch_id = conn.execute(
+        "INSERT INTO parse_batches(file_id, parser, parsed_at, status) "
+        "VALUES (?, 'test', '2026', 'ok')", (file_id,)
+    ).lastrowid
+    sheet_id = conn.execute(
+        "INSERT INTO raw_sheets(batch_id, sheet_index, sheet_name, n_rows, n_cols, period_id) "
+        "VALUES (?, 0, '实际Sheet', 2, 4, ?)", (batch_id, period_id)
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json, "
+        "confidence, needs_review, data_row_start, data_row_end) "
+        "VALUES (?, 1, 1, ?, 1.0, 0, 2, 2)",
+        (sheet_id, json.dumps({"name": 1, "quantity": 2, "unit_price": 3, "amount": 4}),),
+    )
+    digest = conn.execute(
+        "SELECT sha256 FROM source_files WHERE id=?", (file_id,)
+    ).fetchone()[0]
+    create_manifest(
+        conn,
+        info.project_id,
+        "semantic-gate",
+        [ManifestEntrySpec(
+            "wrong-semantic-source",
+            expected_name="实际来源.xlsx",
+            expected_sha256=digest,
+            expected_period_no=99,
+            expected_direction="upward",
+            expected_sheet_name="要求Sheet",
+        )],
+    )
+
+    summary = assess_manifest(conn, info.project_id)
+    entry = summary["entries"][0]
+    assert summary["status"] != "complete"
+    assert entry["state"] != "present"
+    assert any(term in entry["note"] for term in ("期次", "方向", "Sheet", "表头"))
     conn.close()

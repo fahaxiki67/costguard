@@ -28,6 +28,8 @@ def _unique(values: Any) -> tuple[str, ...]:
         return ()
     if isinstance(values, str):
         values = [values]
+    elif not isinstance(values, (list, tuple, set)):
+        values = [values]
     seen: set[str] = set()
     result: list[str] = []
     for value in values:
@@ -44,6 +46,17 @@ def _mapping(values: Any) -> dict[str, str]:
     return {str(key): str(value) for key, value in values.items()}
 
 
+def _raw_sequence(values: Any) -> tuple[tuple[str, ...], bool]:
+    """把输入变成可审计的字符串序列，并标记不支持的容器类型。"""
+    if values is None:
+        return (), False
+    if isinstance(values, str):
+        return (values,), False
+    if isinstance(values, (list, tuple, set)):
+        return tuple(str(value) for value in values), False
+    return (str(values),), True
+
+
 @dataclass(frozen=True)
 class DetectionCoverage:
     """一次检测运行的可审阅覆盖率快照。"""
@@ -54,12 +67,20 @@ class DetectionCoverage:
     failed: dict[str, str] = field(default_factory=dict)
     critical_failed: tuple[str, ...] = ()
     unavailable: bool = False
+    invalid: bool = False
+    invalid_reasons: tuple[str, ...] = ()
 
     @property
     def status(self) -> str:
         if self.unavailable:
             return UNAVAILABLE
         expected = set(self.expected)
+        unexpected = (
+            (set(self.executed) | set(self.skipped) | set(self.failed)
+             | set(self.critical_failed)) - expected
+        )
+        if self.invalid or unexpected:
+            return FAILED
         accounted = set(self.executed) | set(self.skipped) | set(self.failed)
         if not expected:
             return NOT_STARTED
@@ -96,6 +117,8 @@ class DetectionCoverage:
             "failed": dict(self.failed),
             "critical_failed": list(self.critical_failed),
             "unavailable": self.unavailable,
+            "invalid": self.invalid,
+            "invalid_reasons": list(self.invalid_reasons),
             "expected_count": self.expected_count,
             "executed_count": self.executed_count,
             "skipped_count": self.skipped_count,
@@ -112,22 +135,54 @@ def coverage_from_values(
 ) -> DetectionCoverage:
     """从列表/JSON 兼容值构造快照，并保留失败原因。"""
     expected_values = _unique(expected)
-    executed_values = tuple(item for item in _unique(executed) if item in set(expected_values))
-    skipped_values = {
-        key: value for key, value in _mapping(skipped).items() if key in set(expected_values)
-    }
-    failed_values = {
-        key: value for key, value in _mapping(failed).items() if key in set(expected_values)
-    }
-    critical_values = tuple(
-        item for item in _unique(critical_failed) if item in set(expected_values)
+    executed_values = _unique(executed)
+    skipped_values = _mapping(skipped)
+    failed_values = _mapping(failed)
+    critical_values = _unique(critical_failed)
+    expected_set = set(expected_values)
+    unexpected = (
+        (set(executed_values) | set(skipped_values) | set(failed_values)
+         | set(critical_values)) - expected_set
     )
+    invalid_reasons: list[str] = []
+    if unexpected:
+        invalid_reasons.append("出现未声明的覆盖键: " + ", ".join(sorted(unexpected)))
+    if expected is not None and not isinstance(expected, (str, list, tuple, set)):
+        invalid_reasons.append("expected 不是列表或字符串")
+    if executed is not None and not isinstance(executed, (str, list, tuple, set)):
+        invalid_reasons.append("executed 不是列表或字符串")
+    if skipped is not None and not isinstance(skipped, dict):
+        invalid_reasons.append("skipped 不是对象")
+    if failed is not None and not isinstance(failed, dict):
+        invalid_reasons.append("failed 不是对象")
+    if critical_failed is not None and not isinstance(critical_failed, (str, list, tuple, set)):
+        invalid_reasons.append("critical_failed 不是列表或字符串")
+    for field_name, raw_value in (
+        ("expected", expected),
+        ("executed", executed),
+        ("critical_failed", critical_failed),
+    ):
+        raw_values, unsupported = _raw_sequence(raw_value)
+        if unsupported:
+            invalid_reasons.append(f"{field_name} 不是列表或字符串")
+        if len(raw_values) != len(set(raw_values)):
+            invalid_reasons.append(f"{field_name} 存在重复键")
+    if isinstance(skipped, dict):
+        raw_keys = tuple(str(key) for key in skipped)
+        if len(raw_keys) != len(set(raw_keys)):
+            invalid_reasons.append("skipped 存在重复键")
+    if isinstance(failed, dict):
+        raw_keys = tuple(str(key) for key in failed)
+        if len(raw_keys) != len(set(raw_keys)):
+            invalid_reasons.append("failed 存在重复键")
     return DetectionCoverage(
         expected=expected_values,
         executed=executed_values,
         skipped=skipped_values,
         failed=failed_values,
         critical_failed=critical_values,
+        invalid=bool(invalid_reasons),
+        invalid_reasons=tuple(dict.fromkeys(invalid_reasons)),
     )
 
 
