@@ -980,7 +980,7 @@ class TestCrossCheck:
     def test_persistent_invalidation_commit_rejection_is_explicit_physical_boundary(
         self, project_multi
     ):
-        """持续拒绝所有提交时只中止本次运行，不伪造失效标记或新成功。"""
+        """持续拒绝所有提交时必须进入可读取的运行级不可用边界。"""
         from costguard.core.models import project as pm
 
         info, conn, report = project_multi
@@ -1018,28 +1018,178 @@ class TestCrossCheck:
                 crosscheck.run_crosscheck(
                     conn, info.project_id, [report.period_no], direction=direction
                 )
-            # 持续拒绝时两次完整失效化事务均回滚；实现不进入后续业务/coverage
-            # 提交，也不把一次失败调用伪造成新的结果。
-            assert commit_count == 2
+            # 持续拒绝时失效化事务均回滚；实现不把一次失败调用伪造成新的结果。
+            assert commit_count >= 2
             assert conn.in_transaction is False
-            assert conn.execute(
-                "SELECT COUNT(*) AS c FROM evidence WHERE project_id=? AND kind='cross_check'",
-                (info.project_id,),
-            ).fetchone()["c"] == 1
+            state = run_contract.get_fail_closed_state(conn, info.project_id)
+            assert state is not None
+            assert state["status"] == run_contract.FAIL_CLOSED_STATUS
+            assert state["persisted"] is True
             result = conn.execute(
                 "SELECT status, verification_level, evidence_id FROM crosscheck_results "
                 "WHERE project_id=? AND period_id=?",
                 (info.project_id, period_id),
             ).fetchone()
+            # 原始历史行可保留，但不再进入任何当前读取面。
             assert result["status"] == first.status
             assert result["verification_level"] == first.verification_level
             assert result["evidence_id"] == old_evidence
+
+            current_scope, scope_params = run_contract.current_scope(
+                conn, info.project_id, "cr"
+            )
+            assert conn.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND cr.period_id=? AND {current_scope}",
+                (info.project_id, period_id, *scope_params),
+            ).fetchone()["c"] == 0
+            coverage_summary = coverage.coverage_summary(
+                conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+            )
+            assert coverage_summary["fail_closed"] is True
+            assert coverage_summary["availability_status"] == run_contract.FAIL_CLOSED_STATUS
+            assert coverage_summary["status"] != coverage.COMPLETE
+
+            project_summary = build_project_summary(conn, info.project_id)
+            assert project_summary.run_availability["available"] is False
+            assert project_summary.run_availability["status"] == run_contract.FAIL_CLOSED_STATUS
+            assert project_summary.verification["status"] == run_contract.FAIL_CLOSED_STATUS
+            assert project_summary.statuses["automatic_analysis"] == "failed"
         finally:
             conn.set_authorizer(None)
 
-        # 这是数据库写通道持续不可用时的物理边界：本次调用已经抛出，
-        # 没有返回旧结果作为本次结果；但没有任何持久化失败标志可供
-        # current_scope 在新连接中识别时，既有成功只能原样保留。
+        # 侧车是项目级持久边界；重开连接仍必须拒绝旧成功。
+        _reopened, reopened = pm.open_project(workspace)
+        try:
+            reopened_state = run_contract.get_fail_closed_state(
+                reopened, info.project_id
+            )
+            assert reopened_state is not None
+            assert reopened_state["persisted"] is True
+            reopened_scope, reopened_params = run_contract.current_scope(
+                reopened, info.project_id, "cr"
+            )
+            assert reopened.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND cr.period_id=? AND {reopened_scope}",
+                (info.project_id, period_id, *reopened_params),
+            ).fetchone()["c"] == 0
+            reopened_coverage = coverage.coverage_summary(
+                reopened, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+            )
+            assert reopened_coverage["fail_closed"] is True
+            assert reopened_coverage["status"] != coverage.COMPLETE
+            reopened_summary = build_project_summary(reopened, info.project_id)
+            assert reopened_summary.run_availability["available"] is False
+            assert reopened_summary.statuses["automatic_analysis"] == "failed"
+        finally:
+            reopened.close()
+
+    @pytest.mark.parametrize(
+        "failure_target", ["crosscheck_results", "period_totals", "evidence", "detection_coverage"]
+    )
+    def test_invalidation_dml_failure_enters_fail_closed_boundary(
+        self, project_multi, failure_target
+    ):
+        """失效化四类 DML 失败时，原始异常保留且旧成功不进入当前读取面。"""
+        from costguard.core.models import project as pm
+
+        info, conn, report = project_multi
+        workspace = Path(info.workspace_path)
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        first = crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0]
+        assert first.verification_level == "sufficient"
+        signature = run_contract.current_run_signature(conn, info.project_id)
+        trigger_name = f"block_invalidation_{failure_target}"
+        if failure_target == "crosscheck_results":
+            trigger_sql = f"""CREATE TRIGGER {trigger_name}
+                AFTER UPDATE OF run_signature ON crosscheck_results
+                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
+                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic invalidation crosscheck_results failure');
+                END"""
+            error_message = "synthetic invalidation crosscheck_results failure"
+        elif failure_target == "period_totals":
+            trigger_sql = f"""CREATE TRIGGER {trigger_name}
+                AFTER INSERT ON period_totals
+                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
+                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic invalidation period_totals failure');
+                END"""
+            error_message = "synthetic invalidation period_totals failure"
+        elif failure_target == "evidence":
+            trigger_sql = f"""CREATE TRIGGER {trigger_name}
+                AFTER UPDATE OF run_signature ON evidence
+                WHEN NEW.project_id={info.project_id}
+                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic invalidation evidence failure');
+                END"""
+            error_message = "synthetic invalidation evidence failure"
+        else:
+            trigger_sql = f"""CREATE TRIGGER {trigger_name}
+                AFTER UPDATE OF run_signature ON detection_runs
+                WHEN NEW.project_id={info.project_id}
+                  AND NEW.run_kind='{coverage.AGGREGATE_VALIDATION}'
+                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic invalidation detection coverage failure');
+                END"""
+            error_message = "synthetic invalidation detection coverage failure"
+        conn.execute(trigger_sql)
+        try:
+            with pytest.raises(sqlite3.IntegrityError, match=error_message):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [report.period_no], direction=direction
+                )
+            assert conn.in_transaction is False
+            state = run_contract.get_fail_closed_state(conn, info.project_id)
+            assert state is not None
+            assert state["persisted"] is True
+
+            current_scope, scope_params = run_contract.current_scope(
+                conn, info.project_id, "cr"
+            )
+            assert conn.execute(
+                f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+                f"WHERE cr.project_id=? AND cr.period_id=? AND {current_scope}",
+                (info.project_id, period_id, *scope_params),
+            ).fetchone()["c"] == 0
+            old_row = conn.execute(
+                "SELECT run_signature, status, verification_level FROM crosscheck_results "
+                "WHERE project_id=? AND period_id=?",
+                (info.project_id, period_id),
+            ).fetchone()
+            # 失效化事务回滚时，旧行仍是原始成功；运行级边界负责阻断它。
+            assert old_row["run_signature"] == signature
+            assert old_row["status"] == "match"
+            assert old_row["verification_level"] == "sufficient"
+
+            project_summary = build_project_summary(conn, info.project_id)
+            assert project_summary.run_availability["available"] is False
+            assert project_summary.verification["status"] == run_contract.FAIL_CLOSED_STATUS
+            assert project_summary.statuses["automatic_analysis"] == "failed"
+            coverage_summary = coverage.coverage_summary(
+                conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+            )
+            assert coverage_summary["fail_closed"] is True
+            assert coverage_summary["status"] != coverage.COMPLETE
+        finally:
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
         _reopened, reopened = pm.open_project(workspace)
         try:
             reopened_scope, reopened_params = run_contract.current_scope(
@@ -1049,9 +1199,82 @@ class TestCrossCheck:
                 f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
                 f"WHERE cr.project_id=? AND cr.period_id=? AND {reopened_scope}",
                 (info.project_id, period_id, *reopened_params),
-            ).fetchone()["c"] == 1
+            ).fetchone()["c"] == 0
+            assert not run_contract.current_results_available(
+                reopened, info.project_id
+            )["available"]
         finally:
             reopened.close()
+
+    def test_successful_rerun_clears_fail_closed_state_and_is_current(self, project_multi):
+        """完整成功的新运行提交后才清除边界，并恢复当前读取。"""
+        info, conn, report = project_multi
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        first = crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0]
+        assert first.verification_level == "sufficient"
+        run_contract.set_fail_closed_state(
+            conn, info.project_id, reason="synthetic prior failed run"
+        )
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+
+        result = crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0]
+        assert result.verification_level == "sufficient"
+        assert run_contract.get_fail_closed_state(conn, info.project_id) is None
+        assert run_contract.current_results_available(conn, info.project_id)["available"]
+        assert coverage.coverage_summary(
+            conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
+        )["status"] == coverage.COMPLETE
+
+    def test_fail_closed_state_remains_when_success_cleanup_fails(
+        self, project_multi, monkeypatch
+    ):
+        """清除运行级边界失败时不得返回成功或暴露新结果。"""
+        info, conn, report = project_multi
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=? AND period_no=?",
+            (info.project_id, report.period_no),
+        ).fetchone()["id"]
+        direction = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=?", (period_id,)
+        ).fetchone()["direction"]
+        aggregate.persist_period_totals(
+            conn, info.project_id, aggregate.aggregate_project(conn, info.project_id)
+        )
+        assert crosscheck.run_crosscheck(
+            conn, info.project_id, [report.period_no], direction=direction
+        )[0].verification_level == "sufficient"
+
+        real_clear = run_contract.clear_fail_closed_state
+
+        def refuse_clear(*_args, **_kwargs):
+            raise OSError("synthetic fail-closed cleanup failure")
+
+        monkeypatch.setattr(run_contract, "clear_fail_closed_state", refuse_clear)
+        with pytest.raises(OSError, match="synthetic fail-closed cleanup failure"):
+            crosscheck.run_crosscheck(
+                conn, info.project_id, [report.period_no], direction=direction
+            )
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+        scope, params = run_contract.current_scope(conn, info.project_id, "cr")
+        assert conn.execute(
+            f"SELECT COUNT(*) AS c FROM crosscheck_results cr "
+            f"WHERE cr.project_id=? AND cr.period_id=? AND {scope}",
+            (info.project_id, period_id, *params),
+        ).fetchone()["c"] == 0
+        monkeypatch.setattr(run_contract, "clear_fail_closed_state", real_clear)
 
     def _assert_crosscheck_persistence_failure(
         self, tmp_path, *, trigger_name, trigger_sql, error_message

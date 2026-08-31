@@ -171,6 +171,10 @@ def _make_table(headers: list[str], **spec) -> QTableWidget:
 def project_status_summary(conn, project_id: int) -> str:
     """工作台顶部状态信息：集中显示当前待处理事项和最近校核级别。"""
     summary = build_report_model(conn, project_id).project_summary
+    if not summary.run_availability["available"]:
+        # 运行级边界优先于所有历史统计；不要把 current_scope 的空集显示成
+        # “尚未校核”，也不要让旧成功结果继续成为工作台的当前状态。
+        return "数据库不可写 · 当前结果不可用"
     source_files = summary.source_files
     n = summary.pending["sheets"]
     high_open = summary.pending["high_risk"]
@@ -310,7 +314,10 @@ class WorkbenchPage(QWidget):
         }
         for key, value in values.items():
             self.overview_values[key].setText(value)
-        if pending_sheets:
+        if not summary.run_availability["available"]:
+            self._next_action = "crosscheck"
+            suggestion = "数据库不可写，当前结果不可用；请修复写入问题后重新运行校核"
+        elif pending_sheets:
             self._next_action = "sheets"
             suggestion = f"还有 {pending_sheets} 张工作表待确认"
         elif high:
@@ -498,6 +505,16 @@ class WorkbenchPage(QWidget):
                 results.extend(crosscheck.run_crosscheck(self.conn, self.project.project_id, pnos, direction=direction))
             except AmbiguousPeriodError:
                 errors.append("当前期次存在方向歧义，请先标记方向")
+            except Exception as exc:  # noqa: BLE001 — 核心层保留原始异常，UI 负责明确提示
+                availability = run_contract.current_results_available(
+                    self.conn, self.project.project_id
+                )
+                if not availability["available"]:
+                    errors.append(f"数据库不可写，当前结果不可用：{exc}")
+                    # 同一批次前面方向的返回值也不能在运行级边界下继续显示。
+                    results = []
+                else:
+                    raise
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                     "insufficient": "校核不充分"}
@@ -1504,6 +1521,34 @@ class WorkbenchPage(QWidget):
 
     def refresh_export_status(self):
         pid = self.project.project_id
+        availability = run_contract.current_results_available(self.conn, pid)
+        if not availability["available"]:
+            reason = availability.get("reason")
+            suffix = f"（{reason}）" if reason else ""
+            self.export_status_label.setText(
+                f"数据库不可写，当前结果不可用{suffix}；不能登记或生成当前 Excel/Word 成果。"
+            )
+            export_dir = Path(self.project_dir) / "exports"
+            for key, pattern in (
+                ("excel", "CostGuard审核底稿_*.xlsx"),
+                ("docx", "CostGuard管理层摘要_*.docx"),
+            ):
+                card = getattr(self, "export_card_values", {}).get(key)
+                if not card:
+                    continue
+                files = sorted(export_dir.glob(pattern), key=lambda p: p.stat().st_mtime)
+                if files:
+                    latest_path = files[-1]
+                    stamp = datetime.fromtimestamp(
+                        latest_path.stat().st_mtime
+                    ).strftime("%Y-%m-%d %H:%M")
+                    card["generated"].setText(f"最近生成：{stamp}")
+                else:
+                    card["generated"].setText("最近生成：—")
+                card["status"].setText(
+                    "文件状态：当前结果不可用（数据库不可写，旧文件不得视为 current）"
+                )
+            return
         anomaly_scope, anomaly_params = run_contract.current_scope(self.conn, pid, "a")
         match_scope, match_params = run_contract.current_scope(self.conn, pid, "m")
         check_scope, check_params = run_contract.current_scope(self.conn, pid, "cr")
@@ -1609,6 +1654,9 @@ class WorkbenchPage(QWidget):
         try:
             path = excel_export.export_workbook(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "导出不可用", str(exc))
+            return
         except Exception:  # noqa: BLE001 — 普通界面不显示技术异常
             QMessageBox.warning(self, "导出失败", "Excel 审核底稿生成失败，请检查导出目录权限后重试。")
             return
@@ -1620,6 +1668,9 @@ class WorkbenchPage(QWidget):
         try:
             path = excel_export.export_management_summary_docx(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "导出不可用", str(exc))
+            return
         except Exception:  # noqa: BLE001 — 普通界面不显示技术异常
             QMessageBox.warning(self, "导出失败", "Word 管理层摘要生成失败，请检查导出目录权限后重试。")
             return
@@ -1629,29 +1680,47 @@ class WorkbenchPage(QWidget):
 
     def _export_all(self):
         """按固定顺序生成两类成果；任一失败都保留另一类已生成文件。"""
+        try:
+            run_contract.require_current_results_available(
+                self.conn, self.project.project_id, operation="全部成果导出"
+            )
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "导出不可用", str(exc))
+            return
         excel_path = None
         docx_path = None
+        failures = []
         try:
             excel_path = excel_export.export_workbook(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
-        except Exception:  # noqa: BLE001
-            pass
+        except run_contract.CurrentResultsUnavailableError as exc:
+            failures.append(f"Excel：{exc}")
+        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续另一类导出
+            failures.append(f"Excel：{exc}")
         try:
             docx_path = excel_export.export_management_summary_docx(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
-        except Exception:  # noqa: BLE001
-            pass
+        except run_contract.CurrentResultsUnavailableError as exc:
+            failures.append(f"Word：{exc}")
+        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续另一类导出
+            failures.append(f"Word：{exc}")
         self.refresh_export_status()
         created = [str(path) for path in (excel_path, docx_path) if path]
         if created:
             platform_paths.reveal_in_file_manager(Path(created[0]))
             suffix = "审核尚未完成" if "审核尚未完成" in self.export_status_label.text() else ""
+            failure_text = "\n\n失败：\n" + "\n".join(failures) if failures else ""
             QMessageBox.information(
                 self, "成果生成完成",
-                "已生成：\n" + "\n".join(created) + (f"\n\n{suffix}" if suffix else ""),
+                "已生成：\n" + "\n".join(created)
+                + (f"\n\n{suffix}" if suffix else "")
+                + failure_text,
             )
         else:
-            QMessageBox.warning(self, "成果生成失败", "暂未生成成果，请检查导出目录权限后重试。")
+            message = "暂未生成成果，请检查导出目录权限后重试。"
+            if failures:
+                message += "\n\n" + "\n".join(failures)
+            QMessageBox.warning(self, "成果生成失败", message)
 
     def _open_export_dir(self):
         platform_paths.reveal_in_file_manager(Path(self.project_dir) / "exports")

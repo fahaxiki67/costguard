@@ -204,6 +204,23 @@ class TestWorkbench:
             wb_page.conn, wb_page.project.project_id, Path(wb_page.project_dir) / "exports")
         assert path.exists()
 
+    def test_fail_closed_state_is_visible_in_workbench_and_export_cards(self, wb_page):
+        from costguard.core.contracts import run_contract
+
+        run_contract.set_fail_closed_state(
+            wb_page.conn,
+            wb_page.project.project_id,
+            reason="synthetic database is not writable",
+        )
+        wb_page.refresh_all()
+
+        assert "数据库不可写" in wb_page.status_label.text()
+        assert "当前结果不可用" in wb_page.status_label.text()
+        assert "数据库不可写" in wb_page.export_status_label.text()
+        assert "当前结果不可用" in wb_page.export_status_label.text()
+        assert "当前结果不可用" in wb_page.export_card_values["excel"]["status"].text()
+        assert "当前结果不可用" in wb_page.export_card_values["docx"]["status"].text()
+
 
 class TestMainWindow:
     def test_two_pages_and_switch(self, app, tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parents[2] / "synthetic_test_data"))
 from generator import make_messy, make_multi_period  # noqa: E402
 
 from costguard.core.anomalies import engine  # noqa: E402
+from costguard.core.contracts import run_contract  # noqa: E402
 from costguard.core.engine import settlement_io  # noqa: E402
 from costguard.core.engine.money import round2  # noqa: E402
 from costguard.core.export import excel_export  # noqa: E402
@@ -35,6 +36,30 @@ def full_project(tmp_path):
 
 
 class TestExcelExport:
+    @pytest.mark.parametrize("export_kind", ["excel_workbook", "management_summary_docx"])
+    def test_fail_closed_state_blocks_current_export_registration(
+        self, full_project, export_kind
+    ):
+        """运行级不可用时，Excel/Word 均不得生成或登记为当前成果。"""
+        info, conn, exports = full_project
+        run_contract.set_fail_closed_state(
+            conn, info.project_id, reason="synthetic database is not writable"
+        )
+        exporter = (
+            excel_export.export_workbook
+            if export_kind == "excel_workbook"
+            else excel_export.export_management_summary_docx
+        )
+        with pytest.raises(run_contract.CurrentResultsUnavailableError, match="当前结果不可用"):
+            exporter(conn, info.project_id, exports)
+
+        assert not list(exports.glob("CostGuard审核底稿_*.xlsx"))
+        assert not list(exports.glob("CostGuard管理层摘要_*.docx"))
+        assert all(
+            item["status"] != "current"
+            for item in run_contract.export_status(conn, info.project_id, export_kind)
+        )
+
     def test_amount_only_recompute_is_visible_in_period_and_comparison_outputs(
         self, tmp_path
     ):

@@ -1,23 +1,15 @@
-"""Run Contract 兼容导入入口。"""
+"""Run Contract 兼容导入入口。
 
-from costguard.core.contracts.run_contract import (  # noqa: F401
-    CONTRACT_FORMAT_VERSION,
-    INVALIDATED_RUN_SIGNATURE,
-    LEGACY_STALE_SIGNATURE,
-    RunContract,
-    adopt_unsigned_records,
-    build_contract_components,
-    build_run_contract_components,
-    compute_run_signature,
-    current_run_signature,
-    current_scope,
-    ensure_if_materialized,
-    ensure_run_contract,
-    export_status,
-    get_current_contract,
-    has_materialized_contract,
-    record_export_run,
-    register_export,
-    run_signature,
-    sha256_file,
-)
+旧调用方仍可使用 ``costguard.core.run_contract``；该名称与实际实现模块
+保持同一模块对象，确保函数读取和 ``monkeypatch`` 注入不会因兼容层静态
+重导出而分叉。
+"""
+from __future__ import annotations
+
+import sys as _sys
+
+from costguard.core.contracts import run_contract as _implementation
+
+# 让兼容导入和 ``costguard.core.contracts.run_contract`` 指向同一个模块对象。
+# 这样从任一入口替换属性，所有生产调用方都会观察到相同的替换。
+_sys.modules[__name__] = _implementation

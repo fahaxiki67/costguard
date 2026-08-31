@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -46,6 +46,19 @@ class ProjectSummary:
     detection_coverage: dict[str, Any]
     aggregate_coverage: dict[str, Any]
     statuses: dict[str, str]
+    # 运行级可用性不是某一张结果表的派生值；保留在共享摘要上，避免
+    # current_scope 返回空集后把“当前不可用”误降级为 not_started。
+    run_availability: dict[str, Any] = field(default_factory=lambda: {
+        "available": True,
+        "status": "available",
+        "fail_closed": False,
+        "reason": None,
+        "run_signature": None,
+        "persisted": None,
+        "persistence": None,
+        "physical_limitations": [],
+        "state": None,
+    })
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +77,7 @@ class ProjectSummary:
             "detection_coverage": dict(self.detection_coverage),
             "aggregate_coverage": dict(self.aggregate_coverage),
             "statuses": dict(self.statuses),
+            "run_availability": dict(self.run_availability),
         }
 
 
@@ -130,7 +144,13 @@ def _amounts(conn: sqlite3.Connection, project_id: int, directions: dict[str, in
     return result
 
 
-def _verification(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
+def _verification(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    availability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    availability = availability or run_contract.current_results_available(conn, project_id)
     scope, params = run_contract.current_scope(conn, project_id, "cr")
     rows = conn.execute(
         f"""SELECT cr.verification_level, cr.status, cr.detail_rows,
@@ -146,17 +166,27 @@ def _verification(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
     total_periods = _count(
         conn, "SELECT COUNT(*) FROM settlement_periods WHERE project_id=?", (project_id,)
     )
+    if not availability["available"]:
+        status = run_contract.FAIL_CLOSED_STATUS
+    elif not rows:
+        status = "not_started"
+    elif levels.get("insufficient", 0):
+        status = "insufficient"
+    elif levels.get("findings", 0):
+        status = "findings"
+    else:
+        status = "sufficient"
     return {
         "periods_total": total_periods,
         "periods_checked": len(rows),
         "periods_unchecked": max(0, total_periods - len(rows)),
         "levels": levels,
         "range_unproven_sheets": sum(int(row["range_unproven_sheets"] or 0) for row in rows),
-        "status": (
-            "not_started" if not rows else
-            "insufficient" if levels.get("insufficient", 0) else
-            "findings" if levels.get("findings", 0) else "sufficient"
-        ),
+        "status": status,
+        "availability_status": availability["status"],
+        "current_results_available": availability["available"],
+        "availability_reason": availability.get("reason"),
+        "physical_limitations": list(availability.get("physical_limitations") or []),
         "paths": ["A_database", "B_raw_grid", "C_control_total"],
     }
 
@@ -233,11 +263,20 @@ def _statuses(
     aggregate_coverage: dict[str, Any],
     source_files: int,
     period_count: int,
+    run_availability: dict[str, Any] | None = None,
 ) -> dict[str, str]:
-    if not source_files or not period_count:
-        automatic = "not_started"
-    elif coverage["status"] == "failed" or aggregate_coverage["status"] == "failed":
+    unavailable = bool(
+        run_availability is not None and not run_availability.get("available", True)
+    )
+    failed = (
+        verification["status"] in {"failed", run_contract.FAIL_CLOSED_STATUS}
+        or coverage["status"] in {"failed", run_contract.FAIL_CLOSED_STATUS}
+        or aggregate_coverage["status"] in {"failed", run_contract.FAIL_CLOSED_STATUS}
+    )
+    if unavailable or failed:
         automatic = "failed"
+    elif not source_files or not period_count:
+        automatic = "not_started"
     elif (
         coverage["status"] != "complete"
         or aggregate_coverage["status"] != "complete"
@@ -246,7 +285,7 @@ def _statuses(
         automatic = "partial"
     else:
         automatic = "complete"
-    human = "pending" if any((
+    human = "pending" if unavailable or any((
         pending["sheets"], pending["matches"], pending["anomalies"],
         pending["manifest_status"] in {"incomplete", "mismatch"},
         verification["status"] in {"insufficient", "findings"},
@@ -266,7 +305,8 @@ def build_project_summary(conn: sqlite3.Connection, project_id: int) -> ProjectS
     project_name = project["name"] if project else "未命名项目"
     source_files = _count(conn, "SELECT COUNT(*) FROM source_files WHERE project_id=?", (project_id,))
     directions = _direction_counts(conn, project_id)
-    verification = _verification(conn, project_id)
+    run_availability = run_contract.current_results_available(conn, project_id)
+    verification = _verification(conn, project_id, availability=run_availability)
     risk = _risk(conn, project_id)
     pending = _pending(conn, project_id)
     coverage = detection_coverage.coverage_summary(conn, project_id)
@@ -281,7 +321,7 @@ def build_project_summary(conn: sqlite3.Connection, project_id: int) -> ProjectS
         # 导入时间不等于业务数据截止日；没有明确截止字段时保持未知。
         data_cutoff=None,
         data_cutoff_status="not_available",
-        run_signature=run_contract.current_run_signature(conn, project_id),
+        run_signature=run_availability.get("run_signature"),
         source_files=source_files,
         directions=directions,
         amounts=_amounts(conn, project_id, directions),
@@ -298,7 +338,9 @@ def build_project_summary(conn: sqlite3.Connection, project_id: int) -> ProjectS
             aggregate_coverage,
             source_files,
             period_count,
+            run_availability,
         ),
+        run_availability=run_availability,
     )
 
 

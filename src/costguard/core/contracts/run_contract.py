@@ -13,8 +13,11 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -32,6 +35,23 @@ LEGACY_STALE_SIGNATURE = "legacy:stale"
 INVALIDATED_RUN_SIGNATURE = "run:invalidated"
 CONTRACT_FORMAT_VERSION = 1
 _TRANSACTION_COMMIT_FAILURE_ATTR = "_costguard_transaction_commit_failure"
+FAIL_CLOSED_STATUS = "unavailable"
+_FAIL_CLOSED_FORMAT_VERSION = 1
+_PENDING_CLEAR_KEY = "pending_clear"
+_FAIL_CLOSED_STATES: dict[str, dict[str, Any]] = {}
+_FAIL_CLOSED_LOCK = threading.RLock()
+
+
+class CurrentResultsUnavailableError(RuntimeError):
+    """当前运行结果不可用，调用方不得继续生成或登记当前成果。"""
+
+    def __init__(self, message: str, *, state: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.state = state or {}
+
+
+# 兼容不同调用方对运行级不可用异常的命名。
+RunUnavailableError = CurrentResultsUnavailableError
 
 
 def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
@@ -50,6 +70,346 @@ def _now() -> str:
 def _is_transaction_commit_failure(error: BaseException) -> bool:
     """判断异常是否来自外层事务的 COMMIT，而不是事务体内的写入。"""
     return bool(getattr(error, _TRANSACTION_COMMIT_FAILURE_ATTR, False))
+
+
+def _database_path(conn: sqlite3.Connection, project_id: int) -> Path | None:
+    """读取连接实际打开的项目库路径；移动项目时不依赖过期的 workspace_path。"""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        try:
+            name, filename = row[1], row[2]
+        except (IndexError, KeyError, TypeError):
+            name = row["name"]
+            filename = row["file"]
+        if name == "main" and filename:
+            return Path(str(filename)).expanduser().resolve()
+
+    # 仅作为内存/特殊连接的兼容回退；普通项目连接优先使用 PRAGMA 的真实路径。
+    try:
+        row = conn.execute(
+            "SELECT workspace_path FROM projects WHERE id=?", (project_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row and row["workspace_path"]:
+        return (Path(row["workspace_path"]).expanduser() / "project.db").resolve()
+    return None
+
+
+def fail_closed_state_path(conn: sqlite3.Connection, project_id: int) -> Path:
+    """返回与项目数据库同目录的运行级不可用侧车路径。"""
+    db_path = _database_path(conn, project_id)
+    if db_path is None:
+        raise RuntimeError(f"cannot resolve project database path for project {project_id}")
+    return db_path.with_name(f".{db_path.name}.costguard-run-state.json")
+
+
+def _state_key(conn: sqlite3.Connection, project_id: int) -> str:
+    try:
+        return f"{fail_closed_state_path(conn, project_id)}::{int(project_id)}"
+    except Exception:
+        # 该回退仅在连接无法提供数据库路径时使用，明确属于当前连接范围。
+        return f"connection:{id(conn)}::{int(project_id)}"
+
+
+def _write_fail_closed_state_file(path: Path, payload: dict[str, Any]) -> None:
+    """原子写入侧车；临时文件和目标文件位于同一目录。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _fail_closed_payload(
+    project_id: int,
+    reason: str,
+    *,
+    run_signature: str | None = None,
+    error: BaseException | None = None,
+    persisted: bool,
+    persistence: str,
+    persistence_error: str | None = None,
+) -> dict[str, Any]:
+    limitations = []
+    if not persisted:
+        limitations.append(
+            "运行级状态仅保存在当前进程内；新进程无法读取该边界，跨进程物理限制需人工处理"
+        )
+    return {
+        "format_version": _FAIL_CLOSED_FORMAT_VERSION,
+        "project_id": int(project_id),
+        "status": FAIL_CLOSED_STATUS,
+        "reason": str(reason),
+        "run_signature": run_signature,
+        "error_type": type(error).__name__ if error is not None else None,
+        "error_message": str(error) if error is not None else None,
+        "created_at": _now(),
+        "persisted": bool(persisted),
+        "persistence": persistence,
+        "persistence_error": persistence_error,
+        "physical_limitations": limitations,
+    }
+
+
+def _invalid_state_payload(project_id: int, error: BaseException) -> dict[str, Any]:
+    return _fail_closed_payload(
+        project_id,
+        "运行级不可用状态文件无法读取，当前结果不可用",
+        error=error,
+        persisted=True,
+        persistence="sidecar",
+        persistence_error=str(error),
+    )
+
+
+def set_fail_closed_state(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    reason: str,
+    run_signature: str | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    """设置运行级不可用边界，优先写项目侧车，失败时保留进程内边界。"""
+    path: Path | None
+    try:
+        path = fail_closed_state_path(conn, project_id)
+    except Exception as path_error:
+        payload = _fail_closed_payload(
+            project_id,
+            reason,
+            run_signature=run_signature,
+            error=error,
+            persisted=False,
+            persistence="process",
+            persistence_error=str(path_error),
+        )
+        with _FAIL_CLOSED_LOCK:
+            _FAIL_CLOSED_STATES[_state_key(conn, project_id)] = payload
+        return dict(payload)
+
+    payload = _fail_closed_payload(
+        project_id,
+        reason,
+        run_signature=run_signature,
+        error=error,
+        persisted=True,
+        persistence="sidecar",
+    )
+    key = _state_key(conn, project_id)
+    try:
+        _write_fail_closed_state_file(path, payload)
+    except Exception as persistence_error:
+        payload = _fail_closed_payload(
+            project_id,
+            reason,
+            run_signature=run_signature,
+            error=error,
+            persisted=False,
+            persistence="process",
+            persistence_error=str(persistence_error),
+        )
+        with _FAIL_CLOSED_LOCK:
+            _FAIL_CLOSED_STATES[key] = payload
+        return dict(payload)
+
+    with _FAIL_CLOSED_LOCK:
+        # 持久化成功后不缓存文件状态，避免其他连接/进程清除侧车后本进程继续
+        # 读取旧缓存；仅保留侧车不可写时的进程内状态。
+        _FAIL_CLOSED_STATES.pop(key, None)
+    return dict(payload)
+
+
+def get_fail_closed_state(
+    conn: sqlite3.Connection, project_id: int
+) -> dict[str, Any] | None:
+    """读取运行级不可用边界；进程内兜底优先于侧车。"""
+    key = _state_key(conn, project_id)
+    with _FAIL_CLOSED_LOCK:
+        process_state = _FAIL_CLOSED_STATES.get(key)
+        if process_state is not None:
+            return dict(process_state)
+
+    try:
+        path = fail_closed_state_path(conn, project_id)
+    except Exception:
+        return None
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("state payload is not an object")
+        if int(raw.get("project_id")) != int(project_id):
+            raise ValueError("state project_id does not match")
+        if raw.get("status") != FAIL_CLOSED_STATUS:
+            raise ValueError("state status is not fail-closed")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        # 侧车存在但无法可信读取时采取更安全的阻断，避免把损坏状态当作
+        # “没有边界”。调用方可以从 persistence_error 看到物理限制。
+        return _invalid_state_payload(project_id, error)
+    raw["persisted"] = True
+    raw["persistence"] = "sidecar"
+    raw.setdefault("physical_limitations", [])
+    return dict(raw)
+
+
+def defer_fail_closed_state_clear(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    run_signature: str,
+    coverage_run_id: int,
+    coverage_run_kind: str,
+) -> None:
+    """把边界清除延后到调用方外层事务真正提交之后。"""
+    state = get_fail_closed_state(conn, project_id)
+    if state is None:
+        return
+    payload = dict(state)
+    payload[_PENDING_CLEAR_KEY] = {
+        "run_signature": run_signature,
+        "coverage_run_id": int(coverage_run_id),
+        "coverage_run_kind": str(coverage_run_kind),
+        "requires_outer_commit": True,
+    }
+    key = _state_key(conn, project_id)
+    try:
+        path = fail_closed_state_path(conn, project_id)
+        _write_fail_closed_state_file(path, payload)
+    except Exception as persistence_error:
+        # 旧侧车若存在仍然保持 fail-closed；同进程缓存只补充待清除元数据，
+        # 新进程即使读不到该元数据也只会继续阻断，不会误暴露旧成功。
+        payload["pending_clear_error"] = str(persistence_error)
+        with _FAIL_CLOSED_LOCK:
+            _FAIL_CLOSED_STATES[key] = payload
+        return
+    payload["persisted"] = True
+    payload["persistence"] = "sidecar"
+    payload["persistence_error"] = None
+    payload["physical_limitations"] = []
+    with _FAIL_CLOSED_LOCK:
+        # 成功写入新的侧车版本后，避免本进程继续持有不带最新元数据的副本。
+        _FAIL_CLOSED_STATES.pop(key, None)
+
+
+def _pending_clear_is_committed(
+    conn: sqlite3.Connection, project_id: int, state: dict[str, Any]
+) -> bool:
+    """仅当待清除运行的 coverage 行已在外层事务外可见时返回真。"""
+    pending = state.get(_PENDING_CLEAR_KEY)
+    if not isinstance(pending, dict) or conn.in_transaction:
+        return False
+    try:
+        signature = str(pending["run_signature"])
+        coverage_run_id = int(pending["coverage_run_id"])
+        coverage_run_kind = str(pending["coverage_run_kind"])
+        if current_run_signature(conn, project_id) != signature:
+            return False
+        row = conn.execute(
+            """SELECT run_signature, run_kind, status FROM detection_runs
+               WHERE id=? AND project_id=?""",
+            (coverage_run_id, project_id),
+        ).fetchone()
+    except (KeyError, TypeError, ValueError, sqlite3.Error):
+        return False
+    if row is None:
+        return False
+    return (
+        row["run_signature"] == signature
+        and row["run_kind"] == coverage_run_kind
+        and row["status"] not in {"failed", FAIL_CLOSED_STATUS}
+    )
+
+
+def clear_fail_closed_state(conn: sqlite3.Connection, project_id: int) -> None:
+    """仅在完整成功运行提交后清除边界；删除失败会原样抛出并保留边界。"""
+    # 没有边界时清除是幂等操作。先检查状态也兼容 :memory: 或特殊连接：
+    # 这类连接无法解析持久化路径，但没有待清除的状态时不应让正常成功
+    # 运行凭空失败；已有进程 fallback 时仍会继续走下面的路径并报告限制。
+    state = get_fail_closed_state(conn, project_id)
+    if state is None:
+        return
+    if conn.in_transaction:
+        raise RuntimeError("外层事务尚未提交，不能清除当前结果不可用边界")
+    path = fail_closed_state_path(conn, project_id)
+    # 先完成文件删除，再移除进程内状态。任何异常都会保留进程内状态，且
+    # 侧车若仍存在也会继续阻断新连接。
+    try:
+        path.unlink(missing_ok=True)
+    except TypeError:  # Python 3.8 兼容分支
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    with _FAIL_CLOSED_LOCK:
+        _FAIL_CLOSED_STATES.pop(_state_key(conn, project_id), None)
+
+
+def current_results_available(
+    conn: sqlite3.Connection, project_id: int
+) -> dict[str, Any]:
+    """返回所有当前成果读取/导出共用的运行级可用性。"""
+    state = get_fail_closed_state(conn, project_id)
+    if state is not None and _pending_clear_is_committed(conn, project_id, state):
+        try:
+            clear_fail_closed_state(conn, project_id)
+        except Exception:
+            # 清除失败时维持不可用边界；读取接口不能把清除异常误降级为可用。
+            state = get_fail_closed_state(conn, project_id) or state
+        else:
+            state = None
+    if state is None:
+        return {
+            "available": True,
+            "status": "available",
+            "fail_closed": False,
+            "reason": None,
+            "run_signature": current_run_signature(conn, project_id),
+            "persisted": None,
+            "persistence": None,
+            "physical_limitations": [],
+            "state": None,
+        }
+    return {
+        "available": False,
+        "status": FAIL_CLOSED_STATUS,
+        "fail_closed": True,
+        "reason": state.get("reason"),
+        "run_signature": state.get("run_signature") or current_run_signature(conn, project_id),
+        "persisted": state.get("persisted", False),
+        "persistence": state.get("persistence"),
+        "physical_limitations": list(state.get("physical_limitations") or []),
+        "state": state,
+    }
+
+
+def require_current_results_available(
+    conn: sqlite3.Connection, project_id: int, *, operation: str = "当前操作"
+) -> dict[str, Any]:
+    """在读取当前成果或登记导出前执行统一 fail-closed 门控。"""
+    availability = current_results_available(conn, project_id)
+    if not availability["available"]:
+        reason = availability.get("reason") or "运行级不可用边界已生效"
+        raise CurrentResultsUnavailableError(
+            f"{operation}不可用：数据库不可写，当前结果不可用；{reason}",
+            state=availability.get("state"),
+        )
+    return availability
 
 
 @contextmanager
@@ -537,6 +897,10 @@ def current_scope(
     未产生过运行契约的空/导入中项目只显示新写入的 NULL 签名兼容记录；
     v9 迁移已把真正旧结果标成 ``legacy:stale``。
     """
+    # 运行级不可用边界优先于数据库中仍可能存在的旧成功行。即使失效化
+    # 事务因持续 COMMIT 拒绝而全部回滚，任何当前读取面都必须返回空集。
+    if get_fail_closed_state(conn, project_id) is not None:
+        return "1=0", ()
     signature = current_run_signature(conn, project_id)
     if signature:
         if table_alias == "cr":
@@ -559,6 +923,7 @@ def register_export(
     metadata: dict[str, Any] | None = None,
 ) -> int:
     """登记一个已落盘的成果文件；同类旧文件只标记 stale，不删除。"""
+    require_current_results_available(conn, project_id, operation="导出成果登记")
     target = Path(path)
     signature = run_signature or current_run_signature(conn, project_id, ensure=True)
     file_sha = sha256_file(target) if target.is_file() else None
@@ -595,12 +960,15 @@ def export_status(
         sql += " AND kind=?"
         params.append(kind)
     sql += " ORDER BY generated_at DESC, id DESC"
+    availability = current_results_available(conn, project_id)
     signature = current_run_signature(conn, project_id)
     result = []
     for row in conn.execute(sql, params):
         status = row["status"]
         target = Path(row["path"])
-        if not signature or row["run_signature"] != signature:
+        if not availability["available"]:
+            status = FAIL_CLOSED_STATUS
+        elif not signature or row["run_signature"] != signature:
             status = "stale"
         elif not target.is_file():
             status = "missing"
@@ -619,6 +987,9 @@ def export_status(
             "generated_at": row["generated_at"],
             "status": status,
             "metadata": _loads(row["metadata_json"], {}),
+            "availability_status": availability["status"],
+            "current_results_available": availability["available"],
+            "availability_reason": availability.get("reason"),
         })
     return result
 

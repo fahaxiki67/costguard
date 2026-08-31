@@ -70,6 +70,78 @@ def test_export_registry_detects_file_change_and_contract_staleness(tmp_path):
         conn.close()
 
 
+def test_fail_closed_state_persists_across_connections_and_clears_safely(tmp_path):
+    """运行级不可用边界必须落到项目侧车，并可由重开连接读取。"""
+    info, conn = _project(tmp_path)
+    state_path = None
+    try:
+        state = run_contract.set_fail_closed_state(
+            conn,
+            info.project_id,
+            reason="synthetic database commit failure",
+            run_signature="synthetic-signature",
+        )
+        state_path = run_contract.fail_closed_state_path(conn, info.project_id)
+
+        assert state["status"] == run_contract.FAIL_CLOSED_STATUS
+        assert state["persisted"] is True
+        assert state["persistence"] == "sidecar"
+        assert state_path.is_file()
+        assert not run_contract.current_results_available(conn, info.project_id)["available"]
+    finally:
+        conn.close()
+
+    _reopened, reopened = project_model.open_project(Path(info.workspace_path))
+    try:
+        availability = run_contract.current_results_available(reopened, info.project_id)
+        assert availability["available"] is False
+        assert availability["status"] == run_contract.FAIL_CLOSED_STATUS
+        assert availability["persisted"] is True
+        run_contract.clear_fail_closed_state(reopened, info.project_id)
+        assert run_contract.current_results_available(reopened, info.project_id)["available"]
+        assert not state_path.exists()
+    finally:
+        reopened.close()
+
+
+def test_fail_closed_state_reports_process_only_fallback_when_sidecar_is_unwritable(
+    tmp_path, monkeypatch
+):
+    """侧车无法写入时，同进程仍阻断读取，并明确报告跨进程限制。"""
+    info, conn = _project(tmp_path)
+
+    def refuse_sidecar(*_args, **_kwargs):
+        raise OSError("synthetic sidecar permission failure")
+
+    monkeypatch.setattr(run_contract, "_write_fail_closed_state_file", refuse_sidecar)
+    try:
+        state = run_contract.set_fail_closed_state(
+            conn, info.project_id, reason="synthetic unavailable boundary"
+        )
+        assert state["persisted"] is False
+        assert state["persistence"] == "process"
+        assert state["physical_limitations"]
+        assert "当前进程" in "".join(state["physical_limitations"])
+
+        _reopened, reopened = project_model.open_project(Path(info.workspace_path))
+        try:
+            assert not run_contract.current_results_available(
+                reopened, info.project_id
+            )["available"]
+        finally:
+            reopened.close()
+    finally:
+        run_contract.clear_fail_closed_state(conn, info.project_id)
+        conn.close()
+
+
+def test_compatibility_import_uses_the_implementation_module_object():
+    """兼容入口与实际模块必须共享属性，故障注入不能打到分叉引用。"""
+    import costguard.core.run_contract as compatibility
+
+    assert compatibility is run_contract
+
+
 def test_finding_has_stable_identity_and_lossless_fields():
     details = {
         "raw_quantity": "2",

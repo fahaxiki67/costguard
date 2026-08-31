@@ -796,7 +796,7 @@ def _record_validation_coverage(
     period_nos: list[int],
     direction: str | None,
     error: BaseException | None = None,
-) -> None:
+) -> int:
     """记录 A/B/C 实际覆盖率；C 无源表控制额时只能明确标记跳过。"""
     executed: list[str] = []
     skipped: dict[str, str] = {}
@@ -828,7 +828,7 @@ def _record_validation_coverage(
         failed=failed,
         critical_failed=failed,
     )
-    detection_coverage.record_detection_run(
+    return detection_coverage.record_detection_run(
         conn,
         project_id,
         coverage,
@@ -847,6 +847,39 @@ def _record_validation_coverage(
     )
 
 
+def _record_invalidation_failure_boundary(
+    conn: sqlite3.Connection,
+    project_id: int,
+    expected: list[str],
+    active_contract: run_contract.RunContract,
+    *,
+    period_nos: list[int],
+    direction: str | None,
+    error: BaseException,
+) -> None:
+    """把失效化失败提升为运行级不可用，并尽力保留失败覆盖诊断。"""
+    # 先设置边界，再尝试写 FAILED coverage。侧车不可写时
+    # ``set_fail_closed_state`` 会落到同进程 fallback；无论 coverage 是否能
+    # 写入，调用方都继续保留这里收到的原始异常。
+    run_contract.set_fail_closed_state(
+        conn,
+        project_id,
+        reason="失效化阶段未能安全完成，数据库不可写，当前结果不可用",
+        run_signature=active_contract.signature,
+        error=error,
+    )
+    _record_validation_coverage(
+        conn,
+        project_id,
+        expected,
+        [],
+        active_contract,
+        period_nos=period_nos,
+        direction=direction,
+        error=error,
+    )
+
+
 def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[int],
                    direction: str | None = None) -> list[CheckResult]:
     """执行多期校核；差异与结论写入 evidence 表并回填 period_totals。
@@ -854,16 +887,36 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     direction=None 时若某期号对应多个方向，抛 AmbiguousPeriodError。
     证据与 period_totals 回写锁定同一 period_id。
     """
+    had_outer_transaction = conn.in_transaction
     active_contract = run_contract.ensure_run_contract(conn, project_id)
+    had_fail_closed_state = run_contract.get_fail_closed_state(conn, project_id) is not None
     expected = _expected_validation_keys(conn, project_id, period_nos, direction)
     # 同一输入签名的重跑不能让上一次成功结果跨过本次失败继续充当当前
     # 成果。预失效单独落在批次事务之前，才能在后续 Evidence、coverage 或
     # COMMIT 失败回滚后继续保留 fail-closed 边界；嵌套调用方事务则由
     # _transaction 以 savepoint 方式参与其外层事务。
-    _invalidate_previous_validation(
-        conn, project_id, period_nos, direction, active_contract
-    )
+    try:
+        _invalidate_previous_validation(
+            conn, project_id, period_nos, direction, active_contract
+        )
+    except Exception as exc:
+        try:
+            _record_invalidation_failure_boundary(
+                conn,
+                project_id,
+                expected,
+                active_contract,
+                period_nos=period_nos,
+                direction=direction,
+                error=exc,
+            )
+        except Exception as boundary_or_coverage_error:
+            # 失败覆盖或边界登记是补充诊断，绝不能覆盖失效化阶段的原始
+            # SQLite DML/COMMIT 异常；from 链保留补充失败供排查。
+            raise exc from boundary_or_coverage_error
+        raise
     results: list[CheckResult] = []
+    coverage_run_id: int | None = None
     now = datetime.now().isoformat(timespec="seconds")
     batch_transaction = run_contract._transaction(conn, "run_crosscheck_batch")
     batch_transaction.__enter__()
@@ -990,7 +1043,7 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             raise
         results.append(res)
     try:
-        _record_validation_coverage(
+        coverage_run_id = _record_validation_coverage(
             conn,
             project_id,
             expected,
@@ -1036,5 +1089,33 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                 # 失败 coverage 也无法落库时，保持原始 COMMIT 异常为主因；
                 # from 链保留 coverage 写入失败供调用方排查。
                 raise exc from coverage_exc
+            raise
+        try:
+            # 只有业务回写、成功 coverage 和批次外层 COMMIT 全部完成后，
+            # 才允许清除运行级不可用边界。清除失败时立即重新建立边界，
+            # 防止已提交的新结果在一个未完成的清除操作下被当作当前成果。
+            if had_outer_transaction and had_fail_closed_state:
+                if coverage_run_id is None:
+                    raise RuntimeError("成功运行缺少覆盖率记录，不能清除当前结果不可用边界")
+                run_contract.defer_fail_closed_state_clear(
+                    conn,
+                    project_id,
+                    run_signature=active_contract.signature,
+                    coverage_run_id=coverage_run_id,
+                    coverage_run_kind=detection_coverage.AGGREGATE_VALIDATION,
+                )
+            else:
+                run_contract.clear_fail_closed_state(conn, project_id)
+        except Exception as exc:
+            try:
+                run_contract.set_fail_closed_state(
+                    conn,
+                    project_id,
+                    reason="新运行已提交但不可用边界清除失败，当前结果不可用",
+                    run_signature=active_contract.signature,
+                    error=exc,
+                )
+            except Exception as boundary_error:
+                raise exc from boundary_error
             raise
     return results

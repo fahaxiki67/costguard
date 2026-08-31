@@ -896,6 +896,11 @@ def export_management_summary(
 
 def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """导出全部报表到一个 xlsx。返回文件路径。"""
+    # 前置门控必须早于 manifest/摘要计算、目录创建和任何文件写入；旧的
+    # export_runs 即使仍存在，也不能在运行级不可用时产生新的 current 成果。
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Excel 审核底稿导出"
+    )
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     # 兼容未经过新 API 的即时补充记录；v9 已把真正旧记录标为
     # legacy:stale，因此不会把历史结果重新激活。
@@ -910,6 +915,9 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
         active_contract = run_contract.ensure_run_contract(conn, project_id)
         report_model = build_report_model(conn, project_id)
     out_dir = Path(out_dir)
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Excel 审核底稿导出"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     wb.remove(wb.active)
@@ -945,6 +953,9 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     wb.calculation.calcOnSave = True
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = out_dir / f"CostGuard审核底稿_{stamp}.xlsx"
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Excel 审核底稿导出"
+    )
     wb.save(path)
     run_contract.register_export(
         conn,
@@ -959,6 +970,11 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
 
 def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """管理层摘要 Word 版：首屏状态、关键指标、Top 风险和限制均可追溯。"""
+    # 与 Excel 共用同一个运行级前置边界，并且放在 docx 构造和导出目录
+    # 创建之前，避免 fail-closed 状态下产生未登记的成果文件。
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Word 管理层摘要导出"
+    )
     import docx as docx_lib
     from docx.oxml.ns import qn
     from docx.shared import Pt
@@ -1210,8 +1226,14 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         "未经批准，不构成任何真实业务结论，包括最终结算、责任认定或正式管理结论。"
     )
     out_dir = Path(out_dir)
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Word 管理层摘要导出"
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"CostGuard管理层摘要_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    run_contract.require_current_results_available(
+        conn, project_id, operation="Word 管理层摘要导出"
+    )
     doc.save(str(path))
     run_contract.register_export(
         conn,

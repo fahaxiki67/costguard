@@ -17,7 +17,8 @@ NOT_STARTED = "not_started"
 PARTIAL = "partial"
 COMPLETE = "complete"
 FAILED = "failed"
-VALID_STATUSES = {NOT_STARTED, PARTIAL, COMPLETE, FAILED}
+UNAVAILABLE = run_contract.FAIL_CLOSED_STATUS
+VALID_STATUSES = {NOT_STARTED, PARTIAL, COMPLETE, FAILED, UNAVAILABLE}
 ANOMALY_DETECTION = "anomaly_detection"
 AGGREGATE_VALIDATION = "aggregate_validation"
 
@@ -52,9 +53,12 @@ class DetectionCoverage:
     skipped: dict[str, str] = field(default_factory=dict)
     failed: dict[str, str] = field(default_factory=dict)
     critical_failed: tuple[str, ...] = ()
+    unavailable: bool = False
 
     @property
     def status(self) -> str:
+        if self.unavailable:
+            return UNAVAILABLE
         expected = set(self.expected)
         accounted = set(self.executed) | set(self.skipped) | set(self.failed)
         if not expected:
@@ -91,6 +95,7 @@ class DetectionCoverage:
             "skipped": dict(self.skipped),
             "failed": dict(self.failed),
             "critical_failed": list(self.critical_failed),
+            "unavailable": self.unavailable,
             "expected_count": self.expected_count,
             "executed_count": self.executed_count,
             "skipped_count": self.skipped_count,
@@ -206,15 +211,21 @@ def current_detection_run(
     run_kind: str = ANOMALY_DETECTION,
 ) -> sqlite3.Row | None:
     """只读取当前 Run Contract 下最近一次检测，不混入历史签名。"""
+    fail_closed = run_contract.get_fail_closed_state(conn, project_id)
     signature = run_contract.current_run_signature(conn, project_id)
     if not signature:
         return None
-    return conn.execute(
+    row = conn.execute(
         """SELECT * FROM detection_runs
            WHERE project_id=? AND run_signature=? AND run_kind=?
            ORDER BY id DESC LIMIT 1""",
         (project_id, signature, run_kind),
     ).fetchone()
+    # 运行级边界生效时，旧的 complete/partial 运行不能穿过边界。若本次
+    # 失败覆盖已真实写入，则保留 FAILED 事实供诊断；不把它当作可用成果。
+    if fail_closed and (row is None or row["status"] != FAILED):
+        return None
+    return row
 
 
 def current_detection_coverage(
@@ -224,7 +235,11 @@ def current_detection_coverage(
     run_kind: str = ANOMALY_DETECTION,
 ) -> DetectionCoverage:
     row = current_detection_run(conn, project_id, run_kind=run_kind)
-    return _row_to_coverage(row) if row else DetectionCoverage()
+    if row:
+        return _row_to_coverage(row)
+    return DetectionCoverage(
+        unavailable=run_contract.get_fail_closed_state(conn, project_id) is not None
+    )
 
 
 def coverage_summary(
@@ -234,8 +249,11 @@ def coverage_summary(
     run_kind: str = ANOMALY_DETECTION,
 ) -> dict[str, Any]:
     """返回 UI/Excel/Word 可共用的简洁覆盖率字段。"""
+    availability = run_contract.current_results_available(conn, project_id)
     row = current_detection_run(conn, project_id, run_kind=run_kind)
-    coverage = _row_to_coverage(row) if row else DetectionCoverage()
+    coverage = _row_to_coverage(row) if row else DetectionCoverage(
+        unavailable=not availability["available"]
+    )
     result = coverage.as_dict()
     result["run_id"] = int(row["id"]) if row else None
     result["run_kind"] = run_kind
@@ -243,4 +261,9 @@ def coverage_summary(
     result["started_at"] = row["started_at"] if row else None
     result["completed_at"] = row["completed_at"] if row else None
     result["error_summary"] = row["error_summary"] if row else None
+    result["availability_status"] = availability["status"]
+    result["fail_closed"] = not availability["available"]
+    result["current_results_available"] = availability["available"]
+    result["availability_reason"] = availability.get("reason")
+    result["physical_limitations"] = list(availability.get("physical_limitations") or [])
     return result
