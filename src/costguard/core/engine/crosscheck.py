@@ -542,17 +542,14 @@ def _expected_validation_keys(
     period_nos: list[int],
     direction: str | None,
 ) -> list[str]:
-    """按当前项目/方向重建本次范围应覆盖的 A/B/C 路径。
+    """按当前项目重建完整 A/B/C 证明所需覆盖的路径。
 
     ``period_nos`` 只是调用方请求重跑的子集，不能被用来缩小完整性证明的
-    expected 集合；方向参数仍是合法的业务隔离范围。
+    expected 集合；方向参数只用于解析调用方选择，不改变项目级证明范围。
     """
     expected: list[str] = []
     sql = "SELECT id FROM settlement_periods WHERE project_id=?"
     params: list[object] = [project_id]
-    if direction is not None:
-        sql += " AND direction=?"
-        params.append(direction)
     rows = conn.execute(sql + " ORDER BY id", params).fetchall()
     for row in rows:
         expected.extend(
@@ -643,16 +640,13 @@ def _invalidate_previous_validation(
     direction: str | None,
     active_contract: run_contract.RunContract,
 ) -> int:
-    """把当前项目/方向的旧结果移出当前面，并保留可追溯历史。
+    """把当前项目的旧结果移出当前面，并保留可追溯历史。
 
-    即使调用方只请求其中一期，也必须先撤下该业务范围内其余期次的旧
-    current 结果；否则局部重跑会和旧成功结果拼成假完整状态。
+    即使调用方只请求其中一期或一个方向，也必须先撤下项目内其余期次的
+    旧 current 结果；否则局部重跑会和旧成功结果拼成假完整状态。
     """
     sql = "SELECT id FROM settlement_periods WHERE project_id=?"
     params: list[object] = [project_id]
-    if direction is not None:
-        sql += " AND direction=?"
-        params.append(direction)
     period_ids = [
         int(row["id"])
         for row in conn.execute(sql + " ORDER BY id", params).fetchall()
@@ -883,6 +877,8 @@ def _record_validation_coverage(
         error_summary=failure_text if error is not None else None,
         metadata={
             "stage": "A/B/C crosscheck",
+            "producer": "run_crosscheck",
+            "period_ids": sorted({int(result.period_id) for result in results}),
             "period_nos": list(period_nos),
             "direction": direction,
             "result_count": len(results),
@@ -890,6 +886,7 @@ def _record_validation_coverage(
                 result.period_id for result in results if result.status == "incomplete"
             ],
         },
+        _internal_token=detection_coverage._AGGREGATE_VALIDATION_TOKEN,
     )
 
 
@@ -944,19 +941,67 @@ def _set_crosscheck_fail_closed(
     )
 
 
+def _project_period_ids(
+    conn: sqlite3.Connection, project_id: int
+) -> list[tuple[int, int]]:
+    rows = conn.execute(
+        "SELECT id, period_no FROM settlement_periods WHERE project_id=? ORDER BY id",
+        (project_id,),
+    ).fetchall()
+    return [(int(row["id"]), int(row["period_no"])) for row in rows]
+
+
+def run_crosscheck_project(
+    conn: sqlite3.Connection, project_id: int
+) -> list[CheckResult]:
+    """一次性协调项目内所有方向的校核，形成项目级完整 coverage 证明。"""
+    selections = _project_period_ids(conn, project_id)
+    if not selections:
+        return []
+    return run_crosscheck(
+        conn,
+        project_id,
+        [period_no for _period_id, period_no in selections],
+        direction=None,
+        _period_ids=[period_id for period_id, _period_no in selections],
+    )
+
+
 def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[int],
-                   direction: str | None = None) -> list[CheckResult]:
+                   direction: str | None = None, *,
+                   _period_ids: list[int] | None = None) -> list[CheckResult]:
     """执行多期校核；差异与结论写入 evidence 表并回填 period_totals。
 
     direction=None 时若某期号对应多个方向，抛 AmbiguousPeriodError。
     证据与 period_totals 回写锁定同一 period_id。
     """
+    # 项目级协调入口按 period_id 锁定选择，可支持同一期号在不同方向重复。
+    # 兼容入口仍按 (period_no, direction) 做参数校验，避免先失效化旧结果再
+    # 把调用方输入错误记录成数据库故障。
+    selected_period_rows: list[sqlite3.Row] | None = None
+    if _period_ids is not None:
+        ids = [int(period_id) for period_id in _period_ids]
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("项目级校核的期次标识不得为空或重复")
+        placeholders = ",".join("?" for _ in ids)
+        selected_period_rows = conn.execute(
+            f"""SELECT id, period_no, direction
+                   FROM settlement_periods
+                   WHERE project_id=? AND id IN ({placeholders})
+                   ORDER BY id""",
+            (project_id, *ids),
+        ).fetchall()
+        if len(selected_period_rows) != len(ids):
+            raise ValueError("项目级校核包含不属于当前项目的期次")
+        period_nos = [int(row["period_no"]) for row in selected_period_rows]
+        direction = None
     # 参数歧义属于调用方输入错误，不应先失效化旧结果再把它记录成数据库
     # 故障；先完成选择验证，避免一次错误入口永久留下运行级不可用状态。
     # 但验证失败本身仍须留下 FAILED coverage，便于审阅者知道本次入口没有
     # 覆盖任何期次，不能被误读成“没有运行记录所以没有问题”。
     try:
-        _validate_period_selection(conn, project_id, period_nos, direction)
+        if selected_period_rows is None:
+            _validate_period_selection(conn, project_id, period_nos, direction)
     except (AmbiguousPeriodError, ValueError) as validation_error:
         active_contract: run_contract.RunContract | None = None
         try:
@@ -1032,11 +1077,20 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     now = datetime.now().isoformat(timespec="seconds")
     batch_transaction = run_contract._transaction(conn, "run_crosscheck_batch")
     batch_transaction.__enter__()
-    for pno in period_nos:
+    selections = (
+        [(int(row["id"]), int(row["period_no"])) for row in selected_period_rows]
+        if selected_period_rows is not None
+        else [(None, int(pno)) for pno in period_nos]
+    )
+    for period_id, pno in selections:
         try:
             # 计算、状态门控及本期所有业务回写共享同一个错误边界；发生
             # 任何异常时，由事务上下文回滚本期半成品，再登记失败覆盖率。
-            res = check_period_by_no(conn, project_id, pno, direction=direction)
+            res = (
+                check_period(conn, period_id)
+                if period_id is not None
+                else check_period_by_no(conn, project_id, pno, direction=direction)
+            )
             dir_label = direction_label(res.direction)
             status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
             if res.status != "match":

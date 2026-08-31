@@ -378,8 +378,10 @@ def confirm_match(
     actor: str,
     reason: str,
     alias_name: str | None = None,
+    *,
+    require_exact_pending: bool = False,
 ) -> None:
-    """确认一个匹配。可选地把它固化为项目别名映射（保存依据=reason）。"""
+    """确认一个匹配；批量入口可要求候选仍为完全匹配且待确认。"""
     # 先校验人工判断原因，再进行任何状态、别名、证据或审计写入。
     # UI 已有必填门控，核心 API 也必须保持同一边界，避免空原因导致部分写入。
     if not reason or not reason.strip():
@@ -402,6 +404,12 @@ def confirm_match(
             raise run_contract.CurrentResultsUnavailableError(
                 "确认匹配不可用：匹配结果已不在当前运行范围，请刷新后重试。"
             )
+        if require_exact_pending and (
+            live_row["level"] != CONFIRMED or live_row["status"] != "pending"
+        ):
+            raise ValueError(
+                f"匹配组 {match_id} 已发生变化；批量确认仅允许待确认的完全匹配"
+            )
         item_ids = json.loads(live_row["item_ids_json"])
         if not item_ids:
             raise ValueError(f"match {match_id} has no line items")
@@ -420,11 +428,27 @@ def confirm_match(
                 f"match {match_id} spans {sorted(directions)}; direction-isolated confirmation required"
             )
         direction = next(iter(directions))
-        cur = conn.execute(
-            """UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=?
-               WHERE id=? AND project_id=? AND run_signature=?""",
-            (actor, reason, CONFIRMED, match_id, project_id, active_signature),
-        )
+        if require_exact_pending:
+            cur = conn.execute(
+                """UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=?
+                   WHERE id=? AND project_id=? AND run_signature=?
+                     AND level=? AND status='pending'""",
+                (
+                    actor,
+                    reason,
+                    CONFIRMED,
+                    match_id,
+                    project_id,
+                    active_signature,
+                    CONFIRMED,
+                ),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE matches SET status='confirmed', reviewed_by=?, review_note=?, level=?
+                   WHERE id=? AND project_id=? AND run_signature=?""",
+                (actor, reason, CONFIRMED, match_id, project_id, active_signature),
+            )
         if cur.rowcount != 1:
             raise run_contract.CurrentResultsUnavailableError(
                 "确认匹配不可用：匹配结果已发生变化，请刷新后重试。"
@@ -494,7 +518,14 @@ def confirm_matches(
                 )
         # 复用单项核心事务实现；嵌套 savepoint 保证任一项失败时整批回滚。
         for match_id in ids:
-            confirm_match(conn, project_id, match_id, actor, reason)
+            confirm_match(
+                conn,
+                project_id,
+                match_id,
+                actor,
+                reason,
+                require_exact_pending=True,
+            )
     return len(ids)
 
 

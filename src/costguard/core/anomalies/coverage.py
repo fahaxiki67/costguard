@@ -21,6 +21,7 @@ UNAVAILABLE = run_contract.FAIL_CLOSED_STATUS
 VALID_STATUSES = {NOT_STARTED, PARTIAL, COMPLETE, FAILED, UNAVAILABLE}
 ANOMALY_DETECTION = "anomaly_detection"
 AGGREGATE_VALIDATION = "aggregate_validation"
+_AGGREGATE_VALIDATION_TOKEN = object()
 
 
 def _unique(values: Any) -> tuple[str, ...]:
@@ -202,8 +203,18 @@ def record_detection_run(
     error_summary: str | None = None,
     metadata: dict[str, Any] | None = None,
     commit: bool = True,
+    _internal_token: object | None = None,
 ) -> int:
     """保存一次覆盖率快照；``commit=False`` 用于与异常写入同一事务。"""
+    if run_kind == AGGREGATE_VALIDATION and _internal_token is not _AGGREGATE_VALIDATION_TOKEN:
+        has_periods = conn.execute(
+            "SELECT 1 FROM settlement_periods WHERE project_id=? LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if has_periods:
+            raise ValueError(
+                "aggregate_validation coverage 只能由 run_crosscheck 业务事务记录"
+            )
     signature = run_signature or run_contract.current_run_signature(
         conn, project_id, ensure=True
     )
