@@ -61,6 +61,8 @@ class DetectionCoverage:
             return NOT_STARTED
         if self.failed or self.critical_failed:
             return FAILED
+        if self.skipped:
+            return PARTIAL
         if not expected.issubset(accounted):
             return PARTIAL
         return COMPLETE

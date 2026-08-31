@@ -280,30 +280,40 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
 
     # C：原表小计行金额。控制值只认"合计级"行（合计/总计/累计）——真实分页
     # 结算书"本页小计"与"合计"并存，全部求和会把控制值翻倍（v0.1.5 已知限制）。
-    # 唯一合计级有值行 → 控制值；零个 → not_available；多个 → 不唯一，
-    # not_available 并留注（不擅自挑行或求和）。
+    # 存在合计级行时必须恰好一条且金额可解析；否则 C 不可用并留注，
+    # 不擅自挑行、求和或回退到页级小计。无合计级行时，页级小计也必须
+    # 全部可解析后才可互斥求和。
     subtotal_rows = [r for r in rows if json.loads(r["flags_json"] or "{}").get("subtotal")]
     grand_rows = [
         r for r in subtotal_rows
         if json.loads(r["flags_json"] or "{}").get("grand_total")
     ]
-    grand_with_amount = [r for r in grand_rows if r["amount"] is not None]
-    subtotal_with_amount = [r for r in subtotal_rows if r["amount"] is not None]
     control_note = None
-    if len(grand_with_amount) == 1:
-        raw_subtotal, _ = _sum_amounts(grand_with_amount)
-    elif len(grand_with_amount) > 1:
-        raw_subtotal, _ = _sum_amounts([])  # None
-        control_note = (
-            f"{len(grand_with_amount)} 个合计级行均有金额，C 控制值不唯一，"
-            "请人工核对原表（未擅自挑行或求和）")
-    elif subtotal_with_amount:
-        # 无合计级行：页级小计按页互斥，求和即全表控制值（修复 v0.1.5 的
-        # "页小计+合计"混加翻倍；页小计未覆盖全部明细时差额如实呈现为 diff）。
-        raw_subtotal, _ = _sum_amounts(subtotal_with_amount)
-        control_note = f"无合计级行，C 控制值={len(subtotal_with_amount)} 个小计行之和"
+    if grand_rows:
+        # 合计级行一旦存在，就必须恰好只有一条且金额可解析；无效行不能
+        # 被忽略后回退到页级小计，否则同一张表会因脏控制行假绿色。
+        if len(grand_rows) != 1:
+            raw_subtotal = None
+            control_note = (
+                f"{len(grand_rows)} 个合计级行，C 控制值不唯一，"
+                "请人工核对原表（未擅自挑行或求和）"
+            )
+        else:
+            raw_subtotal = _dec_or_none(grand_rows[0]["amount"])
+            if raw_subtotal is None:
+                control_note = "唯一合计级行金额缺失或非法，C 控制不可用"
+    elif subtotal_rows:
+        # 无合计级行时，页级小计按页互斥求和；任一页级小计无效时，
+        # 不能只累计其余可解析值形成不完整的 C 控制值。
+        subtotal_values = [_dec_or_none(row["amount"]) for row in subtotal_rows]
+        if any(value is None for value in subtotal_values):
+            raw_subtotal = None
+            control_note = "无合计级行且页级小计金额缺失或非法，C 控制不可用"
+        else:
+            raw_subtotal = sum(subtotal_values, D("0"))
+            control_note = f"无合计级行，C 控制值={len(subtotal_rows)} 个小计行之和"
     else:
-        raw_subtotal, _ = _sum_amounts([])  # None
+        raw_subtotal = None
         control_note = "无带金额的小计/合计行，C 控制不可用"
 
     # B：从原始网格独立重算（不复用 line_items）
@@ -382,9 +392,11 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         amount_status = amount_source
 
     notes: list[str] = []
-    if derived_rows:
+    missing_raw_rows = max(summary_a.missing_rows, summary_b.missing_rows)
+    if missing_raw_rows:
         notes.append(
-            f"{derived_rows}行原始金额缺失，A/B路径均按数量×单价计算并保留来源"
+            f"{missing_raw_rows}行原始金额缺失或不可解析，"
+            f"{('A/B路径均按数量×单价计算并保留来源' if derived_rows else '候选金额未能完整解析')}"
         )
     if formula_mismatch_rows:
         notes.append(
@@ -422,6 +434,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         reasons.append(f"{pending_sheets} 张工作表待人工确认")
     if range_unproven_sheets:
         reasons.append(f"{range_unproven_sheets} 张工作表取数范围完整性无法证明")
+    if missing_raw_rows:
+        reasons.append("原始金额存在缺失或不可解析")
     if control_status == "not_available":
         reasons.append("C 控制不可用")
     if status == "incomplete":
@@ -621,119 +635,124 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
     now = datetime.now().isoformat(timespec="seconds")
     for pno in period_nos:
         try:
+            # 计算、状态门控及本期所有业务回写共享同一个错误边界；发生
+            # 任何异常时，由事务上下文回滚本期半成品，再登记失败覆盖率。
             res = check_period_by_no(conn, project_id, pno, direction=direction)
+            dir_label = direction_label(res.direction)
+            status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
+            if res.status != "match":
+                combined_status = res.status
+                combined_diff = res.diff_ab
+            elif res.control_status == "diff":
+                combined_status = "control_diff"
+                combined_diff = res.control_diff
+            elif res.control_status == "match":
+                combined_status = "match"
+                combined_diff = res.diff_ab
+            else:
+                combined_status = "ab_match_control_not_available"
+                combined_diff = res.diff_ab
+            # 兼容旧读取面的同时，禁止“数值碰巧一致但证据条件不足”仍落成
+            # ``cross_check_status='match'``。逐清单旧字段保留 A/B/C 原始状态，
+            # 但项目级整体状态以三档校核级别为最终门控；所有新界面/成果读取
+            # verification_level，历史消费者也能从此值看出不能按通过解释。
+            if res.verification_level == "insufficient" and combined_status == "match":
+                combined_status = "insufficient"
+            with run_contract._transaction(conn, "run_crosscheck"):
+                cur = conn.execute(
+                    """INSERT INTO evidence(
+                           project_id, kind, summary, steps_json, sources_json,
+                           created_at, run_signature)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (project_id, "cross_check",
+                     f"第{pno}期{dir_label}双向校核：{status_zh.get(res.status, '待复核')}；"
+                     f"{'校核充分' if res.verification_level == 'sufficient' else '校核有发现' if res.verification_level == 'findings' else '校核不充分'}",
+                     json.dumps(res.__dict__ | {"path_a_total": str(res.path_a_total),
+                                                "path_b_total": str(res.path_b_total),
+                                                "raw_subtotal": str(res.raw_subtotal),
+                                                "diff_ab": str(res.diff_ab),
+                                                "control_diff": str(res.control_diff)},
+                                ensure_ascii=False, default=str),
+                     json.dumps({"period_id": res.period_id, "period": pno, "direction": res.direction}),
+                     now, active_contract.signature),
+                )
+                ev_id = cur.lastrowid
+                conn.execute(
+                    """UPDATE period_totals SET
+                       cross_check_status=?, cross_check_diff=?, evidence_id=?,
+                       ab_status=?, ab_diff=?, control_status=?, control_diff=?,
+                       verification_level=?, run_signature=?
+                       WHERE period_id=?""",
+                    (
+                        combined_status,
+                        str(combined_diff) if combined_diff is not None else None,
+                        ev_id,
+                        res.status,
+                        str(res.diff_ab) if res.diff_ab is not None else None,
+                        res.control_status,
+                        str(res.control_diff) if res.control_diff is not None else None,
+                        res.verification_level,
+                        active_contract.signature,
+                        res.period_id,
+                    ),
+                )
+                conn.execute(
+                    """INSERT INTO crosscheck_results(
+                           project_id, period_id, verification_level, status,
+                           path_a_total, path_b_total, raw_subtotal, diff_ab, control_diff,
+                           ab_status, control_status, detail_rows, excluded_subtotal_rows,
+                           excluded_title_rows, pending_sheets, range_unproven_sheets,
+                           notes_json, evidence_id, checked_at, run_signature)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(period_id) DO UPDATE SET
+                           project_id=excluded.project_id,
+                           verification_level=excluded.verification_level,
+                           status=excluded.status,
+                           path_a_total=excluded.path_a_total,
+                           path_b_total=excluded.path_b_total,
+                           raw_subtotal=excluded.raw_subtotal,
+                           diff_ab=excluded.diff_ab,
+                           control_diff=excluded.control_diff,
+                           ab_status=excluded.ab_status,
+                           control_status=excluded.control_status,
+                           detail_rows=excluded.detail_rows,
+                           excluded_subtotal_rows=excluded.excluded_subtotal_rows,
+                           excluded_title_rows=excluded.excluded_title_rows,
+                           pending_sheets=excluded.pending_sheets,
+                           range_unproven_sheets=excluded.range_unproven_sheets,
+                           notes_json=excluded.notes_json,
+                           evidence_id=excluded.evidence_id,
+                           checked_at=excluded.checked_at,
+                           run_signature=excluded.run_signature""",
+                    (
+                        project_id, res.period_id, res.verification_level, combined_status,
+                        str(res.path_a_total) if res.path_a_total is not None else None,
+                        str(res.path_b_total) if res.path_b_total is not None else None,
+                        str(res.raw_subtotal) if res.raw_subtotal is not None else None,
+                        str(res.diff_ab) if res.diff_ab is not None else None,
+                        str(res.control_diff) if res.control_diff is not None else None,
+                        res.status, res.control_status, res.detail_rows,
+                        res.excluded_subtotal_rows, res.excluded_title_rows,
+                        res.pending_sheets, res.range_unproven_sheets,
+                        json.dumps(res.notes, ensure_ascii=False), ev_id, now,
+                        active_contract.signature,
+                    ),
+                )
         except Exception as exc:
-            _record_validation_coverage(
-                conn,
-                project_id,
-                expected,
-                results,
-                active_contract,
-                period_nos=period_nos,
-                direction=direction,
-                error=exc,
-            )
+            try:
+                _record_validation_coverage(
+                    conn,
+                    project_id,
+                    expected,
+                    results,
+                    active_contract,
+                    period_nos=period_nos,
+                    direction=direction,
+                    error=exc,
+                )
+            except Exception as coverage_exc:
+                raise exc from coverage_exc
             raise
-        dir_label = direction_label(res.direction)
-        status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
-        if res.status != "match":
-            combined_status = res.status
-            combined_diff = res.diff_ab
-        elif res.control_status == "diff":
-            combined_status = "control_diff"
-            combined_diff = res.control_diff
-        elif res.control_status == "match":
-            combined_status = "match"
-            combined_diff = res.diff_ab
-        else:
-            combined_status = "ab_match_control_not_available"
-            combined_diff = res.diff_ab
-        # 兼容旧读取面的同时，禁止“数值碰巧一致但证据条件不足”仍落成
-        # ``cross_check_status='match'``。逐清单旧字段保留 A/B/C 原始状态，
-        # 但项目级整体状态以三档校核级别为最终门控；所有新界面/成果读取
-        # verification_level，历史消费者也能从此值看出不能按通过解释。
-        if res.verification_level == "insufficient" and combined_status == "match":
-            combined_status = "insufficient"
-        with run_contract._transaction(conn, "run_crosscheck"):
-            cur = conn.execute(
-                """INSERT INTO evidence(
-                       project_id, kind, summary, steps_json, sources_json,
-                       created_at, run_signature)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (project_id, "cross_check",
-                 f"第{pno}期{dir_label}双向校核：{status_zh.get(res.status, '待复核')}；"
-                 f"{'校核充分' if res.verification_level == 'sufficient' else '校核有发现' if res.verification_level == 'findings' else '校核不充分'}",
-                 json.dumps(res.__dict__ | {"path_a_total": str(res.path_a_total),
-                                            "path_b_total": str(res.path_b_total),
-                                            "raw_subtotal": str(res.raw_subtotal),
-                                            "diff_ab": str(res.diff_ab),
-                                            "control_diff": str(res.control_diff)},
-                            ensure_ascii=False, default=str),
-                 json.dumps({"period_id": res.period_id, "period": pno, "direction": res.direction}),
-                 now, active_contract.signature),
-            )
-            ev_id = cur.lastrowid
-            conn.execute(
-                """UPDATE period_totals SET
-                   cross_check_status=?, cross_check_diff=?, evidence_id=?,
-                   ab_status=?, ab_diff=?, control_status=?, control_diff=?,
-                   verification_level=?, run_signature=?
-                   WHERE period_id=?""",
-                (
-                    combined_status,
-                    str(combined_diff) if combined_diff is not None else None,
-                    ev_id,
-                    res.status,
-                    str(res.diff_ab) if res.diff_ab is not None else None,
-                    res.control_status,
-                    str(res.control_diff) if res.control_diff is not None else None,
-                    res.verification_level,
-                    active_contract.signature,
-                    res.period_id,
-                ),
-            )
-            conn.execute(
-                """INSERT INTO crosscheck_results(
-                       project_id, period_id, verification_level, status,
-                       path_a_total, path_b_total, raw_subtotal, diff_ab, control_diff,
-                       ab_status, control_status, detail_rows, excluded_subtotal_rows,
-                       excluded_title_rows, pending_sheets, range_unproven_sheets,
-                       notes_json, evidence_id, checked_at, run_signature)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(period_id) DO UPDATE SET
-                       project_id=excluded.project_id,
-                       verification_level=excluded.verification_level,
-                       status=excluded.status,
-                       path_a_total=excluded.path_a_total,
-                       path_b_total=excluded.path_b_total,
-                       raw_subtotal=excluded.raw_subtotal,
-                       diff_ab=excluded.diff_ab,
-                       control_diff=excluded.control_diff,
-                       ab_status=excluded.ab_status,
-                       control_status=excluded.control_status,
-                       detail_rows=excluded.detail_rows,
-                       excluded_subtotal_rows=excluded.excluded_subtotal_rows,
-                       excluded_title_rows=excluded.excluded_title_rows,
-                       pending_sheets=excluded.pending_sheets,
-                       range_unproven_sheets=excluded.range_unproven_sheets,
-                       notes_json=excluded.notes_json,
-                       evidence_id=excluded.evidence_id,
-                       checked_at=excluded.checked_at,
-                       run_signature=excluded.run_signature""",
-                (
-                    project_id, res.period_id, res.verification_level, combined_status,
-                    str(res.path_a_total) if res.path_a_total is not None else None,
-                    str(res.path_b_total) if res.path_b_total is not None else None,
-                    str(res.raw_subtotal) if res.raw_subtotal is not None else None,
-                    str(res.diff_ab) if res.diff_ab is not None else None,
-                    str(res.control_diff) if res.control_diff is not None else None,
-                    res.status, res.control_status, res.detail_rows,
-                    res.excluded_subtotal_rows, res.excluded_title_rows,
-                    res.pending_sheets, res.range_unproven_sheets,
-                    json.dumps(res.notes, ensure_ascii=False), ev_id, now,
-                    active_contract.signature,
-                ),
-            )
         results.append(res)
     _record_validation_coverage(
         conn,

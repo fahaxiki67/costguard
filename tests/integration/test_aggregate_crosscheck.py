@@ -1,5 +1,6 @@
 """Phase 3 结算累计与双向校核测试。"""
 import json
+import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -383,13 +384,94 @@ class TestCrossCheck:
                 run_kind=coverage.AGGREGATE_VALIDATION,
             )
             assert summary["run_kind"] == coverage.AGGREGATE_VALIDATION
-            assert summary["status"] == coverage.COMPLETE
+            assert summary["status"] == coverage.PARTIAL
             assert summary["expected_count"] == 3
             assert summary["executed_count"] == 2
             assert summary["skipped_count"] == 1
             assert summary["failed_count"] == 0
             assert any(key.endswith(":path_c") for key in summary["skipped"])
         finally:
+            conn.close()
+
+    def test_crosscheck_persistence_failure_rolls_back_business_writes_and_records_coverage(
+        self, tmp_path
+    ):
+        """交叉校验证据写入失败时，业务结果回滚但失败覆盖率必须可追溯。"""
+        info, conn, _period_id = _make_amount_case(tmp_path, raw_amount="200")
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
+            period_id = conn.execute(
+                "SELECT id FROM settlement_periods WHERE project_id=?",
+                (info.project_id,),
+            ).fetchone()["id"]
+            before = conn.execute(
+                """SELECT cross_check_status, cross_check_diff, evidence_id,
+                          ab_status, ab_diff, control_status, control_diff
+                   FROM period_totals WHERE period_id=? LIMIT 1""",
+                (period_id,),
+            ).fetchone()
+            assert before["cross_check_status"] == "pending"
+            assert before["evidence_id"] is None
+
+            conn.execute(
+                """CREATE TRIGGER block_crosscheck_evidence
+                   BEFORE INSERT ON evidence
+                   WHEN NEW.kind='cross_check'
+                   BEGIN
+                       SELECT RAISE(ABORT, 'synthetic crosscheck evidence failure');
+                   END"""
+            )
+            with pytest.raises(
+                sqlite3.IntegrityError, match="synthetic crosscheck evidence failure"
+            ):
+                crosscheck.run_crosscheck(
+                    conn, info.project_id, [1], direction="downward"
+                )
+
+            after = conn.execute(
+                """SELECT cross_check_status, cross_check_diff, evidence_id,
+                          ab_status, ab_diff, control_status, control_diff
+                   FROM period_totals WHERE period_id=? LIMIT 1""",
+                (period_id,),
+            ).fetchone()
+            assert dict(after) == dict(before)
+            assert conn.execute(
+                """SELECT COUNT(*) AS c FROM crosscheck_results
+                   WHERE project_id=? AND period_id=?""",
+                (info.project_id, period_id),
+            ).fetchone()["c"] == 0
+            assert conn.execute(
+                """SELECT COUNT(*) AS c FROM evidence
+                   WHERE project_id=? AND kind='cross_check'""",
+                (info.project_id,),
+            ).fetchone()["c"] == 0
+
+            run = conn.execute(
+                """SELECT status, expected_json, failed_json, error_summary
+                   FROM detection_runs
+                   WHERE project_id=? AND run_kind=?
+                   ORDER BY id DESC LIMIT 1""",
+                (info.project_id, coverage.AGGREGATE_VALIDATION),
+            ).fetchone()
+            assert run is not None
+            assert run["status"] == coverage.FAILED
+            expected = json.loads(run["expected_json"])
+            failed = json.loads(run["failed_json"])
+            expected_paths = {
+                f"period:{period_id}:path_a",
+                f"period:{period_id}:path_b",
+                f"period:{period_id}:path_c",
+            }
+            assert set(expected) == expected_paths
+            assert set(failed) == expected_paths
+            assert all(
+                key.startswith(f"period:{period_id}:") and ":path_" in key
+                for key in failed
+            )
+            assert "synthetic crosscheck evidence failure" in run["error_summary"]
+        finally:
+            conn.execute("DROP TRIGGER IF EXISTS block_crosscheck_evidence")
             conn.close()
 
     def test_aggregate_validation_failure_is_recorded(self, tmp_path):

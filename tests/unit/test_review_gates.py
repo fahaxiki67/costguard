@@ -6,35 +6,60 @@ pytest 通过来替代业务验收。
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import openpyxl
 import pytest
 
 
-def _make_book(path: Path, *, two_grand_totals: bool = False) -> None:
+def _make_book(
+    path: Path,
+    *,
+    two_grand_totals: bool = False,
+    single_detail: bool = False,
+    missing_detail_amount: bool = False,
+) -> None:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "第1期明细"
     for col, value in enumerate(("项目编码", "项目名称", "工程量", "综合单价", "合价"), 1):
         ws.cell(1, col, value)
-    ws.append(("A1", "项目A", 2, 100, 200))
-    ws.append(("A2", "项目B", 1, 300, 300))
-    ws.append((None, "本页小计", None, None, 500))
-    ws.append((None, "合计", None, None, 500))
+    detail_rows = [("A1", "项目A", 2, 100, 200)]
+    if not single_detail:
+        detail_rows.append(("A2", "项目B", 1, 300, 300))
+    if missing_detail_amount:
+        code, name, quantity, unit_price, _amount = detail_rows[0]
+        detail_rows[0] = (code, name, quantity, unit_price, None)
+    for row in detail_rows:
+        ws.append(row)
+    control_total = 200 if single_detail else 500
+    ws.append((None, "本页小计", None, None, control_total))
+    ws.append((None, "合计", None, None, control_total))
     if two_grand_totals:
-        ws.append((None, "总计", None, None, 500))
+        ws.append((None, "总计", None, None, control_total))
     wb.save(path)
 
 
-def _import_project(tmp_path: Path, *, two_grand_totals: bool = False):
+def _import_project(
+    tmp_path: Path,
+    *,
+    two_grand_totals: bool = False,
+    single_detail: bool = False,
+    missing_detail_amount: bool = False,
+):
     from costguard.core.engine import settlement_io
     from costguard.core.models import project as pm
 
     info = pm.create_project("复核闸门", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
     src = tmp_path / "第1期结算.xlsx"
-    _make_book(src, two_grand_totals=two_grand_totals)
+    _make_book(
+        src,
+        two_grand_totals=two_grand_totals,
+        single_detail=single_detail,
+        missing_detail_amount=missing_detail_amount,
+    )
     report = settlement_io.import_settlement_file(
         conn, info.project_id, Path(info.workspace_path), src, direction="upward"
     )
@@ -81,6 +106,31 @@ def test_unproven_range_blocks_green_even_when_a_b_c_match(tmp_path):
         assert result.range_unproven_sheets == 1
         assert result.verification_level == "insufficient"
         assert any("取数范围完整性无法证明" in note for note in result.notes)
+    finally:
+        conn.close()
+
+
+def test_missing_raw_amount_cannot_be_sufficient_when_control_matches(tmp_path):
+    from costguard.core.engine import crosscheck
+
+    _info, conn, _report, period_id = _import_project(
+        tmp_path, single_detail=True, missing_detail_amount=True
+    )
+    try:
+        conn.execute(
+            "UPDATE line_items SET amount=NULL, quantity='2', unit_price='100' "
+            "WHERE period_id=? AND json_extract(flags_json, '$.subtotal') IS NULL",
+            (period_id,),
+        )
+        result = crosscheck.check_period(conn, period_id)
+        assert result.path_a_total == Decimal("200")
+        assert result.path_b_total == Decimal("200")
+        assert result.raw_subtotal == Decimal("200")
+        assert result.diff_ab == Decimal("0")
+        assert result.control_status == "match"
+        assert result.verification_level == "insufficient"
+        assert result.amount_source == "calculated"
+        assert any("原始金额缺失" in note for note in result.notes)
     finally:
         conn.close()
 

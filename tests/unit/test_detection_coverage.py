@@ -14,9 +14,15 @@ def _project(tmp_path: Path):
 
 def test_coverage_status_is_fail_closed():
     assert coverage.coverage_from_values(["a", "b"], ["a"]).status == coverage.PARTIAL
-    assert coverage.coverage_from_values(["a", "b"], ["a"], {"b": "不适用"}).status == coverage.COMPLETE
+    assert coverage.coverage_from_values(["a", "b"], ["a"], {"b": "不适用"}).status == coverage.PARTIAL
     assert coverage.coverage_from_values(["a"], [], failed={"a": "boom"}).status == coverage.FAILED
     assert coverage.coverage_from_values([], []).status == coverage.NOT_STARTED
+
+
+def test_skipped_rule_is_partial_not_complete():
+    assert coverage.coverage_from_values(
+        ["a", "b"], ["a"], {"b": "不适用"}
+    ).status == coverage.PARTIAL
 
 
 def test_critical_failure_cannot_appear_complete():
