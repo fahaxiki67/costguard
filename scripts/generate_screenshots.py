@@ -16,6 +16,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -89,6 +90,16 @@ def main() -> int:
     from jiadun.core.models import project as project_model
     from jiadun.ui import main_window as main_window_module
     from jiadun.ui.main_window import MainWindow, NewProjectDialog
+
+    # 导出底稿/摘要会把 datetime.now() 写入工作簿、Word 正文和文件名。截图
+    # 只应反映固定的合成业务输入，因此在受控脚本内替换为固定时点；生产程序
+    # 仍使用真实当前时间，不改变业务运行行为。
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    excel_export.datetime = _FixedDateTime
 
     # 截图生成是可再生测试任务，配置和 QSettings 也必须隔离在临时目录，
     # 防止 provision_demo_project/窗口几何把本机用户设置写入真实位置。
