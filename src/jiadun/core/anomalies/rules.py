@@ -14,6 +14,7 @@ from decimal import Decimal
 from jiadun.core.engine.money import round2
 from jiadun.core.evidence.finding import Finding
 from jiadun.core.labels import DIRECTION_ZH, direction_label
+from jiadun.core.parsing.header_detect import is_subtotal_row
 
 D = Decimal
 
@@ -487,11 +488,18 @@ def rule_suspected_duplicate_settlement(conn, project_id) -> list[Finding]:
 
 # ---------- Sheet 级规则 ----------
 
-def _sheets(conn, project_id: int):
+def _sheets(conn, project_id: int, *, include_unbound: bool = False):
+    """读取项目 Sheet；解析层风险可检查尚未绑定期次的待确认 Sheet。"""
+    period_join = "LEFT JOIN" if include_unbound else "JOIN"
+    project_filter = "sf.project_id=?" if include_unbound else "sp.project_id=?"
     return conn.execute(
-        """SELECT rs.*, sp.period_no AS pno FROM raw_sheets rs
-           JOIN settlement_periods sp ON sp.id = rs.period_id
-           WHERE sp.project_id=?""",
+        f"""SELECT rs.*, sp.period_no AS pno, sp.direction AS direction,
+                  sf.id AS file_id, sf.original_name
+           FROM raw_sheets rs
+           {period_join} settlement_periods sp ON sp.id = rs.period_id
+           JOIN parse_batches pb ON pb.id = rs.batch_id
+           JOIN source_files sf ON sf.id = pb.file_id
+           WHERE {project_filter}""",
         (project_id,),
     ).fetchall()
 
@@ -518,34 +526,236 @@ def rule_hidden_cells(conn, project_id) -> list[Finding]:
 
 
 def rule_formula_issues(conn, project_id) -> list[Finding]:
-    """公式错误与公式无缓存值。"""
-    out = []
-    for s in _sheets(conn, project_id):
+    """公式错误、缺缓存和不可验证缓存。
+
+    公式单元格即使带有缓存值，也不等于本程序已经重算；动态/结构化/外部
+    引用无法在当前确定性解析范围内复算，必须保留为结构性证据缺口。
+    """
+    out: list[Finding] = []
+    # 公式证据属于原始 Sheet 层；即使 Sheet 尚未人工绑定到期次，也必须先报告
+    # 结构性风险，否则待确认 Sheet 的公式会被期次 INNER JOIN 静默漏掉。
+    for s in _sheets(conn, project_id, include_unbound=True):
+        period_label = f"第{s['pno']}期" if s["pno"] is not None else "未绑定期次"
         errs = conn.execute(
-            """SELECT row, col, raw_value, cached_value FROM raw_cells
-               WHERE sheet_id=? AND (raw_value LIKE '#%' OR cached_value LIKE '#%')""",
+            """SELECT row, col, raw_value, cached_value, is_formula,
+                      formula_cache_status
+                 FROM raw_cells
+                WHERE sheet_id=?
+                  AND (raw_value LIKE '#%' OR cached_value LIKE '#%'
+                       OR (is_formula=1 AND formula_cache_status='error'))""",
             (s["id"],),
         ).fetchall()
         for e in errs:
             val = e["cached_value"] or e["raw_value"]
             out.append(Finding(
                 "formula_error", "high", "sheet", s["id"],
-                f"第{s['pno']}期 Sheet「{s['sheet_name']}」单元格"
+                f"{period_label} Sheet「{s['sheet_name']}」单元格"
                 f"({e['row']},{e['col']}) 公式错误 {val}，该值不可信",
-                {"row": e["row"], "col": e["col"], "value": val},
+                {
+                    "row": e["row"], "col": e["col"], "value": val,
+                    "cache_status": "error", "blocks_verification": True,
+                    "file_id": s["file_id"], "file": s["original_name"],
+                    "sheet": s["sheet_name"], "raw_value": e["raw_value"],
+                },
             ))
         nocache = conn.execute(
-            """SELECT row, col, raw_value FROM raw_cells
-               WHERE sheet_id=? AND is_formula=1 AND cached_value IS NULL""",
+            """SELECT row, col, raw_value, cached_value, formula_cache_status
+                 FROM raw_cells
+                WHERE sheet_id=? AND is_formula=1
+                  AND (cached_value IS NULL
+                       OR formula_cache_status IN ('missing', 'opaque'))""",
             (s["id"],),
         ).fetchall()
         for e in nocache:
+            cache_status = e["formula_cache_status"] or (
+                "missing" if e["cached_value"] is None else "opaque"
+            )
+            if cache_status == "opaque":
+                rule_id = "formula_untrusted_cache"
+                message = (
+                    f"{period_label} Sheet「{s['sheet_name']}」单元格"
+                    f"({e['row']},{e['col']}) 公式 {e['raw_value']} 使用动态/结构化"
+                    "引用，缓存值无法由当前确定性解析路径验证"
+                )
+            else:
+                rule_id = "formula_no_cache"
+                message = (
+                    f"{period_label} Sheet「{s['sheet_name']}」单元格"
+                    f"({e['row']},{e['col']}) 公式 {e['raw_value']} 无缓存计算值，"
+                    "请用 WPS/Excel 打开重算后重新导入"
+                )
             out.append(Finding(
-                "formula_no_cache", "medium", "sheet", s["id"],
-                f"第{s['pno']}期 Sheet「{s['sheet_name']}」单元格({e['row']},{e['col']})"
-                f"公式 {e['raw_value']} 无缓存计算值，请用 WPS/Excel 打开重算后重新导入",
-                {"row": e["row"], "col": e["col"]},
+                rule_id, "high", "sheet", s["id"], message,
+                {
+                    "row": e["row"], "col": e["col"],
+                    "cache_status": cache_status, "blocks_verification": True,
+                    "file_id": s["file_id"], "file": s["original_name"],
+                    "sheet": s["sheet_name"], "raw_value": e["raw_value"],
+                    "cached_value": e["cached_value"],
+                },
             ))
+    return out
+
+
+def _formula_cache_status(row) -> str:
+    """读取解析层公式状态，兼容旧手工测试行的缺省列值。"""
+    status = str(row["formula_cache_status"] or "") if "formula_cache_status" in row.keys() else ""
+    if status in {"cached", "missing", "error", "opaque"}:
+        return status
+    if row["cached_value"] is None:
+        return "missing"
+    if str(row["cached_value"]).lstrip().startswith("#"):
+        return "error"
+    return "cached"
+
+
+def _formula_refs(formula: str | None) -> list[tuple[str, int]]:
+    """提取同表 A1 单元格引用；不解释外部/结构化语义。"""
+    if not formula:
+        return []
+    return [
+        (column.upper(), int(row))
+        for column, row in re.findall(r"(?<![A-Z0-9_])\$?([A-Z]{1,3})\$?(\d+)", str(formula).upper())
+    ]
+
+
+def rule_formula_semantics(conn, project_id) -> list[Finding]:
+    """核对金额公式是否符合数量×单价或控制值汇总语义。
+
+    只对带有可读缓存且能定位到已确认金额列的公式做语义判断；无缓存、错误
+    或动态公式由 ``rule_formula_issues`` 单独报告，避免用未验证结果继续猜。
+    公式涉及跨表/结构化引用时不自动改写，保留可回查原文的 Finding。
+    """
+    out: list[Finding] = []
+    for s in _sheets(conn, project_id):
+        header = conn.execute(
+            """SELECT header_row_hi, data_row_start, data_row_end, col_map_json
+                 FROM table_headers WHERE sheet_id=?""",
+            (s["id"],),
+        ).fetchone()
+        if not header:
+            continue
+        try:
+            col_map = json.loads(header["col_map_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        amount_col = col_map.get("amount")
+        if not isinstance(amount_col, int):
+            continue
+        quantity_col = col_map.get("quantity")
+        price_col = col_map.get("unit_price")
+        start = int(header["data_row_start"] or (int(header["header_row_hi"]) + 1))
+        end = int(header["data_row_end"] or s["n_rows"])
+        cells = {
+            (int(row["row"]), int(row["col"])): str(row["raw_value"] or "").strip()
+            for row in conn.execute(
+                "SELECT row, col, raw_value FROM raw_cells WHERE sheet_id=?",
+                (s["id"],),
+            ).fetchall()
+        }
+        name_col = col_map.get("name")
+        min_col = min((int(value) for value in col_map.values() if isinstance(value, int)), default=1)
+        for cell in conn.execute(
+            """SELECT row, col, raw_value, cached_value, is_formula, formula_cache_status
+                 FROM raw_cells
+                WHERE sheet_id=? AND is_formula=1 AND col=?
+                  AND row BETWEEN ? AND ?""",
+            (s["id"], amount_col, start, end),
+        ).fetchall():
+            if _formula_cache_status(cell) != "cached":
+                continue
+            row_no = int(cell["row"])
+            formula = str(cell["raw_value"] or "")
+            refs = _formula_refs(formula)
+            name = cells.get((row_no, int(name_col)), "") if isinstance(name_col, int) else ""
+            lead = "".join(cells.get((row_no, col), "") for col in range(1, min_col + 1))
+            if is_subtotal_row(name, lead):
+                amount_letter = _column_letter(amount_col)
+                if not any(column == amount_letter and start <= ref_row <= end for column, ref_row in refs):
+                    out.append(Finding(
+                        "formula_control_semantics_mismatch", "high", "sheet", s["id"],
+                        f"第{s['pno']}期 Sheet「{s['sheet_name']}」第{row_no}行控制值公式"
+                        f" {formula} 未引用金额列 {_column_letter(amount_col)}，控制值语义无法确认",
+                        {
+                            "row": row_no, "col": int(cell["col"]), "formula": formula,
+                            "expected_field": "amount", "expected_column": amount_letter,
+                            "cached_value": cell["cached_value"], "blocks_verification": True,
+                            "file_id": s["file_id"], "file": s["original_name"],
+                            "sheet": s["sheet_name"],
+                        },
+                    ))
+                continue
+            if not isinstance(quantity_col, int) or not isinstance(price_col, int):
+                continue
+            expected = {
+                (_column_letter(quantity_col), row_no),
+                (_column_letter(price_col), row_no),
+            }
+            compact_formula = re.sub(r"\s+", "", formula.upper()).replace("$", "")
+            quantity_letter = _column_letter(quantity_col)
+            price_letter = _column_letter(price_col)
+            product_pattern = re.compile(
+                rf"{re.escape(quantity_letter)}{row_no}\*{re.escape(price_letter)}{row_no}"
+                rf"|{re.escape(price_letter)}{row_no}\*{re.escape(quantity_letter)}{row_no}"
+            )
+            if not expected <= set(refs) or not product_pattern.search(compact_formula):
+                out.append(Finding(
+                    "formula_semantics_mismatch", "high", "sheet", s["id"],
+                    f"第{s['pno']}期 Sheet「{s['sheet_name']}」第{row_no}行合价公式"
+                    f" {formula} 未按工程量×综合单价引用同一行，语义无法确认",
+                    {
+                        "row": row_no, "col": int(cell["col"]), "formula": formula,
+                        "expected_fields": ["quantity", "unit_price"],
+                        "expected_columns": [_column_letter(quantity_col), _column_letter(price_col)],
+                        "cached_value": cell["cached_value"], "blocks_verification": True,
+                        "file_id": s["file_id"], "file": s["original_name"],
+                        "sheet": s["sheet_name"],
+                    },
+                ))
+    return out
+
+
+def _column_letter(column: int) -> str:
+    """不引入浮点或业务换算的列号格式化。"""
+    result = ""
+    value = int(column)
+    while value:
+        value, rem = divmod(value - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def rule_filter_visibility_unknown(conn, project_id) -> list[Finding]:
+    """筛选条件存在但文件未提供可见行快照时，形成结构性证据缺口。"""
+    out: list[Finding] = []
+    # 筛选条件同样必须在原始层先留痕；未绑定期次的待确认 Sheet 不能绕过
+    # 可见范围闸门。
+    for s in _sheets(conn, project_id, include_unbound=True):
+        if str(s["filter_state"] or "none") != "unknown":
+            continue
+        period_label = f"第{s['pno']}期" if s["pno"] is not None else "未绑定期次"
+        try:
+            conditions = json.loads(s["filter_conditions_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            conditions = []
+        try:
+            tables = json.loads(s["table_ranges_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            tables = []
+        out.append(Finding(
+            "filter_visibility_unknown", "high", "sheet", s["id"],
+            f"{period_label} Sheet「{s['sheet_name']}」存在筛选条件，实际可见行无法从文件确定，"
+            "不得据此形成完整校核结论",
+            {
+                "auto_filter_ref": s["auto_filter_ref"],
+                "filter_state": s["filter_state"],
+                "filter_conditions": conditions,
+                "table_ranges": tables,
+                "blocks_verification": True,
+                "file_id": s["file_id"], "file": s["original_name"],
+                "sheet": s["sheet_name"],
+            },
+        ))
     return out
 
 
@@ -612,8 +822,14 @@ def rule_merged_cells_in_data(conn, project_id) -> list[Finding]:
             out.append(Finding(
                 "merged_cells_in_data", "medium", "sheet", s["id"],
                 f"第{s['pno']}期 Sheet「{s['sheet_name']}」数据区存在合并单元格 {data_merged[:5]}"
-                f"{'…' if len(data_merged) > 5 else ''}，解析按锚点值填充，请抽查确认无错位",
-                {"ranges": data_merged},
+                f"{'…' if len(data_merged) > 5 else ''}，已禁止自动锚点复制，需人工确认字段是否缺失或错位",
+                {
+                    "ranges": data_merged,
+                    "merge_anchor_copy": False,
+                    "blocks_verification": True,
+                    "file_id": s["file_id"], "file": s["original_name"],
+                    "sheet": s["sheet_name"],
+                },
             ))
     return out
 
@@ -736,6 +952,8 @@ ALL_RULES = [
     rule_suspected_duplicate_settlement,
     rule_hidden_cells,
     rule_formula_issues,
+    rule_formula_semantics,
+    rule_filter_visibility_unknown,
     rule_text_numbers_in_value_cols,
     rule_merged_cells_in_data,
     rule_missing_key_fields,

@@ -49,7 +49,16 @@ def test_rule_zh_covers_all_rules_in_engine():
                       "sheet_id", "raw_value", "hidden_rows", "hidden_cols",
                       "header_row_lo", "header_row_hi", "needs_review", "item_ids",
                       "n_rows", "item_ids_json", "flags_json", "merged_ranges_json",
-                      "hidden_rows_json", "hidden_cols_json"}
+                      "hidden_rows_json", "hidden_cols_json",
+                      # 解析结构证据字段（不是异常 rule_id），由
+                      # rules.py 的 SQL/元数据扫描一并出现。
+                      "auto_filter_ref", "blocks_verification", "cache_status",
+                      "data_row_start", "data_row_end", "expected_column",
+                      "expected_columns", "expected_field", "expected_fields",
+                      "file_id", "filter_conditions", "filter_conditions_json",
+                      "filter_state", "formula_cache_status", "merge_anchor_copy",
+                      "original_name", "sheet_name", "table_ranges", "table_ranges_json",
+                      "filter_visibility_unknown"}
     rule_like = {i for i in ids if i not in known_internal}
     missing = [i for i in sorted(rule_like) if i not in labels.RULE_ZH]
     assert not missing, f"以下规则 ID 缺少中文映射：{missing}"

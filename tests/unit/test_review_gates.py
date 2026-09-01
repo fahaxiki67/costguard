@@ -14,6 +14,21 @@ import pytest
 from openpyxl.utils import get_column_letter
 
 
+def _leading_blank_book(path: Path) -> None:
+    """表头后第一条明细前的版式空行不应被当作业务漏行。"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "第1期明细"
+    for col, value in enumerate(("项目编码", "项目名称", "工程量", "综合单价", "合价"), 1):
+        ws.cell(1, col, value)
+    ws.append((None, None, None, None, None))
+    ws.append(("A1", "项目A", 1, 100, 100))
+    ws.append(("A2", "项目B", 2, 200, 400))
+    ws.append((None, "本页小计", None, None, 500))
+    ws.append((None, "合计", None, None, 500))
+    wb.save(path)
+
+
 def _make_book(
     path: Path,
     *,
@@ -155,6 +170,33 @@ def test_automatic_import_binds_coverage_proof_to_final_run_contract(tmp_path):
             (proof["evidence_id"],),
         ).fetchone()
         assert tuple(evidence) == (current.signature, current.run_id, "current")
+    finally:
+        conn.close()
+
+
+def test_leading_blank_after_header_is_classified_without_blocking(tmp_path):
+    """表头后的前置版式空行可计数追溯，但不应误判为内部漏行。"""
+    from jiadun.core.engine import crosscheck, settlement_io
+    from jiadun.core.models import project as pm
+
+    info = pm.create_project("前置空行", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+    src = tmp_path / "前置空行.xlsx"
+    _leading_blank_book(src)
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=?",
+            (info.project_id,),
+        ).fetchone()["id"]
+        result = crosscheck.check_period(conn, period_id)
+        assert report.status == "ok"
+        assert result.excluded_blank_rows == 1
+        assert result.coverage_proof_status == "complete"
+        assert result.verification_level == "sufficient", result.notes
+        assert any("前置被排除" in note for note in result.notes)
     finally:
         conn.close()
 
@@ -303,6 +345,17 @@ def test_c_control_source_retains_original_cell_and_evidence(tmp_path):
         evidence = json.loads(crosscheck.make_evidence(1, result))
         c_step = next(step for step in evidence["steps"] if step["step"] == "C 控制值来源")
         assert c_step["result"]["source_evidence_id"] == result.c_control_evidence_id
+        scope_step = next(step for step in evidence["steps"] if step["step"] == "路径来源范围")
+        assert (
+            scope_step["result"]["path_c"]["selection_rule"]
+            == result.c_control_source["selection_rule"]
+        )
+        assert any(
+            step["step"] == "C 原表唯一合计级行" for step in evidence["steps"]
+        )
+        assert any("唯一合计级行" in note for note in result.notes)
+        assert not any("无合计级行" in note for note in result.notes)
+        assert not any("小计行之和" in note for note in result.notes)
     finally:
         conn.close()
 
@@ -347,6 +400,111 @@ def test_hidden_visibility_blocks_inferred_range(tmp_path, column, value):
         assert result.range_unproven_sheets == 1
         assert result.verification_level == "insufficient"
         assert any("取数范围完整性无法证明" in note for note in result.notes)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("hidden_rows", "hidden_cols"),
+    [([3], []), ([], [5])],
+)
+def test_manual_hidden_scope_is_consistent_through_project_summary(
+    tmp_path, hidden_rows, hidden_cols
+):
+    """人工确认隐藏范围后，期次与项目摘要必须共享同一运行契约。"""
+    from jiadun.core.engine import aggregate, crosscheck, settlement_io
+    from jiadun.core.reporting import build_project_summary
+
+    info, conn, _report, period_id = _import_project(
+        tmp_path, hidden_rows=hidden_rows, hidden_cols=hidden_cols
+    )
+    try:
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE period_id=?", (period_id,)
+        ).fetchone()["id"]
+        settlement_io.confirm_sheet_role_and_extract(
+            conn,
+            info.project_id,
+            int(sheet_id),
+            actor="复核人",
+            reason="人工确认隐藏范围已覆盖完整本期数据区",
+            direction="upward",
+            confirmed_col_map={
+                "code": 1,
+                "name": 2,
+                "quantity": 3,
+                "unit_price": 4,
+                "amount": 5,
+            },
+            confirmed_header_range=(1, 1),
+            # 原始网格的第 5 行仍有控制值；完整人工范围必须把它纳入
+            # 覆盖证明，不能只选到页级小计就把尾部非空行静默排除。
+            confirmed_data_range=(2, 5),
+        )
+        aggregate.persist_period_totals(
+            conn,
+            info.project_id,
+            aggregate.aggregate_project(conn, info.project_id, direction="upward"),
+        )
+        period_result = crosscheck.run_crosscheck(
+            conn, info.project_id, [1], direction="upward"
+        )[0]
+        assert period_result.verification_level == "sufficient", period_result.notes
+        assert period_result.coverage_proof_status == "complete", period_result.notes
+        assert period_result.range_unproven_sheets == 0, period_result.notes
+
+        summary = build_project_summary(conn, info.project_id)
+        assert summary.verification["status"] == "sufficient", summary.verification
+        assert summary.verification["evidence_complete"] is True, summary.verification
+        assert not any(
+            "当前覆盖证明" in gap for gap in summary.verification["evidence_gaps"]
+        ), summary.verification["evidence_gaps"]
+    finally:
+        conn.close()
+
+
+def test_manual_hidden_scope_excluding_nonempty_row_is_fail_closed(tmp_path):
+    """人工范围漏掉表头后的非空行时，期次与项目摘要都必须降级。"""
+    from jiadun.core.engine import aggregate, crosscheck, settlement_io
+    from jiadun.core.reporting import build_project_summary
+
+    info, conn, _report, period_id = _import_project(tmp_path, hidden_rows=[3])
+    try:
+        sheet_id = conn.execute(
+            "SELECT id FROM raw_sheets WHERE period_id=?", (period_id,)
+        ).fetchone()["id"]
+        settlement_io.confirm_sheet_role_and_extract(
+            conn,
+            info.project_id,
+            int(sheet_id),
+            actor="复核人",
+            reason="仅确认到页级小计，尾部控制行尚未纳入范围",
+            direction="upward",
+            confirmed_col_map={
+                "code": 1,
+                "name": 2,
+                "quantity": 3,
+                "unit_price": 4,
+                "amount": 5,
+            },
+            confirmed_header_range=(1, 1),
+            confirmed_data_range=(2, 4),
+        )
+        aggregate.persist_period_totals(
+            conn,
+            info.project_id,
+            aggregate.aggregate_project(conn, info.project_id, direction="upward"),
+        )
+        period_result = crosscheck.run_crosscheck(
+            conn, info.project_id, [1], direction="upward"
+        )[0]
+        assert period_result.verification_level == "insufficient", period_result.notes
+        assert period_result.range_unproven_sheets == 1, period_result.notes
+
+        summary = build_project_summary(conn, info.project_id)
+        assert summary.verification["status"] == "insufficient", summary.verification
+        assert summary.verification["evidence_complete"] is False
+        assert any("未被覆盖" in gap for gap in summary.verification["evidence_gaps"])
     finally:
         conn.close()
 

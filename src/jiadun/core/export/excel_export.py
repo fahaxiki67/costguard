@@ -23,6 +23,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from jiadun import branding
+from jiadun.core import analysis
 from jiadun.core.contracts import run_contract
 from jiadun.core.diff import radar as diff_radar
 from jiadun.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
@@ -325,6 +326,81 @@ def _current_direction_evidence_ids(
         ).fetchone()
         result[direction] = int(row["evidence_id"]) if row else None
     return result
+
+
+def _current_crosscheck_path_notice(conn: sqlite3.Connection, project_id: int) -> str:
+    """把 A/B/C 的来源独立性以业务语言放进 Excel/Word 首屏。
+
+    Evidence 索引保留完整的文件、Sheet、物理行号和过滤条件；管理层成果还
+    必须在正文明确说明“数字相等不等于路径独立”。这里只读当前运行结果，
+    没有结果或 Evidence 损坏时直接写成待复核，不给出静默的肯定语义。
+    """
+    try:
+        scope, scope_params = run_contract.current_scope(conn, project_id, "cr")
+        rows = conn.execute(
+            f"""SELECT cr.period_id, cr.evidence_id, cr.ab_row_set_status
+                  FROM crosscheck_results cr
+                 WHERE cr.project_id=? AND {scope}
+                 ORDER BY cr.period_id""",
+            (project_id, *scope_params),
+        ).fetchall()
+    except (sqlite3.Error, ValueError, TypeError):
+        return "当前校核路径无法读取，需人工复核；不能据此形成通过结论。"
+    if not rows:
+        return "尚未生成当前 A/B/C 校核结果；不能据此形成通过结论。"
+
+    path_levels: set[str] = set()
+    proof_levels: set[str] = set()
+    row_set_statuses: set[str] = {
+        str(row["ab_row_set_status"] or "unknown")
+        for row in rows
+    }
+    evidence_ids: list[int] = []
+    for row in rows:
+        evidence_id = row["evidence_id"]
+        if evidence_id is None:
+            continue
+        evidence_ids.append(int(evidence_id))
+        evidence = conn.execute(
+            "SELECT steps_json FROM evidence WHERE id=? AND project_id=?",
+            (int(evidence_id), project_id),
+        ).fetchone()
+        if evidence is None:
+            continue
+        try:
+            payload = json.loads(evidence["steps_json"] or "")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, list):
+            candidates = [
+                item for item in payload
+                if isinstance(item, dict)
+                and ("path_independence_level" in item or "ab_independence_level" in item)
+            ]
+            payload = candidates[-1] if candidates else None
+        if not isinstance(payload, dict):
+            continue
+        path_levels.add(str(payload.get("path_independence_level") or "unknown"))
+        proof_levels.add(str(payload.get("ab_independence_level") or "unknown"))
+
+    evidence_text = (
+        "；详见当前校核 Evidence ID " + ",".join(str(value) for value in evidence_ids)
+        if evidence_ids else "；当前校核 Evidence 缺失"
+    )
+    if path_levels == {"source_independent_raw_scan"}:
+        notice = (
+            "A 使用清洗明细，B 使用 raw_cells 原始网格独立扫描，C 使用原表合计/小计"
+            "控制值；A/B 数字相等仍不代表业务结论已确认"
+        )
+    else:
+        notice = (
+            "A/B 路径独立性无法完整证明，当前结果只能待人工复核，不能显示为通过"
+        )
+    if "shared_extractor" in proof_levels:
+        notice += "；覆盖证明记录 shared_extractor，覆盖证明本身不构成独立复核"
+    if "same_row_set" in row_set_statuses:
+        notice += f"；{analysis.same_row_set_warning('same_row_set')}"
+    return notice + evidence_text + "。"
 
 
 def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook,
@@ -1274,6 +1350,7 @@ def export_cover_page(
     ws.append(["运行签名", signature or "尚未生成（执行校核/异常检测/匹配或导出后生成）"])
     ws.append(["项目状态", gates["project_status"]])
     ws.append(["审核状态", status])
+    ws.append(["校核路径说明", _current_crosscheck_path_notice(conn, project_id)])
     if gates["project_status_reason_codes"]:
         ws.append(["项目状态依据", "；".join(gates["project_status_reason_codes"])])
     latest_version = summary.version_chain.get("latest") or {}
@@ -1359,6 +1436,7 @@ def export_management_summary(
         ("项目状态", summary.statuses["project_status"]),
         ("期次状态", summary.statuses["period_status"]),
         ("当前运行 ID", summary.run_id or "未生成"),
+        ("校核路径独立性", _current_crosscheck_path_notice(conn, project_id)),
         ("项目版本链", (
             f"{summary.version_chain.get('version_count', 0)} 个版本；"
             f"{summary.version_chain.get('status', 'not_started')}"
@@ -1421,6 +1499,26 @@ def export_management_summary(
 
 def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """导出全部报表到一个 xlsx。返回文件路径。"""
+    # 仅在项目还没有任何校核/聚合/匹配成果时，允许导出入口先把用户
+    # 在导入确认阶段补入的最新明细纳入新 Run Contract；已有结算成果一旦
+    # 发生输入漂移仍由后续门控拒绝，必须重新运行校核，不能悄悄换合同。
+    availability = run_contract.current_results_available(conn, project_id)
+    if not availability["available"] and availability.get("state") is None:
+        materialized = conn.execute(
+            """SELECT 1 FROM (
+                   SELECT project_id FROM crosscheck_results
+                   UNION ALL SELECT project_id FROM period_totals
+                   UNION ALL SELECT project_id FROM matches
+               ) WHERE project_id=? LIMIT 1""",
+            (int(project_id),),
+        ).fetchone()
+        if materialized is None:
+            try:
+                run_contract.ensure_run_contract(conn, project_id)
+            except Exception:
+                # 原始文件身份/路径等不可自动修复的错误交给统一 gate 报告；
+                # 这里不吞掉状态，也不把失败转成可导出。
+                pass
     # 前置门控必须早于 manifest/摘要计算、目录创建和任何文件写入；旧的
     # export_runs 即使仍存在，也不能在运行级不可用时产生新的 current 成果。
     run_contract.require_current_results_available(
@@ -1501,6 +1599,21 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
 
 def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """管理层摘要 Word 版：首屏状态、关键指标、Top 风险和限制均可追溯。"""
+    availability = run_contract.current_results_available(conn, project_id)
+    if not availability["available"] and availability.get("state") is None:
+        materialized = conn.execute(
+            """SELECT 1 FROM (
+                   SELECT project_id FROM crosscheck_results
+                   UNION ALL SELECT project_id FROM period_totals
+                   UNION ALL SELECT project_id FROM matches
+               ) WHERE project_id=? LIMIT 1""",
+            (int(project_id),),
+        ).fetchone()
+        if materialized is None:
+            try:
+                run_contract.ensure_run_contract(conn, project_id)
+            except Exception:
+                pass
     # 与 Excel 共用同一个运行级前置边界，并且放在 docx 构造和导出目录
     # 创建之前，避免 fail-closed 状态下产生未登记的成果文件。
     run_contract.require_current_results_available(
@@ -1626,6 +1739,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
             "项目状态依据：" + "；".join(summary.statuses["project_status_reason_codes"])
         )
     doc.add_paragraph(f"期次状态：{summary.statuses['period_status']}")
+    doc.add_paragraph(f"校核路径说明：{_current_crosscheck_path_notice(conn, project_id)}")
     status_p = doc.add_paragraph(f"成果状态：{result_status}")
     status_p.runs[0].bold = True
 

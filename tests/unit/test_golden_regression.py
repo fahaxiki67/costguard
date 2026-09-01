@@ -23,6 +23,28 @@ def test_synthetic_registry_matches_without_updating_registry():
     assert REGISTRY.read_bytes() == before
 
 
+def test_golden_suite_runs_anonymized_registry_and_reports_real_coverage():
+    report = golden_regression.run_golden_regression_suite()
+    assert report["status"] == "passed", report
+    assert report["registry_count"] == 2
+    assert report["real_case_count"] == 0
+    assert any(
+        item["registry"].endswith("anonymized_golden_cases/cases.json")
+        for item in report["reports"]
+    )
+
+
+def test_golden_suite_isolates_each_registry_workspace(tmp_path):
+    """并行登记表的同名案例不能共享输出目录或相互覆盖。"""
+    report = golden_regression.run_golden_regression_suite(
+        output=tmp_path, keep_workspace=True
+    )
+    workspaces = [Path(item["workspace"]) for item in report["reports"]]
+    assert workspaces[0] != workspaces[1]
+    assert workspaces[0].name == "registry-1"
+    assert workspaces[1].name == "registry-2"
+
+
 def test_mismatch_reports_field_path_and_preserves_registry(tmp_path):
     """黄金值变化必须报告差异，不能被执行器自动更新掩盖。"""
     data = json.loads(REGISTRY.read_text(encoding="utf-8"))
@@ -81,3 +103,15 @@ def test_private_input_path_is_rejected(tmp_path):
 def test_require_real_returns_distinct_gate_code():
     """没有真实黄金案例时，发布门槛返回专用状态码而非误报通过。"""
     assert golden_regression.main(["--registry", str(REGISTRY), "--require-real"]) == 2
+
+
+def test_compare_metrics_rejects_empty_expected_and_extra_actual_fields():
+    """黄金比较采用闭世界口径，不能因 expected 为空或 actual 多字段而静默通过。"""
+    empty = golden_regression.compare_metrics({"file_count": 1}, {})
+    assert empty and any(diff["kind"] == "contract_or_scope" for diff in empty)
+
+    extra = golden_regression.compare_metrics(
+        {"file_count": 1, "crosscheck": {"sufficient_period_count": 0}},
+        {"file_count": 1},
+    )
+    assert any(diff["path"] == "crosscheck.sufficient_period_count" for diff in extra)

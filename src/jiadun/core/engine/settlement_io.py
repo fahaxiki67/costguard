@@ -622,6 +622,99 @@ def load_sheet_grid(conn: sqlite3.Connection, sheet_id: int) -> tuple[dict, list
     return cells, merged, meta["n_rows"], meta["n_cols"]
 
 
+def _merge_bounds(range_text: str) -> tuple[int, int, int, int] | None:
+    """解析 A1 合并范围，返回 (row_start, row_end, col_start, col_end)。"""
+    match = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", (range_text or "").replace("$", ""))
+    if not match:
+        return None
+    from openpyxl.utils import column_index_from_string
+
+    return (
+        int(match.group(2)),
+        int(match.group(4)),
+        column_index_from_string(match.group(1)),
+        column_index_from_string(match.group(3)),
+    )
+
+
+def _header_only_merged_ranges(merged_ranges: list[str], header_row_hi: int) -> list[str]:
+    """只把表头区合并交给字段识别/抽取，禁止明细区锚点复制。"""
+    out: list[str] = []
+    for range_text in merged_ranges:
+        bounds = _merge_bounds(range_text)
+        if bounds is None or bounds[1] <= header_row_hi:
+            out.append(range_text)
+    return out
+
+
+def _data_merged_ranges(
+    merged_ranges: list[str], data_range: tuple[int, int],
+) -> list[str]:
+    """返回与物理数据行相交的合并范围，作为结构性复核风险。"""
+    start, end = data_range
+    out: list[str] = []
+    for range_text in merged_ranges:
+        bounds = _merge_bounds(range_text)
+        if bounds is None:
+            continue
+        if bounds[0] <= end and bounds[1] >= start:
+            out.append(range_text)
+    return out
+
+
+def _json_object(value: str | None, fallback):
+    try:
+        parsed = json.loads(value or "")
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+    return parsed
+
+
+def _structural_gate_reasons(
+    sheet_meta: sqlite3.Row,
+    data_merged_ranges: list[str],
+    *,
+    manual_range_confirmed: bool = False,
+) -> list[str]:
+    """从不可变解析元数据生成导入层结构性证据缺口。"""
+    reasons: list[str] = []
+    hidden_rows = _json_object(sheet_meta["hidden_rows_json"], [])
+    hidden_cols = _json_object(sheet_meta["hidden_cols_json"], [])
+    if not isinstance(hidden_rows, list):
+        hidden_rows = []
+    if not isinstance(hidden_cols, list):
+        hidden_cols = []
+    if (hidden_rows or hidden_cols) and not manual_range_confirmed:
+        reasons.append(
+            "存在隐藏行/列，实际参与校核的取数范围需人工确认"
+        )
+    if str(sheet_meta["filter_state"] or "none") == "unknown":
+        reasons.append("工作表/表格存在筛选条件，筛选影响的实际可见行无法从文件确定")
+    formula_metadata = _json_object(sheet_meta["formula_metadata_json"], {})
+    try:
+        unverified = int(formula_metadata.get("unverified_count", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        unverified = 0
+    limitations = formula_metadata.get("limitations", [])
+    if formula_metadata.get("capability_limited") or limitations:
+        if isinstance(limitations, str):
+            limitations = [limitations]
+        if not isinstance(limitations, list):
+            limitations = []
+        detail = "；".join(str(item) for item in limitations[:3])
+        reasons.append(
+            "解析器能力不足，无法证明公式/合并/筛选结构完整"
+            + (f"（{detail}）" if detail else "")
+        )
+    if unverified:
+        reasons.append(f"存在 {unverified} 个公式缓存未验证单元格，金额不得直接作为确定性依据")
+    if data_merged_ranges:
+        reasons.append(
+            f"明细区存在合并单元格 {data_merged_ranges[:5]}，已禁止自动锚点复制，需人工确认"
+        )
+    return reasons
+
+
 def next_period_no(conn: sqlite3.Connection, project_id: int,
                    direction: str = "unknown") -> int:
     """下一个可用期号——按方向独立递增（对上/对下各自有序）。"""
@@ -739,7 +832,10 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     cells, merged, n_rows, n_cols = load_sheet_grid(conn, sheet_id)
     meta = conn.execute(
         """SELECT rs.sheet_name, sf.id AS file_id, sf.original_name,
-                  rs.hidden_rows_json, rs.hidden_cols_json
+                  rs.hidden_rows_json, rs.hidden_cols_json,
+                  rs.filter_state, rs.filter_conditions_json, rs.table_ranges_json,
+                  rs.formula_metadata_json, rs.auto_filter_ref,
+                  rs.merged_ranges_json
            FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
            WHERE rs.id=? AND sf.project_id=?""",
@@ -796,27 +892,47 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         data_range_status = "inferred" if data_range[1] >= data_range[0] else "unproven"
         data_range_method = "last_non_empty_row" if data_range_status == "inferred" else "no_data_rows"
 
-    # 幂等/重复确认拒绝：已回写 period_id 的 sheet 视为已完成
+    # 表头区合并可用于识别列标题；明细区合并不得自动把左上锚点值复制
+    # 到其它物理行。人工确认仍保留合并风险元数据，后续可在 Evidence 中
+    # 说明人工是否接受该结构。
+    extraction_merged_ranges = _header_only_merged_ranges(merged, header_hi)
+    data_merged_ranges = _data_merged_ranges(merged, data_range)
+    structural_reasons = _structural_gate_reasons(
+        meta,
+        data_merged_ranges,
+        manual_range_confirmed=confirmed_data_range is not None,
+    )
+
+    # 幂等/重复确认拒绝：已确认的 sheet 不能重复写入；自动识别但因
+    # 结构性风险处于 pending 的 sheet 允许人工重新指定范围/映射，且
+    # 会复用原期次并替换该 Sheet 的旧规范明细，避免重复累计。
     already = conn.execute(
-        "SELECT period_id FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
-    if already and already["period_id"] is not None:
+        "SELECT period_id, sheet_status FROM raw_sheets WHERE id=?", (sheet_id,)).fetchone()
+    existing_period_id = (
+        int(already["period_id"])
+        if already and already["period_id"] is not None else None
+    )
+    if existing_period_id is not None and str(already["sheet_status"] or "") != "pending":
         raise ValueError(
-            f"该 sheet 已完成确认抽取（period_id={already['period_id']}），不得重复确认")
+            f"该 sheet 已完成确认抽取（period_id={existing_period_id}），不得重复确认")
 
     # 先抽取（items 非空才建 period，避免失败留空期次）
     det_used = replace(det, header_row_lo=header_lo, header_row_hi=header_hi,
                        col_map=used_map, needs_review=False)
-    items = extract_items.extract_items(cells, merged, det_used, n_rows, data_range=data_range)
+    items = extract_items.extract_items(
+        cells, extraction_merged_ranges, det_used, n_rows, data_range=data_range
+    )
     if not items:
         raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
     proof_draft, proof_rows = coverage_proof.build_sheet_coverage_proof(
         cells,
         det_used,
         n_rows,
-        merged_ranges=merged,
+        merged_ranges=extraction_merged_ranges,
         data_range=data_range,
         hidden_rows=json.loads(meta["hidden_rows_json"] or "[]"),
         hidden_cols=json.loads(meta["hidden_cols_json"] or "[]"),
+        manual_range_confirmed=confirmed_data_range is not None,
     )
     previous_contract = run_contract.get_current_contract(conn, project_id)
 
@@ -831,19 +947,37 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
              "period_no": period_no}, reason, commit=False,
             run_id=previous_contract.run_id if previous_contract else None,
             run_signature=previous_contract.signature if previous_contract else None)
-        pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
-        if not isinstance(pno, int) or pno < 1:
-            raise ValueError("确认期次必须为正整数")
-        period_id = ensure_period(
-            conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
-            direction=direction, commit=False)
+        if existing_period_id is not None and period_no is None:
+            period_id = existing_period_id
+            pno = conn.execute(
+                "SELECT period_no FROM settlement_periods WHERE id=?", (period_id,)
+            ).fetchone()["period_no"]
+        else:
+            pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
+            if not isinstance(pno, int) or pno < 1:
+                raise ValueError("确认期次必须为正整数")
+            period_id = ensure_period(
+                conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
+                direction=direction, commit=False)
+        if existing_period_id is not None and period_id == existing_period_id:
+            conn.execute(
+                "DELETE FROM line_items WHERE period_id=? AND sheet_id=?",
+                (period_id, sheet_id),
+            )
         n = extract_items.persist_line_items(conn, period_id, sheet_id, items, commit=False)
         # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
         conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?",
                      (period_id, sheet_id))
         set_sheet_status(
-            conn, sheet_id, "confirmed",
-            reason=f"人工确认结算清单角色并抽取 {n} 行：{reason.strip()}",
+            conn,
+            sheet_id,
+            "pending" if structural_reasons else "confirmed",
+            reason=(
+                f"人工确认结算清单角色并抽取 {n} 行：{reason.strip()}；"
+                "仍存在结构性证据缺口：" + "；".join(structural_reasons)
+                if structural_reasons
+                else f"人工确认结算清单角色并抽取 {n} 行：{reason.strip()}"
+            ),
             actor=actor,
         )
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
@@ -863,6 +997,20 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                  "hidden_cols": json.loads(meta["hidden_cols_json"] or "[]"),
                  "visibility_risk": bool(meta["hidden_rows_json"] and meta["hidden_rows_json"] != "[]")
                                   or bool(meta["hidden_cols_json"] and meta["hidden_cols_json"] != "[]"),
+                 "auto_filter_ref": meta["auto_filter_ref"],
+                 "filter_state": meta["filter_state"] or "none",
+                 "filter_conditions": _json_object(meta["filter_conditions_json"], []),
+                 "table_ranges": _json_object(meta["table_ranges_json"], []),
+                 "formula_metadata": _json_object(meta["formula_metadata_json"], {}),
+                 "data_merged_ranges": data_merged_ranges,
+                 "merge_anchor_copy": False,
+                 "duplicate_header_rows": list(getattr(det, "duplicate_header_rows", []) or []),
+                 "pre_header_nonempty_rows": list(getattr(det, "pre_header_nonempty_rows", []) or []),
+                 "pre_header_suspect_rows": list(getattr(det, "pre_header_suspect_rows", []) or []),
+                 "unresolved_candidate_count": int(getattr(det, "unresolved_candidate_count", 0) or 0),
+                 "risk_flags": list(getattr(det, "risk_flags", []) or []),
+                 "filter_reviewed_by": actor if meta["filter_state"] == "unknown" else None,
+                 "merge_reviewed_by": actor if data_merged_ranges else None,
              }, ensure_ascii=False)))
         invalidate_crosscheck_results(conn, project_id)
         current_contract = run_contract.ensure_run_contract(conn, project_id)
@@ -1052,6 +1200,94 @@ def guess_period_no_from_text(text: str) -> int | None:
     return _cn_to_int(m.group(1)) if m else None
 
 
+def _existing_import_report(
+    conn: sqlite3.Connection,
+    project_id: int,
+    file_id: int,
+    *,
+    direction: str,
+    period_no: int | None,
+) -> ImportReport | None:
+    """查找同一 SHA 已经形成的规范导入，避免重复追加明细。
+
+    ``source_files`` 按 SHA 复用只是原件层幂等；如果不检查这里，重复选择
+    同一文件仍会新建 parse_batch/raw_sheet/line_items，A/B/C 便可能一起把
+    金额放大。方向或显式期次发生变化时不猜测用户意图，直接要求通过明确
+    的补充/版本入口处理，而不是静默写入旧期次。
+    """
+    batches = conn.execute(
+        """SELECT pb.id, pb.status, pb.parsed_at
+             FROM parse_batches pb
+            WHERE pb.file_id=? ORDER BY pb.parsed_at DESC, pb.id DESC""",
+        (file_id,),
+    ).fetchall()
+    for batch in batches:
+        sheets = conn.execute(
+            """SELECT rs.id, rs.sheet_name, rs.sheet_status, rs.period_id,
+                      sp.period_no, sp.direction
+                 FROM raw_sheets rs
+                 LEFT JOIN settlement_periods sp ON sp.id=rs.period_id
+                WHERE rs.batch_id=? ORDER BY rs.sheet_index, rs.id""",
+            (batch["id"],),
+        ).fetchall()
+        # 只有已经写入 raw_sheets 的成功/部分批次才构成规范导入幂等边界；
+        # 解析失败批次允许用户重新选择后重试，且失败事实仍保留。
+        if not sheets:
+            continue
+        existing_directions = {
+            str(row["direction"] or "unknown")
+            for row in sheets if row["direction"] is not None
+        }
+        if existing_directions and direction not in existing_directions:
+            raise ValueError(
+                "同一原始文件已按其他方向导入；请使用明确的补充导入/版本入口，"
+                "不要把同一文件静默追加到旧期次"
+            )
+        existing_periods = {
+            int(row["period_no"]) for row in sheets if row["period_no"] is not None
+        }
+        if period_no is not None and existing_periods and period_no not in existing_periods:
+            raise ValueError(
+                "同一原始文件已绑定其他期次；请使用明确的版本或补充资料入口"
+            )
+        period_rows = [row for row in sheets if row["period_id"] is not None]
+        item_count = 0
+        reports: list[SheetReport] = []
+        for row in sheets:
+            if row["period_id"] is not None:
+                count = conn.execute(
+                    """SELECT COUNT(*) AS c FROM line_items
+                         WHERE period_id=? AND sheet_id=?""",
+                    (row["period_id"], row["id"]),
+                ).fetchone()
+                n_items = int(count["c"] or 0)
+                item_count += n_items
+            else:
+                n_items = 0
+            state = str(row["sheet_status"] or "pending")
+            reports.append(
+                SheetReport(
+                    row["sheet_name"],
+                    "parsed" if state == "confirmed" else "needs_review",
+                    n_items=n_items,
+                    state_code=state,
+                    notes=["同一 SHA-256 原始文件已导入，本次选择未重复写入明细"],
+                )
+            )
+        first_period = period_rows[0] if period_rows else None
+        return ImportReport(
+            file_id=file_id,
+            batch_id=int(batch["id"]),
+            period_no=int(first_period["period_no"]) if first_period else (period_no or 0),
+            period_id=int(first_period["period_id"]) if first_period else -1,
+            status="ok" if all(row["sheet_status"] == "confirmed" for row in sheets) else "partial",
+            sheets=reports,
+            message="same_source_already_imported",
+            needs_manual_review=any(row["sheet_status"] != "confirmed" for row in sheets),
+        )
+    return None
+
+
 def import_settlement_file(
     conn: sqlite3.Connection,
     project_id: int,
@@ -1068,11 +1304,23 @@ def import_settlement_file(
     """
     src = Path(src)
     sf = import_file(conn, project_id, project_dir, src)
+    existing_report = _existing_import_report(
+        conn,
+        project_id,
+        sf.file_id,
+        direction=direction,
+        period_no=period_no,
+    )
+    if existing_report is not None:
+        return existing_report
     file_period = period_no if period_no is not None else guess_period_no(src)
     used_increment = file_period is None
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
-    if result.status != "ok":
+    # ``partial`` 仍然保留原始网格供预览/人工映射，但所有结构性能力缺口
+    # 必须沿导入链路落库并让工作表进入 pending；只有真正的 unsupported/
+    # failed 才走“无可解析 Sheet”的失败分支。
+    if result.status not in {"ok", "partial"}:
         # 文件登记已经发生；解析失败也必须形成持久化批次和来源 Evidence，
         # 否则重新打开项目后只剩 source_files，无法知道该文件为何没有进入
         # raw_sheets，也无法让统一 Sheet 状态机阻断项目级结论。
@@ -1129,10 +1377,15 @@ def import_settlement_file(
 
     batch_id = persist_parse_result(conn, sf.file_id, result)
 
+    parse_partial = result.status == "partial"
     report = ImportReport(sf.file_id, batch_id, file_period or 0, -1, "partial")
+    if parse_partial:
+        report.needs_manual_review = True
+        report.message = "parser_capability_limited_needs_manual_review"
     parsed_any = False
     form_routed = False
     role_gated = False
+    structural_gate = False
     period_ids: set[int] = set()
     # 覆盖证明要绑定“整次导入完成后”的 Run Contract。导入过程中期次、
     # Sheet 和明细仍在逐步落库，若逐 Sheet 立即 ensure 契约，会把前半个
@@ -1145,6 +1398,13 @@ def import_settlement_file(
         sheet_id = conn.execute(
             "SELECT id FROM raw_sheets WHERE batch_id=? AND sheet_index=?", (batch_id, sheet.sheet_index)
         ).fetchone()["id"]
+        sheet_meta = conn.execute(
+            """SELECT filter_state, filter_conditions_json, table_ranges_json,
+                      formula_metadata_json, merged_ranges_json,
+                      hidden_rows_json, hidden_cols_json
+                 FROM raw_sheets WHERE id=?""",
+            (sheet_id,),
+        ).fetchone()
         cells, merged, n_rows, _ = load_sheet_grid(conn, sheet_id)
         det = detect_header(sheet.sheet_index, cells, merged, n_rows, sheet.n_cols)
         from jiadun.core.parsing.header_detect import detect_form_like
@@ -1209,6 +1469,9 @@ def import_settlement_file(
         stored_end = range_end if has_data_range else None
         range_status = "inferred" if has_data_range else "unproven"
         range_method = "last_non_empty_row" if has_data_range else "no_data_rows"
+        data_merged_ranges = _data_merged_ranges(merged, detected_data_range)
+        extraction_merged_ranges = _header_only_merged_ranges(merged, det.header_row_hi)
+        structural_reasons = _structural_gate_reasons(sheet_meta, data_merged_ranges)
         range_evidence = {
             "method": range_method,
             "header_range": [det.header_row_lo, det.header_row_hi],
@@ -1218,19 +1481,69 @@ def import_settlement_file(
             "hidden_rows": list(sheet.hidden_rows),
             "hidden_cols": list(sheet.hidden_cols),
             "visibility_risk": bool(sheet.hidden_rows or sheet.hidden_cols),
+            "auto_filter_ref": sheet.auto_filter_ref,
+            "filter_state": sheet_meta["filter_state"],
+            "filter_conditions": _json_object(sheet_meta["filter_conditions_json"], []),
+            "table_ranges": _json_object(sheet_meta["table_ranges_json"], []),
+            "formula_metadata": _json_object(sheet_meta["formula_metadata_json"], {}),
+            "data_merged_ranges": data_merged_ranges,
+            "merge_anchor_copy": False,
+            "duplicate_header_rows": list(getattr(det, "duplicate_header_rows", []) or []),
+            "pre_header_nonempty_rows": list(getattr(det, "pre_header_nonempty_rows", []) or []),
+            "pre_header_suspect_rows": list(getattr(det, "pre_header_suspect_rows", []) or []),
+            "unresolved_candidate_count": int(getattr(det, "unresolved_candidate_count", 0) or 0),
+            "risk_flags": list(getattr(det, "risk_flags", []) or []),
         }
         proof_draft, proof_rows = coverage_proof.build_sheet_coverage_proof(
             cells,
             det,
             n_rows,
-            merged_ranges=merged,
+            merged_ranges=extraction_merged_ranges,
             data_range=detected_data_range,
             hidden_rows=list(sheet.hidden_rows),
             hidden_cols=list(sheet.hidden_cols),
         )
+        # 数据区内部存在空白、标题或说明行时，自动识别无法证明这些行
+        # 是安全排除还是漏掉了业务明细；保留逐行 Evidence，并把工作表
+        # 置为 pending，等待人工确认范围。
+        # 仅把明细/控制行之间的数据区内部空白、说明行视为未闭合范围。
+        # 表头下方为多层表头预留的前置空行不属于业务数据区，不应让
+        # 合法的 GB 表式被误报为部分导入；内部空白仍必须人工确认。
+        detail_numbers = [
+            item.row_number for item in proof_rows if item.class_code == "detail"
+        ]
+        control_numbers = [
+            item.row_number
+            for item in proof_rows
+            if item.class_code in {"subtotal", "grand_total"}
+        ]
+        if detail_numbers:
+            interior_lo = min(detail_numbers)
+            interior_hi = max(control_numbers or detail_numbers)
+            excluded_by_kind = {
+                "空白": sum(
+                    1 for item in proof_rows
+                    if item.class_code == "blank"
+                    and interior_lo < item.row_number < interior_hi
+                ),
+                "说明/备注": sum(
+                    1 for item in proof_rows
+                    if item.class_code == "note"
+                    and interior_lo < item.row_number < interior_hi
+                ),
+            }
+        else:
+            excluded_by_kind = {"空白": 0, "说明/备注": 0}
+        for label, count in excluded_by_kind.items():
+            if count:
+                structural_reasons.append(
+                    f"数据区存在被排除的{label}行（{count} 行），实际范围需人工确认"
+                )
+        structural_reasons = list(dict.fromkeys(structural_reasons))
         skip_stats: dict = {}
         items = extract_items.extract_items(
-            cells, merged, det, n_rows, data_range=detected_data_range, stats=skip_stats)
+            cells, extraction_merged_ranges, det, n_rows,
+            data_range=detected_data_range, stats=skip_stats)
         skip_notes = []
         if skip_stats.get("title_rows"):
             skip_notes.append(
@@ -1278,11 +1591,18 @@ def import_settlement_file(
             pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id, direction)
         title = f"{src.stem}/{sheet.sheet_name}"
         period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
+        if structural_reasons:
+            structural_gate = True
         with conn:
             conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
             set_sheet_status(
-                conn, sheet_id, "confirmed",
-                reason="自动表头与数据范围通过确定性规则识别并写入结算模型",
+                conn, sheet_id, "pending" if structural_reasons else "confirmed",
+                reason=(
+                    "自动表头与数据范围已识别，但存在结构性证据缺口："
+                    + "；".join(structural_reasons)
+                    if structural_reasons
+                    else "自动表头与数据范围通过确定性规则识别并写入结算模型"
+                ),
                 actor="system",
             )
             conn.execute(
@@ -1314,8 +1634,9 @@ def import_settlement_file(
                 sheet.sheet_name, status,
                 n_items=len([i for i in items if not i.flags.get("subtotal")]),
                 n_subtotal=len([i for i in items if i.flags.get("subtotal")]),
-                confidence=det.confidence, notes=det.notes + notes + skip_notes,
-                state_code="confirmed",
+                confidence=det.confidence,
+                notes=det.notes + notes + skip_notes + structural_reasons,
+                state_code="pending" if structural_reasons else "confirmed",
             )
         )
     report.period_id = next(iter(period_ids), -1)
@@ -1323,14 +1644,18 @@ def import_settlement_file(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
          for pid in period_ids), default=0,
     )
-    has_pending = role_gated or form_routed
-    if parsed_any and not has_pending:
+    has_pending = role_gated or form_routed or structural_gate
+    if parsed_any and not has_pending and not parse_partial:
         report.status = "ok"
     elif parsed_any:
         # 有 canonical 但仍有被挡 sheet：overall=partial，pending 不得被 full_pipeline 掩盖
         report.status = "partial"
         report.needs_manual_review = True
-        report.message = "settlement_parsed_with_pending_role_review"
+        report.message = (
+            "parser_capability_limited_needs_manual_review"
+            if parse_partial
+            else "settlement_parsed_with_pending_role_review"
+        )
     elif form_routed and not role_gated:
         report.status = "partial"
         report.needs_manual_review = True

@@ -10,16 +10,49 @@ from scripts import release_checklist
 REPO_ROOT = Path(__file__).parents[2]
 
 
-def test_checklist_runs_golden_and_keeps_unverified_gates_conditional(tmp_path):
+def test_checklist_blocks_release_without_real_golden_case_by_default(tmp_path):
     report = release_checklist.build_checklist(REPO_ROOT, output_dir=tmp_path)
 
-    assert report["overall_status"] == "conditional"
+    assert report["overall_status"] == "failed"
+    assert report["production_release_ready"] is False
     by_id = {item["id"]: item for item in report["items"]}
-    assert by_id["golden_regression"]["status"] == "conditional"
+    assert by_id["golden_regression"]["status"] == "failed"
+    assert by_id["golden_regression"]["gate_status"] == "blocked"
+    assert "real_case_count=0" in by_id["golden_regression"]["detail"]
     assert by_id["performance_1w_5w_20w"]["status"] == "not_run"
     assert by_id["office_four_environment"]["status"] == "conditional"
     assert by_id["package_signature"]["status"] in {"conditional", "not_available"}
     assert by_id["unresolved_p0_p1"]["status"] == "conditional"
+
+
+def test_checklist_allows_missing_real_case_only_in_explicit_development_mode(tmp_path):
+    report = release_checklist.build_checklist(
+        REPO_ROOT,
+        output_dir=tmp_path,
+        allow_no_real=True,
+    )
+
+    assert report["overall_status"] == "conditional"
+    assert report["production_release_ready"] is False
+    by_id = {item["id"]: item for item in report["items"]}
+    assert by_id["golden_regression"]["status"] == "conditional"
+    assert by_id["golden_regression"]["gate_status"] == "development_override"
+    assert "allow_no_real" in by_id["golden_regression"]["detail"]
+
+
+def test_checklist_skip_golden_is_a_blocked_release_gate(tmp_path):
+    report = release_checklist.build_checklist(
+        REPO_ROOT,
+        output_dir=tmp_path,
+        run_golden=False,
+    )
+
+    assert report["overall_status"] == "failed"
+    assert report["production_release_ready"] is False
+    item = next(item for item in report["items"] if item["id"] == "golden_regression")
+    assert item["status"] == "failed"
+    assert item["gate_status"] == "blocked"
+    assert "未运行黄金回归" in item["detail"]
 
 
 def test_write_checklist_emits_json_and_markdown_without_private_path(tmp_path):

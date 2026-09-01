@@ -50,6 +50,10 @@ RULE_ZH = {
     "merged_cells_in_data": "数据区合并单元格",
     "hidden_rows": "隐藏行",
     "hidden_cols": "隐藏列",
+    "formula_semantics_mismatch": "公式语义与来源值不一致",
+    "formula_control_semantics_mismatch": "控制金额公式语义与来源值不一致",
+    "formula_untrusted_cache": "公式缓存未经过本程序重算验证",
+    "filter_visibility_unknown": "筛选后的实际可见行无法确认",
 }
 
 # 匹配方法

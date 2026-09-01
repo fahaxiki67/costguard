@@ -637,6 +637,60 @@ def _evidence_contains_control_source(
     return False
 
 
+def _crosscheck_path_scope_gaps(steps_json: str | None) -> list[str]:
+    """验证 A/B 路径 Evidence 是否记录了真实来源和过滤范围。"""
+    try:
+        payload = json.loads(steps_json or "")
+    except (TypeError, json.JSONDecodeError):
+        return ["期次校核 Evidence 缺少可解析的路径范围"]
+    # 旧版/人工构造的 Evidence 可能把步骤保存在列表中，而正式交叉校核
+    # 会把完整结果快照写成对象。两种形态都只接受明确的 path_scopes，
+    # 不因容器形状差异放松来源、行范围和独立性检查。
+    if isinstance(payload, list):
+        candidates = [
+            item for item in payload
+            if isinstance(item, dict)
+            and ("path_scopes" in item or "path_independence_level" in item)
+        ]
+        payload = candidates[-1] if candidates else None
+    if not isinstance(payload, dict):
+        return ["期次校核 Evidence 路径范围不是对象"]
+    scopes = payload.get("path_scopes")
+    if not isinstance(scopes, dict):
+        return ["期次校核 Evidence 缺少 A/B/C 路径范围"]
+    gaps: list[str] = []
+    expected_sources = {"path_a": "line_items", "path_b": "raw_cells"}
+    for key, source_kind in expected_sources.items():
+        scope = scopes.get(key)
+        if not isinstance(scope, dict):
+            gaps.append(f"{key} 路径范围缺失")
+            continue
+        if scope.get("source_kind") != source_kind:
+            gaps.append(f"{key} 路径来源不是 {source_kind}")
+        if not str(scope.get("selection_rule") or "").strip():
+            gaps.append(f"{key} 路径缺少行集选择规则")
+        filters = scope.get("filters")
+        if not isinstance(filters, list) or not filters:
+            gaps.append(f"{key} 路径缺少过滤条件")
+        sheets = scope.get("sheets")
+        if not isinstance(sheets, list) or not sheets:
+            gaps.append(f"{key} 路径缺少文件/Sheet/行范围")
+            continue
+        for item in sheets:
+            if not isinstance(item, dict):
+                gaps.append(f"{key} 路径 Sheet 范围条目不是对象")
+                continue
+            for field_name in ("file_id", "sheet_id", "file_name", "sheet_name"):
+                if item.get(field_name) is None or not str(item.get(field_name)).strip():
+                    gaps.append(f"{key} 路径缺少 {field_name}")
+            if item.get("row_start") is None or item.get("row_end") is None:
+                gaps.append(f"{key} 路径缺少物理行范围")
+    path_level = str(payload.get("path_independence_level") or "unknown")
+    if path_level != "source_independent_raw_scan":
+        gaps.append(f"A/B 本次路径独立性为 {path_level}，不是独立 raw_cells 扫描")
+    return gaps
+
+
 def _control_source_consistency(
     conn: sqlite3.Connection,
     project_id: int,
@@ -1000,7 +1054,8 @@ def _coverage_semantic_consistency(
     prefix = f"Sheet {int(proof['sheet_id'])}"
     header = conn.execute(
         """SELECT header_row_lo, header_row_hi, col_map_json, confidence,
-                          needs_review, data_row_start, data_row_end
+                          needs_review, data_row_start, data_row_end,
+                          data_range_status, data_range_method
              FROM table_headers WHERE sheet_id=? ORDER BY id DESC LIMIT 1""",
         (int(proof["sheet_id"]),),
     ).fetchone()
@@ -1014,6 +1069,10 @@ def _coverage_semantic_consistency(
         data_end = int(header["data_row_end"])
         confidence = float(header["confidence"])
         needs_review = bool(header["needs_review"])
+        manual_range_confirmed = (
+            str(header["data_range_status"] or "") == "confirmed"
+            and str(header["data_range_method"] or "") == "manual_confirmation"
+        )
     except (TypeError, ValueError, json.JSONDecodeError, KeyError):
         return [f"{prefix} 表头字段无法独立复算逐行分类"]
     if not isinstance(col_map, dict) or not col_map:
@@ -1083,6 +1142,7 @@ def _coverage_semantic_consistency(
         data_range=(data_start, data_end),
         hidden_rows=[int(item) for item in hidden_rows],
         hidden_cols=[int(item) for item in hidden_cols],
+        manual_range_confirmed=manual_range_confirmed,
     )
 
     def _same_decimal_or_empty(left: Any, right: Any) -> bool:
@@ -1264,6 +1324,7 @@ def _coverage_proof_consistency(
     # 证明范围不能只与自身的 raw_data_row_count 自洽，还必须与表头确认时
     # 的 data_row_start/end 和当前不可变 raw_cells 网格勾稽。否则旧证明把
     # 行范围写窄，再追加一行真实明细，A/B/C 仍可能碰巧相等而显示绿色。
+    manual_range_confirmed = False
     header = conn.execute(
         """SELECT header_row_hi, data_row_start, data_row_end,
                           data_range_status, data_range_method
@@ -1321,6 +1382,9 @@ def _coverage_proof_consistency(
                     )
         range_status = str(header["data_range_status"] or "unproven")
         range_method = str(header["data_range_method"] or "unknown")
+        manual_range_confirmed = (
+            range_status == "confirmed" and range_method == "manual_confirmation"
+        )
         if range_status not in {"confirmed", "inferred"}:
             gaps.append(f"{prefix} 表头数据范围状态不是 confirmed/inferred")
         if range_method not in {"manual_confirmation", "last_non_empty_row"}:
@@ -1355,7 +1419,14 @@ def _coverage_proof_consistency(
         gaps.append(f"{prefix} 覆盖证明原因无法解析")
         proof_reasons = []
     if proof_status == "complete" and proof_reasons:
-        gaps.append(f"{prefix} 完整覆盖证明仍保留未解决原因")
+        # 人工确认隐藏范围会保留一条“已解决的可见性风险”作为审计痕迹。
+        # 它不是未解决原因，但只有当前表头确实绑定了人工范围确认时才
+        # 允许出现在 complete 证明中；其它任意原因仍然 fail-closed。
+        if not (
+            manual_range_confirmed
+            and proof_reasons == ["hidden_rows_or_columns_manually_confirmed"]
+        ):
+            gaps.append(f"{prefix} 完整覆盖证明仍保留未解决原因")
     elif proof_status in {"partial", "unproven"} and not proof_reasons:
         gaps.append(f"{prefix} 非完整覆盖证明缺少原因")
 
@@ -1526,14 +1597,43 @@ def _verification(
                           cr.classified_detail_rows, cr.business_rows_used,
                           cr.path_a_total, cr.path_b_total, cr.raw_subtotal,
                       cr.diff_ab, cr.ab_status, cr.control_diff, cr.control_status,
-                      cr.c_control_evidence_id, cr.c_control_source_json, cr.evidence_id,
-                      cr.coverage_proof_status
+                          cr.c_control_evidence_id, cr.c_control_source_json, cr.evidence_id,
+                      cr.coverage_proof_status, cr.ab_independence_level
                FROM crosscheck_results cr
                JOIN settlement_periods sp
                  ON sp.id=cr.period_id AND sp.project_id=cr.project_id
                WHERE cr.project_id=? AND {scope}""",
         (project_id, *params),
     ).fetchall()
+    diagnostic_rows: list[sqlite3.Row] = []
+    if not rows and not availability["available"]:
+        # 输入/契约漂移时 current_scope 有意返回 1=0，防止旧结果继续参与
+        # 当前结论。仍保留一份只读诊断快照，用于回读 C 来源并把“为什么被
+        # 降级”写进 evidence_gaps；这些行绝不进入 levels、periods_checked
+        # 或任何当前金额统计。
+        candidates = conn.execute(
+            """SELECT cr.id, cr.period_id, sp.period_no, sp.direction,
+                              cr.verification_level, cr.status, cr.detail_rows,
+                              cr.pending_sheets, cr.range_unproven_sheets,
+                              cr.classified_detail_rows, cr.business_rows_used,
+                              cr.path_a_total, cr.path_b_total, cr.raw_subtotal,
+                              cr.diff_ab, cr.ab_status, cr.control_diff, cr.control_status,
+                              cr.c_control_evidence_id, cr.c_control_source_json, cr.evidence_id,
+                              cr.coverage_proof_status, cr.ab_independence_level
+                       FROM crosscheck_results cr
+                       JOIN settlement_periods sp
+                         ON sp.id=cr.period_id AND sp.project_id=cr.project_id
+                      WHERE cr.project_id=?
+                      ORDER BY cr.id DESC""",
+            (project_id,),
+        ).fetchall()
+        seen_periods: set[int] = set()
+        for candidate in candidates:
+            period_key = int(candidate["period_id"])
+            if period_key in seen_periods:
+                continue
+            seen_periods.add(period_key)
+            diagnostic_rows.append(candidate)
     levels = {"sufficient": 0, "findings": 0, "insufficient": 0}
     unknown_levels: dict[str, int] = {}
     for row in rows:
@@ -1626,6 +1726,12 @@ def _verification(
         if item is not None
     }
     referenced_evidence_ids.update(
+        int(item)
+        for row in diagnostic_rows
+        for item in (row["evidence_id"], row["c_control_evidence_id"])
+        if item is not None
+    )
+    referenced_evidence_ids.update(
         int(row["evidence_id"])
         for row in current_proofs
         if row["evidence_id"] is not None
@@ -1633,7 +1739,7 @@ def _verification(
     evidence_rows = {
         int(item["id"]): item
         for item in conn.execute(
-            """SELECT id, kind, scope, run_id, run_signature, sources_json
+            """SELECT id, kind, scope, run_id, run_signature, sources_json, steps_json
                FROM evidence WHERE project_id=? AND id IN ({})""".format(
                 ",".join("?" for _ in referenced_evidence_ids) or "NULL"
             ),
@@ -1674,6 +1780,16 @@ def _verification(
             if int(row["pending_sheets"] or 0) != 0:
                 evidence_gaps.append(
                     f"第{row['period_no']}期声明校核充分但仍有待确认 Sheet"
+                )
+        if row["verification_level"] == "sufficient":
+            if main_evidence is None:
+                # 主 Evidence 缺失的具体错误已在上方登记，这里只避免重复
+                # 访问 None；缺 Evidence 本身已经是 fail-closed。
+                pass
+            else:
+                evidence_gaps.extend(
+                    f"第{row['period_no']}期 {message}"
+                    for message in _crosscheck_path_scope_gaps(main_evidence["steps_json"])
                 )
             if int(row["range_unproven_sheets"] or 0) != 0:
                 evidence_gaps.append(
@@ -1728,6 +1844,23 @@ def _verification(
                         conn, project_id, row, control_evidence
                     )
                 )
+    for result_row in diagnostic_rows:
+        control_id = result_row["c_control_evidence_id"]
+        control_evidence = (
+            evidence_rows.get(int(control_id))
+            if control_id is not None else None
+        )
+        if (
+            result_row["control_status"] == "match"
+            and control_evidence is not None
+            and control_evidence["kind"] == "line_item_source"
+        ):
+            evidence_gaps.extend(
+                f"第{result_row['period_no']}期历史结果诊断：{message}"
+                for message in _control_source_consistency(
+                    conn, project_id, result_row, control_evidence
+                )
+            )
     # 不能相信结果表自己声明“校核充分”而忽略 coverage 状态。完整覆盖证明
     # 是 P0-01 的必要条件；任何当前期次只要不是明确 complete，就必须保留
     # “校核不充分”，即使 A/B 数字和主 Evidence 恰好相等。
@@ -1863,8 +1996,19 @@ def _verification(
                     f"第{result_row['period_no']}期覆盖证明仍含待确认或解析失败行"
                 )
     evidence_complete = not evidence_gaps
-    if not availability["available"]:
+    # 运行级侧车（例如数据库不可写、上次运行被明确置为不可用）是比期次
+    # 校核更高一级的硬边界，必须保留 ``unavailable``。仅仅因为当前
+    # Run Contract 的输入组成发生漂移时，期次语义仍应落在四级状态中的
+    # ``insufficient``，同时由 ``current_results_available=False`` 和
+    # evidence_gaps 明确告知旧结果已退出当前结论；不能把所有输入漂移都
+    # 混成一个超出期次状态枚举的 unavailable。
+    if not availability["available"] and availability.get("state") is not None:
         status = run_contract.FAIL_CLOSED_STATUS
+    elif not rows and periods_unchecked > 0 and not availability["available"]:
+        # 输入/契约漂移会让 current_scope 主动返回空集，以避免把旧结果继续
+        # 当作当前证据。项目已有期次时，这个空集应解释为“当前校核不充分”，
+        # 而不是“从未开始”；详细缺口已经保存在 evidence_gaps。
+        status = "insufficient"
     elif not rows:
         status = "not_started"
     elif periods_unchecked > 0:

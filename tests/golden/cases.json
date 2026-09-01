@@ -36,8 +36,8 @@
       "expected": {
         "file_count": 4,
         "sheet_count": 8,
-        "automatic_recognition_count": 7,
-        "pending_sheet_count": 1,
+        "automatic_recognition_count": 5,
+        "pending_sheet_count": 3,
         "period_count": 6,
         "detail_row_count": 39,
         "period_amounts": {
@@ -234,13 +234,13 @@
           ]
         },
         "evidence": {
-          "current_count": 122,
+          "current_count": 126,
           "historical_count": 7,
           "by_kind": {
             "anomaly": 42,
             "contract_fact": 13,
             "cross_check": 6,
-            "line_item_source": 53,
+            "line_item_source": 57,
             "sheet_coverage_proof": 7,
             "sheet_role_candidate": 1
           },
@@ -252,7 +252,7 @@
           ]
         },
         "run_contract": {
-          "schema_version": 43,
+          "schema_version": 45,
           "run_id_present": true,
           "signature_present": true
         }

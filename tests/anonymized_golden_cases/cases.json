@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "registry_kind": "anonymized_real_project",
+  "description": "脱敏真实项目黄金回归登记表。没有用户提供并核验的真实资料前，不得把合成演示案例登记为真实案例。",
+  "cases": [
+    {
+      "case_id": "sanitized_real_case_template",
+      "case_kind": "sanitized_real",
+      "availability": "not_available",
+      "reason": "待用户提供脱敏真实项目资料、控制金额、异常项、匹配结果和不可比项；此占位案例不参与金额回归。"
+    }
+  ]
+}

@@ -11,14 +11,15 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.12 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.12
-> candidate adds a blank-by-default startup page, direct file/folder import and
-> drag-and-drop intake while retaining immutable run identities, per-sheet coverage proofs, a shared
-> fail-closed status model, controlled mapping/rule/alias knowledge, project versions,
-> BOQ differences and historical price hints. Real WPS/Excel environment verification,
+> **Status: v0.1.13 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.13
+> candidate tightens A/B/C independence, raw-range coverage, formula/filter/merge/hidden
+> structure gates and the `.xls` capability boundary while retaining blank-by-default startup,
+> direct file/folder import, drag-and-drop intake, immutable run identities, per-sheet coverage
+> proofs, a shared fail-closed status model, controlled mapping/rule/alias knowledge, project
+> versions, BOQ differences and historical price hints. Real WPS/Excel environment verification,
 > sanitized real-case regression and production signing remain open release gates.
-> See the [release notes](docs/RELEASE_NOTES_v0.1.12.md) and the
+> See the [release notes](docs/RELEASE_NOTES_v0.1.13.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -111,7 +112,7 @@ uv run python scripts/release_consistency_check.py
 
 The target-machine performance measurements, WPS/Excel checks, signing and
 notarization, recovery tests and real-case regression remain open release
-gates for v0.1.12.
+gates for v0.1.13.
 
 ## Rename and compatibility
 

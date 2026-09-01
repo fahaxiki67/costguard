@@ -11,7 +11,9 @@
     uv run python scripts/release_checklist.py --run-tests --run-performance
 
 性能基准耗时较长，未显式指定 ``--run-performance`` 时清单会保留
-1万/5万/20万行门禁为 ``not_run``，不能据此宣称生产通过。
+1万/5万/20万行门禁为 ``not_run``，不能据此宣称生产通过。没有脱敏真实黄金案例
+时，生产发布门禁默认 ``failed``；本地开发检查必须显式使用 ``--allow-no-real``，
+并仍保留 ``conditional`` 与 ``production_release_ready=false``。
 """
 from __future__ import annotations
 
@@ -78,6 +80,7 @@ def _item(
     evidence: str | None = None,
     detail: str | None = None,
     command: Sequence[str] | None = None,
+    gate_status: str | None = None,
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "id": item_id,
@@ -90,6 +93,8 @@ def _item(
         item["detail"] = detail
     if command is not None:
         item["command"] = list(command)
+    if gate_status is not None:
+        item["gate_status"] = gate_status
     return item
 
 
@@ -285,6 +290,7 @@ def build_checklist(
     performance_report: Path | None = None,
     keep_workspace: bool = False,
     run_golden: bool = True,
+    allow_no_real: bool = False,
     output_dir: Path | None = None,
 ) -> dict[str, Any]:
     """构造发布清单；所有门禁都显式保留状态和证据边界。"""
@@ -296,6 +302,7 @@ def build_checklist(
     output_root.mkdir(parents=True, exist_ok=True)
 
     items: list[dict[str, Any]] = []
+    real_case_count: int | None = None
     tests_command = [sys.executable, "-m", "pytest", "-q"]
     lint_command = [sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"]
     migration_command = [
@@ -407,24 +414,43 @@ def build_checklist(
 
     if run_golden:
         registry = root / "tests" / "golden" / "cases.json"
-        if root == REPO_ROOT and registry.is_file():
+        anonymized_registry = root / "tests" / "anonymized_golden_cases" / "cases.json"
+        if root == REPO_ROOT and registry.is_file() and anonymized_registry.is_file():
             from scripts import golden_regression
 
-            golden = golden_regression.run_golden_regression(registry)
-            golden_status = "failed" if golden.get("status") != "passed" else (
-                "passed" if golden.get("real_case_count", 0) else "conditional"
+            golden = golden_regression.run_golden_regression_suite(
+                registries=(registry, anonymized_registry)
+            )
+            real_case_count = int(golden.get("real_case_count") or 0)
+            if golden.get("status") != "passed":
+                golden_status = "failed"
+                golden_gate_status = "failed"
+            elif real_case_count > 0:
+                golden_status = "passed"
+                golden_gate_status = "passed"
+            elif allow_no_real:
+                golden_status = "conditional"
+                golden_gate_status = "development_override"
+            else:
+                golden_status = "failed"
+                golden_gate_status = "blocked"
+            golden_note = (
+                "生产发布门禁已阻断：请补齐脱敏真实案例。"
+                if golden_gate_status == "blocked"
+                else "合成与脱敏登记表均已执行；真实脱敏案例数量仍需补齐。"
             )
             items.append(
                 _item(
                     "golden_regression",
                     "真实黄金案例回归",
                     golden_status,
-                    evidence="tests/golden/cases.json",
+                    evidence="tests/golden/cases.json; tests/anonymized_golden_cases/cases.json",
                     detail=(
                         f"status={golden.get('status')}, available={golden.get('available_case_count')}, "
-                        f"real={golden.get('real_case_count')}, mismatches={golden.get('mismatch_case_count')}；"
-                        "当前合成案例通过，真实脱敏案例数量仍需补齐。"
+                        f"real_case_count={real_case_count}, mismatches={golden.get('mismatch_case_count')}；"
+                        f"gate_status={golden_gate_status}, allow_no_real={allow_no_real}；{golden_note}"
                     ),
+                    gate_status=golden_gate_status,
                 )
             )
         else:
@@ -432,8 +458,9 @@ def build_checklist(
                 _item(
                     "golden_regression",
                     "真实黄金案例回归",
-                    "not_available",
-                    detail="当前根目录缺少可执行的黄金回归库。",
+                    "failed",
+                    detail="当前根目录缺少可执行的黄金回归库；生产发布门禁失败。",
+                    gate_status="failed",
                 )
             )
     else:
@@ -441,9 +468,10 @@ def build_checklist(
             _item(
                 "golden_regression",
                 "真实黄金案例回归",
-                "not_run",
+                "failed",
                 evidence="tests/golden/cases.json",
-                detail="未指定黄金回归执行。",
+                detail="未运行黄金回归；生产发布门禁失败。请移除 --skip-golden 后重试。",
+                gate_status="blocked",
             )
         )
 
@@ -516,6 +544,8 @@ def build_checklist(
         "checklist_version": 1,
         "product": "Jiadun（价盾）",
         "version": current_version,
+        "allow_no_real": bool(allow_no_real),
+        "real_case_count": real_case_count,
         "generated_at": _now(),
         "source_commit": _git_commit(root),
         "environment": {
@@ -525,6 +555,9 @@ def build_checklist(
             "python": platform.python_version(),
         },
         "overall_status": overall,
+        "production_release_ready": bool(
+            overall == "passed" and real_case_count is not None and real_case_count > 0
+        ),
         "items": items,
         "summary": {
             "passed": sum(item["status"] == "passed" for item in items),
@@ -585,6 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--performance-report", type=Path, help="读取已生成的性能 JSON，不重复运行")
     parser.add_argument("--keep-workspace", action="store_true", help="性能基准成功后保留现场")
     parser.add_argument("--skip-golden", action="store_true", help="不运行黄金回归（不建议用于发布）")
+    parser.add_argument(
+        "--allow-no-real",
+        action="store_true",
+        help="仅开发检查时允许 real_case_count=0；不会使生产发布门禁通过",
+    )
     parser.add_argument("--json", action="store_true", help="同时把 JSON 报告打印到标准输出")
     return parser
 
@@ -599,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         performance_report=args.performance_report,
         keep_workspace=args.keep_workspace,
         run_golden=not args.skip_golden,
+        allow_no_real=args.allow_no_real,
         output_dir=(args.output if args.output and args.output.suffix.lower() != ".json" else None),
     )
     output = args.output or args.root / "dist"

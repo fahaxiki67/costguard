@@ -72,6 +72,15 @@ class TestToDecimal:
 
 
 class TestMoneyOps:
+    def test_business_operations_reject_float(self):
+        """float 只能在外部解析边界转换，不能进入核心金额运算。"""
+        with pytest.raises(TypeError, match="Decimal"):
+            money_mul(0.1, D("2"))
+        with pytest.raises(TypeError, match="Decimal"):
+            money_add([D("1"), 0.1])
+        with pytest.raises(TypeError, match="Decimal"):
+            weighted_avg_price(1.0, D("2"))
+
     def test_mul_exact(self):
         assert round2(money_mul(D("1234.5"), D("56.78"))) == D("70094.91")
 

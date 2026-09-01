@@ -40,11 +40,12 @@ from PySide6.QtWidgets import (
 )
 
 from jiadun import branding
+from jiadun.core import analysis
 from jiadun.core.anomalies import catalog as rule_catalog
 from jiadun.core.anomalies import coverage as detection_coverage
 from jiadun.core.anomalies import engine as anomaly_engine
 from jiadun.core.contracts import run_contract
-from jiadun.core.engine import crosscheck, settlement_io
+from jiadun.core.engine import settlement_io
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.export import excel_export
 from jiadun.core.matching import matching
@@ -301,6 +302,21 @@ def _export_review_status_text(summary) -> str:
     )
 
 
+def _crosscheck_independence_text(result) -> str:
+    """把 A/B 来源与物理行集事实合并成不易误读的业务文案。"""
+    path_labels = {
+        "source_independent_raw_scan": "已完成原始网格独立扫描",
+        "unknown": "无法证明",
+    }
+    text = path_labels.get(
+        getattr(result, "path_independence_level", None), "需复核"
+    )
+    warning = analysis.same_row_set_warning(
+        getattr(result, "ab_row_set_status", None)
+    )
+    return f"{text}（{warning}）" if warning else text
+
+
 class WorkbenchPage(QWidget):
     def __init__(self, conn, project, project_dir: str, on_back):
         super().__init__()
@@ -340,13 +356,24 @@ class WorkbenchPage(QWidget):
         self.tabs.addTab(self._version_history_tab(), "版本与历史资产")
         self.refresh_all()
 
-    def _ensure_current_results_for_ui(self, operation: str) -> bool:
+    def _ensure_current_results_for_ui(
+        self, operation: str, *, allow_unbound_read_only: bool = False
+    ) -> bool:
         """UI 读写入口统一执行运行级不可用门控。"""
         try:
             run_contract.require_current_results_available(
                 self.conn, self.project.project_id, operation=operation
             )
         except run_contract.CurrentResultsUnavailableError as exc:
+            if allow_unbound_read_only:
+                availability = run_contract.current_results_available(
+                    self.conn, self.project.project_id, allow_state_clear=False
+                )
+                # 只放行未形成运行身份的人工 Finding/源证据只读查看。
+                # 运行级侧车存在时仍保持完全 fail-closed，不能借详情页
+                # 绕过恢复边界。
+                if availability.get("state") is None:
+                    return True
             QMessageBox.warning(self, operation, str(exc))
             return False
         return True
@@ -604,6 +631,7 @@ class WorkbenchPage(QWidget):
                         for sheet in report.sheets
                         if sheet.status
                         in ("needs_role_review", "no_header", "non_settlement_form")
+                        or sheet.state_code == "pending"
                     )
                     if report.status == "ok":
                         ok += 1
@@ -646,8 +674,9 @@ class WorkbenchPage(QWidget):
             ret = QMessageBox.question(
                 self,
                 "待人工确认",
-                f"有 {pending} 个工作表因表头歧义/无表头/表单结构待人工确认，"
-                "未进入结算模型。\n现在打开「人工确认清单页」处理吗？",
+                f"有 {pending} 个工作表需要人工确认（可能涉及表头、取数范围、隐藏行列、"
+                "公式/合并结构或表单角色）；相关结论不会自动显示为校核充分。\n"
+                "现在打开「人工确认清单页」处理吗？",
                 QMessageBox.Yes | QMessageBox.No,
             )
             if ret == QMessageBox.Yes:
@@ -666,46 +695,61 @@ class WorkbenchPage(QWidget):
         self.import_paths(files)
 
     def _run_anomalies(self):
-        findings = anomaly_engine.run_anomalies(self.conn, self.project.project_id)
+        # 异常检测按钮也经过正式分析入口，避免从 UI 直接调用异常引擎而
+        # 绕过 A/B/C 校核。入口会固定先校核、后检测，并以 fail-closed 结果
+        # 回传阶段失败；这里仅展示检测数量和重试提示。
+        analysis_result = analysis.run_analysis(
+            self.conn, self.project.project_id
+        )
+        findings = analysis_result.anomaly_findings
         summary = anomaly_engine.anomaly_summary(findings)
-        QMessageBox.information(
-            self, "异常检测",
+        message = (
             f"检测完成：高 {summary['high']} / 中 {summary['medium']} / 低 {summary['low']}\n"
-            "详见「审核问题中心」页。")
+            "详见「审核问题中心」页。"
+        )
+        if analysis_result.errors:
+            QMessageBox.warning(
+                self,
+                "正式分析未完成",
+                message + "\n\n" + "\n".join(analysis_result.errors)
+                + "\n请修复问题后重试。",
+            )
+        else:
+            QMessageBox.information(self, "异常检测", message)
         self.refresh_anomalies()
         self.refresh_overview()
         self.refresh_export_status()
 
     def _run_crosscheck(self):
         # 项目级一次性协调所有方向，避免各方向分别形成 3/3 coverage 后
-        # 永远无法满足项目级完整证明；核心入口按 period_id 锁定同期异向期次。
-        results = []
-        errors = []
-        try:
-            results = crosscheck.run_crosscheck_project(
-                self.conn, self.project.project_id
-            )
-        except Exception as exc:  # noqa: BLE001 — 核心层保留原始异常，UI 负责明确提示
-            availability = run_contract.current_results_available(
-                self.conn, self.project.project_id
-            )
-            if not availability["available"]:
-                errors.append(f"数据库不可写，当前结果不可用：{exc}")
-            else:
-                raise
+        # 永远无法满足项目级完整证明；正式分析入口固定先跑 A/B/C，再跑
+        # 异常规则，两个阶段的失败统一回传为 fail-closed 结果。
+        analysis_result = analysis.run_analysis(
+            self.conn, self.project.project_id
+        )
+        results = analysis_result.crosscheck_results
+        errors = list(analysis_result.errors)
         status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
         level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                     "insufficient": "校核不充分"}
+        proof_independence_zh = {
+            "shared_extractor": "覆盖证明共用导入抽取器（覆盖证明本身非独立）",
+            "unknown": "覆盖证明独立性无法证明",
+        }
         dir_zh = DIRECTION_ZH
         lines = []
         for r in results:
+            independence_text = _crosscheck_independence_text(r)
             line = (f"第{r.period_no}期{dir_zh.get(r.direction, '未标记')}："
                     f"{level_zh.get(r.verification_level, '待复核')}"
                     f"（A/B {status_zh.get(r.status, '待复核')}；A={r.path_a_total}，B={r.path_b_total}"
                     f"；参与明细 {r.detail_rows}，排除小计 {r.excluded_subtotal_rows}，"
                     f"排除标题/说明 {r.excluded_title_rows}，"
                     f"待确认工作表 {r.pending_sheets}，"
-                    f"取数范围未证明 {r.range_unproven_sheets}）")
+                    f"取数范围未证明 {r.range_unproven_sheets}；"
+                    f"A/B路径 {independence_text}；"
+                    f"{proof_independence_zh.get(r.ab_independence_level, '覆盖证明独立性需复核')}；"
+                    f"一致性问题 {len(r.consistency_findings)}）")
             # C 控制值独立于 A/B：一致时若控制差异仍在，必须显著提示，不得被
             # A/B 一致掩盖（独立复核发现 #6）
             if r.control_status == "diff":
@@ -716,12 +760,35 @@ class WorkbenchPage(QWidget):
                 line += f"　C={r.raw_subtotal}"
             lines.append(line)
         msg = "\n".join(lines)
+        # 期次级结果不能压过项目级证据闸门。即使某一期显示“校核充分”，
+        # 只要项目还有待确认 Sheet、未完成覆盖或其他阻断，弹窗必须明确
+        # 这是局部结果，不构成项目结论，也不使用成功色语义。
+        try:
+            project_summary = build_report_model(
+                self.conn, self.project.project_id, read_only=True
+            ).project_summary
+        except Exception as exc:  # noqa: BLE001 — UI 层保留失败原因并允许重试
+            errors.append(f"report: 项目状态读取失败（{type(exc).__name__}），当前结果不可用")
+            project_summary = None
+        project_status_code = (
+            project_summary.statuses.get("project_status_code", "cannot_conclude")
+            if project_summary is not None else "cannot_conclude"
+        )
+        if project_status_code != "can_conclude":
+            project_status = (
+                project_summary.statuses.get("project_status", "不可形成项目结论")
+                if project_summary is not None else "不可形成项目结论"
+            )
+            msg = (
+                f"项目级状态：{project_status}。以下仅为期次/局部校核结果，"
+                "不构成项目结论：\n" + msg
+            )
         if any(r.verification_level == "insufficient" for r in results):
             msg = "⚠ 校核不充分：证据不足或仍有工作表待人工确认，不得视为通过：\n" + msg
         elif any(r.control_status == "diff" for r in results):
             msg = "⚠ 存在 C 控制差异（A/B 一致也不代表全部通过）：\n" + msg
         if errors:
-            msg += "\n\n以下期号存在方向歧义，已跳过（请先标记方向）：\n" + "\n".join(errors)
+            msg += "\n\n本次正式分析未能完整完成，以下阶段需重试：\n" + "\n".join(errors)
         QMessageBox.information(self, "双向校核", msg or "无期次可校核")
         if any(r.status == "diff" for r in results):
             self.tabs.setCurrentIndex(2)
@@ -1212,7 +1279,9 @@ class WorkbenchPage(QWidget):
         anomaly_id = item.data(Qt.UserRole) if item else None
         if anomaly_id is None:
             return
-        if not self._ensure_current_results_for_ui("异常明细"):
+        if not self._ensure_current_results_for_ui(
+            "异常明细", allow_unbound_read_only=True
+        ):
             self.anomaly_detail_panel.setPlainText("当前结果不可用，不能查看异常明细。")
             return
         scope, scope_params = run_contract.current_scope(

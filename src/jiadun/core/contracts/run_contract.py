@@ -692,14 +692,14 @@ def current_results_available(
     if state is None:
         current = get_current_contract(conn, project_id)
         try:
-            source_gaps = source_file_contract_gaps(conn, project_id, current)
+            contract_gaps = current_contract_gaps(conn, project_id, current)
         except Exception as error:
             # 路径损坏、符号链接循环或其他文件系统异常都必须进入统一的
             # unavailable 状态；读取/导出层不能把异常当作“没有当前结果限制”。
-            source_gaps = [
-                "源文件存储副本闸门检查异常：" + type(error).__name__
+            contract_gaps = [
+                "当前 Run Contract 闸门检查异常：" + type(error).__name__
             ]
-        if source_gaps:
+        if contract_gaps:
             # 这是输入证据闸门产生的运行级不可用，不等同于数据库侧车；
             # 不在这里写侧车，避免只读状态查询产生副作用，但所有读取/导出
             # 调用仍必须看到 fail-closed 结果和具体副本缺口。
@@ -707,7 +707,7 @@ def current_results_available(
                 "available": False,
                 "status": FAIL_CLOSED_STATUS,
                 "fail_closed": True,
-                "reason": "源文件存储副本闸门未通过：" + "；".join(source_gaps),
+                "reason": "当前 Run Contract 证据闸门未通过：" + "；".join(contract_gaps),
                 "run_signature": current.signature if current else None,
                 "run_id": current.run_id if current else None,
                 "persisted": None,
@@ -1316,6 +1316,31 @@ def contract_input_gaps(
     return gaps
 
 
+def current_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """集中检查所有会改变当前结算解释的运行契约组成。
+
+    只读摘要、匹配、异常和导出共用这条入口；不能只检查源文件副本，而
+    放过期次、字段映射、明细投影、Sheet 范围或规则输入的直接漂移。函数
+    不写数据库，也不调用 ``current_scope``，避免读取闸门递归。
+    """
+    checks = (
+        lambda: source_file_contract_gaps(conn, project_id, contract),
+        lambda: line_item_contract_gaps(conn, project_id, contract),
+        lambda: mapping_contract_gaps(conn, project_id, contract),
+        lambda: period_contract_gaps(conn, project_id, contract),
+        lambda: sheet_scope_contract_gaps(conn, project_id, contract),
+        lambda: contract_input_gaps(conn, project_id, contract),
+    )
+    gaps: list[str] = []
+    for check in checks:
+        gaps.extend(check())
+    return list(dict.fromkeys(gaps))
+
+
 def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
     def raw_cell_digest(sheet_id: int) -> str:
         digest = hashlib.sha256()
@@ -1650,7 +1675,11 @@ def _project_version_scope(conn: sqlite3.Connection, project_id: int) -> dict[st
 def _human_confirmation_snapshot(
     conn: sqlite3.Connection, project_id: int
 ) -> list[dict[str, Any]]:
-    """把人工操作前后值、原因和时间纳入合同快照。
+    """把影响当前结算解释的人工操作前后值、原因和时间纳入合同快照。
+
+    历史资产关闭/采集只写长期资产，不改变当前结算口径，因此由专用的
+    ``project_version``/历史资产 Evidence 链负责追溯，不重复触发当前结果
+    的输入漂移。
 
     ``run_id``/``run_signature`` 是这条审计记录的绑定结果，不是人工操作
     本身的输入。若把绑定字段也纳入指纹，人工操作完成后为了绑定新合同
@@ -1660,7 +1689,10 @@ def _human_confirmation_snapshot(
     """
     rows = conn.execute(
         """SELECT ts, actor, action, target, before_json, after_json, reason
-           FROM audit_log WHERE project_id=? ORDER BY id""",
+           FROM audit_log
+          WHERE project_id=?
+            AND action NOT IN ('close_project_for_history', 'collect_historical_prices')
+          ORDER BY id""",
         (project_id,),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1923,6 +1955,46 @@ def current_scope(
         conn, project_id, allow_state_clear=False
     )
     if not availability["available"]:
+        # 契约输入发生漂移时，自动生成的成果必须完全退出当前读取面。
+        # 但在尚未形成运行身份的兼容/人工入口中，仍可能存在没有
+        # ``run_id``/``run_signature`` 的 Finding；这类记录不能被当作当前
+        # 校核结果或绿色结论，但保留在问题中心可见，便于人工看到失败
+        # 原因、补证并重新运行。持久化 fail-closed 侧车（state 非空）仍
+        # 一律返回 1=0，避免旧结果在恢复边界中泄漏。
+        if table_alias in {"a", "e", "ev"} and availability.get("state") is None:
+            # 若当前合同已经产出过带运行身份的自动结果，输入漂移时必须
+            # 把整个派生结果面收紧为 1=0；否则仅凭一个 NULL 身份 Finding
+            # 的兼容放行会让旧结果与新问题混在一起。尚未产出任何派生
+            # 结果时，才允许问题中心查看未绑定的人工 Finding/源证据。
+            current = get_current_contract(conn, project_id)
+            materialized = False
+            if current is not None:
+                for table in ("crosscheck_results", "period_totals", "matches", "anomalies"):
+                    row = conn.execute(
+                        f"SELECT 1 FROM {table} "
+                        "WHERE project_id=? AND run_id=? AND run_signature=? LIMIT 1",
+                        (project_id, current.run_id, current.signature),
+                    ).fetchone()
+                    if row is not None:
+                        materialized = True
+                        break
+            if materialized:
+                return "1=0", ()
+            if table_alias in {"e", "ev"}:
+                # 仅允许回溯没有运行身份的 source 证据；current/human 或
+                # cross_check 证据仍必须等待新的完整运行。source 证据只是
+                # 原始出处展示，不构成项目级校核结论。
+                return (
+                    f"{table_alias}.scope='source' AND {table_alias}.kind<>'cross_check' "
+                    f"AND {table_alias}.run_signature IS NULL AND {table_alias}.run_id IS NULL",
+                    (),
+                )
+            return (
+                "a.run_signature IS NULL AND a.run_id IS NULL "
+                "AND COALESCE(a.status, 'open') NOT IN ('stale', 'historical') "
+                "AND COALESCE(a.lifecycle_status, 'new') <> 'historical'",
+                (),
+            )
         return "1=0", ()
     current = get_current_contract(conn, project_id)
     signature = current.signature if current else None

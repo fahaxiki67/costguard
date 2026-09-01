@@ -69,6 +69,28 @@ def test_contract_input_gaps_use_canonical_component_values(tmp_path):
         conn.close()
 
 
+def test_current_results_availability_rejects_period_metadata_drift(tmp_path):
+    """期次标题/方向等运行契约输入变化时，当前成果读取必须失效。"""
+    info, conn = _project(tmp_path)
+    try:
+        conn.execute(
+            "INSERT INTO settlement_periods(project_id, period_no, title, direction) VALUES (?,?,?,?)",
+            (info.project_id, 1, "第1期", "upward"),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        conn.execute(
+            "UPDATE settlement_periods SET title=? WHERE project_id=?",
+            ("第1期（补充）", info.project_id),
+        )
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        assert "Run Contract" in (availability["reason"] or "")
+        assert run_contract.current_scope(conn, info.project_id, "cr") == ("1=0", ())
+        assert run_contract.period_contract_gaps(conn, info.project_id, active)
+    finally:
+        conn.close()
+
+
 def test_source_copy_content_drift_invalidates_current_contract(tmp_path):
     """解析器实际读取的存储副本被覆盖时，当前运行不得继续有效。"""
     info, conn = _project(tmp_path)

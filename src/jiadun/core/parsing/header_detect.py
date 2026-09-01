@@ -79,6 +79,14 @@ class HeaderDetection:
     confidence: float
     needs_review: bool
     notes: list[str] = field(default_factory=list)
+    # 这些字段是解析门控元数据，不参与业务金额计算。它们必须随检测结果
+    # 一起向上层暴露，避免“选到了一个看似合理的表头”就丢失范围风险。
+    candidate_headers: list[dict[str, object]] = field(default_factory=list)
+    unresolved_candidate_count: int = 0
+    duplicate_header_rows: list[int] = field(default_factory=list)
+    pre_header_nonempty_rows: list[int] = field(default_factory=list)
+    pre_header_suspect_rows: list[int] = field(default_factory=list)
+    risk_flags: list[str] = field(default_factory=list)
 
 
 def _cell_text(sheet_cells: dict[tuple[int, int], str], row: int, col: int,
@@ -126,6 +134,144 @@ def _score_header_cell(text: str) -> list[tuple[str, float]]:
     return hits
 
 
+def _raw_nonempty_texts(
+    cells: dict[tuple[int, int], str], row: int, max_col: int
+) -> list[str]:
+    """取一行实际存储的非空值，不把合并锚点复制成多个值。"""
+    values: list[str] = []
+    for col in range(1, max_col + 1):
+        value = str(cells.get((row, col), "") or "").strip()
+        if value:
+            values.append(value)
+    return values
+
+
+_NUMERIC_CELL_RE = re.compile(
+    r"^[+-]?(?:\d[\d,，\s]*)(?:[.．]\d+)?%?$"
+)
+_CODE_LIKE_RE = re.compile(r"^[A-Za-z]?[A-Za-z0-9][A-Za-z0-9._/\-]*$")
+
+
+def _looks_numeric_cell(text: str) -> bool:
+    compact = (
+        text.strip()
+        .replace("¥", "")
+        .replace("￥", "")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("（", "")
+        .replace("）", "")
+    )
+    return bool(compact and _NUMERIC_CELL_RE.fullmatch(compact))
+
+
+def _looks_code_like(text: str) -> bool:
+    compact = "".join(text.split())
+    return bool(
+        compact
+        and _CODE_LIKE_RE.fullmatch(compact)
+        and any(char.isdigit() for char in compact)
+    )
+
+
+def _row_header_fields(
+    cells: dict[tuple[int, int], str],
+    row: int,
+    max_col: int,
+    anchors: dict[tuple[int, int], tuple[int, int]],
+    expected_map: dict[str, int] | None = None,
+) -> tuple[set[str], set[str]]:
+    """返回该行命中的字段及按既定列位置命中的字段。"""
+    fields: set[str] = set()
+    mapped_fields: set[str] = set()
+    expected_by_col = {col: field for field, col in (expected_map or {}).items()}
+    for col in range(1, max_col + 1):
+        text = _cell_text(cells, row, col, anchors)
+        hits = _score_header_cell(text)
+        for field_name, _score in hits:
+            fields.add(field_name)
+            if expected_by_col.get(col) == field_name:
+                mapped_fields.add(field_name)
+    return fields, mapped_fields
+
+
+def detect_duplicate_header_rows(
+    cells: dict[tuple[int, int], str],
+    det: HeaderDetection,
+    max_row: int,
+    max_col: int | None = None,
+    merged_ranges: list[str] | None = None,
+) -> list[int]:
+    """在完整 Sheet 网格中找出选定表头之外的重复表头行。
+
+    只要一行同时出现“编码+名称”或“名称+数量/单价/金额”等稳定字段组合，
+    就作为待复核候选。这里宁可多报风险，也不把跨页重复表头当成业务明细。
+    """
+    width = max_col if max_col is not None else max_col_of(cells)
+    if width <= 0 or max_row <= 0:
+        return []
+    anchors = build_anchor_map(merged_ranges or [])
+    # 只豁免表头首行。多行表头的后续行通常只有少量叶子字段，不会满足
+    # 下方的完整表头组合；若后续行再次出现完整“编码+名称+金额”等字段，
+    # 即使它落在检测器误扩大的 header_range 内，也必须报为重复表头。
+    # 这一步同时防止检测器把“首表头 + 明细 + 重复表头”误选成一个三行
+    # 表头，从而把首段明细静默排除在数据区之外。
+    selected_rows = set(range(det.header_row_lo, det.header_row_hi + 1))
+    duplicated: list[int] = []
+    for row in range(1, max_row + 1):
+        if not _raw_nonempty_texts(cells, row, width):
+            continue
+        fields, mapped_fields = _row_header_fields(
+            cells, row, width, anchors, det.col_map
+        )
+        has_name_pair = "name" in fields and bool(
+            fields & {"code", "quantity", "unit_price", "amount", "unit"}
+        )
+        is_duplicate = (len(mapped_fields) >= 2 and has_name_pair) or (
+            "name" in fields and len(fields) >= 3
+        )
+        # 选定表头范围中的叶子行可能命中 2 个词典字段，但只有“完整
+        # 稳定组合”才算重复；因此不会把常见的两行块式表头叶子行误报。
+        # 范围之外的行仍按较低阈值识别，以便捕获只重复“编码+名称”的
+        # 跨页表头。范围内只有同时命中至少 3 个字段的行才升级为重复，
+        # 避免合法的多行表头叶子被当成漏行风险。
+        if row in selected_rows and row != det.header_row_lo and len(fields) < 3:
+            continue
+        if is_duplicate and (row not in selected_rows or row > det.header_row_lo):
+            duplicated.append(row)
+    return duplicated
+
+
+def detect_pre_header_rows(
+    cells: dict[tuple[int, int], str],
+    det: HeaderDetection,
+    max_col: int | None = None,
+) -> tuple[list[int], list[int]]:
+    """记录选定表头前所有非空行及其中疑似业务数据行。"""
+    width = max_col if max_col is not None else max_col_of(cells)
+    if width <= 0 or det.header_row_lo <= 1:
+        return [], []
+    nonempty: list[int] = []
+    suspect: list[int] = []
+    for row in range(1, det.header_row_lo):
+        values = _raw_nonempty_texts(cells, row, width)
+        if not values:
+            continue
+        nonempty.append(row)
+        numeric_or_code = any(
+            _looks_numeric_cell(value) or _looks_code_like(value) for value in values
+        )
+        # 单个合并标题/说明行允许存在；多值行或含数字/编码的行必须
+        # 暂停自动解析，防止真实明细位于误选表头之前而被静默漏掉。
+        if (
+            len(values) >= 3
+            or (len(values) >= 2 and numeric_or_code)
+            or (len(values) == 1 and numeric_or_code)
+        ):
+            suspect.append(row)
+    return nonempty, suspect
+
+
 def _merge_width(cells: dict[tuple[int, int], str], merged_ranges: list[str],
                  row: int, col: int) -> int:
     """(row,col) 若是横向合并锚点，返回合并宽度；否则 1。"""
@@ -158,6 +304,7 @@ def detect_header(sheet_index: int, cells: dict[tuple[int, int], str],
     """
     anchors = build_anchor_map(merged_ranges)
     best: HeaderDetection | None = None
+    candidates: list[HeaderDetection] = []
 
     def _better(a: HeaderDetection | None, b: HeaderDetection) -> HeaderDetection:
         if a is None:
@@ -167,6 +314,15 @@ def detect_header(sheet_index: int, cells: dict[tuple[int, int], str],
             return b if b_ok else a
         if b.confidence != a.confidence:
             return b if b.confidence > a.confidence else a
+        # 同一列映射、同等置信度时，优先选择更窄的表头范围。真实表格常在
+        # 正式字段行前放置合并标题/编制说明；把这些说明行吸进多行表头会
+        # 让正式字段行被误报为“重复表头”，并从数据区排除首段明细。若确
+        # 有真正的多行表头，浅层候选通常无法得到同样完整的列映射，仍会
+        # 由置信度/字段覆盖规则保留多行候选。
+        a_span = a.header_row_hi - a.header_row_lo
+        b_span = b.header_row_hi - b.header_row_lo
+        if b_span != a_span:
+            return b if b_span < a_span else a
         return a
 
     for lo in range(1, min(_HEADER_ROW_MAX, max_row) + 1):
@@ -181,11 +337,160 @@ def detect_header(sheet_index: int, cells: dict[tuple[int, int], str],
                                     two_row=depth >= 2, block=depth,
                                     merged_ranges=merged_ranges)
                 if det_n is not None:
+                    candidates.append(det_n)
                     best = _better(best, det_n)
         det = _try_header(lo, lo, cells, anchors, max_col, sheet_index,
                           merged_ranges=merged_ranges)
         if det is not None:
+            candidates.append(det)
             best = _better(best, det)
+    if best is None:
+        return None
+
+    # 同一真实表头会因单行/两行/三行尝试产生多个内部候选。候选中常会有
+    # 一个“浅层表头”因同名列而被标为 needs_review，随后更深的块式表头
+    # 才能确定叶子列。不能把这些已经被确定性排序淘汰的低质候选重新算作
+    # “多个未解决候选”，否则正常三层表头会被无谓地挡在角色审阅门外。
+    # 只有同样通过自身歧义检查的候选才有资格参与多候选闸门；若没有任何
+    # 通过候选，则保留原有 needs_review 结果，避免放宽真正的歧义输入。
+    unique_candidates: dict[tuple[int, int, tuple[tuple[str, int], ...]], HeaderDetection] = {}
+    candidate_pool = [candidate for candidate in candidates if not candidate.needs_review]
+    if not candidate_pool:
+        candidate_pool = candidates
+    for candidate in candidate_pool:
+        key = (
+            candidate.header_row_lo,
+            candidate.header_row_hi,
+            tuple(sorted(candidate.col_map.items())),
+        )
+        previous = unique_candidates.get(key)
+        if previous is None or (
+            (not candidate.needs_review, candidate.confidence)
+            > (not previous.needs_review, previous.confidence)
+        ):
+            unique_candidates[key] = candidate
+    # 同一列映射下，较短且被较长候选完全覆盖的范围只是多行表头的浅层
+    # 变体，不构成真实的“多个未解决候选”。保留最长候选后，跨页的两个
+    # 独立起点（例如 1-1 与 4-4）仍会触发闸门。
+    dominated: set[tuple[int, int, tuple[tuple[str, int], ...]]] = set()
+    for key, candidate in unique_candidates.items():
+        for other_key, other in unique_candidates.items():
+            if key == other_key or candidate.col_map != other.col_map:
+                continue
+            if (
+                other.header_row_lo <= candidate.header_row_lo
+                and other.header_row_hi >= candidate.header_row_hi
+                and (
+                    other.header_row_lo < candidate.header_row_lo
+                    or other.header_row_hi > candidate.header_row_hi
+                )
+            ):
+                dominated.add(key)
+                break
+    unique_candidates = {
+        key: candidate for key, candidate in unique_candidates.items()
+        if key not in dominated
+    }
+    # 在候选排序后再做完整 Sheet 重复表头扫描。若“最佳”候选把一行真实
+    # 重复表头误吸进多行表头范围，优先回退到同一列映射、且在重复行之前
+    # 结束的候选（通常是单行表头）。否则数据区会从重复表头之后才开始，
+    # 首段明细将被静默漏掉。
+    duplicate_probe = detect_duplicate_header_rows(
+        cells, best, max_row, max_col, merged_ranges
+    )
+    duplicate_inside = [
+        row for row in duplicate_probe
+        if best.header_row_lo < row <= best.header_row_hi
+    ]
+    if duplicate_inside:
+        cutoff = min(duplicate_inside)
+        alternatives = [
+            candidate for candidate in candidates
+            if (
+                candidate.header_row_lo == best.header_row_lo
+                and candidate.header_row_hi < cutoff
+                and candidate.col_map == best.col_map
+            )
+        ]
+        if alternatives:
+            best = max(
+                alternatives,
+                key=lambda candidate: (candidate.header_row_hi, candidate.confidence),
+            )
+            # 重新计算探测结果，确保新范围之外的重复表头仍被记录。
+            duplicate_probe = detect_duplicate_header_rows(
+                cells, best, max_row, max_col, merged_ranges
+            )
+
+    candidate_headers = [
+        {
+            "header_range": [candidate.header_row_lo, candidate.header_row_hi],
+            "col_map": dict(candidate.col_map),
+            "confidence": candidate.confidence,
+            "needs_review": candidate.needs_review,
+            "notes": list(candidate.notes),
+        }
+        for candidate in sorted(
+            unique_candidates.values(),
+            key=lambda item: (item.header_row_lo, item.header_row_hi, item.confidence),
+        )
+    ]
+    # 回退到重复表头之前的较窄候选后，``best`` 可能不再属于已裁剪的
+    # ``unique_candidates``。候选清单必须包含最终实际使用的范围，否则
+    # Evidence 会出现“记录了候选但没有记录选中的表头”的不可审计状态。
+    if not any(
+        item["header_range"] == [best.header_row_lo, best.header_row_hi]
+        and item["col_map"] == best.col_map
+        for item in candidate_headers
+    ):
+        candidate_headers.append({
+            "header_range": [best.header_row_lo, best.header_row_hi],
+            "col_map": dict(best.col_map),
+            "confidence": best.confidence,
+            "needs_review": best.needs_review,
+            "notes": list(best.notes),
+        })
+        candidate_headers.sort(
+            key=lambda item: (item["header_range"][0], item["header_range"][1], item["confidence"])
+        )
+    best.candidate_headers = candidate_headers
+    if len(unique_candidates) > 1:
+        best.unresolved_candidate_count = len(unique_candidates)
+        best.needs_review = True
+        best.risk_flags.append("multiple_header_candidates")
+        ranges = ", ".join(
+            f"{candidate.header_row_lo}-{candidate.header_row_hi}"
+            for candidate in sorted(
+                unique_candidates.values(),
+                key=lambda item: (item.header_row_lo, item.header_row_hi),
+            )
+        )
+        best.notes.append(f"多个未解决表头候选（行范围：{ranges}），需人工确认")
+
+    duplicate_rows = duplicate_probe
+    pre_header_rows, pre_header_suspect_rows = detect_pre_header_rows(
+        cells, best, max_col
+    )
+    best.duplicate_header_rows = duplicate_rows
+    best.pre_header_nonempty_rows = pre_header_rows
+    best.pre_header_suspect_rows = pre_header_suspect_rows
+    if duplicate_rows:
+        best.needs_review = True
+        best.risk_flags.append("duplicate_header_rows")
+        best.notes.append(
+            "检测到完整 Sheet 范围内的重复表头行："
+            + ", ".join(str(row) for row in duplicate_rows)
+            + "，需人工确认数据范围"
+        )
+    if pre_header_suspect_rows:
+        best.needs_review = True
+        best.risk_flags.append("pre_header_business_rows")
+        best.notes.append(
+            "选定表头前存在疑似业务数据行："
+            + ", ".join(str(row) for row in pre_header_suspect_rows)
+            + "，已暂停自动解析"
+        )
+    best.risk_flags = sorted(set(best.risk_flags))
     return best
 
 

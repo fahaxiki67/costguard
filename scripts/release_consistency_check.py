@@ -2,6 +2,9 @@
 
 该检查只读仓库文件，不生成或修改任何发布物。它用于把“代码版本、文档版本、
 当前是否仍为预览候选”变成可重复的发布前门槛，避免文档误把候选构建写成正式版。
+生产发布默认要求至少一个脱敏真实黄金案例；本地开发检查若确实需要在真实案例
+补齐前继续运行，必须显式传入 ``allow_no_real=True`` 或命令行
+``--allow-no-real``，该模式会保留有条件状态且不会把结果标记为生产可发布。
 """
 from __future__ import annotations
 
@@ -31,8 +34,18 @@ def _read_version(root: Path) -> str | None:
     return match.group(1) if match else None
 
 
-def _check(checks: list[dict[str, Any]], name: str, passed: bool, detail: str) -> None:
-    checks.append({"name": name, "passed": bool(passed), "detail": detail})
+def _check(
+    checks: list[dict[str, Any]],
+    name: str,
+    passed: bool,
+    detail: str,
+    *,
+    status: str | None = None,
+) -> None:
+    check: dict[str, Any] = {"name": name, "passed": bool(passed), "detail": detail}
+    if status is not None:
+        check["status"] = status
+    checks.append(check)
 
 
 def check_release_consistency(
@@ -40,11 +53,13 @@ def check_release_consistency(
     *,
     expected_version: str | None = None,
     run_golden: bool = True,
+    allow_no_real: bool = False,
 ) -> dict[str, Any]:
     """返回可序列化的检查结果；不通过项列在 ``issues`` 中。"""
     root = Path(root)
     checks: list[dict[str, Any]] = []
     issues: list[str] = []
+    real_case_count: int | None = None
     version = _read_version(root)
     expected = expected_version or version
 
@@ -120,14 +135,22 @@ def check_release_consistency(
     if missing_gates:
         issues.append(f"发布说明未列出门槛: {', '.join(missing_gates)}")
 
-    # 黄金回归是发布前的确定性门槛。合成演示案例用于验证执行器和当前
-    # 代码基线；是否已登记脱敏真实案例另列为条件，不把“无真实案例”
-    # 偷换成回归通过，也不自动更新 cases.json。
+    # 黄金回归是发布前的确定性门槛。合成演示和脱敏真实登记表都必须
+    # 执行；“尚无真实案例”默认阻断生产发布，不能被合成案例冒充。开发
+    # 检查只有显式 allow_no_real 才能保留为 conditional。
     if run_golden:
         registry = root / "tests" / "golden" / "cases.json"
-        if not registry.is_file():
-            _check(checks, "golden_regression", False, f"缺少 {registry}")
-            issues.append("缺少 tests/golden/cases.json，无法执行黄金回归")
+        anonymized_registry = root / "tests" / "anonymized_golden_cases" / "cases.json"
+        if not registry.is_file() or not anonymized_registry.is_file():
+            missing = [str(path.relative_to(root)) for path in (registry, anonymized_registry) if not path.is_file()]
+            _check(
+                checks,
+                "golden_regression",
+                False,
+                f"缺少 {', '.join(missing)}；生产发布门禁失败",
+                status="failed",
+            )
+            issues.append("缺少合成或脱敏真实黄金登记表，无法执行完整黄金回归")
         elif root.resolve() == REPO_ROOT.resolve():
             try:
                 # 直接执行 ``python scripts/release_consistency_check.py`` 时，
@@ -140,27 +163,64 @@ def check_release_consistency(
                     sys.path.insert(0, root_text)
                 from scripts import golden_regression
 
-                golden = golden_regression.run_golden_regression(registry)
+                golden = golden_regression.run_golden_regression_suite(
+                    registries=(registry, anonymized_registry)
+                )
             except Exception as exc:  # noqa: BLE001 - 发布门槛需保留失败原因
-                _check(checks, "golden_regression", False, f"执行失败: {type(exc).__name__}: {exc}")
+                _check(
+                    checks,
+                    "golden_regression",
+                    False,
+                    f"执行失败: {type(exc).__name__}: {exc}",
+                    status="failed",
+                )
                 issues.append(f"黄金回归执行失败: {type(exc).__name__}: {exc}")
             else:
-                passed = golden.get("status") == "passed"
+                real_case_count = int(golden.get("real_case_count") or 0)
+                regression_passed = golden.get("status") == "passed"
+                if not regression_passed:
+                    gate_status = "failed"
+                    passed = False
+                elif real_case_count == 0 and not allow_no_real:
+                    gate_status = "blocked"
+                    passed = False
+                    issues.append(
+                        "生产发布被阻断：真实黄金案例回归 real_case_count=0；"
+                        "补齐脱敏真实案例，或仅在开发检查中显式使用 allow_no_real"
+                    )
+                elif real_case_count == 0:
+                    gate_status = "conditional"
+                    passed = True
+                else:
+                    gate_status = "passed"
+                    passed = True
                 detail = (
                     f"status={golden.get('status')}, available={golden.get('available_case_count')}, "
-                    f"real={golden.get('real_case_count')}, mismatches={golden.get('mismatch_case_count')}"
+                    f"real_case_count={real_case_count}, mismatches={golden.get('mismatch_case_count')}, "
+                    f"gate_status={gate_status}, allow_no_real={allow_no_real}"
                 )
-                _check(checks, "golden_regression", passed, detail)
-                if not passed:
+                _check(checks, "golden_regression", passed, detail, status=gate_status)
+                if not regression_passed:
                     issues.append("黄金回归存在差异或失败案例")
         else:
             # 临时文档一致性测试或外部镜像根目录不应误用当前 checkout
             # 的输入；保留明确的未执行状态，由真实发布根目录负责运行。
-            _check(checks, "golden_regression", False, "非当前仓库根目录，未执行黄金回归")
+            _check(
+                checks,
+                "golden_regression",
+                False,
+                "非当前仓库根目录，未执行黄金回归；生产发布门禁失败",
+                status="failed",
+            )
             issues.append("非当前仓库根目录，未执行黄金回归")
 
     return {
         "ok": not issues,
+        "allow_no_real": bool(allow_no_real),
+        "real_case_count": real_case_count,
+        "production_release_ready": bool(
+            not issues and run_golden and real_case_count is not None and real_case_count > 0
+        ),
         "version": version,
         "expected_version": expected,
         "checks": checks,
@@ -172,13 +232,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="检查 Jiadun 发布版本与文档一致性")
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help="仓库根目录")
     parser.add_argument("--version", dest="expected_version", help="期望版本；默认读取 pyproject.toml")
+    parser.add_argument(
+        "--allow-no-real",
+        action="store_true",
+        help="仅开发检查时允许 real_case_count=0；不会使生产发布门禁通过",
+    )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = check_release_consistency(args.root, expected_version=args.expected_version)
+    result = check_release_consistency(
+        args.root,
+        expected_version=args.expected_version,
+        allow_no_real=args.allow_no_real,
+    )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

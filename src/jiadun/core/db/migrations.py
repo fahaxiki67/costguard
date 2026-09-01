@@ -2649,6 +2649,81 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                END""",
         ],
     ),
+    (
+        # v44: 解析层保留公式缓存、工作表/表格筛选和结构化表范围。
+        # openpyxl 不能证明筛选后的实际可见行，也不能在未缓存或动态公式时
+        # 证明金额值已确定性重算；这些字段作为不可变输入元数据供导入/异常
+        # 层 fail-closed。原始网格仍只允许在解析批次中 INSERT。
+        44,
+        [
+            "ALTER TABLE raw_cells ADD COLUMN formula_cache_status TEXT NOT NULL DEFAULT 'not_formula'",
+            "ALTER TABLE raw_sheets ADD COLUMN auto_filter_ref TEXT",
+            "ALTER TABLE raw_sheets ADD COLUMN filter_conditions_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE raw_sheets ADD COLUMN table_ranges_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE raw_sheets ADD COLUMN filter_state TEXT NOT NULL DEFAULT 'none'",
+            "ALTER TABLE raw_sheets ADD COLUMN formula_metadata_json TEXT NOT NULL DEFAULT '{}'",
+            "DROP TRIGGER IF EXISTS trg_raw_sheets_grid_immutable_update",
+            """CREATE TRIGGER IF NOT EXISTS trg_raw_sheets_grid_immutable_update
+               BEFORE UPDATE ON raw_sheets
+               WHEN NEW.n_rows IS NOT OLD.n_rows
+                 OR NEW.n_cols IS NOT OLD.n_cols
+                 OR NEW.merged_ranges_json IS NOT OLD.merged_ranges_json
+                 OR NEW.hidden_rows_json IS NOT OLD.hidden_rows_json
+                 OR NEW.hidden_cols_json IS NOT OLD.hidden_cols_json
+                 OR NEW.auto_filter_ref IS NOT OLD.auto_filter_ref
+                 OR NEW.filter_conditions_json IS NOT OLD.filter_conditions_json
+                 OR NEW.table_ranges_json IS NOT OLD.table_ranges_json
+                 OR NEW.filter_state IS NOT OLD.filter_state
+                 OR NEW.formula_metadata_json IS NOT OLD.formula_metadata_json
+               BEGIN
+                   SELECT RAISE(ABORT, 'raw sheet grid immutable');
+               END""",
+            "CREATE INDEX IF NOT EXISTS idx_raw_sheets_filter_state ON raw_sheets(filter_state, period_id, id)",
+        ],
+    ),
+    (
+        # v45: 历史单价快照的维度列以空字符串表示缺失，而版本快照仍可
+        # 保留 NULL。来源校验必须按同一“缺失”语义比较，否则真实项目中
+        # 缺少单位/特征的有效单价会在历史资产写入时被错误拒绝。
+        45,
+        [
+            "DROP TRIGGER IF EXISTS trg_historical_unit_prices_snapshot_source_guard",
+            """CREATE TRIGGER IF NOT EXISTS trg_historical_unit_prices_snapshot_source_guard
+               BEFORE INSERT ON historical_unit_prices
+               WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM project_version_items pvi
+                         JOIN project_versions pv
+                           ON pv.id=pvi.version_id
+                          AND pv.project_id=pvi.project_id
+                         JOIN projects p ON p.id=pvi.project_id
+                        WHERE pvi.id=NEW.source_version_item_id
+                          AND pvi.version_id=NEW.source_version_id
+                          AND pvi.project_id=NEW.source_project_id
+                          AND NEW.raw_project_name IS p.name
+                          AND NEW.raw_name IS pvi.name
+                          AND COALESCE(NEW.feature, '') IS COALESCE(pvi.feature, '')
+                          AND COALESCE(NEW.unit, '') IS COALESCE(pvi.unit, '')
+                          AND NEW.direction IS pvi.direction
+                          AND CAST(NEW.unit_price AS NUMERIC)=CAST(pvi.unit_price AS NUMERIC)
+                          AND (
+                              (NEW.quantity IS NULL AND pvi.quantity IS NULL)
+                              OR CAST(NEW.quantity AS NUMERIC)=CAST(pvi.quantity AS NUMERIC)
+                          )
+                          AND (
+                              (NEW.amount IS NULL AND pvi.amount IS NULL)
+                              OR CAST(NEW.amount AS NUMERIC)=CAST(pvi.amount AS NUMERIC)
+                          )
+                          AND NEW.source_file_id IS pvi.source_file_id
+                          AND NEW.source_sheet_id IS pvi.source_sheet_id
+                          AND NEW.source_row IS pvi.source_row
+                          AND NEW.source_evidence_id IS pvi.source_evidence_id
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical unit price snapshot source mismatch');
+               END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

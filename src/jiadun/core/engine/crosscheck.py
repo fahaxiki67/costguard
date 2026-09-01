@@ -23,11 +23,22 @@ from jiadun.core.engine.money import (
     round2,  # noqa: F401  (money 入口纪律：保留显式依赖)
     to_decimal,
 )
-from jiadun.core.engine.settlement_io import load_sheet_grid, pending_sheet_count
+from jiadun.core.engine.settlement_io import (
+    _data_merged_ranges,
+    _header_only_merged_ranges,
+    load_sheet_grid,
+    pending_sheet_count,
+)
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.labels import direction_label
-from jiadun.core.parsing import extract_items
-from jiadun.core.parsing.header_detect import HeaderDetection, detect_header
+from jiadun.core.parsing.header_detect import (
+    HeaderDetection,
+    build_anchor_map,
+    data_rows_range,
+    detect_header,
+    is_grand_total_row,
+    is_subtotal_row,
+)
 
 D = Decimal
 
@@ -85,8 +96,16 @@ class CheckResult:
     ab_row_set_status: str = "unknown"
     ab_row_set_hash: str | None = None
     ab_independence_level: str = "unknown"
+    # ``ab_independence_level`` 保留覆盖证明的历史字段语义（便于旧数据库
+    # 和报告兼容）；该字段表示本次 A/B 实际路径是否完成了独立来源扫描。
+    path_independence_level: str = "unknown"
     c_control_source: dict[str, object] | None = None
     c_control_evidence_id: int | None = None
+    c_independence_level: str = "unknown"
+    # 每条路径的可回读范围。该字段进入 cross_check Evidence，不写入可变
+    # 的业务明细，避免把“来源说明”与金额投影混在一起。
+    path_scopes: dict[str, object] = field(default_factory=dict)
+    consistency_findings: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -101,6 +120,116 @@ class _AmountSummary:
     amount_source: str = "missing"
     amount_status: str = "missing"
     amount_check_status: str = "not_available"
+
+
+@dataclass
+class _IndependentRawScan:
+    """B 路径直接扫描 raw_cells 的结果。
+
+    这不是导入抽取器的第二个调用，而是一个只读、独立的行选择和金额读取
+    过程。它故意保留原始物理行号及过滤计数，便于与 A 的 line_items 行集
+    做形状比较；任何无法解释的行都不会被静默当成零。
+    """
+
+    summary: _AmountSummary = field(default_factory=_AmountSummary)
+    used_rows: list[int] = field(default_factory=list)
+    detail_rows: int = 0
+    excluded_subtotal_rows: int = 0
+    excluded_title_rows: int = 0
+    excluded_blank_rows: int = 0
+    excluded_orphan_rows: int = 0
+    unresolved_rows: list[int] = field(default_factory=list)
+    data_range: tuple[int, int] | None = None
+    _rows: list[dict[str, object]] = field(default_factory=list, repr=False)
+
+
+def _raw_text_at(
+    cells: dict[tuple[int, int], str], anchors: dict[tuple[int, int], tuple[int, int]],
+    row: int, col: int | None,
+) -> str:
+    if col is None:
+        return ""
+    key = anchors.get((row, col), (row, col))
+    return str(cells.get(key, "") or "").strip()
+
+
+def _independent_raw_scan(
+    cells: dict[tuple[int, int], str],
+    merged_ranges: list[str],
+    det: HeaderDetection,
+    max_row: int,
+    data_range: tuple[int, int] | None,
+) -> _IndependentRawScan:
+    """从 raw_cells 独立选择业务行并重算金额。
+
+    ``extract_items.extract_items`` 负责导入时的业务投影；B 路径不能再次
+    调用它，否则 A/B 可能共享同一个漏行或合计行判断。本扫描只依赖不可变
+    原始网格、已确认列映射和物理范围，使用自己的行分类循环。
+    """
+    anchors = build_anchor_map(merged_ranges)
+    start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
+    result = _IndependentRawScan(data_range=(start, end))
+    columns = sorted(set(det.col_map.values()))
+    min_col = min(columns) if columns else 1
+    for row_no in range(start, end + 1):
+        values = {
+            field_name: _raw_text_at(cells, anchors, row_no, col)
+            for field_name, col in det.col_map.items()
+        }
+        if not any(values.values()):
+            result.excluded_blank_rows += 1
+            continue
+        name = values.get("name", "")
+        code = values.get("code", "")
+        numeric_fields = ("quantity", "unit_price", "amount")
+        numeric_values = {
+            field_name: _dec_or_none(values.get(field_name, ""))
+            for field_name in numeric_fields
+        }
+        has_numeric_text = any(values.get(field_name, "") for field_name in numeric_fields)
+        lead = "".join(
+            _raw_text_at(cells, anchors, row_no, col)
+            for col in range(1, min_col + 1)
+            if _raw_text_at(cells, anchors, row_no, col)
+        )
+        # 控制行的识别只用于排除 B 的业务行；C 仍由 line_items 中已保留的
+        # 控制行和其 Evidence 决定，两个职责不混淆。
+        if is_subtotal_row(name, lead):
+            result.excluded_subtotal_rows += 1
+            continue
+        if not code and name and not has_numeric_text:
+            result.excluded_title_rows += 1
+            continue
+        if not code and not name and has_numeric_text:
+            # 没有名称/编码的孤立数值只能作为未解决候选保留；它仍可
+            # 进入 B 的候选金额以便与 A 逐行对照，但 unresolved 标记会
+            # 直接阻断独立性/绿色校核，不能被当作已确认业务行。
+            result.excluded_orphan_rows += 1
+            result.unresolved_rows.append(row_no)
+        if not code and not name and not has_numeric_text:
+            result.unresolved_rows.append(row_no)
+            continue
+        # 任何非空数值字段解析失败都要保留为未解决行。金额仍按既有纪律
+        # 允许 qty×price 候选计算，但最终校核级别必须被该行阻断。
+        if any(
+            values.get(field_name, "") and numeric_values[field_name] is None
+            for field_name in numeric_fields
+        ):
+            result.unresolved_rows.append(row_no)
+        row = {
+            "quantity": values.get("quantity"),
+            "unit_price": values.get("unit_price"),
+            "amount": values.get("amount"),
+        }
+        result.detail_rows += 1
+        _raw, _calculated, effective, _source, _check = _assess_amount(row)
+        if effective is not None:
+            result.used_rows.append(row_no)
+        result._rows.append(row)
+    # 交给同一个 Decimal 金额汇总入口，避免 B 路径另写一套舍入规则。
+    result.summary = _sum_line_item_amounts(result._rows)
+    result._rows.clear()
+    return result
 
 
 def _sum_amounts(rows) -> tuple[Decimal | None, int]:
@@ -251,7 +380,14 @@ def _range_is_proven(
     if start <= int(det.header_row_hi) or end < start or end > int(max_row):
         return False
     if status == "confirmed" and method == "manual_confirmation":
-        return True
+        # 人工确认的是一个完整的物理范围，而不是“从这里开始、尾部随便
+        # 截断”。表头后的任何非空行都必须落在该范围内；否则明细、控制
+        # 行或尾部调整可能被排除，A/B/C 恰好相等也不能放行。
+        non_empty_rows = {
+            row for (row, _col), value in cells.items()
+            if row > int(det.header_row_hi) and value not in (None, "")
+        }
+        return not any(row < start or row > end for row in non_empty_rows)
     # 隐藏行/列可能包含未参与抽取的金额或明细。自动推断不能把“最后非空行”
     # 当作完整范围；只有人工明确确认过边界后才允许继续。
     try:
@@ -272,6 +408,162 @@ def _range_is_proven(
     # 自动推断的边界必须仍覆盖当前原始网格中表头之后的最后非空行；
     # 若原始网格后来新增一行/发生截断，旧结果立即降为不充分。
     return bool(non_empty_rows) and max(non_empty_rows) == end
+
+
+def _json_value(value: object, fallback: object) -> object:
+    """解析结构证据 JSON；损坏或缺失时返回保守默认值。"""
+    try:
+        parsed = json.loads(value or "")
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+    return parsed
+
+
+def _sheet_structural_risks(
+    conn: sqlite3.Connection,
+    sheet_row: sqlite3.Row,
+    confirmed: sqlite3.Row | None,
+    det: HeaderDetection | None,
+    cells: dict[tuple[int, int], str],
+    merged_ranges: list[str],
+    data_range: tuple[int, int] | None,
+) -> list[str]:
+    """返回会阻断期次绿色结论的原始表结构风险。
+
+    这些风险不能靠 A/B 数字恰好相等来消除：重复表头可能漏掉前段明细，
+    明细区合并可能把锚点伪造成多条记录，筛选后的可见行和公式缓存也都
+    无法由 openpyxl 证明为当前业务值。风险一旦出现，B 仍可生成诊断值，
+    但期次必须留在“校核不充分”。
+    """
+    reasons: list[str] = []
+    if det is None or confirmed is None or data_range is None:
+        return ["表头或数据范围无法确认"]
+    evidence = _json_value(confirmed["data_range_evidence_json"], {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    hidden_rows = _json_value(sheet_row["hidden_rows_json"], [])
+    hidden_cols = _json_value(sheet_row["hidden_cols_json"], [])
+    if not isinstance(hidden_rows, list):
+        hidden_rows = []
+    if not isinstance(hidden_cols, list):
+        hidden_cols = []
+    manual_range_confirmed = bool(
+        confirmed is not None
+        and str(confirmed["data_range_status"] or "") == "confirmed"
+        and str(confirmed["data_range_method"] or "") == "manual_confirmation"
+    )
+    if (hidden_rows or hidden_cols) and not manual_range_confirmed:
+        reasons.append("存在隐藏行/列，实际参与校核的取数范围需人工确认")
+
+    duplicate_rows = evidence.get("duplicate_header_rows")
+    if not isinstance(duplicate_rows, list):
+        duplicate_rows = list(getattr(det, "duplicate_header_rows", []) or [])
+    pre_header_suspect = evidence.get("pre_header_suspect_rows")
+    if not isinstance(pre_header_suspect, list):
+        pre_header_suspect = list(getattr(det, "pre_header_suspect_rows", []) or [])
+    try:
+        unresolved_candidates = int(
+            evidence.get(
+                "unresolved_candidate_count",
+                getattr(det, "unresolved_candidate_count", 0),
+            )
+            or 0
+        )
+    except (TypeError, ValueError):
+        unresolved_candidates = 0
+    risk_flags = evidence.get("risk_flags")
+    if not isinstance(risk_flags, list):
+        risk_flags = list(getattr(det, "risk_flags", []) or [])
+    if duplicate_rows or "duplicate_header_rows" in risk_flags:
+        reasons.append(
+            "检测到重复表头行（"
+            + ", ".join(str(item) for item in duplicate_rows[:10])
+            + "），数据范围需人工确认"
+        )
+    if pre_header_suspect or "pre_header_business_rows" in risk_flags:
+        reasons.append("表头前存在疑似业务行，不能证明明细范围完整")
+    if unresolved_candidates > 1 or "multiple_header_candidates" in risk_flags:
+        reasons.append("存在多个未解决表头候选，不能证明明细范围完整")
+
+    data_merges = _data_merged_ranges(merged_ranges, data_range)
+    if data_merges:
+        reasons.append(
+            "明细区存在合并单元格 "
+            + ", ".join(str(item) for item in data_merges[:5])
+            + "，不能自动复制锚点值"
+        )
+    if bool(evidence.get("merge_anchor_copy")):
+        reasons.append("解析证据标记为合并锚点复制，明细行不可信")
+
+    filter_state = str(sheet_row["filter_state"] or "none")
+    filter_conditions = _json_value(sheet_row["filter_conditions_json"], [])
+    if filter_state == "unknown":
+        reasons.append("存在筛选条件但实际可见行无法确认")
+    elif filter_state not in {"none", "range_only"}:
+        reasons.append(f"筛选状态 {filter_state} 未被认可")
+    elif isinstance(filter_conditions, list) and filter_conditions and filter_state != "range_only":
+        reasons.append("筛选条件未能证明未改变参与校核的行")
+
+    formula_metadata = _json_value(sheet_row["formula_metadata_json"], {})
+    if not isinstance(formula_metadata, dict):
+        formula_metadata = {}
+    limitations = formula_metadata.get("limitations", [])
+    if formula_metadata.get("capability_limited") or limitations:
+        if isinstance(limitations, str):
+            limitations = [limitations]
+        if not isinstance(limitations, list):
+            limitations = []
+        detail = "；".join(str(item) for item in limitations[:3])
+        reasons.append(
+            "解析器能力不足，无法证明公式/合并/筛选结构完整"
+            + (f"（{detail}）" if detail else "")
+        )
+    start, end = data_range
+    try:
+        confirmed_map = json.loads(confirmed["col_map_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        confirmed_map = {}
+    if not isinstance(confirmed_map, dict):
+        confirmed_map = {}
+    key_columns: set[int] = set()
+    for field_name, column in confirmed_map.items():
+        if field_name not in {"quantity", "unit_price", "amount", "tax_rate"}:
+            continue
+        try:
+            key_columns.add(int(column))
+        except (TypeError, ValueError):
+            continue
+    formula_rows: list[tuple[int, int]] = []
+    if key_columns:
+        formula_rows = [
+            (int(row["row"]), int(row["col"]))
+            for row in conn.execute(
+                """SELECT row, col FROM raw_cells
+                   WHERE sheet_id=? AND is_formula=1
+                     AND row BETWEEN ? AND ? AND col IN ({})
+                   ORDER BY row, col""".format(
+                       ",".join("?" for _ in key_columns)
+                   ),
+                (int(sheet_row["id"]), start, end, *sorted(key_columns)),
+            ).fetchall()
+        ]
+    # 即使公式携带缓存值，也不能把缓存当成程序已独立重算的金额。公式
+    # 文本可能已被改写而缓存仍保持旧值；只在数量/单价/合价/税额字段中
+    # 发现公式时阻断，标题或说明列公式不影响本路径。
+    if formula_rows:
+        reasons.append(
+            f"明细关键字段含 {len(formula_rows)} 个公式单元格，缓存未经过本程序独立重算"
+        )
+    try:
+        unverified_count = int(formula_metadata.get("unverified_count", 0) or 0)
+    except (TypeError, ValueError):
+        unverified_count = 0
+    if unverified_count and not formula_rows:
+        # 公式位于未映射的控制/辅助列时仍保留结构提示，但只有影响关键
+        # 数值列的公式才直接决定 A/B/C 的校核级别。
+        reasons.append(f"存在 {unverified_count} 个公式缓存未验证单元格")
+    return list(dict.fromkeys(reasons))
 
 
 def _coverage_proofs_for_period(
@@ -303,6 +595,8 @@ def _coverage_proofs_for_period(
             "excluded_tail_note_rows": 0,
             "excluded_orphan_numeric_rows": 0,
             "excluded_parse_failed_rows": 0,
+            "internal_excluded_rows": {"blank": 0, "title": 0, "note": 0},
+            "internal_excluded_sheet_ids": [],
             "pending_rows": 0,
             "unrecognized_rows": 0,
             "coverage_proof_status": "unproven",
@@ -327,6 +621,8 @@ def _coverage_proofs_for_period(
             "excluded_tail_note_rows": 0,
             "excluded_orphan_numeric_rows": 0,
             "excluded_parse_failed_rows": 0,
+            "internal_excluded_rows": {"blank": 0, "title": 0, "note": 0},
+            "internal_excluded_sheet_ids": [],
             "pending_rows": 0,
             "unrecognized_rows": 0,
             "coverage_proof_status": "unproven",
@@ -368,6 +664,42 @@ def _coverage_proofs_for_period(
     }
     counts["raw_data_rows"] = counts.pop("raw_data_row_count")
 
+    # 仅把明细与控制行之间的空白/标题/说明视为可能漏项。表头之后、
+    # 第一条明细之前的前置空行属于版式留白，已经在逐行证明中计数，
+    # 但不应在没有其它风险时把一个可解释的表格布局误判为范围不完整。
+    internal_excluded_rows = {"blank": 0, "title": 0, "note": 0}
+    internal_excluded_sheet_ids: list[int] = []
+    for proof in proofs:
+        classified = conn.execute(
+            "SELECT row_number, class_code FROM row_classifications WHERE proof_id=?",
+            (proof["id"],),
+        ).fetchall()
+        detail_numbers = [
+            int(row["row_number"])
+            for row in classified
+            if str(row["class_code"] or "") == "detail"
+        ]
+        if not detail_numbers:
+            continue
+        control_numbers = [
+            int(row["row_number"])
+            for row in classified
+            if str(row["class_code"] or "") in {"subtotal", "grand_total"}
+        ]
+        interior_lo = min(detail_numbers)
+        interior_hi = max(control_numbers or detail_numbers)
+        sheet_has_internal = False
+        for row in classified:
+            class_code = str(row["class_code"] or "")
+            if class_code not in {"blank", "title", "note"}:
+                continue
+            row_number = int(row["row_number"])
+            if interior_lo < row_number < interior_hi:
+                internal_excluded_rows[class_code] += 1
+                sheet_has_internal = True
+        if sheet_has_internal:
+            internal_excluded_sheet_ids.append(int(proof["sheet_id"]))
+
     statuses = {str(row["proof_status"] or "unproven") for row in proofs}
     if missing_sheet_ids or not proofs or "unproven" in statuses:
         coverage_status = "unproven"
@@ -406,6 +738,8 @@ def _coverage_proofs_for_period(
         "proofs": proofs,
         "missing_sheet_ids": missing_sheet_ids,
         **counts,
+        "internal_excluded_rows": internal_excluded_rows,
+        "internal_excluded_sheet_ids": internal_excluded_sheet_ids,
         "coverage_proof_status": coverage_status,
         "ab_row_set_status": ab_status,
         "ab_row_set_hash": ab_hash,
@@ -413,8 +747,17 @@ def _coverage_proofs_for_period(
     }
 
 
-def _control_source_from_row(row: sqlite3.Row) -> tuple[dict[str, object], int | None]:
-    """从原表合计行保留文件、Sheet、单元格和来源 Evidence 定位。"""
+def _control_source_from_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> tuple[dict[str, object], int | None]:
+    """从原表合计行保留文件、Sheet、单元格和来源 Evidence 定位。
+
+    ``line_items`` 只负责提供“这是一条控制行”的兼容投影；C 的金额读取
+    必须再次回到不可变 ``raw_cells``。因此这里同时保存原始单元格的公式、
+    缓存值和实际使用值，供当前运行的包装 Evidence 及摘要层复核。原始
+    ``line_item_source`` Evidence 只读保留，包装 Evidence 另行追加。
+    """
     try:
         flags = json.loads(row["flags_json"] or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -439,13 +782,160 @@ def _control_source_from_row(row: sqlite3.Row) -> tuple[dict[str, object], int |
         "sheet_index": row["sheet_index"],
         "line_item_id": row["id"],
         "row": amount_evidence.get("row"),
+        "col": amount_evidence.get("col"),
         "amount_col": amount_evidence.get("col"),
         "raw_value": amount_evidence.get("raw"),
         "normalized_value": amount_evidence.get("value") or row["amount"],
         "source_evidence_id": source_evidence_id,
         "selection_rule": "唯一合计级行（flags.grand_total=true）",
     }
+    # amount_evid 记录了抽取时采用的物理行列，但金额控制值必须独立回读
+    # raw_cells。合并单元格允许通过锚点定位；无法定位或公式没有缓存值时
+    # 明确标记，不把 line_items.amount 当作 C 的替代值。
+    source.update({
+        "raw_cell_status": "unlocatable",
+        "raw_cell_row": source["row"],
+        "raw_cell_col": source["amount_col"],
+        "raw_cell_value": None,
+        "raw_cell_raw_value": None,
+        "raw_cell_cached_value": None,
+        "raw_cell_is_formula": False,
+        "raw_cell_resolved_row": None,
+        "raw_cell_resolved_col": None,
+    })
+    sheet_id = source.get("sheet_id")
+    row_no = source.get("row")
+    col_no = source.get("amount_col")
+    try:
+        sheet_id_int = int(sheet_id)
+        row_no_int = int(row_no)
+        col_no_int = int(col_no)
+    except (TypeError, ValueError):
+        sheet_id_int = row_no_int = col_no_int = None
+    cell = None
+    resolved_row, resolved_col = row_no_int, col_no_int
+    if sheet_id_int is not None and row_no_int is not None and col_no_int is not None:
+        cell = conn.execute(
+            """SELECT raw_value, cached_value, is_formula
+                 FROM raw_cells WHERE sheet_id=? AND row=? AND col=?""",
+            (sheet_id_int, row_no_int, col_no_int),
+        ).fetchone()
+        if cell is None:
+            meta = conn.execute(
+                "SELECT merged_ranges_json FROM raw_sheets WHERE id=?",
+                (sheet_id_int,),
+            ).fetchone()
+            try:
+                merged_ranges = json.loads(meta["merged_ranges_json"] or "[]") if meta else []
+            except (TypeError, json.JSONDecodeError, KeyError):
+                merged_ranges = []
+            anchor = build_anchor_map(merged_ranges if isinstance(merged_ranges, list) else [])
+            resolved_row, resolved_col = anchor.get((row_no_int, col_no_int), (row_no_int, col_no_int))
+            if (resolved_row, resolved_col) != (row_no_int, col_no_int):
+                cell = conn.execute(
+                    """SELECT raw_value, cached_value, is_formula
+                         FROM raw_cells WHERE sheet_id=? AND row=? AND col=?""",
+                    (sheet_id_int, resolved_row, resolved_col),
+                ).fetchone()
+    if cell is not None:
+        is_formula = bool(cell["is_formula"])
+        cached_value = cell["cached_value"]
+        raw_cell_value = (
+            cached_value if is_formula and cached_value is not None else cell["raw_value"]
+        )
+        source.update({
+            "raw_cell_status": (
+                "located" if (not is_formula or cached_value is not None)
+                else "formula_cache_missing"
+            ),
+            "raw_cell_row": row_no_int,
+            "raw_cell_col": col_no_int,
+            "raw_cell_value": raw_cell_value,
+            "raw_cell_raw_value": cell["raw_value"],
+            "raw_cell_cached_value": cached_value,
+            "raw_cell_is_formula": is_formula,
+            "raw_cell_resolved_row": resolved_row,
+            "raw_cell_resolved_col": resolved_col,
+        })
+        if raw_cell_value not in (None, ""):
+            # ``normalized_value`` 是 C 重新回读的有效值；原始来源中的
+            # raw_value 保留抽取时的原文，便于比较“原文/缓存/当前回读值”。
+            source["normalized_value"] = str(raw_cell_value)
     return source, source_evidence_id
+
+
+def _raw_control_candidate_keys(
+    conn: sqlite3.Connection,
+    period_id: int,
+    *,
+    grand_only: bool,
+) -> set[tuple[int, int]]:
+    """从原始网格重新发现 C 控制行，核对 line_items 候选集合。
+
+    C 的金额读取本身已经回到 ``raw_cells``；这里再独立复核“候选是哪一
+    行”，防止导入抽取漏掉某个合计/小计后，仍拿剩余控制行与 A 偶然对平。
+    ``grand_only`` 与 C 的选择规则一致：存在合计级行时只认合计级，否
+    则认全部页级小计。
+    """
+    rows = conn.execute(
+        """SELECT rs.id, rs.n_rows, rs.n_cols, rs.merged_ranges_json,
+                         th.header_row_lo, th.header_row_hi,
+                         th.col_map_json, th.data_row_start, th.data_row_end
+                  FROM raw_sheets rs
+                  LEFT JOIN table_headers th ON th.sheet_id=rs.id
+                 WHERE rs.period_id=? ORDER BY rs.id""",
+        (period_id,),
+    ).fetchall()
+    found: set[tuple[int, int]] = set()
+    for sheet in rows:
+        if sheet["header_row_lo"] is None or not sheet["col_map_json"]:
+            continue
+        try:
+            col_map = json.loads(sheet["col_map_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(col_map, dict):
+            continue
+        try:
+            name_col = int(col_map["name"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        cells, merged, n_rows, _n_cols = load_sheet_grid(conn, int(sheet["id"]))
+        anchors = build_anchor_map(
+            _header_only_merged_ranges(merged, int(sheet["header_row_hi"]))
+        )
+        start = sheet["data_row_start"]
+        end = sheet["data_row_end"]
+        if start is None or end is None:
+            start, end = data_rows_range(
+                cells,
+                HeaderDetection(
+                    sheet_index=0,
+                    header_row_lo=int(sheet["header_row_lo"]),
+                    header_row_hi=int(sheet["header_row_hi"]),
+                    col_map={str(key): int(value) for key, value in col_map.items()},
+                    confidence=0.0,
+                    needs_review=True,
+                ),
+                n_rows,
+            )
+        for row_no in range(int(start), int(end) + 1):
+            name = _raw_text_at(cells, anchors, row_no, name_col)
+            lead = "".join(
+                _raw_text_at(cells, anchors, row_no, col)
+                for col in range(1, name_col + 1)
+                if _raw_text_at(cells, anchors, row_no, col)
+            )
+            if not is_subtotal_row(name, lead):
+                continue
+            grand = is_grand_total_row(name, lead)
+            if grand_only and not grand:
+                continue
+            # 先登记所有原始控制候选，包括金额为空或没有明确金额列的行。
+            # 缺值由 C 读取阶段单独报告；若这里提前丢弃，调用方可能误把
+            # 页级小计当成合计级控制值，形成“控制值缺失但仍通过”的回退。
+            found.add((int(sheet["id"]), row_no))
+    return found
 
 
 def _ensure_c_control_evidence(
@@ -454,56 +944,118 @@ def _ensure_c_control_evidence(
     result: CheckResult,
     active_contract: run_contract.RunContract,
 ) -> None:
-    """为页级小计 C 控制值补齐可定位的来源 Evidence。
+    """为 C 控制值追加当前运行绑定的包装 Evidence。
 
-    合计级行通常已经在 ``line_items.flags_json`` 中带有自己的
-    ``line_item_source`` Evidence；没有合计级行时，C 是多个页级小计的
-    互斥求和，不能让 ``c_control_evidence_id`` 为空。这里在校核事务内追加
-    一条聚合来源 Evidence，保留每个文件/Sheet/行列/原文和底层来源 ID。
+    导入时建立的 ``line_item_source`` Evidence 是原始来源事实，默认属于
+    ``source`` 范围，不能直接挂到当前校核结果上。这里保留其 ID 和全部
+    文件/Sheet/行列/原值信息，另追加一条 ``current`` 包装 Evidence；原始
+    Evidence 永不 UPDATE。合计级行和页级小计都走同一入口，避免合计行
+    因已有 source Evidence 而跳过当前运行绑定。
     """
-    if result.control_status != "match" or result.c_control_evidence_id is not None:
+    if result.control_status != "match":
         return
-    rows = conn.execute(
-        """SELECT li.id, li.amount, li.amount_evid, li.flags_json,
-                  rs.sheet_name, rs.sheet_index, rs.id AS sheet_id,
-                  pb.id AS batch_id, sf.id AS file_id, sf.original_name,
-                  sf.sha256 AS file_sha256
-           FROM line_items li
-           LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
-           LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
-           LEFT JOIN source_files sf ON sf.id=pb.file_id
-          WHERE li.period_id=?""",
-        (result.period_id,),
-    ).fetchall()
-    subtotal_rows = [
-        row for row in rows
-        if bool(_loads_flags(row["flags_json"]).get("subtotal"))
-    ]
-    sources: list[dict[str, object]] = []
-    for row in subtotal_rows:
-        source, _source_evidence_id = _control_source_from_row(row)
-        source.update({
-            "period_id": result.period_id,
-            "period": result.period_no,
-            "direction": result.direction,
-            "selection_rule": "无合计级行时页级小计互斥求和",
-        })
-        sources.append(source)
+    source_payload = result.c_control_source or {}
+    if isinstance(source_payload.get("items"), list):
+        sources = [dict(item) for item in source_payload["items"] if isinstance(item, dict)]
+    elif source_payload:
+        sources = [dict(source_payload)]
+    else:
+        # 兼容旧的内存结果：若调用方构造了 control_status=match 但没有
+        # c_control_source，仍从控制行重建来源；真实 check_period 会在 C
+        # 的 raw_cells 回读阶段提前填好 source_payload。
+        rows = conn.execute(
+            """SELECT li.id, li.amount, li.amount_evid, li.flags_json,
+                      rs.sheet_name, rs.sheet_index, rs.id AS sheet_id,
+                      pb.id AS batch_id, sf.id AS file_id, sf.original_name,
+                      sf.sha256 AS file_sha256
+               FROM line_items li
+               LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
+               LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+               LEFT JOIN source_files sf ON sf.id=pb.file_id
+              WHERE li.period_id=?""",
+            (result.period_id,),
+        ).fetchall()
+        subtotal_rows = [
+            row for row in rows
+            if bool(_loads_flags(row["flags_json"]).get("subtotal"))
+        ]
+        sources = []
+        for row in subtotal_rows:
+            source, _source_evidence_id = _control_source_from_row(conn, row)
+            source.update({
+                "period_id": result.period_id,
+                "period": result.period_no,
+                "direction": result.direction,
+                "selection_rule": "无合计级行时页级小计互斥求和",
+            })
+            sources.append(source)
     if not sources:
         return
+    if not isinstance(result.c_control_source, dict):
+        result.c_control_source = {
+            "selection_rule": str(sources[0].get("selection_rule") or ""),
+            "items": sources,
+        }
+    for source in sources:
+        source.setdefault("period_id", result.period_id)
+        source.setdefault("period", result.period_no)
+        source.setdefault("direction", result.direction)
+
+    source_evidence_ids = sorted({
+        int(source["source_evidence_id"])
+        for source in sources
+        if source.get("source_evidence_id") is not None
+    })
+    # 同一运行重复执行时复用已经追加的包装，避免反复创建无法区分的
+    # 当前证据；只按明确的包装步骤和来源 ID 命中，不会误用普通清单来源。
+    candidates = conn.execute(
+        """SELECT id, steps_json FROM evidence
+           WHERE project_id=? AND kind='line_item_source' AND scope='current'
+             AND run_id=? AND run_signature=?
+           ORDER BY id DESC""",
+        (project_id, active_contract.run_id, active_contract.signature),
+    ).fetchall()
+    for candidate in candidates:
+        try:
+            steps = json.loads(candidate["steps_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(steps, list) or not steps or not isinstance(steps[0], dict):
+            continue
+        first = steps[0]
+        if first.get("step") != "C 控制来源包装":
+            continue
+        if int(first.get("period_id", -1)) != int(result.period_id):
+            continue
+        if str(first.get("direction") or "unknown") != str(result.direction or "unknown"):
+            continue
+        existing_ids = sorted({int(item) for item in first.get("source_evidence_ids", [])})
+        if existing_ids != source_evidence_ids:
+            continue
+        result.c_control_evidence_id = int(candidate["id"])
+        result.c_control_source["current_wrapper_evidence_id"] = int(candidate["id"])
+        return
+
+    wrapper_step = {
+        "step": "C 控制来源包装",
+        "period_id": result.period_id,
+        "period": result.period_no,
+        "direction": result.direction,
+        "selection_rule": str(sources[0].get("selection_rule") or ""),
+        "source_evidence_ids": source_evidence_ids,
+        "source_count": len(sources),
+        "control_value": str(result.raw_subtotal),
+        "binding": {
+            "run_id": active_contract.run_id,
+            "run_signature": active_contract.signature,
+        },
+    }
     evidence_id = evidence_api.add_evidence(
         conn,
         project_id,
         "line_item_source",
-        f"第{result.period_no}期 C 控制值来源：{len(sources)} 个页级小计互斥求和",
-        steps=[
-            {
-                "step": "C 控制来源",
-                "selection_rule": "无合计级行时页级小计互斥求和",
-                "source_count": len(sources),
-                "control_value": str(result.raw_subtotal),
-            }
-        ],
+        f"第{result.period_no}期 C 控制值来源包装：保留 {len(sources)} 条原始定位",
+        steps=[wrapper_step],
         sources=sources,
         commit=False,
         run_signature=active_contract.signature,
@@ -511,11 +1063,7 @@ def _ensure_c_control_evidence(
         scope="current",
     )
     result.c_control_evidence_id = evidence_id
-    result.c_control_source = {
-        "selection_rule": "无合计级行时页级小计互斥求和",
-        "items": sources,
-        "evidence_id": evidence_id,
-    }
+    result.c_control_source["current_wrapper_evidence_id"] = evidence_id
 
 
 def _loads_flags(value: str | None) -> dict[str, object]:
@@ -524,6 +1072,202 @@ def _loads_flags(value: str | None) -> dict[str, object]:
     except (TypeError, json.JSONDecodeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _source_row_number(row: sqlite3.Row) -> int | None:
+    """从 line_items 的不可变来源标记中取得物理行号。"""
+    flags = _loads_flags(row["flags_json"] if "flags_json" in row.keys() else None)
+    for value in (flags.get("row"),):
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            pass
+    try:
+        amount_evidence = json.loads(row["amount_evid"] or "{}")
+    except (TypeError, json.JSONDecodeError, KeyError):
+        amount_evidence = {}
+    try:
+        return int(amount_evidence["row"]) if amount_evidence.get("row") is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _path_a_scope(detail_rows: list[sqlite3.Row], period_id: int) -> dict[str, object]:
+    grouped: dict[int, dict[str, object]] = {}
+    missing_row_sources = 0
+    for row in detail_rows:
+        sheet_id = row["sheet_id"]
+        try:
+            sheet_key = int(sheet_id)
+        except (TypeError, ValueError):
+            missing_row_sources += 1
+            continue
+        item = grouped.setdefault(
+            sheet_key,
+            {
+                "file_id": row["file_id"],
+                "file_name": row["original_name"],
+                "file_sha256": row["file_sha256"],
+                "batch_id": row["batch_id"],
+                "sheet_id": sheet_key,
+                "sheet_name": row["sheet_name"],
+                "sheet_index": row["sheet_index"],
+                "rows": [],
+            },
+        )
+        row_no = _source_row_number(row)
+        if row_no is None:
+            missing_row_sources += 1
+        else:
+            item["rows"].append(row_no)
+    sheets: list[dict[str, object]] = []
+    for item in grouped.values():
+        rows = sorted(set(int(value) for value in item.pop("rows", [])))
+        item["row_numbers"] = rows
+        item["row_start"] = min(rows) if rows else None
+        item["row_end"] = max(rows) if rows else None
+        item["row_count"] = len(rows)
+        sheets.append(item)
+    return {
+        "source_kind": "line_items",
+        "source_table": "line_items",
+        "period_id": int(period_id),
+        "selection_rule": (
+            "WHERE period_id=当前期次；排除 flags_json.subtotal=true；"
+            "金额优先使用 amount，缺失时仅按 quantity×unit_price 候选计算"
+        ),
+        "filters": [
+            f"period_id={int(period_id)}",
+            "flags_json.subtotal != true",
+            "effective_amount = amount 或 quantity×unit_price",
+        ],
+        "sheets": sheets,
+        "missing_row_sources": missing_row_sources,
+    }
+
+
+def _normal_text(value: object) -> str:
+    return "".join(str(value or "").split()).lower()
+
+
+def _consistency_findings(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_id: int,
+    detail_rows: list[sqlite3.Row],
+    summary_a: _AmountSummary,
+) -> list[dict[str, object]]:
+    """每次校核执行的轻量一致性扫描。
+
+    这些检查不负责替代异常规则，而是把会让 A/B/C 同时“看起来一致”的
+    数据形状问题直接带入期次校核级别。负数调整可能是合法业务，但没有
+    人工解释前不能获得绿色结论；缺失值也只保留为待补资料，绝不补零。
+    """
+    findings: list[dict[str, object]] = []
+    by_key: dict[tuple[str, ...], list[sqlite3.Row]] = {}
+    for row in detail_rows:
+        normalized_code = _normal_text(row["code"])
+        key = (
+            ("code", normalized_code)
+            if normalized_code
+            else (
+                "name",
+                _normal_text(row["name"]),
+                _normal_text(row["feature"]),
+                _normal_text(row["unit"]),
+            )
+        )
+        if any(key):
+            by_key.setdefault(key, []).append(row)
+        row_no = _source_row_number(row)
+        quantity = _dec_or_none(row["quantity"])
+        unit_price = _dec_or_none(row["unit_price"])
+        amount = _dec_or_none(row["amount"])
+        negative_fields = [
+            field_name for field_name, value in (
+                ("quantity", quantity), ("unit_price", unit_price), ("amount", amount)
+            ) if value is not None and value < 0
+        ]
+        if negative_fields:
+            findings.append({
+                "kind": "negative_adjustment",
+                "row": row_no,
+                "sheet_id": row["sheet_id"],
+                "fields": negative_fields,
+                "message": "存在负数数量/单价/金额，需人工确认调整依据",
+            })
+        if not _normal_text(row["code"]) or not _normal_text(row["name"]):
+            findings.append({
+                "kind": "missing_key_field",
+                "row": row_no,
+                "sheet_id": row["sheet_id"],
+                "missing": [
+                    field_name for field_name, value in (
+                        ("code", row["code"]), ("name", row["name"]), ("unit", row["unit"])
+                    ) if not _normal_text(value)
+                ],
+                "message": "关键字段缺失，保持待补资料",
+            })
+        if amount is None and not (quantity is not None and unit_price is not None):
+            findings.append({
+                "kind": "missing_amount_basis",
+                "row": row_no,
+                "sheet_id": row["sheet_id"],
+                "message": "金额及数量×单价计算依据均缺失或不可解析",
+            })
+    for key, rows in by_key.items():
+        if len(rows) > 1:
+            findings.append({
+                "kind": "duplicate_detail",
+                "fingerprint": "|".join(key),
+                "sheet_rows": [
+                    {"sheet_id": row["sheet_id"], "row": _source_row_number(row)}
+                    for row in rows
+                ],
+                "message": f"同一编码/名称/特征/单位出现 {len(rows)} 条明细，需人工确认是否重复",
+            })
+    if summary_a.formula_mismatch_rows:
+        findings.append({
+            "kind": "qty_price_amount_mismatch",
+            "rows": summary_a.formula_mismatch_rows,
+            "message": "数量×单价与原始金额存在差异，未调平",
+        })
+
+    # 跨期单价变化只作“需解释”提示；不把合法变更直接判为错误，但在
+    # 本期尚无人工说明时仍阻止绿色校核，避免异常被项目级结论吞掉。
+    all_rows = conn.execute(
+        """SELECT li.id, li.period_id, li.sheet_id, li.code, li.name, li.feature,
+                         li.unit, li.unit_price, li.flags_json
+             FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
+            WHERE sp.project_id=?""",
+        (project_id,),
+    ).fetchall()
+    prices: dict[tuple[str, str, str, str], set[Decimal]] = {}
+    for row in all_rows:
+        if _loads_flags(row["flags_json"]).get("subtotal"):
+            continue
+        price = _dec_or_none(row["unit_price"])
+        key = (
+            _normal_text(row["code"]), _normal_text(row["name"]),
+            _normal_text(row["feature"]), _normal_text(row["unit"]),
+        )
+        if price is not None and any(key):
+            prices.setdefault(key, set()).add(price)
+    current_keys = {
+        (
+            _normal_text(row["code"]), _normal_text(row["name"]),
+            _normal_text(row["feature"]), _normal_text(row["unit"]),
+        ) for row in detail_rows
+    }
+    for key in sorted(current_keys):
+        if len(prices.get(key, set())) > 1:
+            findings.append({
+                "kind": "cross_period_unit_price_change",
+                "fingerprint": "|".join(key),
+                "prices": sorted(str(value) for value in prices[key]),
+                "message": "同一清单跨期单价发生变化，需核对合同/变更依据",
+            })
+    return findings
 
 
 def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
@@ -540,7 +1284,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
 
     # A：直接累计清洗后的明细；原始合价缺失时仅在计算路径中回退到数量×单价。
     rows = conn.execute(
-        """SELECT li.id, li.sheet_id, li.quantity, li.unit_price, li.amount,
+        """SELECT li.id, li.sheet_id, li.code, li.name, li.feature, li.unit,
+                  li.quantity, li.unit_price, li.amount,
                   li.amount_evid, li.flags_json,
                   rs.sheet_name, rs.sheet_index,
                   pb.id AS batch_id,
@@ -569,43 +1314,139 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     control_note = None
     c_control_source: dict[str, object] | None = None
     c_control_evidence_id: int | None = None
+    c_control_rows: list[sqlite3.Row] = []
+    c_selection_rule = ""
+    c_independence_level = "unknown"
     if grand_rows:
         # 合计级行一旦存在，就必须恰好只有一条且金额可解析；无效行不能
         # 被忽略后回退到页级小计，否则同一张表会因脏控制行假绿色。
         if len(grand_rows) != 1:
             raw_subtotal = None
+            c_independence_level = "not_proven"
             control_note = (
                 f"{len(grand_rows)} 个合计级行，C 控制值不唯一，"
                 "请人工核对原表（未擅自挑行或求和）"
             )
         else:
-            raw_subtotal = _dec_or_none(grand_rows[0]["amount"])
-            if raw_subtotal is None:
-                control_note = "唯一合计级行金额缺失或非法，C 控制不可用"
-            else:
-                c_control_source, c_control_evidence_id = _control_source_from_row(grand_rows[0])
+            c_control_rows = [grand_rows[0]]
+            c_selection_rule = "唯一合计级行（flags.grand_total=true）"
     elif subtotal_rows:
         # 无合计级行时，页级小计按页互斥求和；任一页级小计无效时，
         # 不能只累计其余可解析值形成不完整的 C 控制值。
-        subtotal_values = [_dec_or_none(row["amount"]) for row in subtotal_rows]
-        if any(value is None for value in subtotal_values):
-            raw_subtotal = None
-            control_note = "无合计级行且页级小计金额缺失或非法，C 控制不可用"
-        else:
-            raw_subtotal = sum(subtotal_values, D("0"))
-            control_note = f"无合计级行，C 控制值={len(subtotal_rows)} 个小计行之和"
+        c_control_rows = subtotal_rows
+        c_selection_rule = "无合计级行时页级小计互斥求和"
     else:
         raw_subtotal = None
+        c_independence_level = "not_proven"
         control_note = "无带金额的小计/合计行，C 控制不可用"
 
-    # B：从原始网格独立重算（不复用 line_items）
+    # C 不能只依赖 line_items.amount。控制行的候选集合仍沿用导入时保留
+    # 的 subtotal/grand_total 投影，但每个金额、行列和公式缓存都必须从
+    # raw_cells 独立回读；无法定位、公式无缓存或多个候选指向同一物理格时
+    # 一律不形成控制值。
+    c_sources: list[dict[str, object]] = []
+    c_values: list[Decimal] = []
+    c_refs: set[tuple[int, int, int]] = set()
+    c_source_issues: list[str] = []
+    if c_control_rows:
+        for control_row in c_control_rows:
+            source, source_evidence_id = _control_source_from_row(conn, control_row)
+            source.update({
+                "period_id": period_id,
+                "period": period_no,
+                "direction": direction,
+                "selection_rule": c_selection_rule,
+            })
+            c_sources.append(source)
+            status = str(source.get("raw_cell_status") or "unlocatable")
+            raw_cell_value = _dec_or_none(source.get("raw_cell_value"))
+            try:
+                reference = (
+                    int(source["sheet_id"]),
+                    int(source["raw_cell_resolved_row"]),
+                    int(source["raw_cell_resolved_col"]),
+                )
+            except (TypeError, ValueError, KeyError):
+                reference = None
+            if reference is None or status == "unlocatable":
+                c_source_issues.append("C 控制来源无法独立定位 raw_cells 原始单元格")
+            elif status == "formula_cache_missing" or raw_cell_value is None:
+                c_source_issues.append("C 控制来源公式缓存缺失或金额不可解析")
+            elif reference in c_refs:
+                c_source_issues.append(
+                    "C 控制来源存在多个候选指向同一 raw_cells 单元格，无法证明独立"
+                )
+            else:
+                c_refs.add(reference)
+                c_values.append(raw_cell_value)
+            # 仅把原始 Evidence ID作为来源关系保留；这里不把它当成当前
+            # C 证据，当前包装由 run_crosscheck 在 active contract 下追加。
+            if source_evidence_id is not None:
+                source["source_evidence_id"] = source_evidence_id
+        # 候选行集合不能只相信 line_items 的 subtotal/grand_total 标记。
+        # 从同一期原始网格重新识别控制行并逐个比对物理 (Sheet, row)；若
+        # 导入阶段漏掉合计行、把标题误标成小计或跨 Sheet 取错，C 直接降级。
+        projected_control_keys: set[tuple[int, int]] = set()
+        for source in c_sources:
+            try:
+                projected_control_keys.add((int(source["sheet_id"]), int(source["row"])))
+            except (KeyError, TypeError, ValueError):
+                c_source_issues.append("C 控制来源缺少可比对的物理 Sheet/行定位")
+        raw_control_keys = _raw_control_candidate_keys(
+            conn,
+            period_id,
+            grand_only=bool(grand_rows),
+        )
+        if raw_control_keys != projected_control_keys:
+            c_source_issues.append(
+                "C 控制候选行与原始网格重新识别结果不一致，不能证明控制范围完整"
+            )
+        if c_source_issues:
+            raw_subtotal = None
+            control_note = "；".join(dict.fromkeys(c_source_issues))
+            c_independence_level = "not_proven"
+        elif c_values:
+            raw_subtotal = c_values[0] if len(c_values) == 1 else sum(c_values, D("0"))
+            c_independence_level = "source_independent_raw_cell"
+            # 选择规则本身必须是唯一的审计说明来源：唯一合计级行是
+            # 直接读取该总计单元格；只有没有合计级行时才是页级小计互斥
+            # 求和，不能把两种口径拼成相互矛盾的文字。
+            control_note = f"{c_selection_rule}；C 控制值={raw_subtotal}"
+        else:
+            raw_subtotal = None
+            control_note = "C 控制来源未形成可复算原始金额"
+            c_independence_level = "not_proven"
+        if len(c_sources) == 1:
+            c_control_source = c_sources[0]
+            c_control_evidence_id = c_sources[0].get("source_evidence_id")
+        else:
+            c_control_source = {
+                "selection_rule": c_selection_rule,
+                "items": c_sources,
+            }
+            c_control_evidence_id = None
+
+    # B：从原始网格独立重算（不复用 line_items 或 extract_items）。
     sheet_ids = conn.execute(
-        "SELECT id FROM raw_sheets rs WHERE rs.period_id=?",
+        """SELECT rs.id, rs.sheet_name, rs.sheet_index, rs.n_rows, rs.n_cols,
+                  rs.hidden_rows_json, rs.hidden_cols_json,
+                  rs.filter_state, rs.filter_conditions_json,
+                  rs.formula_metadata_json, rs.merged_ranges_json,
+                  pb.id AS batch_id, sf.id AS file_id, sf.original_name,
+                  sf.sha256 AS file_sha256
+             FROM raw_sheets rs
+             LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+             LEFT JOIN source_files sf ON sf.id=pb.file_id
+            WHERE rs.period_id=? ORDER BY rs.id""",
         (period_id,),
     ).fetchall()
     summary_b = _AmountSummary()
     excluded_title_rows = 0
     range_unproven_sheets = 0
+    b_scope_sheets: list[dict[str, object]] = []
+    b_scan_row_sets: dict[int, set[int]] = {}
+    structural_risk_notes: list[str] = []
+    b_scan_independent = bool(sheet_ids)
     for sheet_row in sheet_ids:
         sheet_id = int(sheet_row["id"])
         cells, merged, n_rows, _n_cols = load_sheet_grid(conn, sheet_id)
@@ -613,7 +1454,10 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
             """SELECT header_row_lo, header_row_hi, col_map_json, confidence,
                       needs_review, data_row_start, data_row_end,
                       data_range_status, data_range_method,
-                      rs.hidden_rows_json, rs.hidden_cols_json
+                      rs.id AS sheet_id, rs.hidden_rows_json, rs.hidden_cols_json,
+                      rs.filter_state, rs.filter_conditions_json,
+                      rs.formula_metadata_json, rs.merged_ranges_json,
+                      th.data_range_evidence_json
                FROM table_headers th JOIN raw_sheets rs ON rs.id=th.sheet_id
                WHERE th.sheet_id=?""",
             (sheet_id,),
@@ -633,26 +1477,70 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         else:
             det = detect_header(
                 0, cells, merged, n_rows, max((c for _, c in cells), default=0))
-        if det is None or not _range_is_proven(cells, n_rows, det, confirmed):
+        structural_reasons = _sheet_structural_risks(
+            conn,
+            sheet_row,
+            confirmed,
+            det,
+            cells,
+            merged,
+            data_range,
+        )
+        if structural_reasons:
+            structural_risk_notes.extend(
+                f"Sheet「{sheet_row['sheet_name']}」：{reason}"
+                for reason in structural_reasons
+            )
+        if (
+            det is None
+            or not _range_is_proven(cells, n_rows, det, confirmed)
+            or structural_reasons
+        ):
             range_unproven_sheets += 1
         if det is None:
+            b_scan_independent = False
             continue
-        _skip_stats: dict = {}
-        items = extract_items.extract_items(cells, merged, det, n_rows,
-                                            data_range=data_range, stats=_skip_stats)
-        excluded_title_rows += _skip_stats.get("title_rows", 0)
-        rows_b = []
-        for it in items:
-            if it.flags.get("subtotal") or it.flags.get("title_row"):
-                continue
-            rows_b.append(
-                {
-                    "quantity": it.quantity.value if it.quantity else None,
-                    "unit_price": it.unit_price.value if it.unit_price else None,
-                    "amount": it.amount.value if it.amount else None,
-                }
-            )
-        _merge_summaries(summary_b, _sum_line_item_amounts(rows_b))
+        # 只把表头区的合并关系用于列识别；明细区合并单元格不能把锚点值
+        # 复制到多个物理行。其结构风险已由上面的 gate 记录，B 仍保留
+        # 原始空白格以便输出待人工复核，而不是把行伪造成相同明细。
+        scan = _independent_raw_scan(
+            cells,
+            _header_only_merged_ranges(merged, det.header_row_hi),
+            det,
+            n_rows,
+            data_range,
+        )
+        _merge_summaries(summary_b, scan.summary)
+        excluded_title_rows += scan.excluded_title_rows
+        b_scan_row_sets[sheet_id] = set(scan.used_rows)
+        if scan.unresolved_rows or structural_reasons:
+            b_scan_independent = False
+        b_scope_sheets.append({
+            "file_id": sheet_row["file_id"],
+            "file_name": sheet_row["original_name"],
+            "file_sha256": sheet_row["file_sha256"],
+            "batch_id": sheet_row["batch_id"],
+            "sheet_id": sheet_id,
+            "sheet_name": sheet_row["sheet_name"],
+            "sheet_index": sheet_row["sheet_index"],
+            "data_range": list(scan.data_range) if scan.data_range else None,
+            "row_numbers": sorted(scan.used_rows),
+            "row_start": min(scan.used_rows) if scan.used_rows else None,
+            "row_end": max(scan.used_rows) if scan.used_rows else None,
+            "row_count": len(scan.used_rows),
+            "excluded_subtotal_rows": scan.excluded_subtotal_rows,
+            "excluded_title_rows": scan.excluded_title_rows,
+            "excluded_blank_rows": scan.excluded_blank_rows,
+            "excluded_orphan_rows": scan.excluded_orphan_rows,
+            "unresolved_rows": sorted(scan.unresolved_rows),
+            "structural_risks": structural_reasons,
+            "range_method": confirmed["data_range_method"] if confirmed is not None else "auto_detect",
+            "filters": [
+                "直接扫描 raw_cells",
+                "排除空行、小计/合计行和标题行；无名称孤立数值仅作为未解决候选留待复核",
+                "金额优先使用原始合价，缺失时仅按数量×单价候选计算",
+            ],
+        })
 
     total_b = summary_b.total
     amount_source = _merge_source(summary_a.amount_source, summary_b.amount_source)
@@ -674,6 +1562,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         amount_status = amount_source
 
     notes: list[str] = []
+    if structural_risk_notes:
+        notes.extend(dict.fromkeys(structural_risk_notes))
     missing_raw_rows = max(summary_a.missing_rows, summary_b.missing_rows)
     if missing_raw_rows:
         notes.append(
@@ -718,6 +1608,77 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     ab_row_set_status = str(coverage["ab_row_set_status"])
     ab_row_set_hash = coverage["ab_row_set_hash"]
     ab_independence_level = str(coverage["ab_independence_level"])
+    path_independence_level = "unknown"
+    path_a_scope = _path_a_scope(detail_rows, period_id)
+    path_b_scope = {
+        "source_kind": "raw_cells",
+        "source_table": "raw_cells",
+        "period_id": int(period_id),
+        "selection_rule": (
+            "逐 Sheet 按确认数据范围直接扫描 raw_cells；独立排除空行、"
+            "小计/合计、标题和孤立数值行；金额优先原始合价"
+        ),
+        "filters": [
+            "period_id 通过 raw_sheets 关联",
+            "data_range 来自当前 table_headers 确认范围",
+            "不调用 line_items 或 extract_items",
+        ],
+        "sheets": b_scope_sheets,
+        "independence_claim": "line_items 与 raw_cells 两个来源、独立行扫描",
+    }
+    # ``selection_rule`` 必须记录本次实际采用的分支，而不是把“唯一合计
+    # 级行”和“无合计级行时页级小计”两个互斥条件拼成一条泛化描述。
+    # 控制值不可用时也保留明确的失败分支，供摘要和 Evidence 复核。
+    actual_c_selection_rule = c_selection_rule
+    if not actual_c_selection_rule:
+        actual_c_selection_rule = (
+            "合计级行不唯一，C 控制不可用" if grand_rows else "C 控制值不可用"
+        )
+    path_c_scope = {
+        "source_kind": "raw_cells_control",
+        "source_table": "line_items + raw_cells",
+        "period_id": int(period_id),
+        "selection_rule": actual_c_selection_rule,
+        "filters": [
+            "flags_json.subtotal=true",
+            "合计级行 flags_json.grand_total=true 时必须恰好一条",
+            "控制值必须保留原文件、Sheet、行、列、原始值和 Evidence",
+        ],
+        "source": c_control_source,
+        "status": control_status,
+        "independence_level": c_independence_level,
+    }
+    a_rows_by_sheet: dict[int, set[int]] = {}
+    for row in detail_rows:
+        row_no = _source_row_number(row)
+        try:
+            sheet_id = int(row["sheet_id"])
+        except (TypeError, ValueError):
+            continue
+        if row_no is not None and _assess_amount(row)[2] is not None:
+            a_rows_by_sheet.setdefault(sheet_id, set()).add(row_no)
+    if not b_scope_sheets or not b_scan_independent or path_a_scope["missing_row_sources"]:
+        path_independence_level = "unknown"
+        ab_row_set_status = "unknown"
+        ab_row_set_hash = None
+    else:
+        all_sheet_ids = set(a_rows_by_sheet) | set(b_scan_row_sets)
+        if all_sheet_ids and all(
+            a_rows_by_sheet.get(sheet_id, set()) == b_scan_row_sets.get(sheet_id, set())
+            for sheet_id in all_sheet_ids
+        ):
+            ab_row_set_status = "same_row_set"
+            ab_row_set_hash = hashlib.sha256(
+                json.dumps(
+                    sorted((sheet_id, sorted(rows)) for sheet_id, rows in b_scan_row_sets.items()),
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            path_independence_level = "source_independent_raw_scan"
+        else:
+            ab_row_set_status = "different_row_set"
+            ab_row_set_hash = None
+            path_independence_level = "source_independent_raw_scan"
 
     # ---- 校核级别（P0-1/P0-2/P0-5）：A/B 一致不等于结算正确 ----
     # 绿色（校核充分）仅当：A=B 且 C 控制可用且控制一致，且项目无待人工工作表。
@@ -730,6 +1691,60 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         reasons.append(f"{range_unproven_sheets} 张工作表取数范围完整性无法证明")
     if coverage_proof_status != "complete":
         reasons.append("Sheet 逐行覆盖证明未完整")
+    excluded_range_rows = {
+        "空白": int(coverage["excluded_blank_rows"] or 0),
+        "标题": int(coverage["excluded_title_rows"] or 0),
+        "说明/备注": int(coverage["excluded_note_rows"] or 0),
+    }
+    internal_excluded = coverage.get("internal_excluded_rows", {})
+    if not isinstance(internal_excluded, dict):
+        internal_excluded = {}
+    internal_range_rows = {
+        "空白": int(internal_excluded.get("blank", 0) or 0),
+        "标题": int(internal_excluded.get("title", 0) or 0),
+        "说明/备注": int(internal_excluded.get("note", 0) or 0),
+    }
+    if any(excluded_range_rows.values()) and not any(internal_range_rows.values()):
+        # 表头之后、第一条明细之前的前置空白/说明属于版式留白；它们
+        # 已经逐行计数并保留 Evidence，但不应与明细区内部的潜在漏项
+        # 混为一谈，避免一个可解释的表格布局被误判为范围不完整。
+        detail = "、".join(
+            f"{label}{count}行" for label, count in excluded_range_rows.items() if count
+        )
+        notes.append(f"数据区前置被排除的{detail}已分类记录，不计入业务明细")
+    if any(internal_range_rows.values()):
+        detail = "、".join(
+            f"{label}{count}行"
+            for label, count in internal_range_rows.items()
+            if count
+        )
+        # 自动范围中的内部空白/标题/说明不能仅凭分类证明不是漏项；只有
+        # 每个涉事 Sheet 都有带明确范围的人工确认记录，才允许解除这一
+        # 个范围闸门，并把人工依据保留在说明/Evidence 中。
+        affected_sheet_ids = [
+            int(sheet_id)
+            for sheet_id in coverage.get("internal_excluded_sheet_ids", [])
+        ]
+        placeholders = ",".join("?" for _ in affected_sheet_ids)
+        manual_scope_rows = (
+            conn.execute(
+                f"""SELECT th.data_range_status, th.data_range_method
+                    FROM table_headers th
+                    WHERE th.sheet_id IN ({placeholders})""",
+                affected_sheet_ids,
+            ).fetchall()
+            if affected_sheet_ids
+            else []
+        )
+        manual_scope_complete = bool(manual_scope_rows) and all(
+            str(row["data_range_status"] or "") == "confirmed"
+            and str(row["data_range_method"] or "") == "manual_confirmation"
+            for row in manual_scope_rows
+        )
+        if manual_scope_complete:
+            notes.append(f"数据区存在被排除的{detail}；范围已由人工确认")
+        else:
+            reasons.append(f"数据区存在被排除的{detail}，实际范围需人工确认")
     if classified_detail_rows != detail_count:
         reasons.append(
             f"覆盖证明明细行数({classified_detail_rows})与A路径明细行数({detail_count})不一致"
@@ -741,13 +1756,34 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
             f"覆盖证明业务行数({business_rows_used})与有效累计行数({a_business_rows})不一致"
         )
     if ab_independence_level == "shared_extractor":
-        notes.append("A/B 使用同一确定性抽取器和共享行集，仅属交叉复算，非独立证明")
-    elif ab_independence_level == "unknown":
+        # 覆盖证明仍保留旧字段的 shared_extractor 事实；本次 B 若已用
+        # raw_cells 独立扫描，则不因历史字段重复阻断，但必须把事实显式
+        # 写入说明，避免读者误以为覆盖证明本身就是独立路径。
+        notes.append(
+            "覆盖证明记录 A/B 共享导入抽取器（覆盖证明本身非独立）；"
+            "本次 B 另以 raw_cells 独立扫描"
+        )
+    if path_independence_level == "unknown":
         reasons.append("A/B 行集或抽取独立性无法证明")
+    elif path_independence_level != "source_independent_raw_scan":
+        reasons.append("A/B 校核独立性不在受认可的独立扫描范围内")
+    if ab_row_set_status != "same_row_set":
+        reasons.append(f"A/B 参与累计行集状态为 {ab_row_set_status}，无法证明逐行覆盖一致")
+    consistency_findings = _consistency_findings(
+        conn, project_id, period_id, detail_rows, summary_a
+    )
+    if consistency_findings:
+        reasons.append(f"存在 {len(consistency_findings)} 项未解释的数据一致性问题")
+        notes.extend(
+            f"{finding.get('message', '数据一致性问题')}"
+            for finding in consistency_findings
+        )
     if missing_raw_rows:
         reasons.append("原始金额存在缺失或不可解析")
     if control_status == "not_available":
         reasons.append("C 控制不可用")
+    if c_independence_level != "source_independent_raw_cell":
+        reasons.append(f"C 控制来源独立性为 {c_independence_level}，无法证明原始单元格可复核")
     if status == "incomplete":
         reasons.append("明细数据不完整")
     if reasons or status == "incomplete":
@@ -796,8 +1832,12 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         ab_row_set_status=ab_row_set_status,
         ab_row_set_hash=ab_row_set_hash if isinstance(ab_row_set_hash, str) else None,
         ab_independence_level=ab_independence_level,
+        path_independence_level=path_independence_level,
         c_control_source=c_control_source,
         c_control_evidence_id=c_control_evidence_id,
+        c_independence_level=c_independence_level,
+        path_scopes={"path_a": path_a_scope, "path_b": path_b_scope, "path_c": path_c_scope},
+        consistency_findings=consistency_findings,
     )
 
 
@@ -825,6 +1865,18 @@ def check_period_by_no(conn: sqlite3.Connection, project_id: int, period_no: int
 
 def make_evidence(project_id: int, res: CheckResult) -> str:
     status_zh = {"match": "一致", "diff": "存在差异", "incomplete": "数据不完整"}
+    path_c_scope = (
+        res.path_scopes.get("path_c", {})
+        if isinstance(res.path_scopes, dict)
+        else {}
+    )
+    c_selection_rule = str(path_c_scope.get("selection_rule") or "")
+    if "唯一合计级行" in c_selection_rule:
+        c_step_label = "C 原表唯一合计级行"
+    elif "页级小计" in c_selection_rule:
+        c_step_label = "C 原表页级小计互斥汇总"
+    else:
+        c_step_label = "C 控制值不可用"
     return json.dumps(
         {
             "kind": "cross_check",
@@ -836,7 +1888,7 @@ def make_evidence(project_id: int, res: CheckResult) -> str:
             "steps": [
                 {"step": "A 直接累计清洗明细", "result": str(res.path_a_total)},
                 {"step": "B 从原始网格独立重算", "result": str(res.path_b_total)},
-                {"step": "C 原表小计行", "result": str(res.raw_subtotal)},
+                {"step": c_step_label, "result": str(res.raw_subtotal)},
                 {"step": "差异 A-B", "result": str(res.diff_ab)},
                 {"step": "差异 A-C", "result": str(res.control_diff)},
                 {"step": "C 控制状态", "result": res.control_status},
@@ -859,6 +1911,10 @@ def make_evidence(project_id: int, res: CheckResult) -> str:
                 {"step": "A/B 行集状态", "result": res.ab_row_set_status},
                 {"step": "A/B 行集指纹", "result": res.ab_row_set_hash},
                 {"step": "A/B 独立性", "result": res.ab_independence_level},
+                {"step": "本次路径独立扫描", "result": res.path_independence_level},
+                {"step": "路径来源范围", "result": res.path_scopes},
+                {"step": "一致性检查", "result": res.consistency_findings},
+                {"step": "C 控制来源独立性", "result": res.c_independence_level},
                 {"step": "C 控制值来源", "result": res.c_control_source},
                 {"step": "C 控制来源 Evidence", "result": res.c_control_evidence_id},
             ],
@@ -999,7 +2055,8 @@ def _invalidate_previous_validation(
     current_signature = active_contract.signature
     current_scope, current_params = run_contract.current_scope(conn, project_id, "cr")
     old_results = conn.execute(
-        f"""SELECT cr.id, cr.period_id, cr.evidence_id
+        f"""SELECT cr.id, cr.period_id, cr.evidence_id,
+                           cr.c_control_evidence_id
             FROM crosscheck_results cr
             WHERE cr.project_id=? AND {current_scope}
               AND cr.period_id IN ({placeholders})""",
@@ -1035,9 +2092,10 @@ def _invalidate_previous_validation(
 
     stale_ids = sorted(stale_period_ids)
     evidence_ids = {
-        int(row["evidence_id"])
+        int(evidence_id)
         for row in (*old_results, *old_totals)
-        if int(row["period_id"]) in stale_period_ids and row["evidence_id"] is not None
+        for evidence_id in (row["evidence_id"], row["c_control_evidence_id"] if "c_control_evidence_id" in row.keys() else None)
+        if int(row["period_id"]) in stale_period_ids and evidence_id is not None
     }
     invalidation_note = "本次校核重跑尚未成功落库，旧结果已移出当前读取面"
     invalidated_at = datetime.now().isoformat(timespec="seconds")

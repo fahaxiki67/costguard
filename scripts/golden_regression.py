@@ -25,6 +25,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REGISTRY = REPO_ROOT / "tests" / "golden" / "cases.json"
+DEFAULT_ANONYMIZED_REGISTRY = REPO_ROOT / "tests" / "anonymized_golden_cases" / "cases.json"
 PRIVATE_PART = "local_private_data"
 AMOUNT_SCALE = Decimal("0.01")
 
@@ -421,10 +422,24 @@ def _diff_kind(path: str) -> str:
 
 
 def compare_metrics(actual: dict[str, Any], expected: dict[str, Any]) -> list[dict[str, Any]]:
-    """逐字段比较规格，不允许通过写回规格来掩盖回归。"""
+    """按闭世界逐字段比较规格，不允许静默减少或增加关键指标。
+
+    旧实现只遍历 ``expected``，因此 expected 为空或 actual 新增指标时会
+    错误返回“无差异”。黄金库是发布契约，双方字段集合必须完全一致；如
+    需新增指标，应先补充说明和人工确认后的黄金值，而不是让比较器放行。
+    """
     actual_flat = dict(_flatten(actual))
+    expected_flat = dict(_flatten(expected))
     diffs: list[dict[str, Any]] = []
-    for path, expected_value in _flatten(expected):
+    if not expected_flat:
+        return [{
+            "path": "__expected__",
+            "kind": "contract_or_scope",
+            "expected": "non_empty_metrics",
+            "actual": "empty",
+            "reason": "黄金结果不能为空；缺少明确基线时禁止发布",
+        }]
+    for path, expected_value in expected_flat.items():
         actual_value = actual_flat.get(path, "__missing__")
         if actual_value != expected_value:
             diffs.append({
@@ -434,6 +449,16 @@ def compare_metrics(actual: dict[str, Any], expected: dict[str, Any]) -> list[di
                 "actual": None if actual_value == "__missing__" else actual_value,
                 "reason": "黄金结果字段发生变化，需核对输入、规则或运行契约后由人工决定是否更新",
             })
+    for path, actual_value in actual_flat.items():
+        if path in expected_flat:
+            continue
+        diffs.append({
+            "path": path,
+            "kind": _diff_kind(path),
+            "expected": None,
+            "actual": actual_value,
+            "reason": "实际结果出现未登记的黄金指标，需先补充并人工确认黄金契约",
+        })
     return diffs
 
 
@@ -477,6 +502,55 @@ def run_golden_regression(
             work_parent.cleanup()
 
 
+def run_golden_regression_suite(
+    *,
+    registries: tuple[Path, ...] | list[Path] | None = None,
+    output: Path | None = None,
+    keep_workspace: bool = False,
+) -> dict[str, Any]:
+    """执行合成与脱敏真实黄金登记表，并汇总发布门槛。
+
+    两个登记表都只读比较；任一可用案例失败都会让 suite 失败。脱敏真实
+    案例当前可以是 ``not_available`` 占位，但该事实会保留在报告中，不能
+    被合成案例数量冒充生产覆盖。
+    """
+    selected = tuple(Path(path) for path in (registries or (
+        DEFAULT_REGISTRY, DEFAULT_ANONYMIZED_REGISTRY
+    )))
+    reports: list[dict[str, Any]] = []
+    for index, registry in enumerate(selected, start=1):
+        if not registry.is_file():
+            reports.append({
+                "registry": registry.name,
+                "status": "failed",
+                "error": f"黄金登记表不存在：{registry}",
+                "available_case_count": 0,
+                "real_case_count": 0,
+                "mismatch_case_count": 0,
+            })
+            continue
+        # suite 可能同时执行多个登记表；为每个登记表隔离工作区，避免
+        # 同名案例、报告或导出物互相覆盖，且保留每份报告独立可复核。
+        registry_output = (
+            Path(output).resolve() / f"registry-{index}"
+            if output is not None
+            else None
+        )
+        report = run_golden_regression(
+            registry, output=registry_output, keep_workspace=keep_workspace
+        )
+        reports.append(report)
+    return {
+        "schema_version": 1,
+        "status": "passed" if all(report.get("status") == "passed" for report in reports) else "failed",
+        "registry_count": len(reports),
+        "available_case_count": sum(int(report.get("available_case_count", 0)) for report in reports),
+        "real_case_count": sum(int(report.get("real_case_count", 0)) for report in reports),
+        "mismatch_case_count": sum(int(report.get("mismatch_case_count", 0)) for report in reports),
+        "reports": reports,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="运行价盾黄金回归库（只读比较，不自动更新）")
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY)
@@ -509,11 +583,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {result['case_id']}: {result['status']}")
             for diff in result.get("diffs", [])[:20]:
                 print(f"  · {diff['path']}: expected={diff['expected']!r}, actual={diff['actual']!r}")
-    if report["status"] != "passed":
-        return 1
     if args.require_real and report["real_case_count"] == 0:
         print("黄金回归未满足生产门槛：尚无脱敏真实案例。", file=sys.stderr)
         return 2
+    if report["status"] != "passed":
+        return 1
     return 0
 
 

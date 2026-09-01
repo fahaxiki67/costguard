@@ -19,6 +19,8 @@ from jiadun.core.parsing.header_detect import (
     HeaderDetection,
     build_anchor_map,
     data_rows_range,
+    detect_duplicate_header_rows,
+    detect_pre_header_rows,
     is_grand_total_row,
     is_subtotal_row,
 )
@@ -74,6 +76,11 @@ class SheetCoverageProof:
     ab_row_set_status: str = "same_row_set"
     ab_row_set_hash: str | None = None
     ab_independence_level: str = "shared_extractor"
+    duplicate_header_rows: list[int] = field(default_factory=list)
+    pre_header_nonempty_rows: list[int] = field(default_factory=list)
+    pre_header_suspect_rows: list[int] = field(default_factory=list)
+    unresolved_candidate_count: int = 0
+    risk_flags: list[str] = field(default_factory=list)
 
 
 def _text_at(cells: dict[tuple[int, int], str], anchors: dict, row: int, col: int | None) -> str:
@@ -115,14 +122,34 @@ def build_sheet_coverage_proof(
     data_range: tuple[int, int] | None = None,
     hidden_rows: list[int] | None = None,
     hidden_cols: list[int] | None = None,
+    manual_range_confirmed: bool = False,
 ) -> tuple[SheetCoverageProof, list[RowClassification]]:
-    """从原始网格生成证明草稿和逐行分类，不写数据库。"""
+    """从原始网格生成证明草稿和逐行分类，不写数据库。
+
+    隐藏行/列默认会使范围保持 ``unproven``。只有用户在人工确认入口
+    明确给出数据范围时，才把“范围已确认”作为当前证明条件；隐藏结构
+    仍写入 ``proof_reason``，不被静默抹掉。
+    """
     anchors = build_anchor_map(merged_ranges or [])
     start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
     columns = sorted(set(det.col_map.values()))
     all_columns = sorted({col for (_row, col) in cells})
     col_start = min(all_columns or columns or [1])
     col_end = max(all_columns or columns or [1])
+    duplicate_header_rows = detect_duplicate_header_rows(
+        cells, det, max_row, col_end, merged_ranges or []
+    )
+    pre_header_nonempty_rows, pre_header_suspect_rows = detect_pre_header_rows(
+        cells, det, col_end
+    )
+    unresolved_candidate_count = int(getattr(det, "unresolved_candidate_count", 0) or 0)
+    risk_flags = list(getattr(det, "risk_flags", []) or [])
+    if duplicate_header_rows and "duplicate_header_rows" not in risk_flags:
+        risk_flags.append("duplicate_header_rows")
+    if pre_header_suspect_rows and "pre_header_business_rows" not in risk_flags:
+        risk_flags.append("pre_header_business_rows")
+    if unresolved_candidate_count > 1 and "multiple_header_candidates" not in risk_flags:
+        risk_flags.append("multiple_header_candidates")
     classifications: list[RowClassification] = []
     numeric_fields = ("quantity", "unit_price", "amount")
 
@@ -152,7 +179,10 @@ def build_sheet_coverage_proof(
             if _text_at(cells, anchors, row, col)
         )
 
-        if is_subtotal_row(name, lead_text):
+        if row in duplicate_header_rows:
+            class_code = "pending_review"
+            reason = "duplicate_header_row"
+        elif is_subtotal_row(name, lead_text):
             class_code = "grand_total" if is_grand_total_row(name, lead_text) else "subtotal"
             reason = "grand_total_label" if class_code == "grand_total" else "subtotal_label"
         elif not code and name and not any(numeric_raw.values()):
@@ -228,13 +258,14 @@ def build_sheet_coverage_proof(
     # 统一走 ``_safe_decimal``，不能因为原始单元格包含千分位/货币符号而
     # 在证明计算中绕过业务 Decimal 入口；无法解析的金额保留在行分类中，
     # 不纳入金额合计，也不被当作 0。
-    raw_amount_total = D("0")
+    raw_amount_values: list[D] = []
     for item in classifications:
         if item.class_code != "detail":
             continue
         value = _safe_decimal(item.raw_values.get("amount", ""))
         if value is not None:
-            raw_amount_total += value
+            raw_amount_values.append(value)
+    raw_amount_total = sum(raw_amount_values, D("0")) if raw_amount_values else None
     detail_amount_total = sum(
         (D(item.effective_amount) for item in classifications
          if item.class_code == "detail" and item.effective_amount is not None),
@@ -245,19 +276,51 @@ def build_sheet_coverage_proof(
         json.dumps(used_rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest() if used_rows else None
 
+    # 先收集所有未解决条件，再按最保守的级别合并。人工确认只能解除
+    # “隐藏行/列导致的可见性未知”，不能覆盖重复表头、前置业务行、解析
+    # 失败或其它未解决行；否则同一张表会同时出现“证明完整”和“仍有结构
+    # 风险”的矛盾状态。
     reasons: list[str] = []
     if end < start:
-        proof_status = "unproven"
         reasons.append("no_data_range")
-    elif hidden_rows or hidden_cols:
-        proof_status = "unproven"
-        reasons.append("hidden_rows_or_columns")
-    elif det.needs_review:
-        proof_status = "unproven"
+    if hidden_rows or hidden_cols:
+        reasons.append(
+            "hidden_rows_or_columns_manually_confirmed"
+            if manual_range_confirmed
+            else "hidden_rows_or_columns"
+        )
+    if pre_header_suspect_rows:
+        reasons.append("pre_header_business_rows")
+    if unresolved_candidate_count > 1:
+        reasons.append("multiple_header_candidates")
+    if duplicate_header_rows:
+        reasons.append("duplicate_header_rows")
+    if det.needs_review:
         reasons.append("header_mapping_needs_review")
-    elif any(counts.get(key, 0) for key in ("parse_failed", "pending_review", "unrecognized", "orphan_numeric", "tail_note")):
-        proof_status = "partial"
+    if any(
+        counts.get(key, 0)
+        for key in (
+            "parse_failed",
+            "pending_review",
+            "unrecognized",
+            "orphan_numeric",
+            "tail_note",
+        )
+    ):
         reasons.append("unresolved_rows_present")
+
+    unproven_reasons = {
+        "no_data_range",
+        "hidden_rows_or_columns",
+        "pre_header_business_rows",
+        "multiple_header_candidates",
+        "header_mapping_needs_review",
+    }
+    partial_reasons = {"duplicate_header_rows", "unresolved_rows_present"}
+    if any(reason in unproven_reasons for reason in reasons):
+        proof_status = "unproven"
+    elif any(reason in partial_reasons for reason in reasons):
+        proof_status = "partial"
     else:
         proof_status = "complete"
 
@@ -269,12 +332,19 @@ def build_sheet_coverage_proof(
         raw_data_row_count=max(0, end - start + 1),
         classified_row_count=len(classifications),
         counts=counts,
-        raw_amount_total=str(raw_amount_total) if counts.get("detail", 0) else None,
+        # “明细存在但原始合价全缺失”必须保持 None，不能把初始化的 0
+        # 序列化成看似真实的原始控制金额。
+        raw_amount_total=str(raw_amount_total) if raw_amount_total is not None else None,
         detail_amount_total=str(detail_amount_total) if used_rows else None,
         business_rows_used=len(used_rows),
         proof_status=proof_status,
-        proof_reason=reasons,
+        proof_reason=sorted(set(reasons)),
         ab_row_set_hash=row_set_hash,
+        duplicate_header_rows=duplicate_header_rows,
+        pre_header_nonempty_rows=pre_header_nonempty_rows,
+        pre_header_suspect_rows=pre_header_suspect_rows,
+        unresolved_candidate_count=unresolved_candidate_count,
+        risk_flags=sorted(set(risk_flags)),
     )
     return proof, classifications
 

@@ -352,6 +352,16 @@ def match_items(
 
 
 def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGroup]) -> int:
+    availability = run_contract.current_results_available(conn, project_id)
+    if not availability["available"] and availability.get("state") is None:
+        # 导入/清洗后尚未形成匹配成果时，最新明细可以通过一次新合同
+        # 进入候选生成；已有匹配结果一旦发生漂移则必须停下并重新核对，
+        # 不能在保存候选时自动掩盖旧结果。
+        materialized = conn.execute(
+            "SELECT 1 FROM matches WHERE project_id=? LIMIT 1", (int(project_id),)
+        ).fetchone()
+        if materialized is None:
+            run_contract.ensure_run_contract(conn, project_id)
     run_contract.require_current_results_available(conn, project_id, operation="保存匹配候选")
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     with run_contract._transaction(conn, "save_matches"):
@@ -380,9 +390,22 @@ def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGr
 
 
 def _current_match_row(
-    conn: sqlite3.Connection, project_id: int, match_id: int
+    conn: sqlite3.Connection,
+    project_id: int,
+    match_id: int,
+    *,
+    active_contract: run_contract.RunContract | None = None,
 ) -> sqlite3.Row | None:
     """只读取当前运行契约下的匹配行，禁止人工 API 触碰历史候选。"""
+    if active_contract is not None:
+        return conn.execute(
+            """SELECT m.* FROM matches m
+                WHERE m.id=? AND m.project_id=? AND m.run_id=? AND m.run_signature=?""",
+            (
+                int(match_id), int(project_id),
+                active_contract.run_id, active_contract.signature,
+            ),
+        ).fetchone()
     scope, scope_params = run_contract.current_scope(conn, project_id, "m")
     return conn.execute(
         f"SELECT m.* FROM matches m WHERE m.id=? AND m.project_id=? AND {scope}",
@@ -495,8 +518,12 @@ def confirm_match(
     # UI 已有必填门控，核心 API 也必须保持同一边界，避免空原因导致部分写入。
     if not reason or not reason.strip():
         raise audit_log.AuditReasonRequiredError("人工确认匹配必须记录原因（原则 14）")
-    run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
-    row = _current_match_row(conn, project_id, match_id)
+    if _active_contract is None:
+        run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
+    active_contract = _active_contract or run_contract.ensure_run_contract(conn, project_id)
+    row = _current_match_row(
+        conn, project_id, match_id, active_contract=active_contract
+    )
     if not row:
         raise ValueError(f"match {match_id} not found")
     # 状态、别名、证据和审计必须同一事务提交。任何一环失败都回滚整次人工
@@ -504,15 +531,17 @@ def confirm_match(
     # 批量确认在同一事务内共享入口时的 Run Contract。人工审计快照会在
     # 第一项确认后改变下一次契约签名，但不能让同一批剩余候选在事务中途
     # 被误判为“已失效”；事务提交后下一次入口再切换到新契约。
-    active_contract = _active_contract or run_contract.ensure_run_contract(conn, project_id)
     active_signature = active_contract.signature
     if row["run_signature"] != active_signature:
         raise ValueError("该匹配结果已因输入或配置变化失效，请重新运行匹配后再确认")
     with run_contract._transaction(conn, "confirm_match"):
         # UI 对话框或调用方外层事务期间可能发生运行级失效；实际写入前
         # 必须再次检查可用性、当前 scope 和签名，不能复用入口时的快照。
-        run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
-        live_row = _current_match_row(conn, project_id, match_id)
+        if _active_contract is None:
+            run_contract.require_current_results_available(conn, project_id, operation="确认匹配")
+        live_row = _current_match_row(
+            conn, project_id, match_id, active_contract=active_contract
+        )
         if not live_row or live_row["run_signature"] != active_signature:
             raise run_contract.CurrentResultsUnavailableError(
                 "确认匹配不可用：匹配结果已不在当前运行范围，请刷新后重试。"

@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -191,7 +192,16 @@ def test_page_subtotals_sum_to_control(tmp_path):
         # 页小计互斥求和 = 3270 + 1405 = 4675 = A：既不翻倍也不虚缺
         assert result.control_status == "match", (
             f"页级小计之和应为有效控制值，实际 {result.control_status} diff={result.control_diff}")
-        assert any("小计行之和" in n for n in result.notes)
+        assert any("无合计级行时页级小计互斥求和" in n for n in result.notes)
+        evidence = json.loads(crosscheck.make_evidence(1, result))
+        scope_step = next(step for step in evidence["steps"] if step["step"] == "路径来源范围")
+        assert (
+            scope_step["result"]["path_c"]["selection_rule"]
+            == "无合计级行时页级小计互斥求和"
+        )
+        assert any(
+            step["step"] == "C 原表页级小计互斥汇总" for step in evidence["steps"]
+        )
     finally:
         conn.close()
 

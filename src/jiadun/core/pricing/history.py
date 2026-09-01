@@ -906,13 +906,20 @@ def collect_historical_prices(
         raw_flags = _loads(item["flags_json"], {})
         if not isinstance(raw_flags, dict):
             raw_flags = {"raw_flags": raw_flags}
+        # 历史资产表的维度列采用空字符串表示缺失（字段本身为 NOT NULL）。
+        # 来源触发器会把空字符串与版本快照中的 NULL 按同一缺失语义比对，
+        # 因而既不把缺失值伪装成有效维度，也不会因 NULL/'' 表示差异丢失
+        # 本来可用的单价候选。候选本身与 flags_json 是否为对象无关，不能
+        # 把正常字典 flags 的项目静默丢掉。
+        raw_feature = _raw_text(item["feature"])
+        raw_unit = _raw_text(item["unit"])
         candidates.append({
             "item": item,
             "raw_name": raw_name,
             "normalized_name": normalized_name,
-            "feature": _raw_text(item["feature"]),
+            "feature": raw_feature,
             "normalized_feature": _norm_text(item["feature"]),
-            "unit": _raw_text(item["unit"]),
+            "unit": raw_unit,
             "normalized_unit": _norm_text(item["unit"]),
             "direction": item["direction"] if item["direction"] in VALID_DIRECTIONS else "unknown",
             "unit_price": unit_price,
