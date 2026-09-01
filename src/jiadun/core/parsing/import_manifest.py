@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -234,8 +235,15 @@ def _entry_state(
     return "unbound", None, "清单未提供可核对的文件名或 SHA-256"
 
 
-def assess_manifest(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
-    """评估当前权威清单；不从已收到文件反推缺失项。"""
+def assess_manifest(
+    conn: sqlite3.Connection, project_id: int, *, read_only: bool = False
+) -> dict[str, Any]:
+    """评估当前权威清单；不从已收到文件反推缺失项。
+
+    ``read_only`` 用于项目列表、摘要和只读数据库连接。只读评估仍完整
+    计算每个条目的状态，但不回写 ``import_manifest_entries``/``status``，也
+    不因绑定变化刷新运行契约，避免“读取摘要”产生隐式写入。
+    """
     manifest = current_manifest(conn, project_id)
     if not manifest:
         return {
@@ -261,15 +269,17 @@ def assess_manifest(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
     state_counts = {"present": 0, "missing": 0, "mismatch": 0, "ambiguous": 0, "unbound": 0}
     optional_missing = 0
     binding_changed = False
-    with run_contract._transaction(conn, "assess_manifest"):
+    transaction = nullcontext() if read_only else run_contract._transaction(conn, "assess_manifest")
+    with transaction:
         for entry in entries:
             state, file_id, note = _entry_state(conn, entry, source_rows)
             if file_id != entry["received_file_id"]:
                 binding_changed = True
-            conn.execute(
-                "UPDATE import_manifest_entries SET state=?, received_file_id=?, note=? WHERE id=?",
-                (state, file_id, note, entry["id"]),
-            )
+            if not read_only:
+                conn.execute(
+                    "UPDATE import_manifest_entries SET state=?, received_file_id=?, note=? WHERE id=?",
+                    (state, file_id, note, entry["id"]),
+                )
             state_counts[state] = state_counts.get(state, 0) + 1
             if not entry["required"] and state != "present":
                 optional_missing += 1
@@ -295,13 +305,14 @@ def assess_manifest(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
             status = COMPLETE
         else:
             status = INCOMPLETE
-        conn.execute(
-            "UPDATE import_manifests SET status=? WHERE id=?",
-            (status, manifest["id"]),
-        )
+        if not read_only:
+            conn.execute(
+                "UPDATE import_manifests SET status=? WHERE id=?",
+                (status, manifest["id"]),
+            )
     # 哈希唯一命中属于可复核的输入绑定，变化后需立刻让旧成果失效；仅状态
     # 文案变化不会触发新契约。首次尚未物化结果的项目不额外创建契约。
-    if binding_changed and run_contract.get_current_contract(conn, project_id):
+    if not read_only and binding_changed and run_contract.get_current_contract(conn, project_id):
         run_contract.ensure_run_contract(conn, project_id)
     return {
         "status": status,
@@ -344,14 +355,15 @@ def bind_manifest_entry(
     if not row or not source:
         raise ValueError("manifest entry 或 source file 不存在，无法绑定")
     with run_contract._transaction(conn, "bind_manifest_entry"):
-        # 先写入绑定，再依据新的权威范围生成签名；Evidence 必须绑定新签名，
-        # 否则人工绑定完成后会被误归入旧运行。
+        # 先写入绑定，再把 Evidence/Audit 一并纳入最终合同。审计内容属于
+        # 合同输入，不能在 ensure 之后才追加，否则下一次读取会无声地产生
+        # 第三个运行。运行身份字段则在最终合同确定后重绑。
         conn.execute(
             """UPDATE import_manifest_entries
                SET received_file_id=?, state='present', note=? WHERE id=?""",
             (file_id, "人工绑定处理中", entry_id),
         )
-        signature = run_contract.ensure_run_contract(conn, project_id).signature
+        active_contract = run_contract.get_current_contract(conn, project_id)
         evidence_id = evidence_api.add_evidence(
             conn,
             project_id,
@@ -369,7 +381,9 @@ def bind_manifest_entry(
                 "file_id": file_id,
             }],
             commit=False,
-            run_signature=signature,
+            run_signature=active_contract.signature if active_contract else None,
+            run_id=active_contract.run_id if active_contract else None,
+            scope="human",
         )
         audit_id = audit_log.record_audit(
             conn,
@@ -381,13 +395,29 @@ def bind_manifest_entry(
             {"received_file_id": file_id, "evidence_id": evidence_id},
             reason,
             commit=False,
+            run_id=active_contract.run_id if active_contract else None,
+            run_signature=active_contract.signature if active_contract else None,
         )
         conn.execute(
             """UPDATE import_manifest_entries
                SET note=? WHERE id=?""",
             (f"人工绑定；Evidence ID {evidence_id}；Audit ID {audit_id}", entry_id),
         )
+        final_contract = run_contract.ensure_run_contract(conn, project_id)
+        if active_contract is None or final_contract.run_id != active_contract.run_id:
+            conn.execute(
+                """UPDATE evidence SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, evidence_id, project_id),
+            )
+            conn.execute(
+                """UPDATE audit_log SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, audit_id, project_id),
+            )
 
 
-def manifest_summary(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
-    return assess_manifest(conn, project_id)
+def manifest_summary(
+    conn: sqlite3.Connection, project_id: int, *, read_only: bool = False
+) -> dict[str, Any]:
+    return assess_manifest(conn, project_id, read_only=read_only)

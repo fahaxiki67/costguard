@@ -14,8 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import openpyxl
-from openpyxl.styles import Alignment, Border, Font, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Border, Font, Side
 
 _THIN = Side(style="thin", color="9AA5B1")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)

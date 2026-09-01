@@ -1232,8 +1232,10 @@ class TestCrossCheck:
         old_signature = run_contract.current_run_signature(conn, info.project_id)
         with conn:
             conn.execute(
-                "UPDATE source_files SET original_name=? WHERE project_id=?",
-                ("changed-input.xlsx", info.project_id),
+                "UPDATE raw_sheets SET sheet_status=? WHERE id=("
+                "SELECT rs.id FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id "
+                "JOIN source_files sf ON sf.id=pb.file_id WHERE sf.project_id=? LIMIT 1)",
+                ("pending", info.project_id),
             )
 
         def reject_commit(action, arg1, _arg2, _db_name, _trigger_name):
@@ -1332,6 +1334,9 @@ class TestCrossCheck:
         crosscheck.run_crosscheck(conn, info.project_id, [report.period_no])
         summary = build_project_summary(conn, info.project_id)
         assert summary.verification["periods_unchecked"] == len(period_nos) - 1
+        assert summary.verification["status"] != "sufficient"
+        assert summary.verification["period_status"] == "校核不充分"
+        assert summary.statuses["project_status"] == "有条件结论"
         assert summary.aggregate_coverage["status"] == coverage.FAILED
         scope, params = run_contract.current_scope(conn, info.project_id, "cr")
         assert conn.execute(
@@ -1386,6 +1391,9 @@ class TestCrossCheck:
         summary = build_project_summary(conn, info.project_id)
         assert summary.verification["periods_checked"] == 1
         assert summary.verification["periods_unchecked"] == len(period_rows) - 1
+        assert summary.verification["status"] != "sufficient"
+        assert summary.verification["period_status"] == "校核不充分"
+        assert summary.statuses["project_status"] == "有条件结论"
         assert summary.aggregate_coverage["status"] == coverage.FAILED
         scope, scope_params = run_contract.current_scope(conn, info.project_id, "cr")
         current_rows = conn.execute(

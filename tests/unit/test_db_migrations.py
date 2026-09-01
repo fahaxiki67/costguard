@@ -24,7 +24,14 @@ class TestMigrate:
             "matches", "period_totals", "anomalies", "evidence", "audit_log",
             "contract_docs", "contract_facts", "crosscheck_results", "run_contracts",
             "export_runs", "detection_runs", "import_manifests", "import_manifest_entries",
-            "cleaning_changes", "schema_migrations",
+            "cleaning_changes", "sheet_coverage_proofs", "row_classifications",
+            "evidence_events", "crosscheck_result_history", "period_total_history",
+            "diff_runs", "diff_items", "mapping_templates",
+            "finding_status_events",
+            "rule_configurations", "alias_knowledge", "alias_knowledge_events",
+            "project_versions", "project_version_items", "project_closures",
+            "historical_unit_prices",
+            "schema_migrations",
         ]:
             assert expected in tables, f"missing table {expected}"
         alias_columns = {r[1] for r in conn.execute("PRAGMA table_info(item_aliases)")}
@@ -36,25 +43,354 @@ class TestMigrate:
             "ab_diff", "ab_status", "control_diff", "control_status",
             "verification_level",
         } <= total_columns
-        assert "run_signature" in total_columns
+        assert {"run_signature", "run_id"} <= total_columns
         result_columns = {r[1] for r in conn.execute("PRAGMA table_info(crosscheck_results)")}
         assert "run_signature" in result_columns
+        assert {
+            "classified_detail_rows", "business_rows_used", "coverage_proof_status",
+            "ab_row_set_status", "ab_independence_level", "c_control_evidence_id",
+            "run_id",
+        } <= result_columns
         match_columns = {r[1] for r in conn.execute("PRAGMA table_info(matches)")}
-        assert "run_signature" in match_columns
+        assert {"run_signature", "run_id"} <= match_columns
         anomaly_columns = {r[1] for r in conn.execute("PRAGMA table_info(anomalies)")}
-        assert "run_signature" in anomaly_columns
+        assert {"run_signature", "run_id", "lifecycle_status", "repeat_history_json"} <= anomaly_columns
         detection_columns = {r[1] for r in conn.execute("PRAGMA table_info(detection_runs)")}
         assert {
             "expected_json", "executed_json", "skipped_json", "failed_json",
             "status", "run_kind",
         } <= detection_columns
+        assert "run_id" in detection_columns
+        evidence_columns = {r[1] for r in conn.execute("PRAGMA table_info(evidence)")}
+        assert {"run_id", "scope", "historical_reason"} <= evidence_columns
+        audit_columns = {r[1] for r in conn.execute("PRAGMA table_info(audit_log)")}
+        assert {"run_id", "run_signature"} <= audit_columns
         manifest_columns = {r[1] for r in conn.execute("PRAGMA table_info(import_manifests)")}
         assert {"manifest_key", "control_hash", "status", "version"} <= manifest_columns
         cleaning_columns = {r[1] for r in conn.execute("PRAGMA table_info(cleaning_changes)")}
-        assert {"run_signature", "event_key", "status", "evidence_id", "audit_id"} <= cleaning_columns
+        assert {"run_signature", "event_key", "status", "evidence_id", "audit_id", "run_id"} <= cleaning_columns
+        contract_columns = {r[1] for r in conn.execute("PRAGMA table_info(run_contracts)")}
+        assert "run_id" in contract_columns
+        proof_columns = {r[1] for r in conn.execute("PRAGMA table_info(sheet_coverage_proofs)")}
+        assert {
+            "raw_data_row_count", "classified_row_count", "business_rows_used",
+            "proof_status", "c_control_source_json", "ab_independence_level",
+            "run_signature", "run_id",
+        } <= proof_columns
+        row_columns = {r[1] for r in conn.execute("PRAGMA table_info(row_classifications)")}
+        assert {"class_code", "raw_values_json", "effective_amount", "participates_in_a"} <= row_columns
         header_columns = {r[1] for r in conn.execute("PRAGMA table_info(table_headers)")}
         assert {"data_range_status", "data_range_method", "data_range_evidence_json"} <= header_columns
+        sheet_columns = {r[1] for r in conn.execute("PRAGMA table_info(raw_sheets)")}
+        assert {"sheet_status", "sheet_status_reason", "sheet_status_updated_at", "sheet_status_actor"} <= sheet_columns
+        triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='run_contracts'"
+        )}
+        assert {"trg_run_contracts_immutable_update", "trg_run_contracts_immutable_delete"} <= triggers
+        raw_cell_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='raw_cells'"
+        )}
+        assert {
+            "trg_raw_cells_immutable_update",
+            "trg_raw_cells_immutable_delete",
+            "trg_raw_cells_grid_scope_guard",
+        } <= raw_cell_triggers
+        raw_sheet_triggers = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='raw_sheets'"
+            )
+        }
+        assert "trg_raw_sheets_grid_immutable_update" in raw_sheet_triggers
+        table_header_triggers = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='table_headers'"
+            )
+        }
+        assert "trg_table_headers_immutable_update" in table_header_triggers
+        source_file_triggers = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='source_files'"
+            )
+        }
+        assert "trg_source_files_identity_immutable_update" in source_file_triggers
+        version_source_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_project_version_items_snapshot_%'"
+        )}
+        assert "trg_project_version_items_snapshot_source_guard" in version_source_triggers
+        assert "trg_project_version_items_explicit_source_scope_guard" in {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'trg_project_version_items_%source_scope_guard'"
+            )
+        }
+        history_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE '%history_immutable_%'"
+        )}
+        assert {
+            "trg_crosscheck_result_history_immutable_update",
+            "trg_crosscheck_result_history_immutable_delete",
+            "trg_period_total_history_immutable_update",
+            "trg_period_total_history_immutable_delete",
+        } <= history_triggers
+        diff_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_diff_%_immutable_%'"
+        )}
+        assert {
+            "trg_diff_runs_immutable_update",
+            "trg_diff_runs_immutable_delete",
+            "trg_diff_items_immutable_update",
+            "trg_diff_items_immutable_delete",
+        } <= diff_triggers
+        template_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_mapping_templates_immutable_%'"
+        )}
+        assert {
+            "trg_mapping_templates_immutable_update",
+            "trg_mapping_templates_immutable_delete",
+        } <= template_triggers
+        finding_event_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_finding_status_events_immutable_%'"
+        )}
+        assert {
+            "trg_finding_status_events_immutable_update",
+            "trg_finding_status_events_immutable_delete",
+        } <= finding_event_triggers
+        alias_knowledge_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_alias_knowledge%immutable_%'"
+        )}
+        assert {
+            "trg_alias_knowledge_immutable_update",
+            "trg_alias_knowledge_immutable_delete",
+            "trg_alias_knowledge_events_immutable_update",
+            "trg_alias_knowledge_events_immutable_delete",
+        } <= alias_knowledge_triggers
+        assert {
+            "trg_anomalies_snapshot_immutable_update",
+            "trg_anomalies_lifecycle_guard",
+        } <= {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'trg_anomalies_%'"
+            )
+        }
+        rule_config_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_rule_configurations_immutable_%'"
+        )}
+        assert {
+            "trg_rule_configurations_immutable_update",
+            "trg_rule_configurations_immutable_delete",
+        } <= rule_config_triggers
+        history_price_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND (name LIKE 'trg_project_closures_%' OR name LIKE 'trg_historical_unit_prices_%')"
+        )}
+        assert {
+            "trg_project_closures_insert_guard",
+            "trg_project_closures_immutable_update",
+            "trg_project_closures_immutable_delete",
+            "trg_historical_unit_prices_insert_guard",
+            "trg_historical_unit_prices_immutable_update",
+            "trg_historical_unit_prices_immutable_delete",
+            "trg_historical_unit_prices_snapshot_source_guard",
+        } <= history_price_triggers
+        version_scope_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name IN ('trg_project_versions_insert_guard', "
+            "'trg_project_version_items_insert_guard', "
+            "'trg_evidence_historical_immutable_scope', "
+            "'trg_evidence_historical_immutable_delete')"
+        )}
+        assert {
+            "trg_project_versions_insert_guard",
+            "trg_project_version_items_insert_guard",
+            "trg_evidence_historical_immutable_scope",
+            "trg_evidence_historical_immutable_delete",
+        } <= version_scope_triggers
+        version_chain_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_project_versions_evidence_chain_%'"
+        )}
+        assert {
+            "trg_project_versions_evidence_chain_guard",
+            "trg_project_versions_evidence_chain_update_guard",
+        } <= version_chain_triggers
+        version_target_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_project_versions_evidence_target_%'"
+        )}
+        assert {
+            "trg_project_versions_evidence_target_guard",
+            "trg_project_versions_evidence_target_update_guard",
+        } <= version_target_triggers
+        closure_target_triggers = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND name LIKE 'trg_project_closures_evidence_target_%'"
+        )}
+        assert {
+            "trg_project_closures_evidence_target_guard",
+            "trg_project_closures_evidence_target_update_guard",
+        } <= closure_target_triggers
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_project_version_items_period_scope_guard'"
+        ).fetchone()
+        assert {
+            "trg_sheet_coverage_proofs_scope_guard",
+            "trg_row_classifications_scope_guard",
+        } <= {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' "
+                "AND name LIKE 'trg_%_scope_guard'"
+            )
+        }
         conn.close()
+
+    def test_v43_protects_source_file_identity_and_raw_cell_grid(self, tmp_path):
+        """源文件身份不可改写，原始单元格不得写出 Sheet 声明网格。"""
+        db = _tmp_db(tmp_path)
+        migrations.migrate(db, tmp_path / "backups")
+        conn = migrations.connect(db)
+        try:
+            with conn:
+                project_id = conn.execute(
+                    "INSERT INTO projects(name, schema_version, workspace_path, created_at) "
+                    "VALUES ('v43', ?, '/v43', '2026')",
+                    (migrations.LATEST_SCHEMA_VERSION,),
+                ).lastrowid
+                file_id = conn.execute(
+                    """INSERT INTO source_files(
+                           project_id, original_path, stored_path, original_name,
+                           sha256, size_bytes, file_type, imported_at)
+                       VALUES (?, '/in.xlsx', '/stored.xlsx', 'in.xlsx', 'sha', 3, 'xlsx', '2026')""",
+                    (project_id,),
+                ).lastrowid
+                batch_id = conn.execute(
+                    "INSERT INTO parse_batches(file_id, parser, parsed_at, status) "
+                    "VALUES (?, 'test', '2026', 'ok')",
+                    (file_id,),
+                ).lastrowid
+                sheet_id = conn.execute(
+                    """INSERT INTO raw_sheets(
+                           batch_id, sheet_index, sheet_name, n_rows, n_cols)
+                       VALUES (?, 0, 'Sheet1', 2, 2)""",
+                    (batch_id,),
+                ).lastrowid
+            conn.execute(
+                "UPDATE source_files SET stored_path='/restored.xlsx' WHERE id=?",
+                (file_id,),
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="source file identity immutable"):
+                conn.execute(
+                    "UPDATE source_files SET original_name='forged.xlsx' WHERE id=?",
+                    (file_id,),
+                )
+            conn.execute(
+                "INSERT INTO raw_cells(sheet_id, row, col, raw_value) VALUES (?, 2, 2, 'ok')",
+                (sheet_id,),
+            )
+            with pytest.raises(sqlite3.IntegrityError, match="raw cell outside sheet grid"):
+                conn.execute(
+                    "INSERT INTO raw_cells(sheet_id, row, col, raw_value) VALUES (?, 3, 1, 'out')",
+                    (sheet_id,),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="raw cell outside sheet grid"):
+                conn.execute(
+                    "INSERT INTO raw_cells(sheet_id, row, col, raw_value) VALUES (?, 1, 3, 'out')",
+                    (sheet_id,),
+                )
+        finally:
+            conn.close()
+
+    def test_v34_blocks_cross_project_version_items_and_historical_resurrection(self, tmp_path):
+        """v34 不能让旧脚本跨项目写快照，也不能复活或删除历史 Evidence。"""
+        db = _tmp_db(tmp_path)
+        migrations.migrate(db, tmp_path / "backups")
+        conn = migrations.connect(db)
+        try:
+            with conn:
+                p1 = conn.execute(
+                    "INSERT INTO projects(name, schema_version, workspace_path, created_at) "
+                    "VALUES ('P1', ?, '/p1', '2026')",
+                    (migrations.LATEST_SCHEMA_VERSION,),
+                ).lastrowid
+                p2 = conn.execute(
+                    "INSERT INTO projects(name, schema_version, workspace_path, created_at) "
+                    "VALUES ('P2', ?, '/p2', '2026')",
+                    (migrations.LATEST_SCHEMA_VERSION,),
+                ).lastrowid
+                v1 = conn.execute(
+                    """INSERT INTO project_versions(
+                           project_id, version_no, version_kind, title,
+                           snapshot_sha256, created_by, created_at, reason)
+                       VALUES (?, 1, 'initial_submission', 'P1 v1', 'sha', 'u', '2026', 'r')""",
+                    (p1,),
+                ).lastrowid
+                v2 = conn.execute(
+                    """INSERT INTO project_versions(
+                           project_id, version_no, version_kind, title,
+                           snapshot_sha256, created_by, created_at, reason)
+                       VALUES (?, 1, 'initial_submission', 'P2 v1', 'sha', 'u', '2026', 'r')""",
+                    (p2,),
+                ).lastrowid
+                with pytest.raises(
+                    sqlite3.IntegrityError,
+                    match="project version item (source|scope) mismatch|project version item scope incomplete",
+                ):
+                    conn.execute(
+                        """INSERT INTO project_version_items(
+                               version_id, project_id, identity_key, occurrence,
+                               direction, created_at)
+                           VALUES (?, ?, 'cross', 1, 'unknown', '2026')""",
+                        (v1, p2),
+                    )
+                ev = conn.execute(
+                    """INSERT INTO evidence(project_id, kind, summary, created_at)
+                       VALUES (?, 'test', '历史证据', '2026')""",
+                    (p1,),
+                ).lastrowid
+                conn.execute(
+                    "UPDATE evidence SET scope='historical', historical_reason='测试' WHERE id=?",
+                    (ev,),
+                )
+                with pytest.raises(sqlite3.IntegrityError, match="historical evidence cannot be revived"):
+                    conn.execute("UPDATE evidence SET scope='current' WHERE id=?", (ev,))
+                with pytest.raises(sqlite3.IntegrityError, match="historical evidence cannot be deleted"):
+                    conn.execute("DELETE FROM evidence WHERE id=?", (ev,))
+                period_id = conn.execute(
+                    """INSERT INTO settlement_periods(project_id, period_no, title, direction)
+                       VALUES (?, 1, 'P1 第1期', 'upward') RETURNING id""",
+                    (p1,),
+                ).fetchone()[0]
+                line_item_id = conn.execute(
+                    """INSERT INTO line_items(
+                           period_id, code, name, unit, quantity, unit_price, amount, flags_json)
+                       VALUES (?, 'L', '本地项', '项', '1', '1', '1', '{}') RETURNING id""",
+                    (period_id,),
+                ).fetchone()[0]
+                # 合法的同项目版本快照仍可写入，避免闸门把 API 的最小快照路径挡住。
+                conn.execute(
+                    """INSERT INTO project_version_items(
+                           version_id, project_id, identity_key, occurrence,
+                           period_id, period_no, direction, line_item_id,
+                           code, name, unit, quantity, unit_price, amount,
+                           source_row, created_at)
+                       VALUES (?, ?, 'local', 1, ?, 1, 'upward', ?,
+                               'L', '本地项', '项', '1', '1', '1', 1, '2026')""",
+                    (v1, p1, period_id, line_item_id),
+                )
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM project_version_items WHERE version_id=?", (v1,)
+                ).fetchone()[0] == 1
+                assert v2
+        finally:
+            conn.close()
 
     def test_idempotent(self, tmp_path):
         db = _tmp_db(tmp_path)

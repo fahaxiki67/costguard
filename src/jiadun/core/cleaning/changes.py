@@ -114,7 +114,8 @@ def propose_change(
         raise audit_log.AuditReasonRequiredError("清洗变更必须记录原因")
     if not str(subject_type).strip() or not str(field_name).strip():
         raise ValueError("清洗变更必须指定对象类型和字段")
-    signature = run_contract.current_run_signature(conn, project_id, ensure=True)
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    signature = active_contract.signature
     key = event_key or stable_fingerprint({
         "project_id": project_id,
         "run_signature": signature,
@@ -150,6 +151,8 @@ def propose_change(
             sources=[{"subject_type": subject_type, "subject_id": subject_id}],
             commit=False,
             run_signature=signature,
+            run_id=active_contract.run_id,
+            scope="human",
         )
         audit_id = audit_log.record_audit(
             conn,
@@ -161,20 +164,41 @@ def propose_change(
             {"field": field_name, "value": proposed, "evidence_id": evidence_id},
             reason,
             commit=False,
+            run_id=active_contract.run_id,
+            run_signature=signature,
         )
         cur = conn.execute(
             """INSERT INTO cleaning_changes(
                    project_id, run_signature, event_key, subject_type, subject_id,
                    field_name, before_json, proposed_json, status, reason, actor,
-                   created_at, evidence_id, audit_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   created_at, evidence_id, audit_id, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project_id, signature, key, subject_type, subject_id, field_name,
                 _json(before), _json(proposed), PROPOSED, reason.strip(), actor,
-                created_at, evidence_id, audit_id,
+                created_at, evidence_id, audit_id, active_contract.run_id,
             ),
         )
         change_id = int(cur.lastrowid)
+        final_contract = run_contract.ensure_run_contract(conn, project_id)
+        if final_contract.run_id != active_contract.run_id:
+            # 清洗事件和审计内容属于本次人工操作；确认清洗结果已经进入
+            # 新合同后，只重绑运行身份，不改写事实、原因或责任人。
+            conn.execute(
+                """UPDATE evidence SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, evidence_id, project_id),
+            )
+            conn.execute(
+                """UPDATE audit_log SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, audit_id, project_id),
+            )
+            conn.execute(
+                """UPDATE cleaning_changes SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, change_id, project_id),
+            )
     return get_change(conn, project_id, change_id)  # type: ignore[return-value]
 
 
@@ -200,7 +224,8 @@ def decide_change(
         raise ValueError(f"cleaning change {change_id} not found")
     if row["status"] != PROPOSED:
         raise ValueError(f"cleaning change {change_id} 已经作出决定")
-    signature = run_contract.current_run_signature(conn, project_id, ensure=True)
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    signature = active_contract.signature
     decided_at = _now()
     with run_contract._transaction(conn, "decide_cleaning_change"):
         evidence_id = evidence_api.add_evidence(
@@ -217,6 +242,8 @@ def decide_change(
             sources=[{"cleaning_change_id": change_id}],
             commit=False,
             run_signature=signature,
+            run_id=active_contract.run_id,
+            scope="human",
         )
         audit_id = audit_log.record_audit(
             conn,
@@ -228,6 +255,8 @@ def decide_change(
             {"status": status, "evidence_id": evidence_id},
             reason,
             commit=False,
+            run_id=active_contract.run_id,
+            run_signature=signature,
         )
         conn.execute(
             """UPDATE cleaning_changes
@@ -235,6 +264,23 @@ def decide_change(
                    evidence_id=?, audit_id=? WHERE project_id=? AND id=?""",
             (status, decided_at, actor, reason.strip(), evidence_id, audit_id, project_id, change_id),
         )
+        final_contract = run_contract.ensure_run_contract(conn, project_id)
+        if final_contract.run_id != active_contract.run_id:
+            conn.execute(
+                """UPDATE evidence SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, evidence_id, project_id),
+            )
+            conn.execute(
+                """UPDATE audit_log SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, audit_id, project_id),
+            )
+            conn.execute(
+                """UPDATE cleaning_changes SET run_signature=?, run_id=?
+                   WHERE id=? AND project_id=?""",
+                (final_contract.signature, final_contract.run_id, change_id, project_id),
+            )
     return get_change(conn, project_id, change_id)  # type: ignore[return-value]
 
 

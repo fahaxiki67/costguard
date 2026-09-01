@@ -199,6 +199,7 @@ def record_detection_run(
     started_at: str | None = None,
     completed_at: str | None = None,
     run_signature: str | None = None,
+    run_id: str | None = None,
     run_kind: str = ANOMALY_DETECTION,
     error_summary: str | None = None,
     metadata: dict[str, Any] | None = None,
@@ -218,6 +219,10 @@ def record_detection_run(
     signature = run_signature or run_contract.current_run_signature(
         conn, project_id, ensure=True
     )
+    if run_id is None:
+        active = run_contract.get_current_contract(conn, project_id)
+        if active is not None and active.signature == signature:
+            run_id = active.run_id
     started = started_at or _now()
     finished = completed_at or _now()
 
@@ -226,8 +231,8 @@ def record_detection_run(
             """INSERT INTO detection_runs(
                    project_id, run_signature, run_kind, started_at, completed_at, status,
                    expected_json, executed_json, skipped_json, failed_json,
-                   critical_failed_json, error_summary, metadata_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   critical_failed_json, error_summary, metadata_json, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project_id,
                 signature,
@@ -242,6 +247,7 @@ def record_detection_run(
                 json.dumps(list(coverage.critical_failed), ensure_ascii=False),
                 error_summary,
                 json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                run_id,
             ),
         )
         return int(cur.lastrowid)
@@ -278,14 +284,15 @@ def current_detection_run(
 ) -> sqlite3.Row | None:
     """只读取当前 Run Contract 下最近一次检测，不混入历史签名。"""
     fail_closed = run_contract.get_fail_closed_state(conn, project_id)
-    signature = run_contract.current_run_signature(conn, project_id)
-    if not signature:
+    current_contract = run_contract.get_current_contract(conn, project_id)
+    signature = current_contract.signature if current_contract else None
+    if not signature or not current_contract.run_id:
         return None
     row = conn.execute(
         """SELECT * FROM detection_runs
-           WHERE project_id=? AND run_signature=? AND run_kind=?
+           WHERE project_id=? AND run_signature=? AND run_id=? AND run_kind=?
            ORDER BY id DESC LIMIT 1""",
-        (project_id, signature, run_kind),
+        (project_id, signature, current_contract.run_id, run_kind),
     ).fetchone()
     # 运行级边界生效时，旧的 complete/partial 运行不能穿过边界。若本次
     # 失败覆盖已真实写入，则保留 FAILED 事实供诊断；不把它当作可用成果。
@@ -313,9 +320,16 @@ def coverage_summary(
     project_id: int,
     *,
     run_kind: str = ANOMALY_DETECTION,
+    read_only: bool = False,
 ) -> dict[str, Any]:
-    """返回 UI/Excel/Word 可共用的简洁覆盖率字段。"""
-    availability = run_contract.current_results_available(conn, project_id)
+    """返回 UI/Excel/Word 可共用的简洁覆盖率字段。
+
+    只读摘要不得尝试清除运行级 fail-closed 侧车；清除动作必须由显式的
+    成功运行恢复流程完成。
+    """
+    availability = run_contract.current_results_available(
+        conn, project_id, allow_state_clear=not read_only
+    )
     row = current_detection_run(conn, project_id, run_kind=run_kind)
     coverage = _row_to_coverage(row) if row else DetectionCoverage(
         unavailable=not availability["available"]
@@ -324,6 +338,7 @@ def coverage_summary(
     result["run_id"] = int(row["id"]) if row else None
     result["run_kind"] = run_kind
     result["run_signature"] = row["run_signature"] if row else None
+    result["contract_run_id"] = row["run_id"] if row else None
     result["started_at"] = row["started_at"] if row else None
     result["completed_at"] = row["completed_at"] if row else None
     result["error_summary"] = row["error_summary"] if row else None

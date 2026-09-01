@@ -73,6 +73,15 @@ LEVEL_ZH = {
 
 # 处理状态
 ITEM_STATUS_ZH = {
+    # P1-06 Finding 闭环统一状态；旧状态继续保留用于历史库兼容。
+    "new": "新发现",
+    "pending_review": "待复核",
+    "confirmed_issue": "已确认问题",
+    "legitimate_business": "合理业务情形",
+    "pending_data": "待补资料",
+    "rectified": "已整改",
+    "closed": "已关闭",
+    "historical": "历史结果——当前数据或运行契约已经变化，不参与当前结论",
     "pending": "待确认",
     "confirmed": "已确认",
     "open": "待处理",
@@ -87,6 +96,7 @@ ITEM_STATUS_ZH = {
 
 # 审计动作只在用户可见的处理历史中显示中文；原始 action 仍可通过高级信息追溯。
 AUDIT_ACTION_ZH = {
+    "update_finding_status": "更新审核问题状态",
     "resolve_anomaly": "处理审核问题",
     "confirm_match": "确认匹配",
     "override_match": "修正匹配级别",
@@ -98,6 +108,10 @@ AUDIT_ACTION_ZH = {
 
 # 工作表门控状态 → (中文, 徽章级别)
 SHEET_STATE_ZH = {
+    "confirmed": ("已确认", "success"),
+    "pending": ("待确认", "warning"),
+    "non_business": ("非业务表", "neutral"),
+    "parse_failed": ("解析失败", "danger"),
     "parsed": ("已解析", "success"),
     "needs_role_review": ("待人工角色确认", "warning"),
     "non_settlement_form": ("非结算表单", "neutral"),

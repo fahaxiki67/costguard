@@ -18,10 +18,12 @@ import re
 import sqlite3
 import tempfile
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import ROUND_HALF_UP, getcontext
 from pathlib import Path
 from typing import Any
 
@@ -430,20 +432,27 @@ def _coverage_proof_is_valid(
         or str(coverage_run_kind) != str(required_run_kind)
     ):
         return False
-    if conn.in_transaction or current_run_signature(conn, project_id) != run_signature:
+    current_contract = get_current_contract(conn, project_id)
+    if (
+        conn.in_transaction
+        or current_contract is None
+        or current_contract.signature != run_signature
+    ):
         return False
     try:
         row = conn.execute(
             """SELECT id, run_signature, run_kind, status, completed_at,
                               expected_json, executed_json,
                               skipped_json, failed_json, critical_failed_json,
-                              metadata_json
+                              metadata_json, run_id
                        FROM detection_runs WHERE id=? AND project_id=?""",
             (int(coverage_run_id), project_id),
         ).fetchone()
     except (TypeError, ValueError, sqlite3.Error):
         return False
     if row is None or row["run_signature"] != run_signature:
+        return False
+    if row["run_id"] != current_contract.run_id:
         return False
     if (
         int(row["id"]) != int(coverage_run_id)
@@ -456,9 +465,9 @@ def _coverage_proof_is_valid(
     # 不能在更新的 failed/partial 行之后重新打开历史结果。
     latest = conn.execute(
         """SELECT id FROM detection_runs
-           WHERE project_id=? AND run_signature=? AND run_kind=?
+           WHERE project_id=? AND run_signature=? AND run_id=? AND run_kind=?
            ORDER BY id DESC LIMIT 1""",
-        (project_id, run_signature, str(coverage_run_kind)),
+        (project_id, run_signature, current_contract.run_id, str(coverage_run_kind)),
     ).fetchone()
     if latest is None or int(latest["id"]) != int(coverage_run_id):
         return False
@@ -511,9 +520,9 @@ def _coverage_proof_is_valid(
     result_rows = conn.execute(
         f"""SELECT period_id, evidence_id, checked_at, status
                FROM crosscheck_results
-               WHERE project_id=? AND run_signature=?
+               WHERE project_id=? AND run_signature=? AND run_id=?
                  AND period_id IN ({placeholders})""",
-        (project_id, run_signature, *required_period_ids),
+        (project_id, run_signature, current_contract.run_id, *required_period_ids),
     ).fetchall()
     if len(result_rows) != len(required_period_ids):
         return False
@@ -527,19 +536,23 @@ def _coverage_proof_is_valid(
         evidence = conn.execute(
             """SELECT 1 FROM evidence
                WHERE id=? AND project_id=? AND kind='cross_check'
-                 AND run_signature=?""",
-            (result["evidence_id"], project_id, run_signature),
+                 AND run_signature=? AND run_id=?""",
+            (result["evidence_id"], project_id, run_signature, current_contract.run_id),
         ).fetchone()
         if evidence is None:
             return False
         total_counts = conn.execute(
             """SELECT COUNT(*) AS total,
-                      SUM(CASE WHEN run_signature=? THEN 1 ELSE 0 END) AS current_count,
-                      SUM(CASE WHEN run_signature=? AND evidence_id=? THEN 1 ELSE 0 END)
+                      SUM(CASE WHEN run_signature=? AND run_id=? THEN 1 ELSE 0 END) AS current_count,
+                      SUM(CASE WHEN run_signature=? AND run_id=? AND evidence_id=? THEN 1 ELSE 0 END)
                          AS linked_count
                FROM period_totals
                WHERE project_id=? AND period_id=?""",
-            (run_signature, run_signature, result["evidence_id"], project_id, period_id),
+            (
+                run_signature, current_contract.run_id,
+                run_signature, current_contract.run_id, result["evidence_id"],
+                project_id, period_id,
+            ),
         ).fetchone()
         if (
             int(total_counts["total"] or 0) == 0
@@ -603,11 +616,18 @@ def clear_fail_closed_state(
 
 
 def current_results_available(
-    conn: sqlite3.Connection, project_id: int
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    allow_state_clear: bool = True,
 ) -> dict[str, Any]:
     """返回所有当前成果读取/导出共用的运行级可用性。"""
     state = get_fail_closed_state(conn, project_id)
-    if state is not None and _pending_clear_is_committed(conn, project_id, state):
+    if (
+        allow_state_clear
+        and state is not None
+        and _pending_clear_is_committed(conn, project_id, state)
+    ):
         pending = state.get(_PENDING_CLEAR_KEY) or {}
         try:
             clear_fail_closed_state(
@@ -623,12 +643,14 @@ def current_results_available(
         else:
             state = None
     if state is None:
+        current = get_current_contract(conn, project_id)
         return {
             "available": True,
             "status": "available",
             "fail_closed": False,
             "reason": None,
-            "run_signature": current_run_signature(conn, project_id),
+            "run_signature": current.signature if current else None,
+            "run_id": current.run_id if current else None,
             "persisted": None,
             "persistence": None,
             "physical_limitations": [],
@@ -640,6 +662,8 @@ def current_results_available(
         "fail_closed": True,
         "reason": state.get("reason"),
         "run_signature": state.get("run_signature") or current_run_signature(conn, project_id),
+        "run_id": (get_current_contract(conn, project_id).run_id
+                   if get_current_contract(conn, project_id) else None),
         "persisted": state.get("persisted", False),
         "persistence": state.get("persistence"),
         "physical_limitations": list(state.get("physical_limitations") or []),
@@ -771,9 +795,15 @@ def _app_version() -> str:
     return "unknown"
 
 
-def _source_files(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+def _source_files(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    verify_stored_files: bool = True,
+) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT id, original_name, sha256, size_bytes, file_type, stored_path
+        """SELECT id, original_path, original_name, sha256, size_bytes, file_type,
+                         stored_path, imported_at
            FROM source_files WHERE project_id=? ORDER BY id""",
         (project_id,),
     ).fetchall()
@@ -781,28 +811,312 @@ def _source_files(conn: sqlite3.Connection, project_id: int) -> list[dict[str, A
     for row in rows:
         stored = Path(row["stored_path"])
         actual_sha = None
-        if stored.is_file():
+        if verify_stored_files and stored.is_file():
             try:
                 actual_sha = sha256_file(stored)
             except OSError:
                 actual_sha = None
         result.append({
             "file_id": int(row["id"]),
+            "original_path": row["original_path"],
             "original_name": row["original_name"],
             "sha256": row["sha256"],
             "stored_sha256": actual_sha,
             "size_bytes": int(row["size_bytes"]),
             "file_type": row["file_type"],
+            "imported_at": row["imported_at"],
         })
     return result
 
 
+def source_file_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+    *,
+    allow_unbound_sources: bool = False,
+) -> list[str]:
+    """检查当前 Run Contract 已登记源文件的不可变身份。
+
+    ``source_files`` 是原始证据链的根。新导入文件会使运行契约产生新签名，
+    但已经被旧契约引用的文件不能通过直接 SQL 改名、改 SHA、改大小或挪到
+    另一个项目后继续复用旧成果。该读取层检查与 v43 数据库触发器互补，
+    既保护新迁移库，也能在旧库/外部脚本绕过触发器时 fail-closed。
+
+    ``allow_unbound_sources`` 只供受控的 ``ensure_run_contract`` 入口使用：
+    新导入源文件应促成新合同，不应被“当前读取层”误报为旧身份篡改。
+    摘要、导出和其它只读路径保持默认严格模式，将未纳入合同的新文件视为
+    当前输入边界缺口；已登记文件的删除或身份变化无论在哪个模式都拒绝。
+
+    ``stored_path`` 是受控恢复字段，故不纳入身份比较；原始副本的内容
+    SHA-256 已在契约组件中保存，后续需要校验副本内容时可另行执行昂贵的
+    文件哈希，不在每次摘要读取中重复扫描大文件。
+    """
+    if contract is None:
+        return []
+    components = contract.components if isinstance(contract.components, dict) else {}
+    expected_files = components.get("source_files")
+    if not isinstance(expected_files, list):
+        return ["Run Contract 缺少 source_files 文件清单"]
+
+    rows = conn.execute(
+        """SELECT id, project_id, original_path, original_name, sha256,
+                         size_bytes, file_type, imported_at
+             FROM source_files WHERE project_id=? ORDER BY id""",
+        (int(project_id),),
+    ).fetchall()
+    actual_by_id = {int(row["id"]): row for row in rows}
+    gaps: list[str] = []
+    seen_ids: set[int] = set()
+    identity_fields = (
+        "original_path", "original_name", "sha256", "size_bytes",
+        "file_type", "imported_at",
+    )
+    for expected in expected_files:
+        if not isinstance(expected, dict):
+            gaps.append("Run Contract source_files 清单项不是对象")
+            continue
+        try:
+            file_id = int(expected["file_id"])
+        except (KeyError, TypeError, ValueError):
+            gaps.append("Run Contract source_files 缺少合法 file_id")
+            continue
+        if file_id in seen_ids:
+            gaps.append(f"Run Contract source_files 重复 file_id={file_id}")
+            continue
+        seen_ids.add(file_id)
+        row = actual_by_id.get(file_id)
+        if row is None:
+            gaps.append(f"Run Contract 引用的源文件不存在 file_id={file_id}")
+            continue
+        if int(row["project_id"]) != int(project_id):
+            gaps.append(f"源文件项目归属不一致 file_id={file_id}")
+            continue
+        for field in identity_fields:
+            # 旧契约可能没有新增的可选字段；对已登记字段严格比较，避免
+            # 升级旧库时凭空制造无法恢复的历史差异。
+            if field not in expected:
+                continue
+            actual = row[field]
+            wanted = expected[field]
+            if field == "size_bytes":
+                try:
+                    actual = int(actual)
+                    wanted = int(wanted)
+                except (TypeError, ValueError):
+                    pass
+            if actual != wanted:
+                gaps.append(
+                    f"源文件身份与当前 Run Contract 不一致 file_id={file_id} field={field}"
+                )
+    if not allow_unbound_sources:
+        for file_id in sorted(set(actual_by_id) - seen_ids):
+            gaps.append(f"当前项目存在未纳入 Run Contract 的源文件 file_id={file_id}")
+    return gaps
+
+
+def line_item_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """检查当前清单明细是否仍与运行契约的数据指纹一致。
+
+    line_items 是 A 路径的业务投影，虽然金额仍由 Decimal 计算，但它不是
+    原始网格本身。外部脚本若在运行后插入、删除或改写一行，不能继续复用
+    旧校核结果；当前摘要必须把该漂移作为证据缺口，而不是只拿覆盖证明
+    的金额快照显示绿色。
+    """
+    if contract is None:
+        return []
+    components = contract.components if isinstance(contract.components, dict) else {}
+    expected = components.get("data_fingerprint")
+    if not isinstance(expected, dict):
+        return ["Run Contract 缺少 line_items 数据指纹"]
+    actual = _line_item_digest(conn, int(project_id))
+    gaps: list[str] = []
+    for field in ("line_item_count", "line_items_sha256"):
+        if expected.get(field) != actual.get(field):
+            gaps.append(f"line_items 数据指纹与当前 Run Contract 不一致 field={field}")
+    return gaps
+
+
+def mapping_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """检查当前表头/数据范围映射是否仍是运行契约中的快照。
+
+    表头确认通过受控流程会删除旧行、写入新映射并重新形成 Run Contract；
+    读取旧运行时若有人直接追加一条“最新表头”，必须先降级，不能让新的
+    col_map 把原始金额列排除后仍沿用旧 A/B/C 结果。
+    """
+    if contract is None:
+        return []
+    components = contract.components if isinstance(contract.components, dict) else {}
+    expected = components.get("mappings")
+    if not isinstance(expected, list):
+        return ["Run Contract 缺少 table_headers 映射快照"]
+    actual = _mappings(conn, int(project_id))
+    if len(actual) != len(expected):
+        return ["table_headers 映射数量与当前 Run Contract 不一致"]
+    gaps: list[str] = []
+    for index, (wanted, current) in enumerate(zip(expected, actual, strict=True)):
+        if wanted != current:
+            header_id = current.get("header_id") if isinstance(current, dict) else None
+            gaps.append(
+                f"table_headers 映射与当前 Run Contract 不一致 index={index} header_id={header_id}"
+            )
+    return gaps
+
+
+def period_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """检查期次业务元数据是否仍与当前 Run Contract 快照一致。
+
+    期次标题、方向、合同方和计税口径都会影响 A/B/C 的业务解释。受控 API
+    修改这些字段后会形成新合同；旧库或外部 SQL 绕过入口时，摘要必须先把
+    旧结果降级，不能只因金额仍相等就继续显示当前充分。
+    """
+    if contract is None:
+        return []
+    components = contract.components if isinstance(contract.components, dict) else {}
+    expected = components.get("periods")
+    if not isinstance(expected, list):
+        return ["Run Contract 缺少 settlement_periods 期次快照"]
+    actual = _periods(conn, int(project_id))
+    if len(actual) != len(expected):
+        return ["settlement_periods 期次数量与当前 Run Contract 不一致"]
+    gaps: list[str] = []
+    for index, (wanted, current) in enumerate(zip(expected, actual, strict=True)):
+        if wanted != current:
+            period_id = current.get("id") if isinstance(current, dict) else None
+            gaps.append(
+                "settlement_periods 期次快照与当前 Run Contract 不一致 "
+                f"index={index} period_id={period_id}"
+            )
+    return gaps
+
+
+def sheet_scope_contract_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """检查 Sheet/原始网格范围快照是否仍与当前 Run Contract 一致。
+
+    ``raw_sheets`` 的工作表名、所属文件/期次、行列边界、隐藏/合并元数据和
+    原始网格的轻量计数都属于取数范围事实。新库由 v42/v43 触发器保护；读取
+    层还必须覆盖旧库或外部 SQL 绕过触发器的情况。
+    """
+    if contract is None:
+        return []
+    components = contract.components if isinstance(contract.components, dict) else {}
+    expected = components.get("sheet_scope")
+    if not isinstance(expected, list):
+        return ["Run Contract 缺少 raw_sheets 范围快照"]
+    actual = _sheet_scope(conn, int(project_id))
+    if len(actual) != len(expected):
+        return ["raw_sheets 工作表数量与当前 Run Contract 不一致"]
+    gaps: list[str] = []
+    for index, (wanted, current) in enumerate(zip(expected, actual, strict=True)):
+        if wanted != current:
+            sheet_id = current.get("sheet_id") if isinstance(current, dict) else None
+            gaps.append(
+                "raw_sheets 范围快照与当前 Run Contract 不一致 "
+                f"index={index} sheet_id={sheet_id}"
+            )
+    return gaps
+
+
+def contract_input_gaps(
+    conn: sqlite3.Connection,
+    project_id: int,
+    contract: RunContract | None,
+) -> list[str]:
+    """复核 Run Contract 中尚未有专用读取闸门的项目输入快照。
+
+    现有专用检查负责源文件身份、Sheet 范围、表头映射、期次和清单指纹；
+    其余合同组成（项目版本、清洗决定、别名、规则目录、合同事实、权威
+    清单和人工审计快照）也必须在外部 SQL/旧库绕过受控 API 时 fail-closed。
+    这里使用与建合同相同的确定性序列化重新计算输入签名，并报告发生变化
+    的顶层组成。为避免每次摘要读取重复扫描大文件，比较模式不重算受控
+    stored_path 的文件内容哈希；文件身份和原始网格仍由专用闸门检查。
+    """
+    if contract is None:
+        return []
+    expected = contract.components if isinstance(contract.components, dict) else {}
+    try:
+        actual = build_run_contract_components(
+            conn, int(project_id), verify_stored_files=False
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        return [f"Run Contract 输入快照无法重算：{type(exc).__name__}"]
+
+    def comparable(value: Any, *, key: str) -> Any:
+        if key != "source_files" or not isinstance(value, list):
+            return value
+        # stored_sha256 是受控副本内容的昂贵校验值；当前读取层不因省略
+        # 重算而误报，source_files 的身份字段仍由 source_file_contract_gaps
+        # 严格比较，原始网格由 sheet_scope_contract_gaps 比较。
+        return [
+            {field: item[field] for field in item if field != "stored_sha256"}
+            if isinstance(item, dict) else item
+            for item in value
+        ]
+
+    gaps: list[str] = []
+    keys = sorted(set(expected) | set(actual))
+    for key in keys:
+        if key in {"source_files", "sheet_scope", "mappings", "periods", "data_fingerprint"}:
+            continue
+        # 持久化合同已经经过 canonical_json：Decimal 会变成字符串，
+        # set/frozenset 会变成有序列表。直接比较 Python 对象会把同一规则
+        # 快照误判为变化，进而令所有当前 Evidence 失效。用与签名生成完全
+        # 相同的规范化序列比较语义值；真实字段变化仍会产生不同 JSON。
+        expected_value = canonical_json(comparable(expected.get(key), key=key))
+        actual_value = canonical_json(comparable(actual.get(key), key=key))
+        if expected_value != actual_value:
+            gaps.append(f"Run Contract 输入组成发生变化 field={key}")
+    return gaps
+
+
 def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+    def raw_cell_digest(sheet_id: int) -> str:
+        digest = hashlib.sha256()
+        cells = conn.execute(
+            """SELECT row, col, raw_value, cached_value, is_formula,
+                              is_number_stored_as_text, num_fmt
+                 FROM raw_cells WHERE sheet_id=? ORDER BY row, col""",
+            (int(sheet_id),),
+        ).fetchall()
+        for cell in cells:
+            digest.update(
+                canonical_json({
+                    "row": int(cell["row"]),
+                    "col": int(cell["col"]),
+                    "raw_value": cell["raw_value"],
+                    "cached_value": cell["cached_value"],
+                    "is_formula": int(cell["is_formula"] or 0),
+                    "is_number_stored_as_text": int(cell["is_number_stored_as_text"] or 0),
+                    "num_fmt": cell["num_fmt"] or "",
+                }).encode("utf-8")
+            )
+            digest.update(b"\n")
+        return digest.hexdigest()
+
     rows = conn.execute(
         """SELECT rs.id, rs.batch_id, rs.sheet_index, rs.sheet_name, rs.period_id,
                   rs.n_rows, rs.n_cols, rs.merged_ranges_json,
                   rs.hidden_rows_json, rs.hidden_cols_json,
-                  pb.file_id, sf.sha256 AS file_sha256
+                  rs.sheet_status, rs.sheet_status_reason,
+                  rs.sheet_status_updated_at, rs.sheet_status_actor,
+                  pb.file_id, pb.parser, pb.parsed_at, pb.status AS batch_status,
+                  pb.stats_json AS batch_stats_json, sf.sha256 AS file_sha256
            FROM raw_sheets rs
            JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
@@ -821,9 +1135,17 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
             "batch_id": int(row["batch_id"]),
             "file_id": int(row["file_id"]),
             "file_sha256": row["file_sha256"],
+            "parser": row["parser"],
+            "parsed_at": row["parsed_at"],
+            "batch_status": row["batch_status"],
+            "batch_stats": _loads(row["batch_stats_json"], {}),
             "sheet_index": int(row["sheet_index"]),
             "sheet_name": row["sheet_name"],
             "period_id": int(row["period_id"]) if row["period_id"] is not None else None,
+            "sheet_status": row["sheet_status"],
+            "sheet_status_reason": row["sheet_status_reason"],
+            "sheet_status_updated_at": row["sheet_status_updated_at"],
+            "sheet_status_actor": row["sheet_status_actor"],
             "n_rows": int(row["n_rows"]),
             "n_cols": int(row["n_cols"]),
             "merged_ranges": _loads(row["merged_ranges_json"], []),
@@ -834,6 +1156,7 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
             "raw_cell_count": int(raw_cell_meta["cell_count"] or 0),
             "raw_cell_max_row": raw_cell_meta["max_row"],
             "raw_cell_max_col": raw_cell_meta["max_col"],
+            "raw_cell_sha256": raw_cell_digest(int(row["id"])),
         })
     return result
 
@@ -873,7 +1196,8 @@ def _mappings(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]
 
 def _periods(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """SELECT id, period_no, title, direction, contract_party, tax_mode, note
+        """SELECT id, period_no, title, source_file_id, direction,
+                          contract_party, tax_mode, note
            FROM settlement_periods WHERE project_id=? ORDER BY id""",
         (project_id,),
     ).fetchall()
@@ -932,7 +1256,22 @@ def _aliases(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
            FROM item_aliases WHERE project_id=? ORDER BY id""",
         (project_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    legacy = [dict(row) for row in rows]
+    # v27 知识库是新的权威别名快照；保留旧 item_aliases 仅为兼容历史项目，
+    # 但新 active/revoked 版本必须进入合同指纹，撤销也会使旧运行退出 current。
+    try:
+        from jiadun.core.matching import knowledge
+
+        current = knowledge.current_alias_snapshot(conn, project_id)
+    except (ImportError, sqlite3.Error):
+        current = []
+    return [
+        {"source": "item_aliases", **item}
+        for item in legacy
+    ] + [
+        {"source": "alias_knowledge", **item}
+        for item in current
+    ]
 
 
 def _contract_facts(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
@@ -971,6 +1310,8 @@ def _manifest_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
         "declared_at": manifest["declared_at"],
         "control_hash": manifest["control_hash"],
         "version": manifest["version"],
+        "status": manifest["status"],
+        "manifest_note": manifest["note"],
         "entries": [
             {
                 "logical_key": row["logical_key"],
@@ -981,6 +1322,8 @@ def _manifest_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
                 "expected_sheet_name": row["expected_sheet_name"],
                 "required": bool(row["required"]),
                 "received_file_id": row["received_file_id"],
+                "state": row["state"],
+                "note": row["note"],
                 "source_reference": _loads(row["source_reference_json"], {}),
             }
             for row in entries
@@ -988,14 +1331,108 @@ def _manifest_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]
     }
 
 
-def _rule_config() -> dict[str, Any]:
+def _rule_config(
+    conn: sqlite3.Connection | None = None,
+    project_id: int | None = None,
+) -> dict[str, Any]:
     # 延迟导入避免 contracts 包初始化时与 anomalies.rules 的 Finding 导入形成环。
     from jiadun.core.anomalies import rules
 
     names = ("ROUND_TOL", "PRICE_CHANGE_PCT", "QTY_SPIKE_RATIO", "LARGE_INT_THRESHOLDS", "UNIT_ALIASES")
     values = {name: getattr(rules, name) for name in names if hasattr(rules, name)}
     values["rule_ids"] = [rule.__name__ for rule in rules.ALL_RULES]
+    values["version"] = "anomaly-rules-v1"
+    if conn is not None and project_id is not None:
+        try:
+            from jiadun.core.anomalies import catalog
+
+            configured = catalog.rule_config_snapshot(conn, int(project_id))
+        except sqlite3.Error:
+            # 迁移中的极早期数据库可能尚未建立配置表；保留全启用
+            # 默认快照，不能把规则配置缺失误报为规则全部关闭。
+            values["catalog_version"] = "unavailable"
+            values["enabled_rule_ids"] = list(values["rule_ids"])
+            values["disabled_rule_ids"] = []
+            values["configurations"] = []
+        else:
+            values["catalog_version"] = configured["version"]
+            values["enabled_rule_ids"] = configured["enabled_rule_ids"]
+            values["disabled_rule_ids"] = configured["disabled_rule_ids"]
+            values["configurations"] = configured["configurations"]
+    else:
+        values["catalog_version"] = "unbound"
+        values["enabled_rule_ids"] = list(values["rule_ids"])
+        values["disabled_rule_ids"] = []
+        values["configurations"] = []
     return values
+
+
+def _cleaning_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+    """保存清洗提议/决定的完整快照，避免仅凭事件数量判断输入。"""
+    rows = conn.execute(
+        """SELECT event_key, subject_type, subject_id, field_name,
+                  before_json, proposed_json, status, reason, actor, created_at,
+                  decided_at, decided_by, decision_note, evidence_id, audit_id
+           FROM cleaning_changes WHERE project_id=? ORDER BY id""",
+        (project_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _project_version_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
+    """把最新项目版本的事实快照纳入合同，但排除运行绑定字段。"""
+    try:
+        row = conn.execute(
+            """SELECT id, version_no, version_kind, title, description,
+                      source_manifest_id, snapshot_sha256, item_count,
+                      created_by, created_at, reason, evidence_id, audit_id,
+                      metadata_json
+               FROM project_versions WHERE project_id=?
+               ORDER BY version_no DESC, id DESC LIMIT 1""",
+            (int(project_id),),
+        ).fetchone()
+    except sqlite3.Error:
+        return {"status": "not_available", "version": None}
+    if row is None:
+        return {"status": "not_available", "version": None}
+    return {
+        "status": "available",
+        "version": {
+            "id": int(row["id"]),
+            "version_no": int(row["version_no"]),
+            "version_kind": row["version_kind"],
+            "title": row["title"],
+            "description": row["description"] or "",
+            "source_manifest_id": row["source_manifest_id"],
+            "snapshot_sha256": row["snapshot_sha256"],
+            "item_count": int(row["item_count"] or 0),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "reason": row["reason"],
+            "evidence_id": row["evidence_id"],
+            "audit_id": row["audit_id"],
+            "metadata": _loads(row["metadata_json"], {}),
+        },
+    }
+
+
+def _human_confirmation_snapshot(
+    conn: sqlite3.Connection, project_id: int
+) -> list[dict[str, Any]]:
+    """把人工操作前后值、原因和时间纳入合同快照。
+
+    ``run_id``/``run_signature`` 是这条审计记录的绑定结果，不是人工操作
+    本身的输入。若把绑定字段也纳入指纹，人工操作完成后为了绑定新合同
+    又会改变合同指纹，造成“刚绑定即失效”的自引用循环。这里保留操作
+    身份、前后值、原因和时间等责任证据，排除仅用于定位当前运行的绑定
+    字段；绑定字段仍保留在 ``audit_log``，可由 Evidence/Audit 查询追溯。
+    """
+    rows = conn.execute(
+        """SELECT ts, actor, action, target, before_json, after_json, reason
+           FROM audit_log WHERE project_id=? ORDER BY id""",
+        (project_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def build_run_contract_components(
@@ -1004,9 +1441,12 @@ def build_run_contract_components(
     config: dict[str, Any] | None = None,
     *,
     code_version: str | None = None,
+    verify_stored_files: bool = True,
 ) -> dict[str, Any]:
     """构造可审阅的运行契约组成部分。"""
     schema_version = migrations.current_version(conn)
+    aliases = _aliases(conn, project_id)
+    manifest_scope = _manifest_scope(conn, project_id)
     return {
         "format_version": CONTRACT_FORMAT_VERSION,
         # 产品身份属于运行契约的一部分。品牌/发行包从 CostGuard 迁移为
@@ -1017,15 +1457,41 @@ def build_run_contract_components(
         "project_id": int(project_id),
         "schema_version": schema_version,
         "code_version": code_version or _app_version(),
-        "source_files": _source_files(conn, project_id),
+        # 项目版本链尚未创建时显式记录不可用；创建版本后只纳入最新
+        # 版本的事实快照，运行绑定字段不参与指纹。
+        "project_version": _project_version_scope(conn, project_id),
+        "source_files": _source_files(
+            conn, project_id, verify_stored_files=verify_stored_files
+        ),
         "sheet_scope": _sheet_scope(conn, project_id),
         "mappings": _mappings(conn, project_id),
         "periods": _periods(conn, project_id),
-        "aliases": _aliases(conn, project_id),
+        "aliases": aliases,
+        "alias_library_version": stable_fingerprint(aliases),
+        "human_confirmation_snapshot": _human_confirmation_snapshot(conn, project_id),
+        "cleaning_rule_version": "cleaning-v1",
+        "cleaning_changes": _cleaning_scope(conn, project_id),
+        "matching_rule_version": "matching-v1",
+        "matching_rule_config": {
+            "composite_key_version": "composite-key-v1",
+            "similarity_confirmed": "97.0",
+            "similarity_suspected": "85.0",
+        },
+        "anomaly_rule_version": "anomaly-rules-v1",
+        "selected_rule_ids": _rule_config(conn, project_id)["enabled_rule_ids"],
+        "decimal_precision": int(getcontext().prec),
+        "decimal_rounding": str(ROUND_HALF_UP),
+        "decimal_scale": "0.01",
+        # 当前项目模型没有可靠的金额单位字段；unknown 必须触发后续人工
+        # 口径确认，不能从项目名、税率或文件名推断人民币/元。
+        "amount_unit": "unknown",
         "contract_facts": _contract_facts(conn, project_id),
-        "import_manifest": _manifest_scope(conn, project_id),
+        "import_manifest": manifest_scope,
+        # P0-03 要求合同明确绑定权威清单的状态快照；保留旧键供兼容读取，
+        # 新键让审阅者无需从组件名称猜测其语义。
+        "manifest_state_snapshot": manifest_scope,
         "data_fingerprint": _line_item_digest(conn, project_id),
-        "rules": _rule_config(),
+        "rules": _rule_config(conn, project_id),
         "config": config or {},
     }
 
@@ -1037,6 +1503,7 @@ def compute_run_signature(components: dict[str, Any]) -> str:
 @dataclass(frozen=True)
 class RunContract:
     contract_id: int
+    run_id: str
     project_id: int
     signature: str
     components: dict[str, Any]
@@ -1051,6 +1518,7 @@ class RunContract:
 def _row_to_contract(row: sqlite3.Row) -> RunContract:
     return RunContract(
         contract_id=int(row["id"]),
+        run_id=row["run_id"],
         project_id=int(row["project_id"]),
         signature=row["signature"],
         components=_loads(row["components_json"], {}),
@@ -1061,7 +1529,7 @@ def _row_to_contract(row: sqlite3.Row) -> RunContract:
 
 def get_current_contract(conn: sqlite3.Connection, project_id: int) -> RunContract | None:
     row = conn.execute(
-        """SELECT id, project_id, signature, components_json, created_at, invalidated_at
+        """SELECT id, run_id, project_id, signature, components_json, created_at, invalidated_at
            FROM run_contracts WHERE project_id=? AND invalidated_at IS NULL
            ORDER BY id DESC LIMIT 1""",
         (project_id,),
@@ -1094,11 +1562,21 @@ def ensure_run_contract(
     code_version: str | None = None,
 ) -> RunContract:
     """创建或切换当前运行契约，并自动使旧导出失效。"""
+    current = get_current_contract(conn, project_id)
+    # 运行契约切换前先检查已引用的源文件身份。若外部脚本直接改写了
+    # source_files，不能把被篡改后的元数据当成“新输入”创建绿色新合同；
+    # 让上层入口进入 fail-closed，并保留原始合同和审计现场。
+    identity_gaps = source_file_contract_gaps(
+        conn, project_id, current, allow_unbound_sources=True
+    )
+    if identity_gaps:
+        raise RuntimeError(
+            "当前 Run Contract 源文件身份不一致：" + "; ".join(identity_gaps)
+        )
     components = build_run_contract_components(
         conn, project_id, config=config, code_version=code_version
     )
     signature = compute_run_signature(components)
-    current = get_current_contract(conn, project_id)
     if current and current.signature == signature:
         return current
 
@@ -1109,28 +1587,20 @@ def ensure_run_contract(
                 "UPDATE run_contracts SET invalidated_at=? WHERE project_id=? AND invalidated_at IS NULL",
                 (now, project_id),
             )
+        # 同一项目即使恢复到历史相同签名，也必须创建新的运行合同。签名用于
+        # 结果范围隔离，run_id 才是本次不可变运行身份；不得重新激活或改写旧行。
+        run_id = f"run-{uuid.uuid4().hex}"
+        cur = conn.execute(
+            """INSERT INTO run_contracts(
+                   run_id, project_id, signature, components_json, created_at, invalidated_at
+               ) VALUES (?,?,?,?,?,NULL)""",
+            (run_id, project_id, signature, canonical_json(components), now),
+        )
         row = conn.execute(
-            "SELECT id, project_id, signature, components_json, created_at, invalidated_at "
-            "FROM run_contracts WHERE project_id=? AND signature=?",
-            (project_id, signature),
+            """SELECT id, run_id, project_id, signature, components_json, created_at, invalidated_at
+               FROM run_contracts WHERE id=?""",
+            (cur.lastrowid,),
         ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE run_contracts SET components_json=?, created_at=?, invalidated_at=NULL WHERE id=?",
-                (canonical_json(components), now, row["id"]),
-            )
-        else:
-            cur = conn.execute(
-                """INSERT INTO run_contracts(
-                       project_id, signature, components_json, created_at, invalidated_at
-                   ) VALUES (?,?,?,?,NULL)""",
-                (project_id, signature, canonical_json(components), now),
-            )
-            row = conn.execute(
-                """SELECT id, project_id, signature, components_json, created_at, invalidated_at
-                   FROM run_contracts WHERE id=?""",
-                (cur.lastrowid,),
-            ).fetchone()
         # export_runs 是用户可见成果登记，必须明确变成 stale，而不是删除文件或
         # 用新签名覆盖旧记录。
         conn.execute(
@@ -1140,9 +1610,9 @@ def ensure_run_contract(
             (project_id, signature),
         )
     refreshed = conn.execute(
-        """SELECT id, project_id, signature, components_json, created_at, invalidated_at
-           FROM run_contracts WHERE project_id=? AND signature=?""",
-        (project_id, signature),
+        """SELECT id, run_id, project_id, signature, components_json, created_at, invalidated_at
+           FROM run_contracts WHERE id=?""",
+        (row["id"],),
     ).fetchone()
     return _row_to_contract(refreshed)
 
@@ -1165,12 +1635,23 @@ def adopt_unsigned_records(conn: sqlite3.Connection, project_id: int, signature:
     是没有经过新 API 的即时写入（例如插件/旧脚本补充的一条审核问题）。
     不覆盖已有非 NULL 签名，也不改动历史失效记录。
     """
+    signature = str(signature or "").strip()
+    if not signature:
+        raise ValueError("兼容绑定必须提供非空 Run Contract 签名")
     changed = 0
+    current = get_current_contract(conn, project_id)
+    if current is None or current.signature != signature:
+        # 不能把 NULL/NULL 兼容记录绑定到任意外部字符串；这会产生一个
+        # 不属于当前运行的“伪身份”，后续 current_scope 既读不到又无法证明
+        # 它为何被绑定。调用方必须先取得当前活动合同，再执行兼容收口。
+        raise ValueError("兼容绑定签名不是当前活动 Run Contract，拒绝绑定")
+    run_id = current.run_id
     with _transaction(conn, "adopt_unsigned_records"):
         for table in ("period_totals", "crosscheck_results", "matches", "anomalies"):
             cur = conn.execute(
-                f"UPDATE {table} SET run_signature=? WHERE project_id=? AND run_signature IS NULL",
-                (signature, project_id),
+                f"UPDATE {table} SET run_signature=?, run_id=? "
+                "WHERE project_id=? AND run_signature IS NULL AND run_id IS NULL",
+                (signature, run_id, project_id),
             )
             changed += int(cur.rowcount or 0)
     return changed
@@ -1190,16 +1671,90 @@ def current_scope(
     # 事务因持续 COMMIT 拒绝而全部回滚，任何当前读取面都必须返回空集。
     if get_fail_closed_state(conn, project_id) is not None:
         return "1=0", ()
-    signature = current_run_signature(conn, project_id)
+    current = get_current_contract(conn, project_id)
+    signature = current.signature if current else None
     if signature:
+        # v0.1.9 之后同一输入签名允许出现多个不可变运行合同；只按
+        # signature 会把历史同签名结果重新带回 current。自动成果表现在
+        # 以独立 run_id 作为主筛选键，缺失 run_id 的旧结果继续 fail-closed。
+        current_run_id = current.run_id if current else None
+        run_id_tables = {"cr", "pt", "m", "a"}
+        if table_alias in {"e", "ev"}:
+            alias = table_alias
+            # source 证据没有运行身份，属于原始资料链，可在当前项目中继续
+            # 回溯；current/human 证据必须同时命中当前 signature + run_id。
+            # historical 明确排除，避免详情页把旧证据当作当前证据。
+            return (
+                f"(({alias}.scope='source' AND {alias}.kind<>'cross_check' AND ("
+                f"({alias}.run_signature IS NULL AND {alias}.run_id IS NULL) OR "
+                f"({alias}.run_signature=? AND {alias}.run_id=?))) OR "
+                f"({alias}.scope IN ('current','human') AND "
+                f"{alias}.run_signature=? AND {alias}.run_id=?))",
+                (signature, current.run_id, signature, current.run_id),
+            )
+        if table_alias == "a":
+            # anomalies 在早期/插件兼容入口中没有统一的 run_id；迁移 v9
+            # 已把真正旧结果标为 legacy:stale，因此仅保留当前库中仍为
+            # NULL/NULL 的新人工或外部待复核记录。自动检测路径始终写入
+            # 当前 run_id，不得把缺失身份的旧自动结果当作当前成功结论。
+            return (
+                f"(({table_alias}.run_id=? AND {table_alias}.run_signature=? "
+                f"AND {table_alias}.status NOT IN ('stale', 'historical') "
+                f"AND COALESCE({table_alias}.lifecycle_status, 'new')<>'historical') OR "
+                f"({table_alias}.run_id IS NULL AND {table_alias}.run_signature IS NULL "
+                f"AND {table_alias}.status NOT IN ('stale', 'historical') "
+                f"AND COALESCE({table_alias}.lifecycle_status, 'new')<>'historical'))",
+                (current.run_id, signature),
+            )
+        identity_column = "run_id" if table_alias in run_id_tables else "run_signature"
+        identity_value = current_run_id if identity_column == "run_id" else signature
         if table_alias == "cr":
             return (
-                f"{table_alias}.run_signature=? AND "
+                f"{table_alias}.run_id=? AND {table_alias}.run_signature=? AND "
                 f"{table_alias}.status NOT IN ('invalidated', 'stale')",
-                (signature,),
+                (current_run_id, signature),
             )
-        return f"{table_alias}.run_signature=?", (signature,)
-    return f"{table_alias}.run_signature IS NULL", ()
+        if table_alias in {"pt", "m"}:
+            return (
+                f"{table_alias}.run_id=? AND {table_alias}.run_signature=?",
+                (current_run_id, signature),
+            )
+        return f"{table_alias}.{identity_column}=?", (identity_value,)
+    if table_alias in {"e", "ev"}:
+        return (
+            f"{table_alias}.scope='source' AND {table_alias}.kind<>'cross_check' "
+            f"AND {table_alias}.run_signature IS NULL AND {table_alias}.run_id IS NULL",
+            (),
+        )
+    # 没有任何活动 Run Contract 时，只能保留明确属于“尚未形成运行”的
+    # 兼容新写入。旧迁移行、已失效的校核/匹配不能因 NULL/NULL 身份重新
+    # 进入当前读取面；否则项目列表或摘要会把历史绿色状态当成当前结论。
+    if table_alias == "a":
+        return (
+            "a.run_signature IS NULL AND a.run_id IS NULL "
+            "AND COALESCE(a.status, 'open') NOT IN ('stale', 'historical') "
+            "AND COALESCE(a.lifecycle_status, 'new') <> 'historical'",
+            (),
+        )
+    if table_alias == "cr":
+        return (
+            "cr.run_signature IS NULL AND cr.run_id IS NULL "
+            "AND COALESCE(cr.status, 'pending') NOT IN ('invalidated', 'stale')",
+            (),
+        )
+    if table_alias == "pt":
+        return (
+            "pt.run_signature IS NULL AND pt.run_id IS NULL "
+            "AND COALESCE(pt.cross_check_status, 'pending') NOT IN ('invalidated', 'stale')",
+            (),
+        )
+    if table_alias == "m":
+        return (
+            "m.run_signature IS NULL AND m.run_id IS NULL "
+            "AND COALESCE(m.status, 'pending') NOT IN ('historical', 'stale', 'invalidated')",
+            (),
+        )
+    return f"{table_alias}.run_signature IS NULL AND {table_alias}.run_id IS NULL", ()
 
 
 def register_export(
@@ -1214,7 +1769,9 @@ def register_export(
     """登记一个已落盘的成果文件；同类旧文件只标记 stale，不删除。"""
     require_current_results_available(conn, project_id, operation="导出成果登记")
     target = Path(path)
-    signature = run_signature or current_run_signature(conn, project_id, ensure=True)
+    active_contract = ensure_run_contract(conn, project_id)
+    signature = run_signature or active_contract.signature
+    run_id = active_contract.run_id if signature == active_contract.signature else None
     file_sha = sha256_file(target) if target.is_file() else None
     now = _now()
     with _transaction(conn, "register_export"):
@@ -1226,12 +1783,13 @@ def register_export(
         cur = conn.execute(
             """INSERT INTO export_runs(
                    project_id, kind, path, run_signature, file_sha256,
-                   generated_at, status, metadata_json
-               ) VALUES (?,?,?,?,?,?,?,?)""",
+                   generated_at, status, metadata_json, run_id
+               ) VALUES (?,?,?,?,?,?,?,?,?)""",
             (
                 project_id, kind, str(target), signature, file_sha, now,
                 "current" if file_sha else "missing",
                 canonical_json(metadata or {}),
+                run_id,
             ),
         )
     return int(cur.lastrowid)
@@ -1250,14 +1808,19 @@ def export_status(
         params.append(kind)
     sql += " ORDER BY generated_at DESC, id DESC"
     availability = current_results_available(conn, project_id)
-    signature = current_run_signature(conn, project_id)
+    current_contract = get_current_contract(conn, project_id)
+    signature = current_contract.signature if current_contract else None
     result = []
     for row in conn.execute(sql, params):
         status = row["status"]
         target = Path(row["path"])
         if not availability["available"]:
             status = FAIL_CLOSED_STATUS
-        elif not signature or row["run_signature"] != signature:
+        elif (
+            not current_contract
+            or row["run_signature"] != signature
+            or row["run_id"] != current_contract.run_id
+        ):
             status = "stale"
         elif not target.is_file():
             status = "missing"
@@ -1272,6 +1835,7 @@ def export_status(
             "kind": row["kind"],
             "path": row["path"],
             "run_signature": row["run_signature"],
+            "run_id": row["run_id"],
             "file_sha256": row["file_sha256"],
             "generated_at": row["generated_at"],
             "status": status,

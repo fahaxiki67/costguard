@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from jiadun.core.contracts import run_contract
+from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.models.source_file import import_file
-from jiadun.core.parsing import excel_parser, extract_items
+from jiadun.core.parsing import coverage_proof, excel_parser, extract_items
 from jiadun.core.parsing.header_detect import HeaderDetection, detect_header
 
 
@@ -50,20 +51,40 @@ SUMMARY_LIKE_PATTERN = re.compile(r"汇总|核销|台账|summary|reconciliation|
 # raw_sheets/audit_log/evidence 中，但不应继续阻塞项目校核状态。
 PENDING_SHEETS_SQL = """
 SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_cols, rs.n_rows, sf.original_name,
+       rs.sheet_status, rs.sheet_status_reason,
        th.col_map_json, th.header_row_lo, th.header_row_hi, th.needs_review,
        th.data_row_start, th.data_row_end, th.data_range_status, th.data_range_method
 FROM raw_sheets rs
 JOIN parse_batches pb ON pb.id = rs.batch_id
 JOIN source_files sf ON sf.id = pb.file_id
 LEFT JOIN table_headers th ON th.sheet_id = rs.id
-WHERE sf.project_id=? AND rs.period_id IS NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM audit_log al
-      WHERE al.project_id=sf.project_id
-        AND al.target='sheet:'||rs.id
-        AND al.action='confirm_sheet_non_settlement_role'
-  )
+WHERE sf.project_id=? AND rs.sheet_status='pending'
 ORDER BY sf.id, rs.id"""
+
+
+def set_sheet_status(
+    conn: sqlite3.Connection,
+    sheet_id: int,
+    status: str,
+    *,
+    reason: str = "",
+    actor: str | None = None,
+) -> None:
+    """持久化 Sheet 四级状态；状态码只允许来自统一状态合同。"""
+    from jiadun.core.reporting.state import SHEET_STATE_CODES
+
+    if status not in SHEET_STATE_CODES:
+        raise ValueError(f"不支持的 Sheet 状态: {status!r}")
+    from datetime import datetime
+
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """UPDATE raw_sheets
+           SET sheet_status=?, sheet_status_reason=?, sheet_status_updated_at=?,
+               sheet_status_actor=?
+           WHERE id=?""",
+        (status, reason.strip(), now, actor, int(sheet_id)),
+    )
 
 
 def pending_sheet_count(conn: sqlite3.Connection, project_id: int) -> int:
@@ -77,16 +98,302 @@ def pending_sheet_count(conn: sqlite3.Connection, project_id: int) -> int:
            FROM raw_sheets rs
            JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
-           WHERE sf.project_id=? AND rs.period_id IS NULL
-             AND NOT EXISTS (
-                 SELECT 1 FROM audit_log al
-                 WHERE al.project_id=sf.project_id
-                   AND al.target='sheet:'||rs.id
-                   AND al.action='confirm_sheet_non_settlement_role'
-             )""",
+           WHERE sf.project_id=? AND rs.sheet_status='pending'""",
         (project_id,),
     ).fetchone()
     return int(row["c"] if row else 0)
+
+
+def _persist_coverage_proof(
+    conn: sqlite3.Connection,
+    *,
+    project_id: int,
+    file_id: int,
+    batch_id: int,
+    sheet_id: int,
+    period_id: int | None,
+    direction: str,
+    proof: coverage_proof.SheetCoverageProof,
+    rows: list[coverage_proof.RowClassification],
+    run_signature: str | None = None,
+    run_id: str | None = None,
+) -> int:
+    """保存 Sheet 覆盖证明及其 Evidence；证明失败不得静默转为成功。"""
+    evidence_id = evidence_api.add_evidence(
+        conn,
+        project_id,
+        "sheet_coverage_proof",
+        f"Sheet 覆盖证明：数据区第{proof.raw_row_start}至{proof.raw_row_end}行，"
+        f"分类{proof.classified_row_count}行，参与累计{proof.business_rows_used}行，状态{proof.proof_status}",
+        steps=[
+            {
+                "step": "逐行分类",
+                "raw_data_row_count": proof.raw_data_row_count,
+                "classified_row_count": proof.classified_row_count,
+                "counts": proof.counts,
+                "proof_status": proof.proof_status,
+                "proof_reason": proof.proof_reason,
+                "ab_row_set_status": proof.ab_row_set_status,
+                "ab_independence_level": proof.ab_independence_level,
+            }
+        ],
+        sources=[
+            {
+                "file_id": file_id,
+                "batch_id": batch_id,
+                "sheet_id": sheet_id,
+                "period_id": period_id,
+                "direction": direction,
+                "location": (
+                    f"行{proof.raw_row_start}-行{proof.raw_row_end}，"
+                    f"列{proof.raw_col_start}-列{proof.raw_col_end}"
+                ),
+            }
+        ],
+        commit=False,
+        run_signature=run_signature,
+        run_id=run_id,
+        scope="current" if (run_signature or run_id) else "source",
+    )
+    return coverage_proof.persist_sheet_coverage_proof(
+        conn,
+        project_id=project_id,
+        file_id=file_id,
+        batch_id=batch_id,
+        sheet_id=sheet_id,
+        period_id=period_id,
+        direction=direction,
+        proof=proof,
+        rows=rows,
+        run_signature=run_signature,
+        run_id=run_id,
+        evidence_id=evidence_id,
+        commit=False,
+    )
+
+
+def _rebind_coverage_proofs_for_run(
+    conn: sqlite3.Connection,
+    project_id: int,
+    previous: run_contract.RunContract | None,
+    current: run_contract.RunContract,
+    *,
+    reason: str,
+) -> int:
+    """把未受数据影响的旧覆盖证明重新固化到新运行。
+
+    人工确认“非结算 Sheet”只改变项目门控事实，不改变结算 Sheet 的原始
+    网格、行分类或金额。旧证明仍作为历史快照保留；这里追加一份逐字段相同、
+    但绑定新 ``run_id`` 的当前证明，并为其生成新的当前 Evidence。若输入
+    运行不存在或没有旧证明，返回 0，不通过任何默认值补齐。
+    """
+    if previous is None or previous.run_id == current.run_id:
+        return 0
+    # 运行契约的变化可能已经经历多次派生运行。例如先完成一次校核、再
+    # 聚合、再确认非结算 Sheet 时，某些 Sheet 的最近证明属于更早的运行，
+    # 而不一定属于 ``previous``。只取上一运行会让这些 Sheet 在当前运行
+    # 丢失覆盖证明，导致 C 路径被错误降级为 ``unproven``。因此按每个
+    # Sheet 取最新一份历史证明，并排除当前运行；证明本身是不可变快照，
+    # 跨运行复用不会改变原始网格或逐行分类。
+    rows = conn.execute(
+        """SELECT p.*
+           FROM sheet_coverage_proofs p
+           WHERE p.project_id=?
+             AND p.period_id IS NOT NULL
+             AND NOT (p.run_signature=? AND p.run_id=?)
+             AND p.id=(SELECT MAX(p2.id) FROM sheet_coverage_proofs p2
+                       WHERE p2.project_id=p.project_id AND p2.sheet_id=p.sheet_id
+                         AND p2.period_id IS NOT NULL)
+           ORDER BY p.id""",
+        (project_id, current.signature, current.run_id),
+    ).fetchall()
+    if not rows:
+        return 0
+    from datetime import datetime
+
+    rebound = 0
+    for row in rows:
+        # 方向属于 Run Contract 输入，而不是 coverage 证明的原始网格事实。
+        # 方向可能由人工确认或历史兼容脚本在上一次证明之后才被补齐；重绑
+        # 时必须读取当前 period 的方向，不能把旧快照中的 ``unknown`` 再
+        # 复制到当前运行，否则摘要的 period/sheet/方向证据闸门会误判为
+        # 证据不一致。旧 proof 仍保持不可变并留作历史追溯。
+        current_period = conn.execute(
+            "SELECT direction FROM settlement_periods WHERE id=? AND project_id=?",
+            (row["period_id"], project_id),
+        ).fetchone()
+        current_direction = (
+            str(current_period["direction"] or "unknown")
+            if current_period is not None else str(row["direction"] or "unknown")
+        )
+        old_evidence = conn.execute(
+            "SELECT sources_json FROM evidence WHERE id=?",
+            (row["evidence_id"],),
+        ).fetchone()
+        try:
+            old_sources = json.loads(old_evidence["sources_json"] or "[]") if old_evidence else []
+        except (TypeError, json.JSONDecodeError):
+            old_sources = []
+        if isinstance(old_sources, dict):
+            old_sources = [old_sources]
+        elif not isinstance(old_sources, list):
+            old_sources = []
+        # 旧证明的事实内容不变，但其运行身份已退出 current；先保留
+        # Evidence 事件与历史原因，再追加同内容的新运行证明。这样直接读取
+        # evidence 表、导出历史计数和 current_scope 三者口径一致。
+        if row["evidence_id"] is not None:
+            evidence_api.mark_historical(
+                conn,
+                project_id,
+                [int(row["evidence_id"])],
+                reason,
+                commit=False,
+            )
+        evidence_id = evidence_api.add_evidence(
+            conn,
+            project_id,
+            "sheet_coverage_proof",
+            f"Sheet 覆盖证明重新绑定当前运行：证明内容不变；{reason}",
+            steps=[
+                {
+                    "step": "复用不可变覆盖证明",
+                    "source_proof_id": int(row["id"]),
+                    "source_run_id": row["run_id"],
+                    "source_run_signature": row["run_signature"],
+                    "reason": reason,
+                }
+            ],
+            sources=[
+                *old_sources,
+                {
+                    "source_proof_id": int(row["id"]),
+                    "sheet_id": int(row["sheet_id"]),
+                    "period_id": int(row["period_id"]),
+                    "direction": current_direction,
+                },
+            ],
+            commit=False,
+            run_signature=current.signature,
+            run_id=current.run_id,
+            scope="current",
+        )
+        cur = conn.execute(
+            """INSERT INTO sheet_coverage_proofs(
+                   project_id, run_signature, run_id, file_id, batch_id, sheet_id,
+                   period_id, direction, raw_row_start, raw_row_end, raw_col_start,
+                   raw_col_end, raw_data_row_count, classified_row_count,
+                   classified_detail_rows, excluded_subtotal_rows, excluded_title_rows,
+                   excluded_note_rows, excluded_blank_rows, excluded_tail_note_rows,
+                   excluded_orphan_numeric_rows, excluded_parse_failed_rows,
+                   pending_rows, unrecognized_rows, business_rows_used, raw_amount_total,
+                   detail_amount_total, proof_status, proof_reason, c_control_status,
+                   c_control_value, c_control_source_json, c_control_evidence_id,
+                   ab_row_set_status, ab_row_set_hash, ab_independence_level,
+                   evidence_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                project_id,
+                current.signature,
+                current.run_id,
+                row["file_id"],
+                row["batch_id"],
+                row["sheet_id"],
+                row["period_id"],
+                current_direction,
+                row["raw_row_start"],
+                row["raw_row_end"],
+                row["raw_col_start"],
+                row["raw_col_end"],
+                row["raw_data_row_count"],
+                row["classified_row_count"],
+                row["classified_detail_rows"],
+                row["excluded_subtotal_rows"],
+                row["excluded_title_rows"],
+                row["excluded_note_rows"],
+                row["excluded_blank_rows"],
+                row["excluded_tail_note_rows"],
+                row["excluded_orphan_numeric_rows"],
+                row["excluded_parse_failed_rows"],
+                row["pending_rows"],
+                row["unrecognized_rows"],
+                row["business_rows_used"],
+                row["raw_amount_total"],
+                row["detail_amount_total"],
+                row["proof_status"],
+                row["proof_reason"],
+                row["c_control_status"],
+                row["c_control_value"],
+                row["c_control_source_json"],
+                row["c_control_evidence_id"],
+                row["ab_row_set_status"],
+                row["ab_row_set_hash"],
+                row["ab_independence_level"],
+                evidence_id,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        new_proof_id = int(cur.lastrowid)
+        conn.execute(
+            """INSERT INTO row_classifications(
+                   proof_id, project_id, sheet_id, row_number, class_code, reason_code,
+                   source_range_json, raw_values_json, calculated_amount, effective_amount,
+                   participates_in_a, participates_in_b, participates_in_c, is_pending,
+                   is_parse_failed, evidence_id, created_at)
+               SELECT ?, project_id, sheet_id, row_number, class_code, reason_code,
+                      source_range_json, raw_values_json, calculated_amount, effective_amount,
+                      participates_in_a, participates_in_b, participates_in_c, is_pending,
+                      is_parse_failed, evidence_id, created_at
+                 FROM row_classifications WHERE proof_id=?""",
+            (new_proof_id, int(row["id"])),
+        )
+        rebound += 1
+    return rebound
+
+
+def _validation_evidence_ids_before_invalidation(
+    conn: sqlite3.Connection,
+    project_id: int,
+    period_ids: list[int],
+    previous_contract: run_contract.RunContract | None,
+) -> tuple[set[int], set[int]]:
+    """读取失效化前仍属于旧当前运行的校核 Evidence。
+
+    ``invalidate_crosscheck_results`` 会先刷新 Run Contract。若在刷新后再用
+    ``current_scope`` 查询，旧结果已经不再命中当前 ``run_id``，其 Evidence
+    ID 便会丢失，随后只能删除结果表而无法把旧证据标成历史。本函数因此在
+    契约切换前按旧运行身份取快照，且只纳入结果表直接引用的 Evidence；原始
+    行来源/C 控制证据仍属于 source，不被错误历史化。
+    """
+    if previous_contract is None:
+        identity_sql = "run_id IS NULL AND run_signature IS NULL"
+        identity_params: tuple[object, ...] = ()
+    else:
+        identity_sql = "run_id=? AND run_signature=?"
+        identity_params = (previous_contract.run_id, previous_contract.signature)
+    period_sql = ""
+    period_params: tuple[object, ...] = ()
+    if period_ids:
+        placeholders = ",".join("?" for _ in period_ids)
+        period_sql = f" AND period_id IN ({placeholders})"
+        period_params = tuple(period_ids)
+    result_evidence_ids: set[int] = set()
+    proof_evidence_ids: set[int] = set()
+    for table in ("crosscheck_results", "period_totals"):
+        rows = conn.execute(
+            f"""SELECT evidence_id FROM {table}
+                WHERE project_id=? AND evidence_id IS NOT NULL
+                  AND {identity_sql}{period_sql}""",
+            (int(project_id), *identity_params, *period_params),
+        ).fetchall()
+        result_evidence_ids.update(int(row["evidence_id"]) for row in rows)
+    rows = conn.execute(
+        f"""SELECT evidence_id FROM sheet_coverage_proofs
+            WHERE project_id=? AND evidence_id IS NOT NULL
+              AND {identity_sql}{period_sql}""",
+        (int(project_id), *identity_params, *period_params),
+    ).fetchall()
+    proof_evidence_ids.update(int(row["evidence_id"]) for row in rows)
+    return result_evidence_ids, proof_evidence_ids
 
 
 def invalidate_crosscheck_results(
@@ -100,11 +407,37 @@ def invalidate_crosscheck_results(
     项目总览当作“最近校核”的结果，避免输入变更后继续显示旧的绿色结论。
     ``period_ids=None`` 表示项目级变更（新增文件、方向或待确认状态变化）。
     """
+    # 必须在刷新契约前捕获旧运行身份。若先 ensure，再按 current_scope 查，
+    # 旧结果会因新 run_id 立即退出读取面，Evidence ID 也随之丢失，无法写入
+    # “历史结果——不参与当前结论”的明确边界。
+    previous_contract = run_contract.get_current_contract(conn, project_id)
     # 首次导入只建立输入，不强行创建一个尚未运行的契约；已有运行结果的
     # 项目则立即计算新签名并把旧导出标为 stale。
     run_contract.ensure_if_materialized(conn, project_id)
     ids = sorted({int(pid) for pid in (period_ids or [])})
+    old_result_evidence_ids, old_proof_evidence_ids = _validation_evidence_ids_before_invalidation(
+        conn, project_id, ids, previous_contract
+    )
+    current_contract = run_contract.get_current_contract(conn, project_id)
+    contract_changed = (
+        (previous_contract is None and current_contract is not None)
+        or (
+            previous_contract is not None
+            and current_contract is not None
+            and previous_contract.run_id != current_contract.run_id
+        )
+    )
+    old_evidence_ids = old_result_evidence_ids | (
+        old_proof_evidence_ids if contract_changed else set()
+    )
     with run_contract._transaction(conn, "invalidate_crosscheck"):
+        evidence_api.mark_historical(
+            conn,
+            project_id,
+            old_evidence_ids,
+            "本次结算范围或人工门控发生变化，旧校核结果已移出当前读取面，需重新运行",
+            commit=False,
+        )
         if ids:
             placeholders = ",".join("?" for _ in ids)
             cur = conn.execute(
@@ -184,6 +517,7 @@ def set_project_direction(
         "direction": old_direction,
     }
     after = {**before, "direction": direction}
+    previous_contract = run_contract.get_current_contract(conn, project_id)
     with run_contract._transaction(conn, "set_project_direction"):
         changed = conn.execute(
             """UPDATE settlement_periods SET direction=?
@@ -192,20 +526,10 @@ def set_project_direction(
         )
         if changed.rowcount != 1:
             raise RuntimeError("期次方向在操作期间发生变化，请刷新后重试")
-        # 方向属于运行范围；契约切换与旧校核结果失效必须处于同一事务。
-        invalidate_crosscheck_results(conn, project_id)
-        signature = run_contract.current_run_signature(conn, project_id)
-        evidence_api.add_evidence(
-            conn,
-            project_id,
-            "direction_change",
-            f"第{period['period_no']}期方向由 {old_direction} 改为 {direction}：{reason.strip()}",
-            steps=[{"step": "人工标记方向", "actor": actor, "reason": reason.strip()}],
-            sources=[{"period_id": int(period_id), "period_no": int(period["period_no"])}],
-            commit=False,
-            run_signature=signature,
-        )
-        audit_log.record_audit(
+        # 审计本身属于 Run Contract 输入，必须在契约刷新前写入快照；
+        # 刷新后再把这条责任记录绑定到最终当前运行，避免“刚写审计又
+        # 产生第三个运行”的自失效窗口。
+        audit_id = audit_log.record_audit(
             conn,
             project_id,
             actor,
@@ -215,6 +539,41 @@ def set_project_direction(
             after,
             reason,
             commit=False,
+            run_id=previous_contract.run_id if previous_contract else None,
+            run_signature=previous_contract.signature if previous_contract else None,
+        )
+        # 方向属于运行范围；契约切换与旧校核结果失效必须处于同一事务。
+        invalidate_crosscheck_results(conn, project_id)
+        active_contract = run_contract.get_current_contract(conn, project_id)
+        if active_contract is not None:
+            # 方向修改不会改变原始网格、表头或逐行分类；但方向是当前
+            # Evidence 的作用域，必须追加一份绑定新运行且携带新方向的
+            # 不可变 coverage 快照。否则旧 ``unknown`` 方向证明会在严格
+            # 摘要闸门中被当成跨方向证据，导致合法的重跑无法形成有条件
+            # 结果。原 proof/Evidence 仍由失效化逻辑保留为历史记录。
+            _rebind_coverage_proofs_for_run(
+                conn,
+                project_id,
+                previous_contract,
+                active_contract,
+                reason="期次方向人工修正；原始网格和逐行覆盖分类未改变",
+            )
+        if active_contract is not None:
+            conn.execute(
+                "UPDATE audit_log SET run_id=?, run_signature=? WHERE id=?",
+                (active_contract.run_id, active_contract.signature, audit_id),
+            )
+        evidence_api.add_evidence(
+            conn,
+            project_id,
+            "direction_change",
+            f"第{period['period_no']}期方向由 {old_direction} 改为 {direction}：{reason.strip()}",
+            steps=[{"step": "人工标记方向", "actor": actor, "reason": reason.strip()}],
+            sources=[{"period_id": int(period_id), "period_no": int(period["period_no"])}],
+            commit=False,
+            run_signature=active_contract.signature if active_contract else None,
+            run_id=active_contract.run_id if active_contract else None,
+            scope="human",
         )
     return 1
 
@@ -306,6 +665,7 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
 
     reason = reason or ("超长汇总/台账/核销型结构，疑似非结算清单"
                         if oversized else f"表头识别置信度不足（{confidence}）")
+    set_sheet_status(conn, sheet_id, "pending", reason=reason, actor="system")
     evidence_api.add_evidence(
         conn, project_id, "sheet_role_candidate",
         f"Sheet「{sheet_name}」待人工角色确认：{reason}",
@@ -435,6 +795,16 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     items = extract_items.extract_items(cells, merged, det_used, n_rows, data_range=data_range)
     if not items:
         raise ValueError("确认后抽取 0 行：请核对人工列映射（未创建期次）")
+    proof_draft, proof_rows = coverage_proof.build_sheet_coverage_proof(
+        cells,
+        det_used,
+        n_rows,
+        merged_ranges=merged,
+        data_range=data_range,
+        hidden_rows=json.loads(meta["hidden_rows_json"] or "[]"),
+        hidden_cols=json.loads(meta["hidden_cols_json"] or "[]"),
+    )
+    previous_contract = run_contract.get_current_contract(conn, project_id)
 
     with run_contract._transaction(conn, "confirm_sheet_role_and_extract"):
         audit_log.record_audit(
@@ -444,7 +814,9 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             {"role": "settlement", "confidence": det.confidence,
              "mapping": {"detected": det.col_map, "confirmed": used_map},
              "header_range": [header_lo, header_hi], "data_range": list(data_range),
-             "period_no": period_no}, reason, commit=False)
+             "period_no": period_no}, reason, commit=False,
+            run_id=previous_contract.run_id if previous_contract else None,
+            run_signature=previous_contract.signature if previous_contract else None)
         pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
         if not isinstance(pno, int) or pno < 1:
             raise ValueError("确认期次必须为正整数")
@@ -455,6 +827,11 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
         # 回写：sheet→期次关联 + 已确认列映射（needs_review 归零，保持证据链）
         conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?",
                      (period_id, sheet_id))
+        set_sheet_status(
+            conn, sheet_id, "confirmed",
+            reason=f"人工确认结算清单角色并抽取 {n} 行：{reason.strip()}",
+            actor=actor,
+        )
         conn.execute("DELETE FROM table_headers WHERE sheet_id=?", (sheet_id,))
         conn.execute(
             """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi,
@@ -473,6 +850,8 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                  "visibility_risk": bool(meta["hidden_rows_json"] and meta["hidden_rows_json"] != "[]")
                                   or bool(meta["hidden_cols_json"] and meta["hidden_cols_json"] != "[]"),
              }, ensure_ascii=False)))
+        invalidate_crosscheck_results(conn, project_id)
+        current_contract = run_contract.ensure_run_contract(conn, project_id)
         evidence_api.add_evidence(
             conn, project_id, "sheet_role_confirmed",
             f"Sheet「{sheet_name}」经人工确认为结算清单，重放抽取 {n} 行",
@@ -482,8 +861,32 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                     "period_no": pno, "confidence": det.confidence}],
             sources=[{"sheet_id": sheet_id, "period_id": period_id, "n_items": n}],
             commit=False,
+            run_signature=current_contract.signature,
+            run_id=current_contract.run_id,
+            scope="human",
         )
-        invalidate_crosscheck_results(conn, project_id)
+        _rebind_coverage_proofs_for_run(
+            conn,
+            project_id,
+            previous_contract,
+            current_contract,
+            reason="人工确认结算 Sheet 并重放抽取；既有结算 Sheet 证明内容未改变",
+        )
+        _persist_coverage_proof(
+            conn,
+            project_id=project_id,
+            file_id=int(meta["file_id"]),
+            batch_id=int(conn.execute(
+                "SELECT batch_id FROM raw_sheets WHERE id=?", (sheet_id,)
+            ).fetchone()["batch_id"]),
+            sheet_id=sheet_id,
+            period_id=period_id,
+            direction=direction,
+            proof=proof_draft,
+            rows=proof_rows,
+            run_signature=current_contract.signature,
+            run_id=current_contract.run_id,
+        )
     return n
 
 
@@ -532,11 +935,21 @@ def confirm_sheet_non_settlement_role(
     if duplicate:
         raise ValueError("该 sheet 的非结算角色已确认，不得重复确认")
 
+    previous_contract = run_contract.get_current_contract(conn, project_id)
     with run_contract._transaction(conn, "confirm_sheet_non_settlement_role"):
+        set_sheet_status(
+            conn, sheet_id, "non_business",
+            reason=f"人工确认为 {confirmed_role}，仅作证据：{reason.strip()}",
+            actor=actor,
+        )
         audit_log.record_audit(
             conn, project_id, actor, "confirm_sheet_non_settlement_role", f"sheet:{sheet_id}",
             {"role": "gated"}, {"role": confirmed_role}, reason, commit=False,
         )
+        invalidate_crosscheck_results(conn, project_id)
+        # 角色确认本身属于新的运行输入。先让失效化逻辑固定新契约，再把
+        # 人工 Evidence 绑定到该契约，避免 human 证据落在旧/空运行上。
+        current_contract = run_contract.ensure_run_contract(conn, project_id)
         evidence_api.add_evidence(
             conn, project_id, "sheet_role_confirmed",
             f"Sheet「{meta['sheet_name']}」经人工确认为 {confirmed_role}，仅作证据，不进入结算模型",
@@ -544,8 +957,17 @@ def confirm_sheet_non_settlement_role(
                     "role": confirmed_role, "reason": reason}],
             sources=[{"file_id": meta["file_id"], "sheet_id": sheet_id, "location": "整表"}],
             commit=False,
+            run_signature=current_contract.signature,
+            run_id=current_contract.run_id,
+            scope="human",
         )
-        invalidate_crosscheck_results(conn, project_id)
+        _rebind_coverage_proofs_for_run(
+            conn,
+            project_id,
+            previous_contract,
+            current_contract,
+            reason="人工确认非结算 Sheet 角色；结算 Sheet 原始网格和逐行分类未改变",
+        )
 
 
 def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
@@ -589,6 +1011,11 @@ def _route_form_sheet(conn: sqlite3.Connection, project_id: int, file_id: int,
                 # 位置记真实值列（可反向定位到原格），不是 col+1
                 kv_pairs.append((label, nxt, row, value_col, f"{t} {nxt}"))
     with run_contract._transaction(conn, "route_form_sheet"):
+        set_sheet_status(
+            conn, sheet_id, "pending",
+            reason="检测为键值对表单，等待人工确认是否为非业务表",
+            actor="system",
+        )
         for key, value, row, col, quote in kv_pairs[:40]:
             evidence_api.add_evidence(
                 conn, project_id, "form_field_candidate",
@@ -647,6 +1074,10 @@ def import_settlement_file(
     form_routed = False
     role_gated = False
     period_ids: set[int] = set()
+    # 覆盖证明要绑定“整次导入完成后”的 Run Contract。导入过程中期次、
+    # Sheet 和明细仍在逐步落库，若逐 Sheet 立即 ensure 契约，会把前半个
+    # 文件错误地绑定到中间状态；先保留草稿，等输入范围稳定后统一写入。
+    pending_coverage_proofs: list[dict[str, object]] = []
     # 文档级语义门控：文件名含汇总/核销/台账语义 → 整文件需角色审阅
     # （copy 文件名是用户/验收语境的真实命名，非 test_id 硬编码）
     doc_summary_like = bool(SUMMARY_LIKE_PATTERN.search(src.stem))
@@ -692,6 +1123,11 @@ def import_settlement_file(
         if det is None:
             # 无法识别表头的 Sheet 仍属于待人工确认，不应被整体报告静默归为
             # “导入失败”或让项目状态看起来像没有待处理事项。
+            set_sheet_status(
+                conn, sheet_id, "pending",
+                reason="未识别到可靠表头，等待人工指定角色、表头和字段映射",
+                actor="system",
+            )
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "no_header",
                 notes=["未识别到可靠表头，保留原始网格，需人工指定角色、表头和字段映射"],
@@ -720,6 +1156,15 @@ def import_settlement_file(
             "hidden_cols": list(sheet.hidden_cols),
             "visibility_risk": bool(sheet.hidden_rows or sheet.hidden_cols),
         }
+        proof_draft, proof_rows = coverage_proof.build_sheet_coverage_proof(
+            cells,
+            det,
+            n_rows,
+            merged_ranges=merged,
+            data_range=detected_data_range,
+            hidden_rows=list(sheet.hidden_rows),
+            hidden_cols=list(sheet.hidden_cols),
+        )
         skip_stats: dict = {}
         items = extract_items.extract_items(
             cells, merged, det, n_rows, data_range=detected_data_range, stats=skip_stats)
@@ -732,6 +1177,20 @@ def import_settlement_file(
                 f"剔除明细区尾部尾注行 {skip_stats['tail_note_rows']} 行（原文见保真层）")
         if not items:
             notes = ["header-like but 0 data rows"] + skip_notes
+            set_sheet_status(
+                conn, sheet_id, "pending",
+                reason="识别到表头但数据区没有可写入的明细，等待人工确认范围",
+                actor="system",
+            )
+            pending_coverage_proofs.append({
+                "file_id": sf.file_id,
+                "batch_id": batch_id,
+                "sheet_id": sheet_id,
+                "period_id": None,
+                "direction": direction,
+                "proof": proof_draft,
+                "rows": proof_rows,
+            })
             report.sheets.append(SheetReport(sheet.sheet_name, "no_header", notes=notes))
             continue
 
@@ -756,6 +1215,11 @@ def import_settlement_file(
         period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
         with conn:
             conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
+            set_sheet_status(
+                conn, sheet_id, "confirmed",
+                reason="自动表头与数据范围通过确定性规则识别并写入结算模型",
+                actor="system",
+            )
             conn.execute(
                 """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
                    confidence, needs_review, data_row_start, data_row_end,
@@ -769,6 +1233,15 @@ def import_settlement_file(
         period_ids.add(period_id)
 
         extract_items.persist_line_items(conn, period_id, sheet_id, items)
+        pending_coverage_proofs.append({
+            "file_id": sf.file_id,
+            "batch_id": batch_id,
+            "sheet_id": sheet_id,
+            "period_id": period_id,
+            "direction": direction,
+            "proof": proof_draft,
+            "rows": proof_rows,
+        })
         parsed_any = True
         status = "needs_review" if det.needs_review else "parsed"
         report.sheets.append(
@@ -808,4 +1281,26 @@ def import_settlement_file(
         # 新导入既可能新增明细，也可能只新增待确认工作表；两者都会改变
         # 项目级校核前提，因此旧的最新结果必须重新计算。
         invalidate_crosscheck_results(conn, project_id)
+        if pending_coverage_proofs:
+            # 只有在整份文件的 Sheet/期次/明细已落库后才固定运行契约，
+            # 覆盖证明、逐行分类和其 Evidence 共享同一 run_id/signature。
+            active_contract = run_contract.ensure_run_contract(conn, project_id)
+            with run_contract._transaction(conn, "persist_import_coverage_proofs"):
+                for pending in pending_coverage_proofs:
+                    _persist_coverage_proof(
+                        conn,
+                        project_id=project_id,
+                        file_id=int(pending["file_id"]),
+                        batch_id=int(pending["batch_id"]),
+                        sheet_id=int(pending["sheet_id"]),
+                        period_id=(
+                            int(pending["period_id"])
+                            if pending["period_id"] is not None else None
+                        ),
+                        direction=str(pending["direction"]),
+                        proof=pending["proof"],
+                        rows=pending["rows"],
+                        run_signature=active_contract.signature,
+                        run_id=active_contract.run_id,
+                    )
     return report

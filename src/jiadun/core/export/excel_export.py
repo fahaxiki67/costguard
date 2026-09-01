@@ -24,8 +24,10 @@ from openpyxl.utils import get_column_letter
 
 from jiadun import branding
 from jiadun.core.contracts import run_contract
+from jiadun.core.diff import radar as diff_radar
 from jiadun.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
 from jiadun.core.engine.money import NotANumberError, round2, to_decimal
+from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.parsing import import_manifest
 from jiadun.core.reporting import ProjectSummary, build_report_model
 
@@ -107,6 +109,14 @@ RULE_ZH_CN = {
 }
 SUBJECT_ZH = {"line_item": "清单行", "period": "期次", "sheet": "工作表", "project": "项目"}
 ANOMALY_STATUS_ZH = {
+    "new": "新发现",
+    "pending_review": "待复核",
+    "confirmed_issue": "已确认问题",
+    "legitimate_business": "合理业务情形",
+    "pending_data": "待补资料",
+    "rectified": "已整改",
+    "closed": "已关闭",
+    "historical": "历史结果——当前数据或运行契约已经变化，不参与当前结论",
     "open": "待处理",
     "resolved": "已处理",
     "verified_no_issue": "已核实无问题",
@@ -206,7 +216,9 @@ def _link_evidence_references(wb: Workbook) -> None:
                 cell = ws.cell(row=row, column=col)
                 value = cell.value
                 header = str(ws.cell(row=1, column=col).value or "")
-                evidence_column = "证据" in header or "出处" in header
+                evidence_column = (
+                    "证据" in header or "出处" in header or "Evidence ID" in header
+                )
                 if not evidence_column and not (
                     isinstance(value, str) and "Evidence ID" in value
                 ):
@@ -252,6 +264,20 @@ def _num(value, money: bool = False):
     return d
 
 
+def canonical_source_text(sources: tuple[dict, ...] | list[dict]) -> str:
+    """将差异项来源压缩为可扫读的文件/Sheet/行引用。"""
+    if not sources:
+        return "—"
+    rendered: list[str] = []
+    for source in sources:
+        file_name = source.get("file") or f"文件#{source.get('file_id') or '?'}"
+        sheet_name = source.get("sheet") or f"Sheet#{source.get('sheet_id') or '?'}"
+        row_no = source.get("row") or source.get("source_row")
+        suffix = f"，行{row_no}" if row_no is not None else ""
+        rendered.append(f"{file_name} / {sheet_name}{suffix}")
+    return "；".join(rendered)
+
+
 def _fetch_periods(conn, project_id):
     return conn.execute(
         "SELECT id, period_no, title, direction, contract_party, tax_mode FROM settlement_periods"
@@ -271,6 +297,34 @@ def _project_directions(conn: sqlite3.Connection, project_id: int) -> list[str]:
         (project_id,),
     ).fetchall()
     return [r["direction"] for r in rows] or ["unknown"]
+
+
+def _current_direction_evidence_ids(
+    conn: sqlite3.Connection, project_id: int
+) -> dict[str, int | None]:
+    """返回当前运行各方向最近一条校核 Evidence。
+
+    方向 Evidence 属于 ``crosscheck_results`` 的运行成果，不能仅按签名或
+    时间读取。当前签名在输入恢复时可能与历史合同相同，故这里统一复用
+    ``current_scope`` 的 ``run_id`` 范围，避免 Word/Excel 把历史校核证据带回
+    当前摘要。
+    """
+    scope, scope_params = run_contract.current_scope(conn, project_id, "cr")
+    result: dict[str, int | None] = {}
+    for direction in _project_directions(conn, project_id):
+        row = conn.execute(
+            f"""SELECT cr.evidence_id
+                  FROM crosscheck_results cr
+                  JOIN settlement_periods sp ON sp.id=cr.period_id
+                 WHERE cr.project_id=? AND {scope}
+                   AND COALESCE(sp.direction, 'unknown')=?
+                   AND cr.evidence_id IS NOT NULL
+                 ORDER BY cr.checked_at DESC, cr.id DESC
+                 LIMIT 1""",
+            (project_id, *scope_params, direction),
+        ).fetchone()
+        result[direction] = int(row["evidence_id"]) if row else None
+    return result
 
 
 def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Workbook,
@@ -488,6 +542,326 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
         _autowidth(ws)
 
 
+def _period_pairs_by_direction(
+    conn: sqlite3.Connection, project_id: int
+) -> list[tuple[sqlite3.Row, sqlite3.Row]]:
+    """返回同一方向内相邻期次，避免把对上/对下同期号串成一条链。"""
+    rows = conn.execute(
+        """SELECT id, period_no, direction
+           FROM settlement_periods WHERE project_id=?
+           ORDER BY COALESCE(direction, 'unknown'), period_no, id""",
+        (project_id,),
+    ).fetchall()
+    by_direction: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        by_direction.setdefault(row["direction"] or "unknown", []).append(row)
+    pairs: list[tuple[sqlite3.Row, sqlite3.Row]] = []
+    for direction in sorted(by_direction):
+        ordered = by_direction[direction]
+        pairs.extend(zip(ordered, ordered[1:], strict=False))
+    return pairs
+
+
+def _radar_for_export(
+    conn: sqlite3.Connection,
+    project_id: int,
+    baseline_period_id: int,
+    current_period_id: int,
+) -> diff_radar.DiffRadar:
+    """构造当前运行下的差异雷达，并复用同一运行已持久化的快照。"""
+    radar = diff_radar.build_diff_radar(
+        conn, project_id, baseline_period_id, current_period_id
+    )
+    active = run_contract.get_current_contract(conn, project_id)
+    if active is None:
+        active = run_contract.ensure_run_contract(conn, project_id)
+    existing = conn.execute(
+        """SELECT id, evidence_id FROM diff_runs
+           WHERE project_id=? AND run_id=? AND run_signature=?
+             AND baseline_period_id=? AND current_period_id=?
+           ORDER BY id DESC LIMIT 1""",
+        (
+            project_id, active.run_id, active.signature,
+            baseline_period_id, current_period_id,
+        ),
+    ).fetchone()
+    if existing is not None:
+        return diff_radar.DiffRadar(
+            **{
+                **radar.__dict__,
+                "evidence_id": existing["evidence_id"],
+                "run_id": active.run_id,
+                "run_signature": active.signature,
+                "diff_run_id": existing["id"],
+            }
+        )
+    return diff_radar.persist_diff_radar(conn, radar)
+
+
+def export_diff_radar_sheet(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+    """导出 P1-01 清单差异雷达摘要与明细。
+
+    摘要按“比较期次 + 分类”给出项目数量和确认后的金额影响；待确认与
+    不可比事项的金额影响保持空白。明细保留两侧字段、原因、Evidence ID
+    和来源行，便于造价人员回到原始文件复核。
+    """
+    pairs = _period_pairs_by_direction(conn, project_id)
+    radars = [
+        _radar_for_export(conn, project_id, int(base["id"]), int(current["id"]))
+        for base, current in pairs
+    ]
+    ws = wb.create_sheet("清单差异雷达")
+    ws.append(["比较范围", "基准期", "当前期", "方向", "类别", "项目数量", "确认金额影响"])
+    _style_header(ws, 1, 7)
+    ws.append(["全部比较", "", "", "", "确认净金额影响", "", None])
+    net_values = [radar.confirmed_net_amount_impact for radar in radars if radar.confirmed_net_amount_impact is not None]
+    net_total = sum(net_values, D(0)) if net_values else None
+    ws.cell(row=2, column=7, value=_num(net_total, money=True) if net_total is not None else "无法确认")
+    for radar in radars:
+        scope = f"第{radar.baseline_period_no}期→第{radar.current_period_no}期"
+        direction = DIRECTION_LABELS.get(radar.current_direction, radar.current_direction)
+        for category in diff_radar.CATEGORIES:
+            stats = radar.category_summary[category]
+            ws.append([
+                scope,
+                f"第{radar.baseline_period_no}期",
+                f"第{radar.current_period_no}期",
+                direction,
+                stats["label"],
+                stats["count"],
+                _num(D(stats["amount_impact"]), money=True)
+                if stats["amount_impact"] is not None else None,
+            ])
+    _autowidth(ws)
+    for row in ws.iter_rows(min_row=2, min_col=7, max_col=7):
+        if isinstance(row[0].value, (D, int, float)):
+            row[0].number_format = MONEY_FMT
+
+    detail = wb.create_sheet("差异雷达明细")
+    detail.append([
+        "比较范围", "方向", "类别", "状态", "编码", "名称",
+        "基准数量", "当前数量", "基准单价", "当前单价", "基准合价", "当前合价",
+        "金额影响", "确认金额影响", "原因", "Evidence ID", "基准来源", "当前来源",
+    ])
+    _style_header(detail, 1, 18)
+    for radar in radars:
+        scope = f"第{radar.baseline_period_no}期→第{radar.current_period_no}期"
+        direction = DIRECTION_LABELS.get(radar.current_direction, radar.current_direction)
+        for item in radar.items:
+            baseline = item.baseline
+            current = item.current
+            detail.append([
+                scope,
+                direction,
+                diff_radar.CATEGORY_LABELS[item.primary_category],
+                diff_radar.STATUS_LABELS[item.status],
+                current.get("code") or baseline.get("code") or "",
+                current.get("name") or baseline.get("name") or "",
+                _num(D(baseline["quantity"])) if baseline.get("quantity") is not None else None,
+                _num(D(current["quantity"])) if current.get("quantity") is not None else None,
+                _num(D(baseline["unit_price"]), money=True) if baseline.get("unit_price") is not None else None,
+                _num(D(current["unit_price"]), money=True) if current.get("unit_price") is not None else None,
+                _num(D(baseline["amount"]), money=True) if baseline.get("amount") is not None else None,
+                _num(D(current["amount"]), money=True) if current.get("amount") is not None else None,
+                _num(item.amount_impact, money=True),
+                _num(item.confirmed_amount_impact, money=True),
+                item.reason,
+                item.evidence_id or radar.evidence_id,
+                canonical_source_text(item.baseline_sources),
+                canonical_source_text(item.current_sources),
+            ])
+    _autowidth(detail)
+    for row in detail.iter_rows(min_row=2, min_col=7, max_col=14):
+        for cell in row:
+            if isinstance(cell.value, (D, int, float)):
+                cell.number_format = MONEY_FMT if cell.column in {9, 10, 11, 12, 13, 14} else "#,##0.###"
+
+
+def export_project_versions_sheets(
+    conn: sqlite3.Connection,
+    project_id: int,
+    wb: Workbook,
+) -> None:
+    """导出 P2-03 项目版本链及相邻版本差异。
+
+    版本行、快照完整性、Evidence/Audit 责任链均只读；任何链条不完整时
+    明确标为“待复核”，不把比较结果提升为已确认金额。版本差异明细保留
+    待确认/不可比状态和 Evidence ID，供造价人员回查来源。
+    """
+    from jiadun.core.reporting.summary import _version_snapshot_chain
+    from jiadun.core.versions import compare_project_versions, list_project_versions
+
+    versions = list_project_versions(conn, project_id)
+    chain_ws = wb.create_sheet("项目版本链")
+    chain_ws.append([
+        "版本ID", "版本序号", "版本类型", "标题", "创建人", "创建时间", "原因",
+        "清单行数", "快照SHA-256", "运行ID", "运行签名", "是否当前运行",
+        "Evidence ID", "Audit ID", "责任链状态", "完整性原因",
+    ])
+    _style_header(chain_ws, 1, 16)
+    for version in versions:
+        valid, reasons = _version_snapshot_chain(conn, project_id, version.version_id)
+        chain_ws.append([
+            version.version_id,
+            version.version_no,
+            version.version_label,
+            version.title,
+            version.created_by,
+            version.created_at,
+            version.reason,
+            version.item_count,
+            version.snapshot_sha256,
+            version.run_id,
+            version.run_signature,
+            "是" if version.is_current_run else "否",
+            version.evidence_id,
+            version.audit_id,
+            "有效" if valid else "待复核",
+            "；".join(reasons) if reasons else "",
+        ])
+    if not versions:
+        chain_ws.append([
+            "", "", "", "尚未建立项目版本链", "", "", "", 0, "", "", "", "",
+            "", "", "待确认", "没有可验证的版本快照",
+        ])
+    _autowidth(chain_ws)
+
+    detail_ws = wb.create_sheet("版本差异明细")
+    detail_ws.append([
+        "记录类型", "比较范围", "比较状态", "类别", "匹配键", "状态",
+        "基准编码", "当前编码", "基准名称", "当前名称", "基准数量", "当前数量",
+        "基准单价", "当前单价", "基准合价", "当前合价", "金额影响",
+        "确认金额影响", "原因", "Evidence ID",
+    ])
+    _style_header(detail_ws, 1, 20)
+    if len(versions) >= 2:
+        baseline, current = versions[-2], versions[-1]
+        comparison = compare_project_versions(
+            conn, project_id, baseline.version_id, current.version_id
+        )
+        detail_ws.append([
+            "比较摘要",
+            f"v{baseline.version_no} → v{current.version_no}",
+            comparison.status,
+            "确认净金额影响",
+            "",
+            "；".join(comparison.reason_codes),
+            "", "", "", "", "", "", "", "", "", "",
+            _num(comparison.confirmed_net_amount_impact, money=True),
+            _num(comparison.confirmed_net_amount_impact, money=True),
+            "待确认/不可比项目不计入确认净影响；详见明细",
+            "；".join(str(item) for item in comparison.evidence_ids),
+        ])
+        for item in comparison.items:
+            left, right = item.baseline, item.current
+            detail_ws.append([
+                "差异明细",
+                f"v{baseline.version_no} → v{current.version_no}",
+                comparison.status,
+                item.category,
+                item.identity_key,
+                item.status,
+                left.get("code"),
+                right.get("code"),
+                left.get("name"),
+                right.get("name"),
+                _num(left.get("quantity")) if left.get("quantity") is not None else None,
+                _num(right.get("quantity")) if right.get("quantity") is not None else None,
+                _num(left.get("unit_price"), money=True) if left.get("unit_price") is not None else None,
+                _num(right.get("unit_price"), money=True) if right.get("unit_price") is not None else None,
+                _num(left.get("amount"), money=True) if left.get("amount") is not None else None,
+                _num(right.get("amount"), money=True) if right.get("amount") is not None else None,
+                _num(item.amount_impact, money=True),
+                _num(item.confirmed_amount_impact, money=True),
+                item.reason,
+                "；".join(str(evidence_id) for evidence_id in item.evidence_ids),
+            ])
+    else:
+        detail_ws.append([
+            "比较摘要", "", "not_comparable", "", "", "至少需要两个不可变项目版本",
+            "", "", "", "", "", "", "", "", "", "", None, None,
+            "当前没有可比较的相邻版本", "",
+        ])
+    _autowidth(detail_ws)
+    for row in detail_ws.iter_rows(min_row=2, min_col=11, max_col=18):
+        for cell in row:
+            if isinstance(cell.value, (D, int, float)) and cell.column in {13, 14, 15, 16, 17, 18}:
+                cell.number_format = MONEY_FMT
+
+
+def export_historical_price_sheet(
+    conn: sqlite3.Connection,
+    project_id: int,
+    wb: Workbook,
+) -> None:
+    """导出历史综合单价资产及其不可比/仅提示限制。"""
+    from jiadun.core.pricing.history import list_historical_unit_prices
+
+    records = list_historical_unit_prices(
+        conn, source_project_id=project_id, include_revoked=True
+    )
+    ws = wb.create_sheet("历史综合单价库")
+    ws.append([
+        "资产ID", "状态", "来源项目", "关闭ID", "来源版本ID", "来源版本清单项ID",
+        "原始项目名", "原始清单名", "规范化清单名", "项目特征", "单位", "地区",
+        "时间", "项目类型", "方向", "单价", "数量", "合价", "来源文件ID",
+        "来源Sheet ID", "来源行", "来源Evidence ID", "资产Evidence ID", "Audit ID",
+        "创建人", "创建时间", "用途限制", "单价完整性", "单价原始值",
+    ])
+    _style_header(ws, 1, 29)
+    limitation = "仅提示复核，不直接认定当前单价错误；维度不一致时不可直接比较"
+    for record in records:
+        unit_price_integrity = record.metadata.get("unit_price_integrity_status")
+        if unit_price_integrity is None:
+            unit_price_integrity = "valid" if record.unit_price is not None else "missing"
+        unit_price_raw = record.metadata.get("unit_price_raw")
+        if unit_price_raw is not None:
+            unit_price_raw = str(unit_price_raw)
+        ws.append([
+            record.price_id,
+            record.status,
+            record.source_project_id,
+            record.closure_id,
+            record.source_version_id,
+            record.source_version_item_id,
+            record.raw_project_name,
+            record.raw_name,
+            record.normalized_name,
+            record.feature,
+            record.unit,
+            record.region,
+            record.observed_at,
+            record.project_type,
+            _business_direction(record.direction),
+            _num(record.unit_price, money=True),
+            _num(record.quantity) if record.quantity is not None else None,
+            _num(record.amount, money=True) if record.amount is not None else None,
+            record.source_file_id,
+            record.source_sheet_id,
+            record.source_row,
+            record.source_evidence_id,
+            record.evidence_id,
+            record.audit_id,
+            record.created_by,
+            record.created_at,
+            limitation,
+            unit_price_integrity,
+            unit_price_raw,
+        ])
+    if not records:
+        ws.append([
+            "", "", "", "", "", "", "尚未沉淀历史单价资产", "", "", "", "", "",
+            "", "", "", None, None, None, "", "", "", "", "", "", "", "", limitation,
+        ])
+        ws.cell(row=ws.max_row, column=28).value = "missing"
+        ws.cell(row=ws.max_row, column=29).value = None
+    _autowidth(ws)
+    for row in ws.iter_rows(min_row=2, min_col=16, max_col=18):
+        for cell in row:
+            if isinstance(cell.value, (D, int, float)):
+                cell.number_format = MONEY_FMT
+
+
 def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction: str) -> dict[str, dict]:
     """按方向聚合：item_key -> {qty, amount, names}。缺失值不补 0。"""
     rows = conn.execute(
@@ -562,7 +936,7 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
     scope, scope_params = run_contract.current_scope(conn, project_id, "a")
     anomaly_rows = conn.execute(
         f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
-                  a.evidence_id, a.message, a.status,
+                  a.evidence_id, a.message, a.status, a.lifecycle_status,
                   COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
                     AS direction
            FROM anomalies a
@@ -586,7 +960,7 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
         sev = sev_zh.get(r["severity"], "其他")
         direction = _business_direction(r["direction"], project_level=not r["direction"])
         subject = _business_subject(r["subject_type"])
-        status = _business_status(r["status"])
+        status = _business_status(finding_lifecycle.lifecycle_status(r))
         ws.append([r["id"], direction, _business_rule(r["rule_id"]), sev,
                    f"{subject}#{r['subject_id']}",
                    _normalize_business_text(r["message"]), r["evidence_id"], status, r["rule_id"]])
@@ -600,12 +974,17 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
     _style_header(ws2, 1, 6)
     idx = 1
     for r in anomaly_rows:
-        if r["severity"] not in {"high", "medium"} or r["status"] not in {"open", "deferred"}:
+        lifecycle = finding_lifecycle.lifecycle_status(r)
+        if r["severity"] not in {"high", "medium"} or lifecycle not in {
+            "new", "pending_review", "confirmed_issue", "pending_data",
+        }:
             continue
         direction = _business_direction(r["direction"], project_level=not r["direction"])
         message = _normalize_business_text(r["message"])
-        if r["status"] == "deferred":
-            message = f"【暂不处理】{message}"
+        if lifecycle == "pending_review":
+            message = f"【待复核】{message}"
+        elif lifecycle == "pending_data":
+            message = f"【待补资料】{message}"
         ws2.append([idx, direction, _business_rule(r["rule_id"]),
                     message, r["evidence_id"], r["rule_id"]])
         idx += 1
@@ -644,14 +1023,49 @@ def export_contract_risks(conn: sqlite3.Connection, project_id: int, wb: Workboo
 
 def export_evidence_index(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
     ws = wb.create_sheet("证据索引")
-    ws.append(["证据ID", "类型", "摘要", "计算过程(JSON)", "来源(JSON)", "生成时间"])
-    _style_header(ws, 1, 6)
+    ws.append([
+        "证据ID", "类型", "范围", "是否参与当前结论", "运行ID", "运行签名",
+        "历史原因", "摘要", "计算过程(JSON)", "来源(JSON)", "生成时间",
+    ])
+    _style_header(ws, 1, 11)
+    current_scope, current_params = run_contract.current_scope(conn, project_id, "e")
+    current_ids = {
+        int(row["id"]) for row in conn.execute(
+            f"SELECT e.id FROM evidence e WHERE e.project_id=? AND {current_scope}",
+            (project_id, *current_params),
+        )
+    }
+    scope_labels = {
+        "source": "来源证据",
+        "current": "当前运行",
+        "historical": "历史结果",
+        "human": "人工确认",
+    }
     for r in conn.execute(
-        "SELECT id, kind, summary, steps_json, sources_json, created_at FROM evidence WHERE project_id=? ORDER BY id",
+        """SELECT id, kind, scope, run_id, run_signature, historical_reason,
+                  summary, steps_json, sources_json, created_at
+           FROM evidence WHERE project_id=? ORDER BY id""",
         (project_id,),
     ):
-        ws.append([r["id"], r["kind"], _normalize_business_text(r["summary"]),
-                   r["steps_json"], r["sources_json"], r["created_at"]])
+        evidence_id = int(r["id"])
+        is_current = evidence_id in current_ids
+        history_reason = r["historical_reason"] or (
+            "历史结果——当前数据或运行契约已经变化，不参与当前结论"
+            if r["scope"] == "historical" else ""
+        )
+        ws.append([
+            evidence_id,
+            r["kind"],
+            scope_labels.get(r["scope"], f"未识别范围({r['scope']})"),
+            "是" if is_current else "否",
+            r["run_id"],
+            r["run_signature"],
+            history_reason,
+            _normalize_business_text(r["summary"]),
+            r["steps_json"],
+            r["sources_json"],
+            r["created_at"],
+        ])
     _autowidth(ws)
 
 
@@ -775,6 +1189,9 @@ def _review_gate_counts(
     summary = summary or build_report_model(conn, project_id).project_summary
     levels = summary.verification["levels"]
     risk = summary.risk
+    version_chain = summary.version_chain or {}
+    history_assets = summary.historical_price_assets or {}
+    latest_version = version_chain.get("latest") or {}
     return {
         "source_files": summary.source_files,
         "pending_sheets": int(summary.pending["sheets"]),
@@ -790,6 +1207,21 @@ def _review_gate_counts(
         "detection_status": summary.detection_coverage["status"],
         "aggregate_status": summary.aggregate_coverage["status"],
         "manifest_status": summary.pending["manifest_status"],
+        "version_count": int(version_chain.get("version_count", 0) or 0),
+        "latest_version_no": latest_version.get("version_no"),
+        "version_status": version_chain.get("status", "not_started"),
+        "closure_status": (
+            "closed" if version_chain.get("closure") else "not_closed"
+        ),
+        "historical_price_count": int(history_assets.get("active", 0) or 0),
+        # 成果封面和 Word 摘要必须直接服从共享状态快照；不能只从局部
+        # 期次/覆盖计数重新拼出绿色结论。
+        "project_status_code": summary.statuses.get("project_status_code", "cannot_conclude"),
+        "project_status": summary.statuses.get("project_status", "不可形成项目结论"),
+        "project_status_reason_codes": list(summary.statuses.get("project_status_reason_codes", [])),
+        "period_status_code": summary.statuses.get("period_status_code", "insufficient"),
+        "evidence_complete": bool(summary.verification.get("evidence_complete", False)),
+        "direction_status_code": dict(summary.statuses.get("direction_status_code", {})),
     }
 
 
@@ -808,8 +1240,10 @@ def export_cover_page(
     project_name = project["name"] if project else "未命名项目"
     signature = run_contract.current_run_signature(conn, project_id)
     app_version = run_contract._app_version()
+    summary = summary or build_report_model(conn, project_id).project_summary
     gates = _review_gate_counts(conn, project_id, summary=summary)
     unchecked = max(0, gates["period_count"] - gates["checked_count"])
+    project_gate_open = gates["project_status_code"] != "can_conclude"
     if not gates["source_files"]:
         status = "尚未导入资料"
     elif not gates["period_count"]:
@@ -821,8 +1255,15 @@ def export_cover_page(
         gates["detection_status"] != "complete",
         gates["aggregate_status"] != "complete",
         gates["manifest_status"] in {"incomplete", "mismatch"},
+        project_gate_open,
+        gates["period_status_code"] != "sufficient",
+        not gates["evidence_complete"],
     )):
-        status = "审核尚未完成"
+        status = (
+            "不可形成项目结论"
+            if gates["project_status_code"] == "cannot_conclude"
+            else "有条件结论；审核尚未完成"
+        )
     else:
         status = "当前未发现主要待处理事项"
     ws.append([f"{branding.PRODUCT_DISPLAY_NAME} Excel 审核底稿"])
@@ -831,7 +1272,20 @@ def export_cover_page(
     ws.append(["生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")])
     ws.append(["成果版本", f"v{app_version} 预览候选"])
     ws.append(["运行签名", signature or "尚未生成（执行校核/异常检测/匹配或导出后生成）"])
+    ws.append(["项目状态", gates["project_status"]])
     ws.append(["审核状态", status])
+    if gates["project_status_reason_codes"]:
+        ws.append(["项目状态依据", "；".join(gates["project_status_reason_codes"])])
+    latest_version = summary.version_chain.get("latest") or {}
+    latest_version_text = (
+        f"v{latest_version['version_no']} {latest_version.get('title', '')}".strip()
+        if latest_version else "尚未建立版本链"
+    )
+    ws.append(["项目版本链", latest_version_text])
+    ws.append([
+        "历史综合单价资产",
+        f"{summary.historical_price_assets.get('active', 0)} 条（仅复核提示，不直接认定当前价格错误）",
+    ])
     completion = (
         f"待确认工作表 {gates['pending_sheets']} 张；高风险未处理 {gates['high_unresolved']} 项；"
         f"待确认匹配 {gates['pending_matches']} 组；尚未校核 {unchecked} 期；"
@@ -878,6 +1332,19 @@ def export_management_summary(
         if direction not in {"upward", "downward"}
     )
     n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
+    current_evidence_scope, current_evidence_params = run_contract.current_scope(
+        conn, project_id, "e"
+    )
+    current_ev = conn.execute(
+        f"""SELECT COUNT(*) c FROM evidence e
+            WHERE e.project_id=? AND {current_evidence_scope}""",
+        (project_id, *current_evidence_params),
+    ).fetchone()["c"]
+    historical_ev = conn.execute(
+        """SELECT COUNT(*) c FROM evidence
+           WHERE project_id=? AND scope='historical'""",
+        (project_id,),
+    ).fetchone()["c"]
     data = [
         ("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M")),
         ("—— 统计范围 ——", ""),
@@ -887,6 +1354,21 @@ def export_management_summary(
         ("其中：对下结算", n_down),
         ("其中：未标记", n_none),
         ("—— 金额与状态 ——", ""),
+        ("项目状态", summary.statuses["project_status"]),
+        ("期次状态", summary.statuses["period_status"]),
+        ("当前运行 ID", summary.run_id or "未生成"),
+        ("项目版本链", (
+            f"{summary.version_chain.get('version_count', 0)} 个版本；"
+            f"{summary.version_chain.get('status', 'not_started')}"
+        )),
+        ("最终审定/关闭状态", (
+            "已关闭" if summary.version_chain.get("closure") else
+            "已记录最终审定版本" if summary.version_chain.get("final_approval") else
+            "尚未记录最终审定版本"
+        )),
+        ("历史综合单价资产", (
+            f"{summary.historical_price_assets.get('active', 0)} 条（仅复核提示）"
+        )),
     ]
     for direction, stats in summary.amounts.items():
         label = _business_direction(direction)
@@ -921,6 +1403,8 @@ def export_management_summary(
         ("校核不充分期数", levels.get("insufficient", 0)),
         ("—— 追溯 ——", ""),
         ("证据记录数", n_ev),
+        ("当前范围证据数", current_ev),
+        ("历史证据数（不参与当前结论）", historical_ev),
         ("证据索引位置", "本工作簿《证据索引》工作表（evidence ID）"),
     ])
     for k, v in data:
@@ -967,6 +1451,9 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
         export_settlement_summary(conn, project_id, wb, direction=direction)
     export_updown_comparison(conn, project_id, wb)
     export_diff_sheets(conn, project_id, wb)
+    export_diff_radar_sheet(conn, project_id, wb)
+    export_project_versions_sheets(conn, project_id, wb)
+    export_historical_price_sheet(conn, project_id, wb)
     export_anomaly_lists(conn, project_id, wb)
     export_contract_risks(conn, project_id, wb)
     export_evidence_index(conn, project_id, wb)
@@ -1041,17 +1528,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         )
         for direction, stats in summary.amounts.items()
     }
-    direction_evidence: dict[str, int | None] = {}
-    for direction in _project_directions(conn, project_id):
-        ev = conn.execute(
-            """SELECT cr.evidence_id FROM crosscheck_results cr
-               JOIN settlement_periods sp ON sp.id=cr.period_id
-               WHERE cr.project_id=? AND cr.run_signature=?
-                 AND COALESCE(sp.direction, 'unknown')=?
-               ORDER BY cr.checked_at DESC, cr.id DESC LIMIT 1""",
-            (project_id, active_contract.signature, direction),
-        ).fetchone()
-        direction_evidence[direction] = int(ev["evidence_id"]) if ev and ev["evidence_id"] else None
+    direction_evidence = _current_direction_evidence_ids(conn, project_id)
     anomaly_scope, anomaly_params = run_contract.current_scope(conn, project_id, "a")
     risk = summary.risk
     high = risk["severity"]["high"]
@@ -1076,11 +1553,18 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         gates["detection_status"] != "complete",
         gates["aggregate_status"] != "complete",
         gates["manifest_status"] in {"incomplete", "mismatch"},
+        gates["project_status_code"] != "can_conclude",
+        gates["period_status_code"] != "sufficient",
+        not gates["evidence_complete"],
     ))
     if not gates["source_files"]:
         result_status = "尚未导入资料"
     elif not gates["period_count"]:
         result_status = "暂无可审核结算期次"
+    elif gates["project_status_code"] == "cannot_conclude":
+        result_status = "不可形成项目结论"
+    elif gates["project_status_code"] != "can_conclude":
+        result_status = "有条件结论；审核尚未完成"
     else:
         result_status = "审核尚未完成" if gates_open else "当前未发现主要待处理事项"
     doc = docx_lib.Document()
@@ -1119,7 +1603,14 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(f"审核范围：已导入文件 {conn.execute('SELECT COUNT(*) c FROM source_files WHERE project_id=?', (project_id,)).fetchone()['c']} 份，"
                       f"期次 {len(periods)} 期（对上结算 {n_up} 期、对下结算 {n_down} 期、未标记 {n_none} 期）")
     doc.add_paragraph(f"生成时间/版本：{generated_at} / v{app_version} 预览候选")
+    doc.add_paragraph(f"运行 ID：{active_contract.run_id}")
     doc.add_paragraph(f"运行签名：{active_contract.signature}")
+    doc.add_paragraph(f"项目状态：{summary.statuses['project_status']}")
+    if summary.statuses.get("project_status_reason_codes"):
+        doc.add_paragraph(
+            "项目状态依据：" + "；".join(summary.statuses["project_status_reason_codes"])
+        )
+    doc.add_paragraph(f"期次状态：{summary.statuses['period_status']}")
     status_p = doc.add_paragraph(f"成果状态：{result_status}")
     status_p.runs[0].bold = True
 
@@ -1144,6 +1635,22 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         ("检测覆盖率", gates["detection_status"]),
         ("聚合验证覆盖率", gates["aggregate_status"]),
         ("暂不处理异常", gates["deferred"]),
+        ("当前范围证据数", conn.execute(
+            f"""SELECT COUNT(*) c FROM evidence e
+                 WHERE e.project_id=? AND {run_contract.current_scope(conn, project_id, 'e')[0]}""",
+            (project_id, *run_contract.current_scope(conn, project_id, "e")[1]),
+        ).fetchone()["c"]),
+        ("历史证据数（不参与当前结论）", conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE project_id=? AND scope='historical'",
+            (project_id,),
+        ).fetchone()["c"]),
+        ("项目版本链", (
+            f"{summary.version_chain.get('version_count', 0)} 个；"
+            f"{summary.version_chain.get('status', 'not_started')}"
+        )),
+        ("历史综合单价资产", (
+            f"{summary.historical_price_assets.get('active', 0)} 条；仅复核提示"
+        )),
     ]
     for label, value in metric_rows:
         row = metrics.add_row().cells
@@ -1183,6 +1690,36 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         )
     else:
         doc.add_paragraph("尚未生成双向校核结果，暂不能形成校核结论。")
+
+    # 版本链/历史资产只读展示：管理层先看到当前阶段、责任链和限制，
+    # 字段级差异与逐条来源仍留在 Excel 专用工作表，避免 Word 把历史资产
+    # 误写成当前结算结论。
+    version_chain = summary.version_chain or {}
+    latest_version = version_chain.get("latest") or {}
+    if latest_version:
+        latest_chain_status = "责任链有效" if latest_version.get("chain_valid") else "责任链待复核"
+        doc.add_paragraph(
+            f"项目版本链：当前共 {version_chain.get('version_count', 0)} 个版本，"
+            f"最新为 v{latest_version.get('version_no')}「{latest_version.get('title', '未命名')}」，"
+            f"{latest_chain_status}；Evidence ID {latest_version.get('evidence_id') or '待生成'}，"
+            f"Audit ID {latest_version.get('audit_id') or '待生成'}。"
+        )
+    else:
+        doc.add_paragraph("项目版本链：尚未建立版本快照，无法进行版本间新增、删除和字段变化比较。")
+    closure_info = version_chain.get("closure") or {}
+    if closure_info:
+        closure_status = "关闭链有效" if closure_info.get("chain_valid") else "关闭链待复核"
+        doc.add_paragraph(
+            f"项目关闭与历史资产：{closure_status}，最终审定版本 v{closure_info.get('final_version_id')}；"
+            f"Evidence ID {closure_info.get('evidence_id') or '待生成'}，"
+            f"Audit ID {closure_info.get('audit_id') or '待生成'}。"
+        )
+    history_info = summary.historical_price_assets or {}
+    doc.add_paragraph(
+        f"历史综合单价：可用 {history_info.get('active', 0)} 条，"
+        f"已撤销 {history_info.get('revoked', 0)} 条，来源异常 {history_info.get('invalid', 0)} 条；"
+        "仅用于提示复核，不直接认定当前单价错误，维度不齐时不可直接比较。"
+    )
 
     doc.add_heading("Top 风险事项", level=1)
     risks = conn.execute(

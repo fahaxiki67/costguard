@@ -38,6 +38,9 @@ jobs:
       - name: Build DMG (tests already run above)
         run: ./scripts/build_macos_arm64.sh --skip-checks
 
+      - name: Generate release checklist
+        run: .venv/bin/python scripts/release_checklist.py --run-tests --output dist/release-checklist
+
       - name: Sensitive-data scan (tracked files)
         run: |
           set -e
@@ -60,5 +63,6 @@ jobs:
           path: |
             dist/*.dmg
             dist/SHA256SUMS.txt
+            dist/release-checklist/*
           if-no-files-found: error
           retention-days: 14

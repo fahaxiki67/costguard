@@ -4,6 +4,7 @@ import json
 import pytest
 
 from jiadun.core.anomalies import engine, rules
+from jiadun.core.contracts import run_contract
 from jiadun.core.db import migrations
 
 D = 0
@@ -285,10 +286,16 @@ class TestEngine:
         n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (pid,)).fetchone()["c"]
         assert n_anom == len(findings)
         assert n_ev == len(findings)
-        # 可重跑不重复累积
+        # 重跑不得删除历史：总表保留不可变审计轨迹，但当前读取面仍只含
+        # 本次检测快照，不能把历史行算入当前 Finding 数量。
         engine.run_anomalies(conn, pid)
         n_anom2 = conn.execute("SELECT COUNT(*) c FROM anomalies WHERE project_id=?", (pid,)).fetchone()["c"]
-        assert n_anom2 == len(findings)
+        assert n_anom2 == len(findings) * 2
+        scope, params = run_contract.current_scope(conn, pid, "a")
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM anomalies a WHERE a.project_id=? AND {scope}",
+            (pid, *params),
+        ).fetchone()[0] == len(findings)
 
     def test_rule_failure_recorded(self, db, monkeypatch):
         conn, pid, pmap = db

@@ -39,6 +39,7 @@ def check_release_consistency(
     root: Path = REPO_ROOT,
     *,
     expected_version: str | None = None,
+    run_golden: bool = True,
 ) -> dict[str, Any]:
     """返回可序列化的检查结果；不通过项列在 ``issues`` 中。"""
     root = Path(root)
@@ -118,6 +119,45 @@ def check_release_consistency(
     _check(checks, "preview_release_gates_listed", not missing_gates, f"missing={missing_gates}")
     if missing_gates:
         issues.append(f"发布说明未列出门槛: {', '.join(missing_gates)}")
+
+    # 黄金回归是发布前的确定性门槛。合成演示案例用于验证执行器和当前
+    # 代码基线；是否已登记脱敏真实案例另列为条件，不把“无真实案例”
+    # 偷换成回归通过，也不自动更新 cases.json。
+    if run_golden:
+        registry = root / "tests" / "golden" / "cases.json"
+        if not registry.is_file():
+            _check(checks, "golden_regression", False, f"缺少 {registry}")
+            issues.append("缺少 tests/golden/cases.json，无法执行黄金回归")
+        elif root.resolve() == REPO_ROOT.resolve():
+            try:
+                # 直接执行 ``python scripts/release_consistency_check.py`` 时，
+                # Python 的 sys.path[0] 是 scripts/，仓库根目录不会自动进入
+                # import 搜索路径；测试环境从仓库根目录导入时则不暴露这个问题。
+                # 这里显式补入当前受检根目录，保证发布门槛在命令行和测试中
+                # 使用同一条黄金回归路径。
+                root_text = str(root.resolve())
+                if root_text not in sys.path:
+                    sys.path.insert(0, root_text)
+                from scripts import golden_regression
+
+                golden = golden_regression.run_golden_regression(registry)
+            except Exception as exc:  # noqa: BLE001 - 发布门槛需保留失败原因
+                _check(checks, "golden_regression", False, f"执行失败: {type(exc).__name__}: {exc}")
+                issues.append(f"黄金回归执行失败: {type(exc).__name__}: {exc}")
+            else:
+                passed = golden.get("status") == "passed"
+                detail = (
+                    f"status={golden.get('status')}, available={golden.get('available_case_count')}, "
+                    f"real={golden.get('real_case_count')}, mismatches={golden.get('mismatch_case_count')}"
+                )
+                _check(checks, "golden_regression", passed, detail)
+                if not passed:
+                    issues.append("黄金回归存在差异或失败案例")
+        else:
+            # 临时文档一致性测试或外部镜像根目录不应误用当前 checkout
+            # 的输入；保留明确的未执行状态，由真实发布根目录负责运行。
+            _check(checks, "golden_regression", False, "非当前仓库根目录，未执行黄金回归")
+            issues.append("非当前仓库根目录，未执行黄金回归")
 
     return {
         "ok": not issues,

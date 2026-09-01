@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from jiadun.core.anomalies import coverage, engine, rules
+from jiadun.core.contracts import run_contract
 from jiadun.core.models import project as project_model
 
 
@@ -68,4 +69,37 @@ def test_rule_failure_is_not_persisted_as_low_business_anomaly(tmp_path):
         "SELECT COUNT(*) FROM evidence WHERE project_id=? AND kind='detection_failure'",
         (info.project_id,),
     ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_detection_failure_evidence_is_historical_after_successful_rerun(tmp_path):
+    """失败→成功重跑时，旧技术证据不能继续进入当前 Evidence 范围。"""
+    info, conn = _project(tmp_path)
+
+    def broken_rule(_conn, _project_id):
+        raise RuntimeError("synthetic detector failure")
+
+    engine.run_anomalies(conn, info.project_id, rules=[broken_rule])
+    failure = conn.execute(
+        "SELECT id, run_id, run_signature, scope FROM evidence "
+        "WHERE project_id=? AND kind='detection_failure'",
+        (info.project_id,),
+    ).fetchone()
+    assert failure is not None and failure["scope"] == "current"
+
+    engine.run_anomalies(conn, info.project_id, rules=[])
+    historical = conn.execute(
+        "SELECT scope, historical_reason FROM evidence WHERE id=?", (failure["id"],)
+    ).fetchone()
+    assert historical["scope"] == "historical"
+    assert historical["historical_reason"]
+    assert conn.execute(
+        "SELECT COUNT(*) FROM evidence_events WHERE evidence_id=? AND event_type='invalidated'",
+        (failure["id"],),
+    ).fetchone()[0] == 1
+    scope, params = run_contract.current_scope(conn, info.project_id, "e")
+    assert conn.execute(
+        f"SELECT COUNT(*) FROM evidence e WHERE e.project_id=? AND {scope}",
+        (info.project_id, *params),
+    ).fetchone()[0] == 0
     conn.close()

@@ -182,3 +182,37 @@ class TestSheetConfirmDialog:
         assert "settlement_summary" in (audit["after_json"] or "")
         assert dlg.sheet_list.count() == 0
         conn.close()
+
+    def test_save_mapping_template_is_explicit_candidate(self, qapp, quiet_boxes, gated_project):
+        """人工映射可另存模板，但保存动作不直接写入当前 Sheet 映射。"""
+        conn, pid = gated_project
+        dlg = self._dialog(conn, pid)
+        dlg._on_select(0)
+        # 演示附表的人工核对范围与测试前置数据一致；不触发抽取。
+        for field, col in {
+            "name": 2, "unit": 3, "quantity": 4,
+            "unit_price": 5, "amount": 6,
+        }.items():
+            dlg._col_spins[field].setValue(col)
+        dlg.hdr_lo.setValue(2)
+        dlg.hdr_hi.setValue(2)
+        dlg.reason_edit.setPlainText("已核对附表列位，保存为本项目候选模板")
+        dlg.template_name_edit.setText("附表人工映射")
+        dlg.template_scope_combo.setCurrentIndex(1)  # 本项目
+        before = conn.execute(
+            "SELECT COUNT(*) FROM line_items WHERE sheet_id=?",
+            (conn.execute("SELECT id FROM raw_sheets WHERE sheet_name='人材机汇总'").fetchone()[0],),
+        ).fetchone()[0]
+        dlg._save_template()
+        row = conn.execute(
+            "SELECT template_name, scope, created_by, evidence_id FROM mapping_templates "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert tuple(row[:3]) == ("附表人工映射", "project", "user")
+        assert row["evidence_id"] is not None
+        after = conn.execute(
+            "SELECT COUNT(*) FROM line_items WHERE sheet_id=?",
+            (conn.execute("SELECT id FROM raw_sheets WHERE sheet_name='人材机汇总'").fetchone()[0],),
+        ).fetchone()[0]
+        assert after == before
+        conn.close()

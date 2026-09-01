@@ -2,6 +2,7 @@
 import sys
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,8 @@ from jiadun.core.contracts import run_contract  # noqa: E402
 from jiadun.core.engine import settlement_io  # noqa: E402
 from jiadun.core.engine.money import round2  # noqa: E402
 from jiadun.core.export import excel_export  # noqa: E402
+from jiadun.core.pricing import history  # noqa: E402
+from jiadun.core.versions import create_project_version  # noqa: E402
 
 
 @pytest.fixture()
@@ -143,8 +146,94 @@ class TestExcelExport:
 
         wb = openpyxl.load_workbook(path)
         expected = {"管理层摘要", "未标记累计表", "对上对下对比表", "单价差异表", "工程量差异表",
-                    "金额差异表", "异常清单", "待核实事项清单", "证据索引", "审核底稿"}
+                    "金额差异表", "清单差异雷达", "差异雷达明细", "项目版本链",
+                    "版本差异明细", "历史综合单价库", "异常清单", "待核实事项清单",
+                    "证据索引", "审核底稿"}
         assert expected <= set(wb.sheetnames), wb.sheetnames
+
+    def test_version_and_history_assets_are_exported_with_traceable_fields(
+        self, full_project, monkeypatch
+    ):
+        """版本链和历史单价资产进入专用工作表，且金额保持 Decimal 序列化。"""
+        info, conn, exports = full_project
+        # 版本快照要求每一行有确定方向；合成导入故意未标记方向，先按
+        # 测试口径补齐为对下，再由版本 API 绑定新的运行契约。
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='downward' WHERE project_id=?",
+                (info.project_id,),
+            )
+        first = create_project_version(
+            conn,
+            info.project_id,
+            "initial_submission",
+            "第一次送审",
+            created_by="测试人",
+            reason="建立导出版本基线",
+        )
+        second = create_project_version(
+            conn,
+            info.project_id,
+            "final_approval",
+            "最终审定",
+            created_by="测试人",
+            reason="建立导出审定版本",
+        )
+        monkeypatch.setattr(
+            "jiadun.core.reporting.summary.build_project_summary",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                statuses={"project_status_code": "can_conclude"},
+                verification={"status": "sufficient", "evidence_complete": True},
+            ),
+        )
+        closure = history.close_project_for_history(
+            conn,
+            info.project_id,
+            second.version_id,
+            closed_by="测试人",
+            reason="建立历史资产导出基线",
+            region="北京",
+            project_type="房建",
+            observed_at="2026-08",
+        )
+        collection = history.collect_historical_prices(
+            conn,
+            closure.closure_id,
+            created_by="测试人",
+            reason="导出历史资产",
+        )
+        assert collection.records
+        # 关闭 API 的测试夹具需要临时放宽项目状态；导出必须恢复真实共享摘要。
+        monkeypatch.undo()
+
+        path = excel_export.export_workbook(conn, info.project_id, exports)
+        import openpyxl
+
+        wb = openpyxl.load_workbook(path, data_only=False)
+        versions = wb["项目版本链"]
+        assert versions.max_row >= 3
+        assert versions.cell(row=2, column=2).value == first.version_no
+        assert versions.cell(row=3, column=2).value == second.version_no
+        assert versions.cell(row=2, column=13).value == first.evidence_id
+        assert versions.cell(row=2, column=15).value == "有效"
+        diffs = wb["版本差异明细"]
+        assert diffs.max_row >= 2
+        assert diffs.cell(row=2, column=1).value == "比较摘要"
+        prices = wb["历史综合单价库"]
+        assert prices.max_row >= 2
+        exported_ids = {
+            prices.cell(row=row, column=1).value
+            for row in range(2, prices.max_row + 1)
+            if prices.cell(row=row, column=1).value is not None
+        }
+        assert {record.price_id for record in collection.records} <= exported_ids
+        record = collection.records[0]
+        asset_row = next(
+            row for row in range(2, prices.max_row + 1)
+            if prices.cell(row=row, column=1).value == record.price_id
+        )
+        assert prices.cell(row=asset_row, column=16).value == Decimal(str(record.unit_price))
+        assert "仅提示复核" in str(prices.cell(row=asset_row, column=27).value)
 
     def test_audit_worksheet_has_formulas(self, full_project):
         info, conn, exports = full_project

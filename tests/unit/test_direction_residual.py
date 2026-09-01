@@ -17,7 +17,9 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from jiadun.core.anomalies.rules import rule_duplicates  # noqa: E402
+from jiadun.core.contracts import run_contract  # noqa: E402
 from jiadun.core.db import migrations  # noqa: E402
+from jiadun.core.engine import settlement_io  # noqa: E402
 from jiadun.core.engine.settlement_io import ensure_period, next_period_no  # noqa: E402
 from jiadun.core.export.excel_export import export_diff_sheets  # noqa: E402
 
@@ -124,6 +126,46 @@ class TestBlock1DiffSheets:
 
 
 class TestBlock2SetDirection:
+    def test_direction_evidence_and_audit_bind_to_current_run(self, db):
+        """方向人工确认产生的 Evidence/Audit 必须属于变更后的当前运行。"""
+        conn, pid = db
+        period_id = ensure_period(conn, pid, 1, "up1", None, direction="upward")
+        first = run_contract.ensure_run_contract(conn, pid)
+
+        assert settlement_io.set_project_direction(
+            conn, pid, period_id, "downward", actor="tester", reason="方向口径复核"
+        ) == 1
+
+        current = run_contract.get_current_contract(conn, pid)
+        assert current is not None and current.run_id != first.run_id
+        scope, params = run_contract.current_scope(conn, pid, "e")
+        evidence = conn.execute(
+            f"""SELECT e.run_id, e.run_signature, e.scope
+                FROM evidence e
+                WHERE e.project_id=? AND e.kind='direction_change' AND {scope}
+                ORDER BY e.id DESC LIMIT 1""",
+            (pid, *params),
+        ).fetchone()
+        assert evidence is not None
+        assert (evidence["run_id"], evidence["run_signature"], evidence["scope"]) == (
+            current.run_id,
+            current.signature,
+            "human",
+        )
+        audit = conn.execute(
+            """SELECT run_id, run_signature FROM audit_log
+               WHERE project_id=? AND action='set_direction'
+               ORDER BY id DESC LIMIT 1""",
+            (pid,),
+        ).fetchone()
+        assert audit is not None
+        assert (audit["run_id"], audit["run_signature"]) == (
+            current.run_id,
+            current.signature,
+        )
+        stable = run_contract.ensure_run_contract(conn, pid)
+        assert stable.run_id == current.run_id
+
     def test_set_direction_updates_selected_period_only(self, db, monkeypatch):
         """同期号 up/down 两行，只改选中行；audit subject 按 period_id。"""
         from PySide6.QtWidgets import QApplication

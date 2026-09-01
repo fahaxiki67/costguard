@@ -8,6 +8,7 @@ C 校验：明细合计 vs 原表自带"小计"行。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from jiadun.core.engine.money import (
     to_decimal,
 )
 from jiadun.core.engine.settlement_io import load_sheet_grid, pending_sheet_count
+from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.labels import direction_label
 from jiadun.core.parsing import extract_items
 from jiadun.core.parsing.header_detect import HeaderDetection, detect_header
@@ -69,6 +71,22 @@ class CheckResult:
     excluded_title_rows: int = 0
     pending_sheets: int = 0       # 项目级待人工确认工作表数
     range_unproven_sheets: int = 0  # 取数范围无法证明完整的工作表数
+    raw_data_rows: int = 0         # 覆盖证明记录的物理数据区行数
+    excluded_note_rows: int = 0
+    excluded_blank_rows: int = 0
+    excluded_tail_note_rows: int = 0
+    excluded_orphan_numeric_rows: int = 0
+    excluded_parse_failed_rows: int = 0
+    pending_rows: int = 0
+    unrecognized_rows: int = 0
+    classified_detail_rows: int = 0  # 覆盖证明识别的明细行数
+    business_rows_used: int = 0      # 实际有有效金额并参与累计的业务行数
+    coverage_proof_status: str = "unproven"
+    ab_row_set_status: str = "unknown"
+    ab_row_set_hash: str | None = None
+    ab_independence_level: str = "unknown"
+    c_control_source: dict[str, object] | None = None
+    c_control_evidence_id: int | None = None
 
 
 @dataclass
@@ -256,6 +274,258 @@ def _range_is_proven(
     return bool(non_empty_rows) and max(non_empty_rows) == end
 
 
+def _coverage_proofs_for_period(
+    conn: sqlite3.Connection, project_id: int, period_id: int
+) -> dict[str, object]:
+    """读取当前 Run Contract 下某期每个结算 Sheet 的覆盖证明。
+
+    覆盖证明是导入时按 Sheet 追加的不可变事实；同一输入签名也可能对应
+    多个不可变运行，因此必须同时命中当前 ``run_signature`` 和 ``run_id``。
+    查询按 ``sheet_id`` 只取当前运行最新一份，避免历史证明重复累计。若
+    当前期次存在 Sheet 但没有对应证明，直接返回 ``unproven``，不能因为
+    A/B/C 数字碰巧一致而放行。
+    """
+    sheet_rows = conn.execute(
+        "SELECT id FROM raw_sheets WHERE period_id=? ORDER BY id", (period_id,)
+    ).fetchall()
+    expected_ids = [int(row["id"]) for row in sheet_rows]
+    if not expected_ids:
+        return {
+            "proofs": [],
+            "missing_sheet_ids": [],
+            "raw_data_rows": 0,
+            "classified_detail_rows": 0,
+            "business_rows_used": 0,
+            "excluded_subtotal_rows": 0,
+            "excluded_title_rows": 0,
+            "excluded_note_rows": 0,
+            "excluded_blank_rows": 0,
+            "excluded_tail_note_rows": 0,
+            "excluded_orphan_numeric_rows": 0,
+            "excluded_parse_failed_rows": 0,
+            "pending_rows": 0,
+            "unrecognized_rows": 0,
+            "coverage_proof_status": "unproven",
+            "ab_row_set_status": "unknown",
+            "ab_row_set_hash": None,
+            "ab_independence_level": "unknown",
+        }
+    current_contract = run_contract.get_current_contract(conn, project_id)
+    if current_contract is None:
+        # 没有当前运行身份时，旧的 NULL/仅签名证明都无法证明本次校核
+        # 读取范围；保持 fail-closed，而不是把导入历史当作当前结果。
+        return {
+            "proofs": [],
+            "missing_sheet_ids": expected_ids,
+            "raw_data_rows": 0,
+            "classified_detail_rows": 0,
+            "business_rows_used": 0,
+            "excluded_subtotal_rows": 0,
+            "excluded_title_rows": 0,
+            "excluded_note_rows": 0,
+            "excluded_blank_rows": 0,
+            "excluded_tail_note_rows": 0,
+            "excluded_orphan_numeric_rows": 0,
+            "excluded_parse_failed_rows": 0,
+            "pending_rows": 0,
+            "unrecognized_rows": 0,
+            "coverage_proof_status": "unproven",
+            "ab_row_set_status": "unknown",
+            "ab_row_set_hash": None,
+            "ab_independence_level": "unknown",
+        }
+    placeholders = ",".join("?" for _ in expected_ids)
+    rows = conn.execute(
+        f"""SELECT * FROM sheet_coverage_proofs
+            WHERE project_id=? AND period_id=?
+              AND run_signature=? AND run_id=?
+              AND sheet_id IN ({placeholders})
+            ORDER BY sheet_id, id DESC""",
+        (
+            project_id,
+            period_id,
+            current_contract.signature,
+            current_contract.run_id,
+            *expected_ids,
+        ),
+    ).fetchall()
+    latest_by_sheet: dict[int, sqlite3.Row] = {}
+    for row in rows:
+        sheet_id = int(row["sheet_id"])
+        latest_by_sheet.setdefault(sheet_id, row)
+    proofs = [latest_by_sheet[sheet_id] for sheet_id in expected_ids if sheet_id in latest_by_sheet]
+    missing_sheet_ids = [sheet_id for sheet_id in expected_ids if sheet_id not in latest_by_sheet]
+
+    count_fields = (
+        "raw_data_row_count", "classified_detail_rows", "business_rows_used",
+        "excluded_subtotal_rows", "excluded_title_rows", "excluded_note_rows",
+        "excluded_blank_rows", "excluded_tail_note_rows", "excluded_orphan_numeric_rows",
+        "excluded_parse_failed_rows", "pending_rows", "unrecognized_rows",
+    )
+    counts = {
+        field_name: sum(int(row[field_name] or 0) for row in proofs)
+        for field_name in count_fields
+    }
+    counts["raw_data_rows"] = counts.pop("raw_data_row_count")
+
+    statuses = {str(row["proof_status"] or "unproven") for row in proofs}
+    if missing_sheet_ids or not proofs or "unproven" in statuses:
+        coverage_status = "unproven"
+    elif "partial" in statuses:
+        coverage_status = "partial"
+    else:
+        coverage_status = "complete"
+
+    if missing_sheet_ids or any(
+        str(row["ab_row_set_status"] or "unknown") != "same_row_set"
+        for row in proofs
+    ):
+        ab_status = "unknown" if missing_sheet_ids else "different_row_set"
+        ab_hash = None
+        independence = "unknown"
+    else:
+        # 每个 Sheet 的行集哈希带上 sheet_id 后再聚合，避免不同 Sheet 中
+        # 相同的行号发生碰撞；这只是同一抽取器的共享行集指纹，不宣称独立。
+        row_set_payload = [
+            {"sheet_id": int(row["sheet_id"]), "row_set_hash": row["ab_row_set_hash"]}
+            for row in proofs
+        ]
+        ab_hash = hashlib.sha256(
+            json.dumps(row_set_payload, ensure_ascii=False, separators=(",", ":"))
+            .encode("utf-8")
+        ).hexdigest()
+        ab_status = "same_row_set"
+        independence = (
+            "shared_extractor"
+            if all(str(row["ab_independence_level"] or "unknown") == "shared_extractor"
+                   for row in proofs)
+            else "unknown"
+        )
+
+    return {
+        "proofs": proofs,
+        "missing_sheet_ids": missing_sheet_ids,
+        **counts,
+        "coverage_proof_status": coverage_status,
+        "ab_row_set_status": ab_status,
+        "ab_row_set_hash": ab_hash,
+        "ab_independence_level": independence,
+    }
+
+
+def _control_source_from_row(row: sqlite3.Row) -> tuple[dict[str, object], int | None]:
+    """从原表合计行保留文件、Sheet、单元格和来源 Evidence 定位。"""
+    try:
+        flags = json.loads(row["flags_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        flags = {}
+    try:
+        amount_evidence = json.loads(row["amount_evid"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        amount_evidence = {}
+    source_evidence_id = flags.get("source_evidence_id")
+    try:
+        source_evidence_id = int(source_evidence_id) if source_evidence_id is not None else None
+    except (TypeError, ValueError):
+        source_evidence_id = None
+    source = {
+        "field": "amount",
+        "file_id": row["file_id"],
+        "file_name": row["original_name"],
+        "file_sha256": row["file_sha256"],
+        "batch_id": row["batch_id"],
+        "sheet_id": row["sheet_id"],
+        "sheet_name": row["sheet_name"],
+        "sheet_index": row["sheet_index"],
+        "line_item_id": row["id"],
+        "row": amount_evidence.get("row"),
+        "amount_col": amount_evidence.get("col"),
+        "raw_value": amount_evidence.get("raw"),
+        "normalized_value": amount_evidence.get("value") or row["amount"],
+        "source_evidence_id": source_evidence_id,
+        "selection_rule": "唯一合计级行（flags.grand_total=true）",
+    }
+    return source, source_evidence_id
+
+
+def _ensure_c_control_evidence(
+    conn: sqlite3.Connection,
+    project_id: int,
+    result: CheckResult,
+    active_contract: run_contract.RunContract,
+) -> None:
+    """为页级小计 C 控制值补齐可定位的来源 Evidence。
+
+    合计级行通常已经在 ``line_items.flags_json`` 中带有自己的
+    ``line_item_source`` Evidence；没有合计级行时，C 是多个页级小计的
+    互斥求和，不能让 ``c_control_evidence_id`` 为空。这里在校核事务内追加
+    一条聚合来源 Evidence，保留每个文件/Sheet/行列/原文和底层来源 ID。
+    """
+    if result.control_status != "match" or result.c_control_evidence_id is not None:
+        return
+    rows = conn.execute(
+        """SELECT li.id, li.amount, li.amount_evid, li.flags_json,
+                  rs.sheet_name, rs.sheet_index, rs.id AS sheet_id,
+                  pb.id AS batch_id, sf.id AS file_id, sf.original_name,
+                  sf.sha256 AS file_sha256
+           FROM line_items li
+           LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
+           LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+           LEFT JOIN source_files sf ON sf.id=pb.file_id
+          WHERE li.period_id=?""",
+        (result.period_id,),
+    ).fetchall()
+    subtotal_rows = [
+        row for row in rows
+        if bool(_loads_flags(row["flags_json"]).get("subtotal"))
+    ]
+    sources: list[dict[str, object]] = []
+    for row in subtotal_rows:
+        source, _source_evidence_id = _control_source_from_row(row)
+        source.update({
+            "period_id": result.period_id,
+            "period": result.period_no,
+            "direction": result.direction,
+            "selection_rule": "无合计级行时页级小计互斥求和",
+        })
+        sources.append(source)
+    if not sources:
+        return
+    evidence_id = evidence_api.add_evidence(
+        conn,
+        project_id,
+        "line_item_source",
+        f"第{result.period_no}期 C 控制值来源：{len(sources)} 个页级小计互斥求和",
+        steps=[
+            {
+                "step": "C 控制来源",
+                "selection_rule": "无合计级行时页级小计互斥求和",
+                "source_count": len(sources),
+                "control_value": str(result.raw_subtotal),
+            }
+        ],
+        sources=sources,
+        commit=False,
+        run_signature=active_contract.signature,
+        run_id=active_contract.run_id,
+        scope="current",
+    )
+    result.c_control_evidence_id = evidence_id
+    result.c_control_source = {
+        "selection_rule": "无合计级行时页级小计互斥求和",
+        "items": sources,
+        "evidence_id": evidence_id,
+    }
+
+
+def _loads_flags(value: str | None) -> dict[str, object]:
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     """对单期做 A/B/C 三重校核。全部查询以 period_id 锁定，
     A/B/C 三路径、异常与证据都落在同一期次上。"""
@@ -270,7 +540,15 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
 
     # A：直接累计清洗后的明细；原始合价缺失时仅在计算路径中回退到数量×单价。
     rows = conn.execute(
-        """SELECT li.quantity, li.unit_price, li.amount, li.flags_json FROM line_items li
+        """SELECT li.id, li.sheet_id, li.quantity, li.unit_price, li.amount,
+                  li.amount_evid, li.flags_json,
+                  rs.sheet_name, rs.sheet_index,
+                  pb.id AS batch_id,
+                  sf.id AS file_id, sf.original_name, sf.sha256 AS file_sha256
+           FROM line_items li
+           LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
+           LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+           LEFT JOIN source_files sf ON sf.id=pb.file_id
            WHERE li.period_id=?""",
         (period_id,),
     ).fetchall()
@@ -289,6 +567,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         if json.loads(r["flags_json"] or "{}").get("grand_total")
     ]
     control_note = None
+    c_control_source: dict[str, object] | None = None
+    c_control_evidence_id: int | None = None
     if grand_rows:
         # 合计级行一旦存在，就必须恰好只有一条且金额可解析；无效行不能
         # 被忽略后回退到页级小计，否则同一张表会因脏控制行假绿色。
@@ -302,6 +582,8 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
             raw_subtotal = _dec_or_none(grand_rows[0]["amount"])
             if raw_subtotal is None:
                 control_note = "唯一合计级行金额缺失或非法，C 控制不可用"
+            else:
+                c_control_source, c_control_evidence_id = _control_source_from_row(grand_rows[0])
     elif subtotal_rows:
         # 无合计级行时，页级小计按页互斥求和；任一页级小计无效时，
         # 不能只累计其余可解析值形成不完整的 C 控制值。
@@ -425,7 +707,19 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     if control_note:
         notes.append(control_note)
 
-    # ---- 校核级别（P0-2/P0-5）：A/B 一致不等于结算正确 ----
+    # ---- P0-01：逐 Sheet 覆盖证明、业务行集和 A/B 独立性 ----
+    coverage = _coverage_proofs_for_period(conn, project_id, period_id)
+    coverage_proof_status = str(coverage["coverage_proof_status"])
+    classified_detail_rows = int(coverage["classified_detail_rows"] or 0)
+    business_rows_used = int(coverage["business_rows_used"] or 0)
+    a_business_rows = sum(
+        1 for row in detail_rows if _assess_amount(row)[2] is not None
+    )
+    ab_row_set_status = str(coverage["ab_row_set_status"])
+    ab_row_set_hash = coverage["ab_row_set_hash"]
+    ab_independence_level = str(coverage["ab_independence_level"])
+
+    # ---- 校核级别（P0-1/P0-2/P0-5）：A/B 一致不等于结算正确 ----
     # 绿色（校核充分）仅当：A=B 且 C 控制可用且控制一致，且项目无待人工工作表。
     pending_sheets = pending_sheet_count(conn, project_id)
     detail_count = len(detail_rows)
@@ -434,6 +728,22 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         reasons.append(f"{pending_sheets} 张工作表待人工确认")
     if range_unproven_sheets:
         reasons.append(f"{range_unproven_sheets} 张工作表取数范围完整性无法证明")
+    if coverage_proof_status != "complete":
+        reasons.append("Sheet 逐行覆盖证明未完整")
+    if classified_detail_rows != detail_count:
+        reasons.append(
+            f"覆盖证明明细行数({classified_detail_rows})与A路径明细行数({detail_count})不一致"
+        )
+    if business_rows_used != a_business_rows:
+        # 这是保守的形状校验：A/B 可能在其它字段缺失时仍有有效金额，
+        # 不能用 0 补齐；不一致只说明证明与累计行集尚未闭合，必须人工复核。
+        reasons.append(
+            f"覆盖证明业务行数({business_rows_used})与有效累计行数({a_business_rows})不一致"
+        )
+    if ab_independence_level == "shared_extractor":
+        notes.append("A/B 使用同一确定性抽取器和共享行集，仅属交叉复算，非独立证明")
+    elif ab_independence_level == "unknown":
+        reasons.append("A/B 行集或抽取独立性无法证明")
     if missing_raw_rows:
         reasons.append("原始金额存在缺失或不可解析")
     if control_status == "not_available":
@@ -461,6 +771,14 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         excluded_title_rows=excluded_title_rows,
         pending_sheets=pending_sheets,
         range_unproven_sheets=range_unproven_sheets,
+        raw_data_rows=int(coverage["raw_data_rows"] or 0),
+        excluded_note_rows=int(coverage["excluded_note_rows"] or 0),
+        excluded_blank_rows=int(coverage["excluded_blank_rows"] or 0),
+        excluded_tail_note_rows=int(coverage["excluded_tail_note_rows"] or 0),
+        excluded_orphan_numeric_rows=int(coverage["excluded_orphan_numeric_rows"] or 0),
+        excluded_parse_failed_rows=int(coverage["excluded_parse_failed_rows"] or 0),
+        pending_rows=int(coverage["pending_rows"] or 0),
+        unrecognized_rows=int(coverage["unrecognized_rows"] or 0),
         notes=notes,
         path_a_raw_total=summary_a.raw_total,
         path_a_calculated_total=summary_a.calculated_total,
@@ -472,6 +790,14 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         amount_status=amount_status,
         derived_rows=derived_rows,
         formula_mismatch_rows=formula_mismatch_rows,
+        classified_detail_rows=classified_detail_rows,
+        business_rows_used=business_rows_used,
+        coverage_proof_status=coverage_proof_status,
+        ab_row_set_status=ab_row_set_status,
+        ab_row_set_hash=ab_row_set_hash if isinstance(ab_row_set_hash, str) else None,
+        ab_independence_level=ab_independence_level,
+        c_control_source=c_control_source,
+        c_control_evidence_id=c_control_evidence_id,
     )
 
 
@@ -519,6 +845,22 @@ def make_evidence(project_id: int, res: CheckResult) -> str:
                 {"step": "排除标题/说明行数", "result": res.excluded_title_rows},
                 {"step": "待确认工作表数量", "result": res.pending_sheets},
                 {"step": "取数范围未证明工作表数量", "result": res.range_unproven_sheets},
+                {"step": "原始数据区行数", "result": res.raw_data_rows},
+                {"step": "覆盖证明识别明细行数", "result": res.classified_detail_rows},
+                {"step": "排除说明/备注行数", "result": res.excluded_note_rows},
+                {"step": "排除空白行数", "result": res.excluded_blank_rows},
+                {"step": "排除尾注行数", "result": res.excluded_tail_note_rows},
+                {"step": "排除孤立数值行数", "result": res.excluded_orphan_numeric_rows},
+                {"step": "解析失败行数", "result": res.excluded_parse_failed_rows},
+                {"step": "待人工确认行数", "result": res.pending_rows},
+                {"step": "未识别行数", "result": res.unrecognized_rows},
+                {"step": "参与最终累计业务行数", "result": res.business_rows_used},
+                {"step": "Sheet 覆盖证明状态", "result": res.coverage_proof_status},
+                {"step": "A/B 行集状态", "result": res.ab_row_set_status},
+                {"step": "A/B 行集指纹", "result": res.ab_row_set_hash},
+                {"step": "A/B 独立性", "result": res.ab_independence_level},
+                {"step": "C 控制值来源", "result": res.c_control_source},
+                {"step": "C 控制来源 Evidence", "result": res.c_control_evidence_id},
             ],
             "sources": [{"period_id": res.period_id, "period": res.period_no,
                          "direction": res.direction, "missing_rows": res.missing_rows}],
@@ -758,12 +1100,27 @@ def _invalidate_previous_validation(
 
             for evidence_id in sorted(evidence_ids):
                 evidence_row = conn.execute(
-                    """SELECT summary, steps_json, run_signature FROM evidence
+                    """SELECT summary, steps_json, run_signature, run_id FROM evidence
                        WHERE id=? AND project_id=?""",
                     (evidence_id, project_id),
                 ).fetchone()
                 if not evidence_row or evidence_row["run_signature"] != current_signature:
                     continue
+                evidence_api.record_event(
+                    conn,
+                    project_id,
+                    evidence_id,
+                    "invalidated",
+                    invalidation_note,
+                    run_id=evidence_row["run_id"],
+                    run_signature=current_signature,
+                    after_scope="historical",
+                    metadata={
+                        "previous_run_signature": current_signature,
+                        "replacement_run_signature": invalidated_signature,
+                    },
+                    commit=False,
+                )
                 try:
                     steps = json.loads(evidence_row["steps_json"] or "{}")
                 except (TypeError, json.JSONDecodeError):
@@ -781,12 +1138,14 @@ def _invalidate_previous_validation(
                     summary = f"【已失效】{summary}"
                 conn.execute(
                     """UPDATE evidence
-                       SET summary=?, steps_json=?, run_signature=?
+                       SET summary=?, steps_json=?, run_signature=?, scope='historical',
+                           historical_reason=?
                        WHERE id=? AND project_id=? AND run_signature=?""",
                     (
                         summary,
                         json.dumps(steps, ensure_ascii=False, default=str),
                         invalidated_signature,
+                        invalidation_note,
                         evidence_id,
                         project_id,
                         current_signature,
@@ -873,6 +1232,7 @@ def _record_validation_coverage(
         project_id,
         coverage,
         run_signature=active_contract.signature,
+        run_id=active_contract.run_id,
         run_kind=detection_coverage.AGGREGATE_VALIDATION,
         error_summary=failure_text if error is not None else None,
         metadata={
@@ -1112,11 +1472,12 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
             if res.verification_level == "insufficient" and combined_status == "match":
                 combined_status = "insufficient"
             with run_contract._transaction(conn, "run_crosscheck"):
+                _ensure_c_control_evidence(conn, project_id, res, active_contract)
                 cur = conn.execute(
                     """INSERT INTO evidence(
                            project_id, kind, summary, steps_json, sources_json,
-                           created_at, run_signature)
-                       VALUES (?,?,?,?,?,?,?)""",
+                           created_at, run_signature, run_id, scope)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
                     (project_id, "cross_check",
                      f"第{pno}期{dir_label}双向校核：{status_zh.get(res.status, '待复核')}；"
                      f"{'校核充分' if res.verification_level == 'sufficient' else '校核有发现' if res.verification_level == 'findings' else '校核不充分'}",
@@ -1126,15 +1487,21 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                                                 "diff_ab": str(res.diff_ab),
                                                 "control_diff": str(res.control_diff)},
                                 ensure_ascii=False, default=str),
-                     json.dumps({"period_id": res.period_id, "period": pno, "direction": res.direction}),
-                     now, active_contract.signature),
+                     json.dumps({"period_id": res.period_id, "period": pno,
+                                 "direction": res.direction,
+                                 "coverage_proof_status": res.coverage_proof_status,
+                                 "ab_independence_level": res.ab_independence_level,
+                                 "c_control_source": res.c_control_source,
+                                 "c_control_evidence_id": res.c_control_evidence_id},
+                                ensure_ascii=False, default=str),
+                     now, active_contract.signature, active_contract.run_id, "current"),
                 )
                 ev_id = cur.lastrowid
                 totals_cur = conn.execute(
                     """UPDATE period_totals SET
                        cross_check_status=?, cross_check_diff=?, evidence_id=?,
                        ab_status=?, ab_diff=?, control_status=?, control_diff=?,
-                       verification_level=?, run_signature=?
+                       verification_level=?, run_signature=?, run_id=?
                        WHERE project_id=? AND period_id=?""",
                     (
                         combined_status,
@@ -1146,6 +1513,7 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                         str(res.control_diff) if res.control_diff is not None else None,
                         res.verification_level,
                         active_contract.signature,
+                        active_contract.run_id,
                         project_id,
                         res.period_id,
                     ),
@@ -1161,8 +1529,11 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                            path_a_total, path_b_total, raw_subtotal, diff_ab, control_diff,
                            ab_status, control_status, detail_rows, excluded_subtotal_rows,
                            excluded_title_rows, pending_sheets, range_unproven_sheets,
-                           notes_json, evidence_id, checked_at, run_signature)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           classified_detail_rows, business_rows_used, coverage_proof_status,
+                           ab_row_set_status, ab_row_set_hash, ab_independence_level,
+                           c_control_source_json, c_control_evidence_id,
+                           notes_json, evidence_id, checked_at, run_signature, run_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(period_id) DO UPDATE SET
                            project_id=excluded.project_id,
                            verification_level=excluded.verification_level,
@@ -1179,10 +1550,19 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                            excluded_title_rows=excluded.excluded_title_rows,
                            pending_sheets=excluded.pending_sheets,
                            range_unproven_sheets=excluded.range_unproven_sheets,
+                           classified_detail_rows=excluded.classified_detail_rows,
+                           business_rows_used=excluded.business_rows_used,
+                           coverage_proof_status=excluded.coverage_proof_status,
+                           ab_row_set_status=excluded.ab_row_set_status,
+                           ab_row_set_hash=excluded.ab_row_set_hash,
+                           ab_independence_level=excluded.ab_independence_level,
+                           c_control_source_json=excluded.c_control_source_json,
+                           c_control_evidence_id=excluded.c_control_evidence_id,
                            notes_json=excluded.notes_json,
                            evidence_id=excluded.evidence_id,
                            checked_at=excluded.checked_at,
-                           run_signature=excluded.run_signature""",
+                           run_signature=excluded.run_signature,
+                           run_id=excluded.run_id""",
                     (
                         project_id, res.period_id, res.verification_level, combined_status,
                         str(res.path_a_total) if res.path_a_total is not None else None,
@@ -1193,8 +1573,13 @@ def run_crosscheck(conn: sqlite3.Connection, project_id: int, period_nos: list[i
                         res.status, res.control_status, res.detail_rows,
                         res.excluded_subtotal_rows, res.excluded_title_rows,
                         res.pending_sheets, res.range_unproven_sheets,
+                        res.classified_detail_rows, res.business_rows_used,
+                        res.coverage_proof_status, res.ab_row_set_status,
+                        res.ab_row_set_hash, res.ab_independence_level,
+                        json.dumps(res.c_control_source or {}, ensure_ascii=False),
+                        res.c_control_evidence_id,
                         json.dumps(res.notes, ensure_ascii=False), ev_id, now,
-                        active_contract.signature,
+                        active_contract.signature, active_contract.run_id,
                     ),
                 )
         except Exception as exc:

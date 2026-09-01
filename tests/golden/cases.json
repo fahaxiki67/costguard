@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "description": "价盾黄金回归案例登记；金额与数量采用 Decimal 字符串，规格只读，禁止执行器自动更新。",
+  "cases": [
+    {
+      "case_id": "demo_synthetic_v1",
+      "case_kind": "synthetic_demo",
+      "availability": "available",
+      "project_name": "黄金回归-匿名演示",
+      "inputs": [
+        {
+          "path": "examples/demo/演示-对上结算-第1至3期.xlsx",
+          "type": "xlsx",
+          "direction": "upward",
+          "sha256": "defbd6e65d0ccf3fb071bb845c410156c14c23635c929f8b93cd56a0ad2eab29"
+        },
+        {
+          "path": "examples/demo/演示-对下结算-第1至3期.xlsx",
+          "type": "xlsx",
+          "direction": "downward",
+          "sha256": "af3dda93118ee3b09c00f1f7c7ec2c89b349932efd351ddf743406928fd88872"
+        },
+        {
+          "path": "examples/demo/演示-对下结算-附表.xlsx",
+          "type": "xlsx",
+          "direction": "downward",
+          "sha256": "da901b96c3b45e80cde5bcdbec35eb23dd27aa47419c0e54fb26e8117d966894"
+        },
+        {
+          "path": "examples/demo/演示-合同摘录-合成.docx",
+          "type": "docx",
+          "direction": "contract",
+          "sha256": "9602fc5ccf7aa883192a3fd8afb7c5417912b16799c0b6a4e057ae52f61e9d5a"
+        }
+      ],
+      "expected": {
+        "file_count": 4,
+        "sheet_count": 8,
+        "automatic_recognition_count": 7,
+        "pending_sheet_count": 1,
+        "period_count": 6,
+        "detail_row_count": 39,
+        "period_amounts": {
+          "downward:1": {
+            "direction": "downward",
+            "period_no": 1,
+            "amount": null,
+            "available_amount": "134134.90",
+            "item_count": 8,
+            "missing_amount_items": 1
+          },
+          "downward:2": {
+            "direction": "downward",
+            "period_no": 2,
+            "amount": "44550.00",
+            "available_amount": "44550.00",
+            "item_count": 4,
+            "missing_amount_items": 0
+          },
+          "downward:3": {
+            "direction": "downward",
+            "period_no": 3,
+            "amount": "41760.00",
+            "available_amount": "41760.00",
+            "item_count": 2,
+            "missing_amount_items": 0
+          },
+          "upward:1": {
+            "direction": "upward",
+            "period_no": 1,
+            "amount": null,
+            "available_amount": "359098.26",
+            "item_count": 13,
+            "missing_amount_items": 1
+          },
+          "upward:2": {
+            "direction": "upward",
+            "period_no": 2,
+            "amount": "175380.00",
+            "available_amount": "175380.00",
+            "item_count": 7,
+            "missing_amount_items": 0
+          },
+          "upward:3": {
+            "direction": "upward",
+            "period_no": 3,
+            "amount": null,
+            "available_amount": "57240.00",
+            "item_count": 4,
+            "missing_amount_items": 1
+          }
+        },
+        "cumulative_amounts": {
+          "downward": {
+            "amount": null,
+            "available_amount": "220444.90",
+            "period_count": 3,
+            "incomplete_periods": 1,
+            "missing_amount_items": 0
+          },
+          "upward": {
+            "amount": null,
+            "available_amount": "591718.26",
+            "period_count": 3,
+            "incomplete_periods": 2,
+            "missing_amount_items": 0
+          }
+        },
+        "crosscheck": {
+          "count": 6,
+          "by_verification_level": {
+            "insufficient": 6
+          },
+          "by_status": {
+            "ab_match_control_not_available": 1,
+            "diff": 1,
+            "insufficient": 4
+          },
+          "sufficient_period_count": 0,
+          "period_ids": [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "evidence_linked_count": 6,
+          "coverage_proof_statuses": {
+            "complete": 4,
+            "partial": 2
+          }
+        },
+        "matches": {
+          "count": 31,
+          "by_level": {
+            "confirmed": 21,
+            "incomparable": 1,
+            "pending_data": 2,
+            "probable": 7
+          },
+          "group_keys": [
+            "downward:code:010101001001",
+            "downward:code:010401001001",
+            "downward:code:010416001001",
+            "downward:code:010501001001",
+            "downward:code:011001001001",
+            "downward:code:011702002001",
+            "downward:code:D1-001",
+            "downward:name:c25砼垫层",
+            "downward:name:劳务队土方用工",
+            "downward:name:合计",
+            "downward:name:小计",
+            "downward:pending:orphan",
+            "upward:code:010101001001",
+            "upward:code:010101003001",
+            "upward:code:010401001001",
+            "upward:code:010402001001",
+            "upward:code:010416001001",
+            "upward:code:010501001001",
+            "upward:code:010501002001",
+            "upward:code:010503001001",
+            "upward:code:010515001001",
+            "upward:code:010515002001",
+            "upward:code:010901001001",
+            "upward:code:011001001001",
+            "upward:code:011001002001",
+            "upward:code:011702002001",
+            "upward:code:011703001001",
+            "upward:code:012999001001",
+            "upward:name:合计",
+            "upward:name:小计",
+            "upward:pending:blocked_by_duplicate"
+          ],
+          "partition": {
+            "candidate_group_keys": [
+              "downward:code:010101001001",
+              "downward:code:010401001001",
+              "downward:code:010416001001",
+              "downward:code:010501001001",
+              "downward:code:011001001001",
+              "downward:code:011702002001",
+              "downward:code:D1-001",
+              "downward:name:c25砼垫层",
+              "downward:name:劳务队土方用工",
+              "downward:name:合计",
+              "downward:name:小计",
+              "upward:code:010101001001",
+              "upward:code:010101003001",
+              "upward:code:010401001001",
+              "upward:code:010402001001",
+              "upward:code:010416001001",
+              "upward:code:010501002001",
+              "upward:code:010503001001",
+              "upward:code:010515001001",
+              "upward:code:010515002001",
+              "upward:code:010901001001",
+              "upward:code:011001001001",
+              "upward:code:011001002001",
+              "upward:code:011702002001",
+              "upward:code:011703001001",
+              "upward:code:012999001001",
+              "upward:name:合计",
+              "upward:name:小计"
+            ],
+            "non_match_group_keys": [
+              "downward:pending:orphan",
+              "upward:code:010501001001",
+              "upward:pending:blocked_by_duplicate"
+            ]
+          }
+        },
+        "anomalies": {
+          "count": 42,
+          "rule_ids": [
+            "duplicate_item",
+            "formula_no_cache",
+            "large_round_amount",
+            "missing_key_fields",
+            "negative_quantity",
+            "orphan_numeric_row",
+            "price_abnormal_change",
+            "price_changed",
+            "qty_price_amount_mismatch",
+            "qty_sudden_change",
+            "rounding_difference",
+            "same_code_diff_name",
+            "summary_mismatch",
+            "summary_missing_data",
+            "tax_rate_changed",
+            "text_number_in_value_col",
+            "unit_changed",
+            "unparsed_number"
+          ]
+        },
+        "evidence": {
+          "current_count": 122,
+          "historical_count": 7,
+          "by_kind": {
+            "anomaly": 42,
+            "contract_fact": 13,
+            "cross_check": 6,
+            "line_item_source": 53,
+            "sheet_coverage_proof": 7,
+            "sheet_role_candidate": 1
+          },
+          "key_kinds": [
+            "anomaly",
+            "cross_check",
+            "line_item_source",
+            "sheet_coverage_proof"
+          ]
+        },
+        "run_contract": {
+          "schema_version": 43,
+          "run_id_present": true,
+          "signature_present": true
+        }
+      }
+    },
+    {
+      "case_id": "sanitized_real_template",
+      "case_kind": "sanitized_real",
+      "availability": "not_available",
+      "reason": "尚未登记经过脱敏、授权和哈希核验的真实项目；不得用合成演示数据冒充真实黄金案例。"
+    }
+  ]
+}

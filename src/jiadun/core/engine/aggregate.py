@@ -205,6 +205,7 @@ def aggregate_project(
     direction: str | None = None,
     *,
     include_all_directions: bool = False,
+    persist_derived_flags: bool = True,
 ) -> list[ItemAggregate]:
     """按 item_key 累计项目全部期次。跳过小计行；缺失值不补 0。
 
@@ -379,7 +380,7 @@ def aggregate_project(
                 agg.wavg_price = weighted_avg_price(effective_amt_total, qty_total)
         elif effective_amt_total is None or agg.quantity_required:
             agg.status = "incomplete"
-    if flag_updates:
+    if flag_updates and persist_derived_flags:
         with conn:
             conn.executemany("UPDATE line_items SET flags_json=? WHERE id=?", flag_updates)
     return sorted(aggs.values(), key=lambda a: (a.item_key,))
@@ -387,16 +388,32 @@ def aggregate_project(
 
 def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[ItemAggregate],
                           evidence_id: int | None = None) -> int:
-    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    previous_contract = run_contract.get_current_contract(conn, project_id)
     n = 0
     period_ids = sorted({int(pid) for agg in aggs for pid in agg.per_period})
+    settlement_io = None
+    if period_ids:
+        # 聚合重算也属于输入/结果边界变化，统一通过结算 IO 的失效化入口
+        # 先保存旧校核 Evidence 的历史事件，再刷新 Run Contract。不能只删
+        # crosscheck_results，否则旧 Evidence 会继续显示为 current。
+        from jiadun.core.engine import settlement_io as settlement_io_module
+
+        settlement_io = settlement_io_module
+
+        settlement_io.invalidate_crosscheck_results(conn, project_id, period_ids)
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
     with run_contract._transaction(conn, "persist_period_totals"):
-        if period_ids:
-            placeholders = ",".join("?" for _ in period_ids)
-            # 聚合结果改变后，旧的整体校核结论不能继续作为最新状态展示。
-            conn.execute(
-                f"DELETE FROM crosscheck_results WHERE project_id=? AND period_id IN ({placeholders})",
-                (project_id, *period_ids),
+        if settlement_io is not None:
+            # aggregate_project 可能只更新了行级派生标记；这会形成新的
+            # Run Contract，但不改变原始网格和逐行覆盖事实。失效化已把旧
+            # proof Evidence 标为 historical，这里追加同内容的新运行证明，
+            # 避免后续 A/B/C 因缺少当前覆盖证明而被错误降级。
+            settlement_io._rebind_coverage_proofs_for_run(
+                conn,
+                project_id,
+                previous_contract,
+                active_contract,
+                reason="聚合派生标记更新；原始网格和逐行覆盖分类未改变",
             )
         for agg in aggs:
             for pid, pp in agg.per_period.items():  # 键即 period_id
@@ -406,8 +423,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                        cross_check_diff, cross_check_status, evidence_id,
                        raw_amount_sum, calculated_amount_sum, calculated_amount_used_sum,
                        effective_amount_sum, amount_source, amount_status, verification_level,
-                       run_signature)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       run_signature, run_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(period_id, item_key) DO UPDATE SET
                          qty_sum=excluded.qty_sum, amount_sum=excluded.amount_sum,
                          wavg_price=excluded.wavg_price,
@@ -423,7 +440,8 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                          amount_source=excluded.amount_source,
                          amount_status=excluded.amount_status,
                          verification_level='insufficient',
-                         run_signature=excluded.run_signature""",
+                         run_signature=excluded.run_signature,
+                         run_id=excluded.run_id""",
                     (project_id, pid, agg.item_key,
                      str(pp["qty"]) if pp["qty"] is not None else None,
                      str(pp["effective_amount"]) if pp["effective_amount"] is not None else None,
@@ -436,7 +454,7 @@ def persist_period_totals(conn: sqlite3.Connection, project_id: int, aggs: list[
                      (str(pp["effective_amount"])
                       if pp["effective_amount"] is not None else None),
                      pp["amount_source"], pp["amount_status"], "insufficient",
-                     active_contract.signature),
+                     active_contract.signature, active_contract.run_id),
                 )
                 n += 1
     return n

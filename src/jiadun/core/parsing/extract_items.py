@@ -166,6 +166,7 @@ def persist_line_items(
     # 字段重复写三份证据，同时保留原始行列和值。
     meta = conn.execute(
         """SELECT sp.project_id, sp.period_no, sp.direction, rs.sheet_name,
+                  sp.id AS period_id, rs.id AS sheet_id, sf.id AS file_id,
                   sf.original_name
            FROM settlement_periods sp
            LEFT JOIN raw_sheets rs ON rs.id=?
@@ -217,8 +218,12 @@ def persist_line_items(
                             [{
                                 "file": meta["original_name"] if meta else None,
                                 "sheet": meta["sheet_name"] if meta else None,
+                                "file_id": meta["file_id"] if meta else None,
+                                "sheet_id": meta["sheet_id"] if meta else None,
+                                "period_id": meta["period_id"] if meta else None,
                                 "period": meta["period_no"] if meta else None,
                                 "direction": meta["direction"] if meta else "unknown",
+                                "selection_rule": "原始字段定位",
                                 **source,
                             } for source in field_sources],
                             ensure_ascii=False,

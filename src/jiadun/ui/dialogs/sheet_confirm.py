@@ -10,11 +10,12 @@
 视觉结构（本次重构）：左侧待确认列表（名称+状态徽章+来源文件 Tooltip）；
 右侧区块：基本信息 / 原始工作表预览（列标题可直接映射）/ 字段映射（Spin +
 "第 N 列 · 列名 · 示例值"提示 + 自动识别浅蓝底标识）/ 表头与数据范围 /
-确认依据 / 操作（关闭 Tertiary、仅存证 Secondary、确认并抽取 Primary）。
+  确认依据 / 可复用映射模板 / 操作（关闭 Tertiary、仅存证 Secondary、确认并抽取 Primary）。
 """
 from __future__ import annotations
 
 import json
+import sqlite3
 
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from jiadun.core.engine.settlement_io import PENDING_SHEETS_SQL
+from jiadun.core.mapping import templates as mapping_templates
 from jiadun.ui import theme
 from jiadun.ui.labels import DIRECTION_ZH
 from jiadun.ui.widgets import section_header
@@ -176,6 +179,28 @@ class SheetConfirmDialog(QDialog):
         self.reason_edit.setMinimumHeight(64)
         form.addWidget(self.reason_edit, 1)
 
+        # ---- 7. 可复用字段映射模板 ----
+        form.addWidget(section_header("可复用字段映射模板（仅作候选，不会自动套用）"))
+        template_row = QHBoxLayout()
+        template_row.addWidget(QLabel("名称："))
+        self.template_name_edit = QLineEdit()
+        self.template_name_edit.setPlaceholderText("保存时填写模板名称")
+        template_row.addWidget(self.template_name_edit, 2)
+        template_row.addWidget(QLabel("作用域："))
+        self.template_scope_combo = QComboBox()
+        for key, label in (("sheet", "本 Sheet"), ("project", "本项目"), ("global", "全局")):
+            self.template_scope_combo.addItem(label, key)
+        template_row.addWidget(self.template_scope_combo, 1)
+        self.save_template_btn = QPushButton("保存映射模板")
+        self.save_template_btn.setToolTip("只保存当前人工核对的候选；不会修改当前 Sheet 映射")
+        self.save_template_btn.clicked.connect(self._save_template)
+        template_row.addWidget(self.save_template_btn)
+        form.addLayout(template_row)
+        self.template_hint = QLabel("暂无候选模板。模板推荐必须再次人工核对。")
+        self.template_hint.setWordWrap(True)
+        self.template_hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        form.addWidget(self.template_hint)
+
         # ---- 仅存证角色 ----
         role_row = QHBoxLayout()
         role_row.addWidget(QLabel("仅存证角色："))
@@ -297,6 +322,34 @@ class SheetConfirmDialog(QDialog):
             f"当前第 {self.sheet_list.currentRow() + 1} / 共 {len(self._sheets)} 张待确认工作表\n"
             f"工作表「{s['sheet_name']}」（共 {max_col} 列）\n{src}"
         )
+        self._refresh_template_hint()
+
+    def _refresh_template_hint(self):
+        """显示只读候选模板；候选不会直接写入 SpinBox 或 table_headers。"""
+        s = self._current()
+        if not s:
+            self.template_hint.setText("暂无候选模板。模板推荐必须再次人工核对。")
+            return
+        try:
+            candidates = mapping_templates.recommend_mapping_templates(
+                self.conn, self.project_id, int(s["sheet_id"]), limit=3)
+        except (ValueError, sqlite3.Error):
+            candidates = []
+        if not candidates:
+            self.template_hint.setText("暂无相似模板。保存后模板只会作为后续人工核对候选。")
+            return
+        details = []
+        for candidate in candidates:
+            template = candidate.template
+            scope = {"sheet": "本 Sheet", "project": "本项目", "global": "全局"}.get(
+                template.scope, template.scope)
+            details.append(
+                f"{template.template_name} v{template.version}（{scope}，相似度 {candidate.score}，"
+                f"创建人：{template.created_by}）"
+            )
+        self.template_hint.setText(
+            "候选模板（仅供人工核对，不会自动套用）：" + "；".join(details)
+        )
 
     def _refresh_auto_style(self):
         for field, spin in self._col_spins.items():
@@ -407,6 +460,40 @@ class SheetConfirmDialog(QDialog):
         if not (1 <= hdr[0] <= hdr[1] <= n_rows):
             raise ValueError(f"表头行范围无效（有效行 1..{n_rows}）")
         return col_map, hdr, reason
+
+    def _save_template(self):
+        """把当前人工选择追加保存为模板，不改变当前 Sheet 的实际映射。"""
+        s = self._current()
+        if not s:
+            return
+        template_name = self.template_name_edit.text().strip()
+        if not template_name:
+            QMessageBox.warning(self, "保存映射模板", "模板名称必填。")
+            return
+        try:
+            col_map, hdr, reason = self._validated()
+            data_range = self._data_range(int(s["n_rows"] or 1))
+            template = mapping_templates.save_mapping_template(
+                self.conn,
+                self.project_id,
+                int(s["sheet_id"]),
+                scope=self.template_scope_combo.currentData(),
+                template_name=template_name,
+                col_map=col_map,
+                header_range=hdr,
+                data_range=data_range,
+                created_by="user",
+                reason=reason,
+            )
+        except (ValueError, mapping_templates.audit_log.AuditReasonRequiredError) as exc:
+            QMessageBox.warning(self, "保存映射模板", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "保存映射模板",
+            f"已保存「{template.template_name}」v{template.version}。\n"
+            "后续仅作为候选推荐，仍需人工核对后再确认。",
+        )
 
     def _do_extract(self, advance: bool = False):
         s = self._current()

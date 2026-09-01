@@ -1,6 +1,6 @@
 """工作台页面（Phase 8）。
 
-Tab 结构：期次概览 | 清单明细 | 审核问题中心 | 匹配复核 | 成果导出。
+Tab 结构：期次概览 | 清单明细 | 审核问题中心 | 匹配复核 | 成果导出 | 版本与历史资产。
 纪律落进 UI：
 - 修改匹配级别 / 处理异常必须填写原因（原则 14）；
 - 所有查询只读，绝不直接改业务数据；
@@ -9,6 +9,7 @@ Tab 结构：期次概览 | 清单明细 | 审核问题中心 | 匹配复核 | �
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -39,13 +40,18 @@ from PySide6.QtWidgets import (
 )
 
 from jiadun import branding
+from jiadun.core.anomalies import catalog as rule_catalog
 from jiadun.core.anomalies import coverage as detection_coverage
 from jiadun.core.anomalies import engine as anomaly_engine
 from jiadun.core.contracts import run_contract
 from jiadun.core.engine import crosscheck, settlement_io
+from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.export import excel_export
 from jiadun.core.matching import matching
+from jiadun.core.matching import mirror as matching_mirror
+from jiadun.core.pricing import history as pricing_history
 from jiadun.core.reporting import build_report_model
+from jiadun.core.versions import project as project_versions
 from jiadun.platform import paths as platform_paths
 from jiadun.ui import theme
 from jiadun.ui.labels import (
@@ -197,7 +203,7 @@ def project_status_summary(conn, project_id: int) -> str:
     if not summary.run_availability["available"]:
         # 运行级边界优先于所有历史统计；不要把 current_scope 的空集显示成
         # “尚未校核”，也不要让旧成功结果继续成为工作台的当前状态。
-        return "数据库不可写 · 当前结果不可用"
+        return f"项目状态：{summary.statuses['project_status']} · 数据库不可写 · 当前结果不可用"
     source_files = summary.source_files
     n = summary.pending["sheets"]
     high_open = summary.pending["high_risk"]
@@ -214,10 +220,9 @@ def project_status_summary(conn, project_id: int) -> str:
         parts.append(f"高风险未处理 {high_open} 项")
     if pending_matches:
         parts.append(f"待确认匹配 {pending_matches} 组")
-    level_zh = {"sufficient": "校核充分", "findings": "校核有发现", "insufficient": "校核不充分"}
     verification_status = summary.verification["status"]
     if verification_status != "not_started":
-        parts.append(f"最近校核：{level_zh.get(verification_status, '待复核')}")
+        parts.append(f"最近校核：{summary.verification['period_status']}")
     elif period_count:
         parts.append("最近校核：尚未校核")
     if period_count and summary.detection_coverage["status"] != "complete":
@@ -226,7 +231,69 @@ def project_status_summary(conn, project_id: int) -> str:
         parts.append("聚合验证覆盖率未完整")
     if summary.pending["manifest_status"] in {"incomplete", "mismatch"}:
         parts.append("权威批次清单未闭合")
+    parts.insert(0, f"项目状态：{summary.statuses['project_status']}")
     return " · ".join(p for p in parts if p)
+
+
+def _export_review_status_text(summary) -> str:
+    """从共享项目摘要生成成果页状态，不在 UI 重新查询或推导结论。"""
+    project_status = summary.statuses.get("project_status", "不可形成项目结论")
+    project_status_code = summary.statuses.get(
+        "project_status_code", "cannot_conclude"
+    )
+    period_count = sum(summary.directions.values())
+    checked_count = int(summary.verification.get("periods_checked", 0) or 0)
+    levels = summary.verification.get("levels", {})
+    issues: list[str] = []
+    if not summary.source_files:
+        issues.append("尚未导入资料")
+    elif not period_count:
+        issues.append("暂无可审核结算期次")
+    pending_sheets = int(summary.pending.get("sheets", 0) or 0)
+    high = int(summary.pending.get("high_risk", 0) or 0)
+    deferred = int(summary.risk.get("status", {}).get("deferred", 0) or 0)
+    pending_matches = int(summary.pending.get("matches", 0) or 0)
+    insufficient = int(levels.get("insufficient", 0) or 0)
+    findings = int(levels.get("findings", 0) or 0)
+    range_unproven = int(
+        summary.verification.get("range_unproven_sheets", 0) or 0
+    )
+    if pending_sheets:
+        issues.append(f"待确认工作表 {pending_sheets} 张")
+    if high:
+        issues.append(f"高风险未处理 {high} 项")
+    if deferred:
+        issues.append(f"暂不处理异常 {deferred} 项")
+    if pending_matches:
+        issues.append(f"待确认匹配 {pending_matches} 组")
+    if insufficient:
+        issues.append(f"校核不充分 {insufficient} 期")
+    if findings:
+        issues.append(f"校核有发现 {findings} 期")
+    if period_count and checked_count < period_count:
+        issues.append(f"尚未校核 {period_count - checked_count} 期")
+    if range_unproven:
+        issues.append(f"取数范围未证明 {range_unproven} 张工作表")
+    if period_count and summary.detection_coverage.get("status") != "complete":
+        issues.append("异常检测覆盖率未完整")
+    if period_count and summary.aggregate_coverage.get("status") != "complete":
+        issues.append("聚合验证覆盖率未完整")
+    if summary.pending.get("manifest_status") in {"incomplete", "mismatch"}:
+        issues.append("权威批次清单未闭合")
+    if not summary.verification.get("evidence_complete", False):
+        issues.append("当前 Evidence 不完整")
+    if project_status_code != "can_conclude" and not issues:
+        issues.append("共享证据闸门尚未闭合")
+    if issues:
+        return (
+            f"项目状态：{project_status}；审核尚未完成："
+            + "、".join(issues)
+            + "。仍可生成成果，但成果中会保留待补资料和未完成标记。"
+        )
+    return (
+        f"项目状态：{project_status}；审核完成度：当前未发现主要待处理事项；"
+        "导出内容仍需按证据索引复核。"
+    )
 
 
 class WorkbenchPage(QWidget):
@@ -265,6 +332,7 @@ class WorkbenchPage(QWidget):
         self.tabs.addTab(self._anomaly_tab(), "审核问题中心")
         self.tabs.addTab(self._match_tab(), "匹配复核")
         self.tabs.addTab(self._export_tab(), "成果导出")
+        self.tabs.addTab(self._version_history_tab(), "版本与历史资产")
         self.refresh_all()
 
     def _ensure_current_results_for_ui(self, operation: str) -> bool:
@@ -306,6 +374,8 @@ class WorkbenchPage(QWidget):
             ("high", "高风险未处理"),
             ("matches", "待确认匹配"),
             ("latest", "最近校核"),
+            ("version", "当前版本"),
+            ("historical_prices", "历史单价资产"),
         ):
             card = QWidget()
             cv = QVBoxLayout(card)
@@ -335,22 +405,32 @@ class WorkbenchPage(QWidget):
         high = summary.pending["high_risk"]
         matches = summary.pending["matches"]
         period_total = sum(period_counts.values())
-        level_zh = {
-            "sufficient": "校核充分", "findings": "校核有发现", "insufficient": "校核不充分",
-        }
-        latest_text = level_zh.get(summary.verification["status"], "待复核") \
+        latest_text = summary.verification["period_status"] \
             if summary.verification["status"] != "not_started" else "尚未校核"
+        latest_version = summary.version_chain.get("latest") or {}
+        version_text = (
+            f"v{latest_version['version_no']}"
+            if latest_version else "未建立"
+        )
         values = {
             "files": str(files), "pending_sheets": str(pending_sheets),
             "upward": str(period_counts.get("upward", 0)),
             "downward": str(period_counts.get("downward", 0)),
             "high": str(high), "matches": str(matches), "latest": latest_text,
+            "version": version_text,
+            "historical_prices": str(summary.historical_price_assets.get("active", 0)),
         }
         for key, value in values.items():
             self.overview_values[key].setText(value)
         if not summary.run_availability["available"]:
             self._next_action = "crosscheck"
             suggestion = "数据库不可写，当前结果不可用；请修复写入问题后重新运行校核"
+        elif summary.statuses["project_status_code"] == "cannot_conclude":
+            self._next_action = "crosscheck" if period_total else "import"
+            suggestion = (
+                "当前不可形成项目结论：请先补齐资料并完成当前运行校核"
+                if period_total else "当前不可形成项目结论：请先导入结算资料"
+            )
         elif pending_sheets:
             self._next_action = "sheets"
             suggestion = f"还有 {pending_sheets} 张工作表待确认"
@@ -898,8 +978,14 @@ class WorkbenchPage(QWidget):
                 evidence_id = int(raw_provenance)
             except (TypeError, ValueError):
                 continue
+            evidence_scope, evidence_params = run_contract.current_scope(
+                self.conn, self.project.project_id, "e"
+            )
             evidence = self.conn.execute(
-                "SELECT summary, sources_json FROM evidence WHERE id=?", (evidence_id,)
+                f"""SELECT summary, sources_json, scope, historical_reason
+                    FROM evidence e
+                    WHERE e.id=? AND e.project_id=? AND {evidence_scope}""",
+                (evidence_id, self.project.project_id, *evidence_params),
             ).fetchone()
             if not evidence:
                 continue
@@ -919,16 +1005,20 @@ class WorkbenchPage(QWidget):
                         lines.append(f"  来源：{location} {raw}".strip())
         if not provenance_found:
             lines.append("- 当前清单行没有独立字段来源记录；可根据上方文件、Sheet、行ID回查保真数据。")
+        anomaly_scope, anomaly_params = run_contract.current_scope(
+            self.conn, self.project.project_id, "a"
+        )
         anomalies = self.conn.execute(
-            """SELECT rule_id, message, status, evidence_id FROM anomalies
-               WHERE project_id=? AND subject_type='line_item' AND subject_id=? ORDER BY id""",
-            (self.project.project_id, int(item_id)),
+            f"""SELECT rule_id, message, status, evidence_id FROM anomalies a
+               WHERE a.project_id=? AND a.subject_type='line_item' AND a.subject_id=?
+                 AND {anomaly_scope} ORDER BY a.id""",
+            (self.project.project_id, int(item_id), *anomaly_params),
         ).fetchall()
         if anomalies:
             lines.append("相关异常：")
             for anomaly in anomalies:
                 lines.append(
-                    f"- {rule_zh(anomaly['rule_id'])}（{item_status_zh(anomaly['status'])}）："
+                    f"- {rule_zh(anomaly['rule_id'])}（{item_status_zh(finding_lifecycle.lifecycle_status(anomaly))}）："
                     f"{normalize_business_text(anomaly['message'])}"
                 )
         else:
@@ -946,11 +1036,15 @@ class WorkbenchPage(QWidget):
         v.addWidget(self.anomaly_summary_label)
         refresh_btn = QPushButton("刷新")
         refresh_btn.clicked.connect(self.refresh_anomalies)
+        rule_btn = QPushButton("规则目录…")
+        rule_btn.setToolTip("查看规则适用范围与版本；启停变更会进入下一次 Run Contract")
+        rule_btn.clicked.connect(self._edit_rule_configuration)
         process_btn = QPushButton("处理选中问题…")
         process_btn.setObjectName("btnPrimary")
         process_btn.clicked.connect(self._process_anomaly)
         row = QHBoxLayout()
         row.addWidget(refresh_btn)
+        row.addWidget(rule_btn)
         row.addWidget(process_btn)
         row.addStretch(1)
         v.addLayout(row)
@@ -973,6 +1067,7 @@ class WorkbenchPage(QWidget):
         scope, scope_params = run_contract.current_scope(self.conn, self.project.project_id, "a")
         rows = self.conn.execute(
             f"""SELECT a.id, a.rule_id, a.severity, a.message, a.evidence_id, a.status,
+                      a.lifecycle_status, a.repeat_history_json,
                       COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
                         AS direction
                FROM anomalies a
@@ -990,18 +1085,22 @@ class WorkbenchPage(QWidget):
             (self.project.project_id, *scope_params),
         ).fetchall()
         counts = {"high": 0, "medium": 0, "pending": 0, "deferred": 0, "processed": 0}
+        pending_lifecycle = {"new", "pending_review", "confirmed_issue", "pending_data"}
+        deferred_lifecycle = {"pending_review", "pending_data"}
+        processed_lifecycle = {"legitimate_business", "rectified", "closed"}
         for row in rows:
+            status_code = finding_lifecycle.lifecycle_status(row)
             if row["severity"] == "high":
                 counts["high"] += 1
             elif row["severity"] == "medium":
                 counts["medium"] += 1
-            if row["status"] == "open":
+            if status_code in pending_lifecycle:
                 counts["pending"] += 1
-            elif row["status"] == "deferred":
+            if status_code in deferred_lifecycle:
                 counts["deferred"] += 1
-            elif row["status"] in {"verified_no_issue", "supplemented", "corrected", "resolved"}:
+            elif status_code in processed_lifecycle:
                 counts["processed"] += 1
-            else:
+            elif status_code not in pending_lifecycle and status_code != "historical":
                 # 未知历史状态仍归入待人工确认，避免被误算为已处理。
                 counts["pending"] += 1
         coverage = detection_coverage.coverage_summary(self.conn, self.project.project_id)
@@ -1031,8 +1130,9 @@ class WorkbenchPage(QWidget):
             t.setItem(i, 3, rule_item)
             t.setItem(i, 4, QTableWidgetItem(normalize_business_text(r["message"])))
             fill_cell(t, i, 5, r["evidence_id"], secondary=True, mono=True)
-            fill_cell(t, i, 6, item_status_zh(r["status"]))
+            fill_cell(t, i, 6, item_status_zh(finding_lifecycle.lifecycle_status(r)))
         t.setSortingEnabled(True)
+        self._apply_match_filters()
 
     def _show_anomaly_detail(self, row: int, _column: int):
         item = self.anomaly_table.item(row, 0)
@@ -1047,9 +1147,9 @@ class WorkbenchPage(QWidget):
         )
         anomaly = self.conn.execute(
             f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id, a.evidence_id,
-                      message, status, resolved_note, created_at, finding_id, fingerprint,
+                      message, status, lifecycle_status, resolved_note, created_at, finding_id, fingerprint,
                       confidence, detection_mode, raw_values_json, normalized_values_json,
-                      impact, limitations_json, recommendation, suppression_reason
+                      impact, limitations_json, recommendation, suppression_reason, repeat_history_json
                FROM anomalies a WHERE a.id=? AND a.project_id=? AND {scope}""",
             (int(anomaly_id), self.project.project_id, *scope_params),
         ).fetchone()
@@ -1058,7 +1158,7 @@ class WorkbenchPage(QWidget):
             return
         lines = [
             f"问题 #{anomaly['id']}：{rule_zh(anomaly['rule_id'])}",
-            f"级别：{SEVERITY_ZH.get(anomaly['severity'], '其他')}　状态：{item_status_zh(anomaly['status'])}",
+            f"级别：{SEVERITY_ZH.get(anomaly['severity'], '其他')}　状态：{item_status_zh(finding_lifecycle.lifecycle_status(anomaly))}",
             f"对象：{subject_type_zh(anomaly['subject_type'])} #{anomaly['subject_id']}",
             f"说明：{normalize_business_text(anomaly['message'])}",
             f"发现时间：{anomaly['created_at'] or '—'}",
@@ -1089,6 +1189,18 @@ class WorkbenchPage(QWidget):
                 lines.append(f"{label}：{_evidence_entry_text(values, source=(label == '原始值'))}")
         if anomaly["suppression_reason"]:
             lines.append(f"抑制原因：{normalize_business_text(anomaly['suppression_reason'])}")
+        repeated = finding_lifecycle.repeat_history(anomaly["repeat_history_json"])
+        if repeated:
+            lines.append("相同问题指纹历史处理（仅供参考，不自动关闭当前 Finding）：")
+            for previous in repeated[-8:]:
+                previous_status = finding_lifecycle.lifecycle_status(
+                    previous.get("lifecycle_status") or previous.get("legacy_status")
+                )
+                lines.append(
+                    f"- Finding #{previous.get('anomaly_id', '—')}："
+                    f"{item_status_zh(previous_status)}；处理说明："
+                    f"{normalize_business_text(previous.get('reason') or '暂无')}"
+                )
         if anomaly["evidence_id"]:
             evidence_scope, evidence_params = run_contract.current_scope(
                 self.conn, self.project.project_id, "e"
@@ -1135,6 +1247,65 @@ class WorkbenchPage(QWidget):
             lines.append("处理历史：暂无")
         self.anomaly_detail_panel.setPlainText("\n".join(lines))
 
+    def _edit_rule_configuration(self):
+        """通过规则目录启停一条项目规则；每次变更均要求人工原因。"""
+        configurations = rule_catalog.current_configurations(
+            self.conn, self.project.project_id
+        )
+        definitions = rule_catalog.catalog_entries()
+        labels = [
+            f"{definition.name_zh}（{definition.rule_id}）· "
+            f"{'启用' if configurations[definition.rule_id]['enabled'] else '已停用'}"
+            for definition in definitions
+        ]
+        label, ok = QInputDialog.getItem(
+            self, "规则目录", "选择要切换的规则（目录详情见提示）", labels, 0, False
+        )
+        if not ok:
+            return
+        selected = definitions[labels.index(label)]
+        current = configurations[selected.rule_id]
+        if not selected.allow_disable and current["enabled"]:
+            QMessageBox.warning(self, "规则目录", "该规则是安全闸门，不允许停用。")
+            return
+        target_enabled = not current["enabled"]
+        detail = (
+            f"规则：{selected.name_zh}\n"
+            f"场景：{selected.as_dict()['scenario_zh']}\n"
+            f"严重度：{selected.severity}\n"
+            f"触发条件：{selected.trigger_condition}\n"
+            f"证据要求：{selected.evidence_requirements}\n"
+            f"限制：{selected.limitations}\n"
+            f"启停后将形成新的 Run Contract；旧结果不参与当前结论。"
+        )
+        QMessageBox.information(self, "规则目录", detail)
+        reason_dlg = ReasonDialog(
+            "调整规则配置",
+            f"将「{selected.name_zh}」设置为{'启用' if target_enabled else '停用'}",
+            self,
+        )
+        if reason_dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            rule_catalog.set_rule_enabled(
+                self.conn,
+                self.project.project_id,
+                selected.rule_id,
+                target_enabled,
+                actor="user",
+                reason=reason_dlg.reason(),
+            )
+        except (ValueError, rule_catalog.audit_log.AuditReasonRequiredError) as exc:
+            QMessageBox.warning(self, "规则目录", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "规则目录",
+            f"已将「{selected.name_zh}」设置为{'启用' if target_enabled else '停用'}。\n"
+            "当前已有校核/检测结果需要按新运行契约重新执行。",
+        )
+        self.refresh_all()
+
     def _process_anomaly(self, forced_status: str | None = None):
         row = self.anomaly_table.currentRow()
         if row < 0:
@@ -1144,67 +1315,42 @@ class WorkbenchPage(QWidget):
         if not self._ensure_current_results_for_ui("处理异常"):
             return
         status_map = {
-            "verified_no_issue": "已核实无问题",
-            "supplemented": "已补资料",
-            "corrected": "已修正",
-            "deferred": "暂不处理",
-            "resolved": "已处理",
+            "pending_review": "待复核",
+            "confirmed_issue": "已确认问题",
+            "legitimate_business": "合理业务情形",
+            "pending_data": "待补资料",
+            "rectified": "已整改",
+            "closed": "已关闭",
         }
-        new_status = forced_status
+        new_status = finding_lifecycle.LEGACY_TO_LIFECYCLE.get(
+            forced_status, forced_status
+        ) if forced_status else None
         if new_status is None:
-            labels = [status_map[key] for key in ("verified_no_issue", "supplemented", "corrected", "deferred")]
+            labels = [status_map[key] for key in (
+                "pending_review", "confirmed_issue", "legitimate_business",
+                "pending_data", "rectified", "closed",
+            )]
             label, ok = QInputDialog.getItem(self, "处理审核问题", "处理状态", labels, 0, False)
             if not ok:
                 return
             new_status = next(key for key, value in status_map.items() if value == label)
+        if new_status not in status_map:
+            QMessageBox.warning(self, "处理异常", "不支持的 Finding 状态，请刷新后重试。")
+            return
         dlg = ReasonDialog("处理异常", f"将异常 #{aid} 标记为“{status_map[new_status]}”", self)
         if dlg.exec() != QDialog.Accepted:
             return
-        from jiadun.core.evidence import audit as audit_log
-        from jiadun.core.evidence import evidence as evidence_api
-
         try:
-            # 重新在实际写入事务内取 current scope。对话框停留期间若运行级
-            # 状态失效，不能继续使用对话框打开前捕获的范围。
-            with run_contract._transaction(self.conn, "resolve_anomaly"):
-                run_contract.require_current_results_available(
-                    self.conn, self.project.project_id, operation="处理异常"
-                )
-                scope, scope_params = run_contract.current_scope(
-                    self.conn, self.project.project_id, "a"
-                )
-                old = self.conn.execute(
-                    f"""SELECT status, run_signature, finding_id FROM anomalies a
-                        WHERE a.id=? AND a.project_id=? AND {scope}""",
-                    (aid, self.project.project_id, *scope_params),
-                ).fetchone()
-                if not old:
-                    raise run_contract.CurrentResultsUnavailableError(
-                        "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
-                    )
-                signature_clause = "run_signature IS NULL" if old["run_signature"] is None else "run_signature=?"
-                signature_params = () if old["run_signature"] is None else (old["run_signature"],)
-                cur = self.conn.execute(
-                    f"""UPDATE anomalies SET status=?, resolved_note=?
-                        WHERE id=? AND project_id=? AND {signature_clause}""",
-                    (new_status, dlg.reason(), aid, self.project.project_id, *signature_params))
-                if cur.rowcount != 1:
-                    raise run_contract.CurrentResultsUnavailableError(
-                        "处理异常不可用：问题已不在当前运行范围，请刷新后重试。"
-                    )
-                evidence_api.add_evidence(
-                    self.conn, self.project.project_id, "anomaly_resolution",
-                    f"异常 #{aid} 已标记为{status_map[new_status]}：{dlg.reason()}",
-                    steps=[{"step": "人工处理", "status": new_status, "reason": dlg.reason()}],
-                    sources=[{"anomaly_id": aid}],
-                    commit=False,
-                    run_signature=old["run_signature"],
-                    finding_id=old["finding_id"],
-                )
-                audit_log.record_audit(
-                    self.conn, self.project.project_id, "user", "resolve_anomaly", f"anomaly:{aid}",
-                    {"status": old["status"]}, {"status": new_status}, dlg.reason(), commit=False)
-        except run_contract.CurrentResultsUnavailableError as exc:
+            finding_lifecycle.update_finding_status(
+                self.conn,
+                self.project.project_id,
+                aid,
+                new_status,
+                actor="user",
+                reason=dlg.reason(),
+            )
+        except (run_contract.CurrentResultsUnavailableError,
+                finding_lifecycle.FindingLifecycleError, ValueError) as exc:
             QMessageBox.warning(self, "处理异常", str(exc))
             return
         self.refresh_anomalies()
@@ -1220,6 +1366,21 @@ class WorkbenchPage(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         row = QHBoxLayout()
+        self.match_search = QLineEdit()
+        self.match_search.setPlaceholderText("搜索编码、名称或匹配理由")
+        self.match_search.setClearButtonEnabled(True)
+        self.match_search.textChanged.connect(self._apply_match_filters)
+        row.addWidget(self.match_search, 1)
+        self.match_filter = QComboBox()
+        self.match_filter.addItem("全部匹配", "all")
+        self.match_filter.addItem("只看未匹配", "unmatched")
+        self.match_filter.addItem("只看高金额差", "high_amount_diff")
+        self.match_filter.addItem("只看单价差", "unit_price_diff")
+        self.match_filter.addItem("只看数量差", "quantity_diff")
+        self.match_filter.addItem("只看不可比", "incomparable")
+        self.match_filter.addItem("只看待人工确认", "pending")
+        self.match_filter.currentIndexChanged.connect(self._apply_match_filters)
+        row.addWidget(self.match_filter)
         run_btn = QPushButton("运行匹配")
         run_btn.clicked.connect(self._run_match)
         confirm_btn = QPushButton("确认选中匹配（需原因）")
@@ -1248,6 +1409,49 @@ class WorkbenchPage(QWidget):
         match_split.setSizes([700, 300])
         v.addWidget(match_split, 1)
         return w
+
+    def _apply_match_filters(self):
+        """只隐藏表格行，不删除当前运行的匹配候选。"""
+        if not hasattr(self, "match_table"):
+            return
+        keyword = self.match_search.text().strip().casefold()
+        filter_code = self.match_filter.currentData() or "all"
+        for row in range(self.match_table.rowCount()):
+            id_item = self.match_table.item(row, 0)
+            if id_item is None:
+                self.match_table.setRowHidden(row, True)
+                continue
+            match_id = id_item.data(Qt.UserRole)
+            display_text = " ".join(
+                (self.match_table.item(row, column).text() if self.match_table.item(row, column) else "")
+                for column in (1, 2, 3, 6)
+            ).casefold()
+            visible = not keyword or keyword in display_text
+            level_text = self.match_table.item(row, 2).text() if self.match_table.item(row, 2) else ""
+            status_text = self.match_table.item(row, 6).text() if self.match_table.item(row, 6) else ""
+            if filter_code in {"unmatched", "pending"}:
+                visible = visible and status_text not in {"已确认", "已处理"}
+            if filter_code == "unmatched":
+                visible = visible and status_text != "已确认"
+            elif filter_code == "pending":
+                visible = visible and status_text == "待确认"
+            elif filter_code == "incomparable":
+                visible = visible and "不可比" in (level_text or status_text)
+            elif filter_code in {"high_amount_diff", "unit_price_diff", "quantity_diff"}:
+                try:
+                    mirror = matching_mirror.build_mirror_comparison(
+                        self.conn, self.project.project_id, int(match_id)
+                    )
+                except (ValueError, sqlite3.Error):
+                    visible = False
+                else:
+                    if filter_code == "high_amount_diff":
+                        visible = visible and mirror.amount_difference is not None and abs(mirror.amount_difference) >= 1000
+                    elif filter_code == "unit_price_diff":
+                        visible = visible and mirror.unit_price_difference not in (None, 0)
+                    else:
+                        visible = visible and mirror.quantity_difference not in (None, 0)
+            self.match_table.setRowHidden(row, not visible)
 
     def _run_match(self):
         if not self._ensure_current_results_for_ui("运行匹配"):
@@ -1310,6 +1514,15 @@ class WorkbenchPage(QWidget):
         if not match:
             self.match_detail_panel.setPlainText("未找到对应匹配组，可能已重新运行匹配。")
             return
+        mirror = None
+        try:
+            mirror = matching_mirror.build_mirror_comparison(
+                self.conn, self.project.project_id, int(match_id)
+            )
+        except (ValueError, sqlite3.Error):
+            # 旧项目/兼容候选缺少左右字段时保留下方旧详情路径；一旦核心
+            # 镜像模型可用，数量、单价、金额差异均来自 Decimal 计算。
+            mirror = None
         try:
             item_ids = [int(value) for value in json.loads(match["item_ids_json"] or "[]")]
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1320,6 +1533,25 @@ class WorkbenchPage(QWidget):
             f"置信度：{float(match['score']):.2f}" if match["score"] is not None else "置信度：待确认",
         ]
         lines[-1] += f"　状态：{item_status_zh(match['status'])}"
+        if mirror is not None:
+            lines.append(
+                "镜像复核范围：对上结算 ↔ 对下结算；"
+                f"数量差 {mirror.quantity_difference if mirror.quantity_difference is not None else '待补资料'}；"
+                f"单价差 {mirror.unit_price_difference if mirror.unit_price_difference is not None else '待补资料'}；"
+                f"金额差 {mirror.amount_difference if mirror.amount_difference is not None else '待补资料'}；"
+                f"差异率 {mirror.amount_difference_rate if mirror.amount_difference_rate is not None else '不可比'}"
+            )
+            lines.append(
+                "镜像字段状态：" + "；".join(
+                    f"{field.label}={field.status}" for field in mirror.fields
+                )
+            )
+            lines.append(
+                "相关 Evidence ID：" + (
+                    "、".join(map(str, mirror.evidence_ids))
+                    if mirror.evidence_ids else "待生成（来源行已在下方保留）"
+                )
+            )
         if match["review_note"]:
             lines.append(f"人工判断原因：{match['review_note']}")
         if item_ids:
@@ -1397,10 +1629,12 @@ class WorkbenchPage(QWidget):
                     return "待补资料/缺一侧"
                 if field == "name":
                     return "完全一致" if matching.normalize_name(left) == matching.normalize_name(right) else "名称存在差异"
-                if field in {"quantity", "unit_price"}:
+                if field in {"quantity", "unit_price", "amount"}:
                     try:
-                        return "完全一致" if abs(float(left) - float(right)) < 1e-9 else "数值存在差异"
-                    except (TypeError, ValueError):
+                        from decimal import Decimal
+
+                        return "完全一致" if Decimal(str(left)) == Decimal(str(right)) else "数值存在差异"
+                    except (TypeError, ValueError, ArithmeticError):
                         pass
                 return "完全一致" if left == right else "存在差异"
 
@@ -1408,13 +1642,14 @@ class WorkbenchPage(QWidget):
             if key_kind:
                 lines.append(f"对照依据：{('编码' if key_kind == 'code' else '名称')} {key_value}")
             left_values = {field: "；".join(values(left_rows, field)[:5]) for field in
-                           ("code", "name", "unit", "quantity", "unit_price")}
+                           ("code", "name", "feature", "unit", "quantity", "unit_price", "amount")}
             right_values = {field: "；".join(values(right_rows, field)[:5]) for field in
-                            ("code", "name", "unit", "quantity", "unit_price")}
+                            ("code", "name", "feature", "unit", "quantity", "unit_price", "amount")}
             lines.append("字段 | 对上结算 | 匹配程度 | 对下结算")
             lines.append("---|---|---|---")
-            for field, label in (("code", "编码"), ("name", "名称"), ("unit", "单位"),
-                                 ("quantity", "数量"), ("unit_price", "单价")):
+            for field, label in (("code", "编码"), ("name", "名称"), ("feature", "项目特征"),
+                                 ("unit", "单位"), ("quantity", "数量"),
+                                 ("unit_price", "单价"), ("amount", "金额")):
                 left = left_values[field]
                 right = right_values[field]
                 if field == "name":
@@ -1558,6 +1793,270 @@ class WorkbenchPage(QWidget):
         self.refresh_overview()
         self.refresh_export_status()
 
+    # ---------- 版本与历史资产 ----------
+    def _version_history_tab(self) -> QWidget:
+        """展示不可覆盖版本链与历史单价资产；所有内容均为只读回读。"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        toolbar = QHBoxLayout()
+        refresh_btn = QPushButton("刷新版本与资产")
+        refresh_btn.clicked.connect(self.refresh_version_assets)
+        create_btn = QPushButton("创建项目版本…")
+        create_btn.setObjectName("btnPrimary")
+        create_btn.clicked.connect(self._create_project_version_ui)
+        collect_btn = QPushButton("关闭/沉淀历史单价…")
+        collect_btn.clicked.connect(self._collect_historical_prices_ui)
+        toolbar.addWidget(refresh_btn)
+        toolbar.addWidget(create_btn)
+        toolbar.addWidget(collect_btn)
+        toolbar.addStretch(1)
+        v.addLayout(toolbar)
+
+        self.version_asset_status_label = QLabel("")
+        self.version_asset_status_label.setWordWrap(True)
+        self.version_asset_status_label.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; background: transparent;"
+        )
+        v.addWidget(self.version_asset_status_label)
+        self.version_compare_label = QLabel("")
+        self.version_compare_label.setWordWrap(True)
+        self.version_compare_label.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; background: transparent;"
+        )
+        v.addWidget(self.version_compare_label)
+
+        v.addWidget(QLabel("项目版本链（历史版本不覆盖，责任链无效时只作待复核线索）"))
+        self.version_chain_table = _make_table(
+            [
+                "版本", "类型", "标题", "清单行数", "创建人", "创建时间",
+                "当前运行", "Evidence ID", "Audit ID", "责任链",
+            ],
+            stretch_cols=(2,), right_cols=(0, 3, 7, 8),
+            fixed_widths={0: 58, 1: 100, 3: 75, 6: 75, 7: 85, 8: 70},
+        )
+        v.addWidget(self.version_chain_table, 2)
+
+        v.addWidget(QLabel("历史综合单价库（仅提示复核，不直接认定当前单价错误）"))
+        self.historical_price_table = _make_table(
+            [
+                "状态", "规范项目名", "项目特征", "单位", "地区", "时间",
+                "项目类型", "方向", "历史单价", "来源版本", "来源行", "Evidence ID", "Audit ID",
+            ],
+            stretch_cols=(1, 2), right_cols=(8, 9, 10, 11, 12),
+            fixed_widths={0: 70, 3: 58, 7: 75, 8: 90, 9: 75, 10: 65, 11: 85, 12: 70},
+        )
+        v.addWidget(self.historical_price_table, 2)
+        return w
+
+    @staticmethod
+    def _asset_status_label(status: str) -> str:
+        return {
+            "not_started": "未建立",
+            "in_progress": "进行中",
+            "final_approval_recorded": "已记录最终审定版本",
+            "closed": "已关闭，可沉淀历史资产",
+            "available": "有可用资产",
+            "not_available": "暂无可用资产",
+            "conditional": "有条件/待复核",
+            "not_comparable": "不可直接比较",
+        }.get(str(status), "待复核")
+
+    def refresh_version_assets(self):
+        """刷新版本链和历史单价，保留失效/撤销记录并显示证据状态。"""
+        pid = self.project.project_id
+        try:
+            summary = build_report_model(self.conn, pid).project_summary
+            versions = project_versions.list_project_versions(self.conn, pid)
+            prices = pricing_history.list_historical_unit_prices(
+                self.conn, source_project_id=pid, include_revoked=True
+            )
+        except Exception:  # noqa: BLE001 — UI 层只给可行动提示
+            self.version_asset_status_label.setText(
+                "版本或历史资产读取失败，请检查数据库状态后重试。"
+            )
+            self.version_chain_table.setRowCount(0)
+            self.historical_price_table.setRowCount(0)
+            self.version_compare_label.setText("")
+            return
+
+        chain = summary.version_chain or {}
+        history = summary.historical_price_assets or {}
+        closure = chain.get("closure") or {}
+        closure_text = (
+            f"已关闭（最终审定 v{closure.get('final_version_id')}）"
+            if closure and closure.get("chain_valid") else "尚未形成有效关闭链"
+        )
+        self.version_asset_status_label.setText(
+            f"版本链：{self._asset_status_label(chain.get('status', 'not_started'))}；"
+            f"共 {chain.get('version_count', 0)} 个版本；{closure_text}。"
+            f"历史单价：{self._asset_status_label(history.get('status', 'not_available'))}，"
+            f"可用 {history.get('active', 0)} 条，已撤销 {history.get('revoked', 0)} 条；"
+            "历史价格只用于提示复核，维度不齐时不可直接比较。"
+        )
+        self.version_chain_table.setRowCount(len(versions))
+        current = run_contract.get_current_contract(self.conn, pid)
+        for row_no, version in enumerate(versions):
+            valid, reasons = project_versions._version_integrity(self.conn, version)
+            current_run = bool(
+                current
+                and version.run_id == current.run_id
+                and version.run_signature == current.signature
+            )
+            values = (
+                f"v{version.version_no}",
+                project_versions.VERSION_KINDS.get(version.version_kind, version.version_kind),
+                version.title,
+                str(version.item_count),
+                version.created_by,
+                version.created_at,
+                "是" if current_run else "否",
+                str(version.evidence_id) if version.evidence_id is not None else "待生成",
+                str(version.audit_id) if version.audit_id is not None else "待生成",
+                "有效" if valid else "待复核：" + ", ".join(reasons[:2]),
+            )
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col in {7, 8} and str(value).isdigit():
+                    item.setData(Qt.UserRole, int(value))
+                self.version_chain_table.setItem(row_no, col, item)
+
+        if len(versions) >= 2:
+            try:
+                comparison = project_versions.compare_project_versions(
+                    self.conn, pid, versions[-2].version_id, versions[-1].version_id
+                )
+                impact = (
+                    str(comparison.confirmed_net_amount_impact)
+                    if comparison.confirmed_net_amount_impact is not None else "无法确认"
+                )
+                self.version_compare_label.setText(
+                    f"相邻版本 v{comparison.baseline.version_no} → v{comparison.current.version_no}："
+                    f"{self._asset_status_label(comparison.status)}；"
+                    f"差异 {len(comparison.items)} 项；已确认净金额影响 {impact} 元；"
+                    f"Evidence ID {', '.join(map(str, comparison.evidence_ids)) or '待生成'}。"
+                )
+            except Exception:  # noqa: BLE001 — 保留链状态，比较异常只提示待复核
+                self.version_compare_label.setText("相邻版本比较暂不可用，需检查版本 Evidence/快照完整性。")
+        else:
+            self.version_compare_label.setText("尚未形成两个可比较版本；新增、删除和字段变化将在下一版本建立后显示。")
+
+        self.historical_price_table.setRowCount(len(prices))
+        direction_labels = {"upward": "对上结算", "downward": "对下结算", "unknown": "未标记"}
+        status_labels = {"active": "可用", "revoked": "已撤销"}
+        for row_no, price in enumerate(prices):
+            values = (
+                status_labels.get(price.status, "待复核"),
+                price.normalized_project_name,
+                price.normalized_feature or "—",
+                price.normalized_unit or "—",
+                price.region or "待补资料",
+                price.observed_at or "待补资料",
+                price.project_type or "待补资料",
+                direction_labels.get(price.direction, "未标记"),
+                str(price.unit_price),
+                f"v{price.source_version_id}",
+                str(price.source_row) if price.source_row is not None else "待补资料",
+                str(price.evidence_id),
+                str(price.audit_id),
+            )
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if col in {8, 9, 10, 11, 12}:
+                    item.setData(Qt.UserRole, value)
+                self.historical_price_table.setItem(row_no, col, item)
+
+    def _create_project_version_ui(self):
+        """通过人工输入创建不可覆盖版本；原因、操作人进入 Evidence/Audit。"""
+        kinds = list(project_versions.VERSION_KINDS.items())
+        labels = [label for _kind, label in kinds]
+        kind_label, ok = QInputDialog.getItem(self, "创建项目版本", "版本类型：", labels, 0, False)
+        if not ok:
+            return
+        version_kind = next(kind for kind, label in kinds if label == kind_label)
+        title, ok = QInputDialog.getText(self, "创建项目版本", "版本标题：")
+        if not ok or not title.strip():
+            return
+        actor, ok = QInputDialog.getText(self, "创建项目版本", "操作人：")
+        if not ok or not actor.strip():
+            return
+        dlg = ReasonDialog("创建项目版本", f"将当前清单冻结为「{kind_label}」版本，请填写原因。", self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            version = project_versions.create_project_version(
+                self.conn,
+                self.project.project_id,
+                version_kind,
+                title.strip(),
+                created_by=actor.strip(),
+                reason=dlg.reason(),
+            )
+        except Exception as exc:  # noqa: BLE001 — 核心异常不在 UI 中展开堆栈
+            QMessageBox.warning(self, "创建版本失败", str(exc))
+            return
+        self.refresh_all()
+        QMessageBox.information(
+            self, "版本已创建",
+            f"已创建 v{version.version_no}「{version.title}」。旧版本仍保留，详情请回查 Evidence ID {version.evidence_id}。",
+        )
+
+    def _collect_historical_prices_ui(self):
+        """关闭项目并沉淀历史单价，缺失单价由核心 API 返回待补资料。"""
+        pid = self.project.project_id
+        closure = pricing_history.get_project_closure(self.conn, pid)
+        actor, ok = QInputDialog.getText(self, "沉淀历史单价", "操作人：")
+        if not ok or not actor.strip():
+            return
+        dlg = ReasonDialog("沉淀历史单价", "将从已关闭的最终审定版本复制单价，请填写原因。", self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        reason = dlg.reason()
+        try:
+            if closure is None:
+                final_versions = [
+                    item for item in project_versions.list_project_versions(self.conn, pid)
+                    if item.version_kind == "final_approval"
+                ]
+                if not final_versions:
+                    raise pricing_history.HistoricalPriceError(
+                        "尚未建立最终审定版本，不能关闭项目"
+                    )
+                region, ok = QInputDialog.getText(self, "沉淀历史单价", "地区（可留空，缺失时不可直接比较）：")
+                if not ok:
+                    return
+                project_type, ok = QInputDialog.getText(self, "沉淀历史单价", "项目类型（可留空）：")
+                if not ok:
+                    return
+                observed_at, ok = QInputDialog.getText(self, "沉淀历史单价", "观察日期（可留空）：")
+                if not ok:
+                    return
+                closure = pricing_history.close_project_for_history(
+                    self.conn,
+                    pid,
+                    final_versions[-1].version_id,
+                    closed_by=actor.strip(),
+                    reason=reason,
+                    region=region.strip(),
+                    project_type=project_type.strip(),
+                    observed_at=observed_at.strip() or None,
+                )
+            collection = pricing_history.collect_historical_prices(
+                self.conn,
+                closure.closure_id,
+                created_by=actor.strip(),
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — 核心异常保留为可行动提示
+            QMessageBox.warning(self, "历史单价沉淀失败", str(exc))
+            return
+        self.refresh_all()
+        QMessageBox.information(
+            self,
+            "历史单价沉淀完成",
+            f"已沉淀 {len(collection.records)} 条历史单价；待补资料 {len(collection.pending_items)} 条。"
+            "历史价格仅用于提示复核，不直接认定当前单价错误。",
+        )
+
     # ---------- 成果导出 ----------
     def _export_tab(self) -> QWidget:
         w = QWidget()
@@ -1638,7 +2137,8 @@ class WorkbenchPage(QWidget):
 
     def refresh_export_status(self):
         pid = self.project.project_id
-        availability = run_contract.current_results_available(self.conn, pid)
+        summary = build_report_model(self.conn, pid).project_summary
+        availability = summary.run_availability
         if not availability["available"]:
             reason = availability.get("reason")
             suffix = f"（{reason}）" if reason else ""
@@ -1663,75 +2163,7 @@ class WorkbenchPage(QWidget):
                     "文件状态：当前结果不可用（数据库不可写，旧文件不得视为 current）"
                 )
             return
-        anomaly_scope, anomaly_params = run_contract.current_scope(self.conn, pid, "a")
-        match_scope, match_params = run_contract.current_scope(self.conn, pid, "m")
-        check_scope, check_params = run_contract.current_scope(self.conn, pid, "cr")
-        pending_sheets = settlement_io.pending_sheet_count(self.conn, pid)
-        high = self.conn.execute(
-            f"SELECT COUNT(*) AS c FROM anomalies a WHERE a.project_id=? AND {anomaly_scope} "
-            "AND a.severity='high' AND a.status IN ('open', 'deferred')",
-            (pid, *anomaly_params),
-        ).fetchone()["c"]
-        pending_matches = self.conn.execute(
-            f"SELECT COUNT(*) AS c FROM matches m WHERE m.project_id=? AND {match_scope} "
-            "AND m.status='pending'", (pid, *match_params),
-        ).fetchone()["c"]
-        insufficient = self.conn.execute(
-            f"""SELECT COUNT(*) AS c FROM crosscheck_results cr
-               WHERE cr.project_id=? AND {check_scope} AND cr.verification_level='insufficient'""",
-            (pid, *check_params),
-        ).fetchone()["c"]
-        findings = self.conn.execute(
-            f"""SELECT COUNT(*) AS c FROM crosscheck_results cr
-               WHERE cr.project_id=? AND {check_scope} AND cr.verification_level='findings'""",
-            (pid, *check_params),
-        ).fetchone()["c"]
-        period_count = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM settlement_periods WHERE project_id=?", (pid,)
-        ).fetchone()["c"]
-        checked_count = self.conn.execute(
-            f"SELECT COUNT(*) AS c FROM crosscheck_results cr WHERE cr.project_id=? AND {check_scope}",
-            (pid, *check_params),
-        ).fetchone()["c"]
-        range_unproven = self.conn.execute(
-            f"""SELECT COALESCE(SUM(cr.range_unproven_sheets), 0) AS c
-               FROM crosscheck_results cr WHERE cr.project_id=? AND {check_scope}""",
-            (pid, *check_params),
-        ).fetchone()["c"]
-        deferred = self.conn.execute(
-            f"SELECT COUNT(*) AS c FROM anomalies a WHERE a.project_id=? AND {anomaly_scope} "
-            "AND a.status='deferred'", (pid, *anomaly_params),
-        ).fetchone()["c"]
-        source_files = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM source_files WHERE project_id=?", (pid,)
-        ).fetchone()["c"]
-        issues = []
-        if not source_files:
-            issues.append("尚未导入资料")
-        elif not period_count:
-            issues.append("暂无可审核结算期次")
-        if pending_sheets:
-            issues.append(f"待确认工作表 {pending_sheets} 张")
-        if high:
-            issues.append(f"高风险未处理 {high} 项")
-        if deferred:
-            issues.append(f"暂不处理异常 {deferred} 项")
-        if pending_matches:
-            issues.append(f"待确认匹配 {pending_matches} 组")
-        if insufficient:
-            issues.append(f"校核不充分 {insufficient} 期")
-        if findings:
-            issues.append(f"校核有发现 {findings} 期")
-        if period_count and checked_count < period_count:
-            issues.append(f"尚未校核 {period_count - checked_count} 期")
-        if range_unproven:
-            issues.append(f"取数范围未证明 {range_unproven} 张工作表")
-        if issues:
-            self.export_status_label.setText(
-                "审核尚未完成：" + "、".join(issues) + "。仍可生成成果，但成果中会保留待补资料和未完成标记。"
-            )
-        else:
-            self.export_status_label.setText("审核完成度：当前未发现主要待处理事项；导出内容仍需按证据索引复核。")
+        self.export_status_label.setText(_export_review_status_text(summary))
         # 成果卡片显示最近生成时间和文件状态，避免用户只看到“导出”按钮而
         # 不知道是否已有可用成果。文件名沿用导出器前缀，不读取文件内容。
         export_dir = Path(self.project_dir) / "exports"
@@ -1753,7 +2185,7 @@ class WorkbenchPage(QWidget):
                 continue
             latest_path = files[-1]
             stamp = datetime.fromtimestamp(latest_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            registered = registry_by_kind[kind]
+            registered = registry_by_kind[file_kind]
             if registered:
                 item = registered[0]
                 status_zh = {
@@ -1850,6 +2282,7 @@ class WorkbenchPage(QWidget):
         self.refresh_anomalies()
         self.refresh_matches()
         self.refresh_export_status()
+        self.refresh_version_assets()
 
     def _notify_import(self, ok: int, fail: list[str], pending: int = 0):
         msg = f"成功导入 {ok} 个文件（原文件未改动）。"

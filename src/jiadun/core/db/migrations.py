@@ -501,6 +501,2154 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ON detection_runs(project_id, run_signature, run_kind, id)",
         ],
     ),
+    (
+        # v12: Run Contract 历史不可变与独立运行身份。
+        # v8 的 UNIQUE(project_id, signature) 会让输入恢复到旧签名时重新
+        # 激活历史合同。重建表移除该唯一约束，保留 signature 索引；历史行
+        # 获得稳定迁移 run_id，新合同永远插入新行，不改写旧合同。
+        12,
+        [
+            "ALTER TABLE run_contracts RENAME TO run_contracts_v11",
+            "DROP INDEX IF EXISTS idx_run_contracts_current",
+            """CREATE TABLE run_contracts (
+                id INTEGER PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                signature TEXT NOT NULL,
+                components_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                invalidated_at TEXT
+            )""",
+            """INSERT INTO run_contracts(
+                   id, run_id, project_id, signature, components_json,
+                   created_at, invalidated_at
+               )
+               SELECT id, 'legacy-run-' || project_id || '-' || id,
+                      project_id, signature, components_json,
+                      created_at, invalidated_at
+               FROM run_contracts_v11""",
+            "DROP TABLE run_contracts_v11",
+            "CREATE INDEX IF NOT EXISTS idx_run_contracts_current "
+            "ON run_contracts(project_id, invalidated_at, id)",
+            "CREATE INDEX IF NOT EXISTS idx_run_contracts_signature "
+            "ON run_contracts(project_id, signature, id)",
+        ],
+    ),
+    (
+        # v13: Sheet 覆盖证明与逐行分类。
+        # 聚合计数只能说明结果形状，不能证明原始有效区域内每一行如何被
+        # 处理；新表保留逐 Sheet、逐行的不可变事实，旧结果不被覆盖。
+        13,
+        [
+            """CREATE TABLE IF NOT EXISTS sheet_coverage_proofs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                run_signature TEXT,
+                file_id INTEGER REFERENCES source_files(id),
+                batch_id INTEGER REFERENCES parse_batches(id),
+                sheet_id INTEGER NOT NULL REFERENCES raw_sheets(id),
+                period_id INTEGER REFERENCES settlement_periods(id),
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                raw_row_start INTEGER NOT NULL,
+                raw_row_end INTEGER NOT NULL,
+                raw_col_start INTEGER NOT NULL,
+                raw_col_end INTEGER NOT NULL,
+                raw_data_row_count INTEGER NOT NULL,
+                classified_row_count INTEGER NOT NULL,
+                classified_detail_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_subtotal_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_title_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_note_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_blank_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_tail_note_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_orphan_numeric_rows INTEGER NOT NULL DEFAULT 0,
+                excluded_parse_failed_rows INTEGER NOT NULL DEFAULT 0,
+                pending_rows INTEGER NOT NULL DEFAULT 0,
+                unrecognized_rows INTEGER NOT NULL DEFAULT 0,
+                business_rows_used INTEGER NOT NULL DEFAULT 0,
+                raw_amount_total TEXT,
+                detail_amount_total TEXT,
+                proof_status TEXT NOT NULL,
+                proof_reason TEXT NOT NULL DEFAULT '[]',
+                c_control_status TEXT NOT NULL DEFAULT 'not_assessed',
+                c_control_value TEXT,
+                c_control_source_json TEXT NOT NULL DEFAULT '{}',
+                c_control_evidence_id INTEGER REFERENCES evidence(id),
+                ab_row_set_status TEXT NOT NULL DEFAULT 'same_row_set',
+                ab_row_set_hash TEXT,
+                ab_independence_level TEXT NOT NULL DEFAULT 'shared_extractor',
+                evidence_id INTEGER REFERENCES evidence(id),
+                created_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_sheet_coverage_proofs_current "
+            "ON sheet_coverage_proofs(project_id, run_signature, sheet_id, id)",
+            """CREATE TABLE IF NOT EXISTS row_classifications (
+                id INTEGER PRIMARY KEY,
+                proof_id INTEGER NOT NULL REFERENCES sheet_coverage_proofs(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                sheet_id INTEGER NOT NULL REFERENCES raw_sheets(id),
+                row_number INTEGER NOT NULL,
+                class_code TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                source_range_json TEXT NOT NULL DEFAULT '{}',
+                raw_values_json TEXT NOT NULL DEFAULT '{}',
+                calculated_amount TEXT,
+                effective_amount TEXT,
+                participates_in_a INTEGER NOT NULL DEFAULT 0,
+                participates_in_b INTEGER NOT NULL DEFAULT 0,
+                participates_in_c INTEGER NOT NULL DEFAULT 0,
+                is_pending INTEGER NOT NULL DEFAULT 0,
+                is_parse_failed INTEGER NOT NULL DEFAULT 0,
+                evidence_id INTEGER REFERENCES evidence(id),
+                created_at TEXT NOT NULL,
+                UNIQUE(proof_id, row_number)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_row_classifications_proof "
+            "ON row_classifications(proof_id, row_number)",
+            "CREATE INDEX IF NOT EXISTS idx_row_classifications_sheet "
+            "ON row_classifications(project_id, sheet_id, row_number)",
+        ],
+    ),
+    (
+        # v14: 将 P0-01 覆盖证明摘要固定在校核结果快照中。
+        # ``crosscheck_results`` 仍保留旧字段以兼容现有读取面；新增字段只
+        # 保存本次结果使用的逐 Sheet 证明、A/B 行集关系和 C 控制来源摘要，
+        # 不把历史结果重写成当前结果。
+        14,
+        [
+            "ALTER TABLE crosscheck_results ADD COLUMN classified_detail_rows INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE crosscheck_results ADD COLUMN business_rows_used INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE crosscheck_results ADD COLUMN coverage_proof_status TEXT NOT NULL DEFAULT 'unproven'",
+            "ALTER TABLE crosscheck_results ADD COLUMN ab_row_set_status TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE crosscheck_results ADD COLUMN ab_row_set_hash TEXT",
+            "ALTER TABLE crosscheck_results ADD COLUMN ab_independence_level TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE crosscheck_results ADD COLUMN c_control_source_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE crosscheck_results ADD COLUMN c_control_evidence_id INTEGER REFERENCES evidence(id)",
+        ],
+    ),
+    (
+        # v15: 把不可变 Run Contract 的独立运行身份传播到成果和证据。
+        # ``run_signature`` 继续作为兼容筛选键；``run_id`` 用于审计和跨表
+        # 追踪同一次运行。列允许 NULL 以兼容原始来源/历史人工记录，当前
+        # 自动校核写入时必须绑定活动合同的 run_id。
+        15,
+        [
+            "ALTER TABLE evidence ADD COLUMN run_id TEXT",
+            "ALTER TABLE period_totals ADD COLUMN run_id TEXT",
+            "ALTER TABLE crosscheck_results ADD COLUMN run_id TEXT",
+            "ALTER TABLE matches ADD COLUMN run_id TEXT",
+            "ALTER TABLE anomalies ADD COLUMN run_id TEXT",
+            "ALTER TABLE detection_runs ADD COLUMN run_id TEXT",
+            "ALTER TABLE export_runs ADD COLUMN run_id TEXT",
+            "ALTER TABLE cleaning_changes ADD COLUMN run_id TEXT",
+            "ALTER TABLE audit_log ADD COLUMN run_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_run_id ON evidence(project_id, run_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_crosscheck_results_run_id ON crosscheck_results(project_id, run_id, period_id)",
+            "CREATE INDEX IF NOT EXISTS idx_period_totals_run_id ON period_totals(project_id, run_id, period_id)",
+            "CREATE INDEX IF NOT EXISTS idx_detection_runs_run_id ON detection_runs(project_id, run_id, id)",
+        ],
+    ),
+    (
+        # v16: Evidence/人工审计范围显式化。
+        # source、current、historical、human 四类范围不能依赖摘要文字猜测；
+        # 历史原因单独保存，旧 Evidence 内容仍保留并可被审计追溯。
+        16,
+        [
+            "ALTER TABLE evidence ADD COLUMN scope TEXT NOT NULL DEFAULT 'source'",
+            "ALTER TABLE evidence ADD COLUMN historical_reason TEXT",
+            "ALTER TABLE audit_log ADD COLUMN run_signature TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_scope ON evidence(project_id, scope, id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_run_id ON audit_log(project_id, run_id, id)",
+        ],
+    ),
+    (
+        # v17: 持久化 Sheet 四级状态，并为 Evidence 失效动作保留追加事件。
+        # raw_sheets 的状态是当前事实快照；原始网格和历史 Evidence 不删除，
+        # evidence_events 保存失效前快照，避免仅靠 UPDATE 后的文字无法还原
+        # 原始证据语义。
+        17,
+        [
+            "ALTER TABLE raw_sheets ADD COLUMN sheet_status TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE raw_sheets ADD COLUMN sheet_status_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE raw_sheets ADD COLUMN sheet_status_updated_at TEXT",
+            "ALTER TABLE raw_sheets ADD COLUMN sheet_status_actor TEXT",
+            "UPDATE raw_sheets SET sheet_status='confirmed', sheet_status_reason='已进入结算模型' "
+            "WHERE period_id IS NOT NULL",
+            "UPDATE raw_sheets SET sheet_status='non_business', "
+            "sheet_status_reason='历史人工确认非结算角色' "
+            "WHERE period_id IS NULL AND EXISTS ("
+            "SELECT 1 FROM audit_log al WHERE al.project_id=("
+            "SELECT sf.project_id FROM parse_batches pb JOIN source_files sf ON sf.id=pb.file_id "
+            "WHERE pb.id=raw_sheets.batch_id"
+            ") AND al.target='sheet:'||raw_sheets.id "
+            "AND al.action='confirm_sheet_non_settlement_role')",
+            "CREATE INDEX IF NOT EXISTS idx_raw_sheets_status "
+            "ON raw_sheets(sheet_status, period_id, id)",
+            """CREATE TABLE IF NOT EXISTS evidence_events (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'system',
+                run_id TEXT,
+                run_signature TEXT,
+                before_scope TEXT,
+                after_scope TEXT,
+                before_summary TEXT,
+                before_steps_json TEXT,
+                before_sources_json TEXT,
+                reason TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_events_evidence "
+            "ON evidence_events(project_id, evidence_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_evidence_events_run "
+            "ON evidence_events(project_id, run_id, id)",
+        ],
+    ),
+    (
+        # v18: 在数据库层锁定 Run Contract 的不可变字段。
+        # 应用层只允许把当前合同从 active 单向标记为 invalidated；运行身份、
+        # 项目、签名、组成快照和创建时间不得被就地修改，历史行也不得删除或
+        # 重新激活。这样即使有旧脚本/插件绕过 ensure_run_contract，也不能把
+        # 历史合同伪装成当前合同。
+        18,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_run_contracts_immutable_update
+               BEFORE UPDATE ON run_contracts
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.run_id IS OLD.run_id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.signature IS OLD.signature
+                   AND NEW.components_json IS OLD.components_json
+                   AND NEW.created_at IS OLD.created_at
+                   AND (
+                       NEW.invalidated_at IS OLD.invalidated_at
+                       OR (OLD.invalidated_at IS NULL AND NEW.invalidated_at IS NOT NULL)
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_contract immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_run_contracts_immutable_delete
+               BEFORE DELETE ON run_contracts
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_contract immutable');
+               END""",
+        ],
+    ),
+    (
+        # v19: 为按期次唯一的 A/B/C 与聚合结果保留不可变历史快照。
+        # 现有结果表继续作为“当前运行读取面”兼容视图使用；重跑时由触发器
+        # 先把旧行完整序列化到历史表，避免 ON CONFLICT UPDATE 覆盖原始金额、
+        # 校核级别和 Evidence 关联。历史快照永不进入 current_scope。
+        19,
+        [
+            """CREATE TABLE IF NOT EXISTS crosscheck_result_history (
+                history_id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL,
+                period_id INTEGER NOT NULL,
+                run_signature TEXT,
+                run_id TEXT,
+                snapshot_json TEXT NOT NULL,
+                archived_at TEXT NOT NULL,
+                archive_reason TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_crosscheck_history_period "
+            "ON crosscheck_result_history(project_id, period_id, history_id)",
+            "CREATE INDEX IF NOT EXISTS idx_crosscheck_history_run "
+            "ON crosscheck_result_history(project_id, run_id, history_id)",
+            """CREATE TABLE IF NOT EXISTS period_total_history (
+                history_id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                source_id INTEGER NOT NULL,
+                period_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                run_signature TEXT,
+                run_id TEXT,
+                snapshot_json TEXT NOT NULL,
+                archived_at TEXT NOT NULL,
+                archive_reason TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_period_total_history_period "
+            "ON period_total_history(project_id, period_id, history_id)",
+            "CREATE INDEX IF NOT EXISTS idx_period_total_history_run "
+            "ON period_total_history(project_id, run_id, history_id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_crosscheck_result_archive_update
+               BEFORE UPDATE ON crosscheck_results
+               BEGIN
+                   INSERT INTO crosscheck_result_history(
+                       project_id, source_id, period_id, run_signature, run_id,
+                       snapshot_json, archived_at, archive_reason
+                   ) VALUES (
+                       OLD.project_id, OLD.id, OLD.period_id, OLD.run_signature, OLD.run_id,
+                       json_object(
+                           'id', OLD.id, 'project_id', OLD.project_id, 'period_id', OLD.period_id,
+                           'verification_level', OLD.verification_level, 'status', OLD.status,
+                           'path_a_total', OLD.path_a_total, 'path_b_total', OLD.path_b_total,
+                           'raw_subtotal', OLD.raw_subtotal, 'diff_ab', OLD.diff_ab,
+                           'control_diff', OLD.control_diff, 'ab_status', OLD.ab_status,
+                           'control_status', OLD.control_status, 'detail_rows', OLD.detail_rows,
+                           'excluded_subtotal_rows', OLD.excluded_subtotal_rows,
+                           'excluded_title_rows', OLD.excluded_title_rows,
+                           'pending_sheets', OLD.pending_sheets,
+                           'range_unproven_sheets', OLD.range_unproven_sheets,
+                           'classified_detail_rows', OLD.classified_detail_rows,
+                           'business_rows_used', OLD.business_rows_used,
+                           'coverage_proof_status', OLD.coverage_proof_status,
+                           'ab_row_set_status', OLD.ab_row_set_status,
+                           'ab_row_set_hash', OLD.ab_row_set_hash,
+                           'ab_independence_level', OLD.ab_independence_level,
+                           'c_control_source_json', OLD.c_control_source_json,
+                           'c_control_evidence_id', OLD.c_control_evidence_id,
+                           'notes_json', OLD.notes_json, 'evidence_id', OLD.evidence_id,
+                           'checked_at', OLD.checked_at, 'run_signature', OLD.run_signature,
+                           'run_id', OLD.run_id
+                       ), datetime('now'), 'replaced'
+                   );
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_crosscheck_result_archive_delete
+               BEFORE DELETE ON crosscheck_results
+               BEGIN
+                   INSERT INTO crosscheck_result_history(
+                       project_id, source_id, period_id, run_signature, run_id,
+                       snapshot_json, archived_at, archive_reason
+                   ) VALUES (
+                       OLD.project_id, OLD.id, OLD.period_id, OLD.run_signature, OLD.run_id,
+                       json_object(
+                           'id', OLD.id, 'project_id', OLD.project_id, 'period_id', OLD.period_id,
+                           'verification_level', OLD.verification_level, 'status', OLD.status,
+                           'path_a_total', OLD.path_a_total, 'path_b_total', OLD.path_b_total,
+                           'raw_subtotal', OLD.raw_subtotal, 'diff_ab', OLD.diff_ab,
+                           'control_diff', OLD.control_diff, 'ab_status', OLD.ab_status,
+                           'control_status', OLD.control_status, 'detail_rows', OLD.detail_rows,
+                           'excluded_subtotal_rows', OLD.excluded_subtotal_rows,
+                           'excluded_title_rows', OLD.excluded_title_rows,
+                           'pending_sheets', OLD.pending_sheets,
+                           'range_unproven_sheets', OLD.range_unproven_sheets,
+                           'classified_detail_rows', OLD.classified_detail_rows,
+                           'business_rows_used', OLD.business_rows_used,
+                           'coverage_proof_status', OLD.coverage_proof_status,
+                           'ab_row_set_status', OLD.ab_row_set_status,
+                           'ab_row_set_hash', OLD.ab_row_set_hash,
+                           'ab_independence_level', OLD.ab_independence_level,
+                           'c_control_source_json', OLD.c_control_source_json,
+                           'c_control_evidence_id', OLD.c_control_evidence_id,
+                           'notes_json', OLD.notes_json, 'evidence_id', OLD.evidence_id,
+                           'checked_at', OLD.checked_at, 'run_signature', OLD.run_signature,
+                           'run_id', OLD.run_id
+                       ), datetime('now'), 'deleted'
+                   );
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_period_total_archive_update
+               BEFORE UPDATE ON period_totals
+               BEGIN
+                   INSERT INTO period_total_history(
+                       project_id, source_id, period_id, item_key, run_signature, run_id,
+                       snapshot_json, archived_at, archive_reason
+                   ) VALUES (
+                       OLD.project_id, OLD.id, OLD.period_id, OLD.item_key,
+                       OLD.run_signature, OLD.run_id,
+                       json_object(
+                           'id', OLD.id, 'project_id', OLD.project_id, 'period_id', OLD.period_id,
+                           'item_key', OLD.item_key, 'qty_sum', OLD.qty_sum,
+                           'amount_sum', OLD.amount_sum, 'wavg_price', OLD.wavg_price,
+                           'cross_check_diff', OLD.cross_check_diff,
+                           'cross_check_status', OLD.cross_check_status, 'evidence_id', OLD.evidence_id,
+                           'raw_amount_sum', OLD.raw_amount_sum,
+                           'calculated_amount_sum', OLD.calculated_amount_sum,
+                           'calculated_amount_used_sum', OLD.calculated_amount_used_sum,
+                           'effective_amount_sum', OLD.effective_amount_sum,
+                           'amount_source', OLD.amount_source, 'amount_status', OLD.amount_status,
+                           'ab_diff', OLD.ab_diff, 'ab_status', OLD.ab_status,
+                           'control_diff', OLD.control_diff, 'control_status', OLD.control_status,
+                           'verification_level', OLD.verification_level,
+                           'run_signature', OLD.run_signature, 'run_id', OLD.run_id
+                       ), datetime('now'), 'replaced'
+                   );
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_period_total_archive_delete
+               BEFORE DELETE ON period_totals
+               BEGIN
+                   INSERT INTO period_total_history(
+                       project_id, source_id, period_id, item_key, run_signature, run_id,
+                       snapshot_json, archived_at, archive_reason
+                   ) VALUES (
+                       OLD.project_id, OLD.id, OLD.period_id, OLD.item_key,
+                       OLD.run_signature, OLD.run_id,
+                       json_object(
+                           'id', OLD.id, 'project_id', OLD.project_id, 'period_id', OLD.period_id,
+                           'item_key', OLD.item_key, 'qty_sum', OLD.qty_sum,
+                           'amount_sum', OLD.amount_sum, 'wavg_price', OLD.wavg_price,
+                           'cross_check_diff', OLD.cross_check_diff,
+                           'cross_check_status', OLD.cross_check_status, 'evidence_id', OLD.evidence_id,
+                           'raw_amount_sum', OLD.raw_amount_sum,
+                           'calculated_amount_sum', OLD.calculated_amount_sum,
+                           'calculated_amount_used_sum', OLD.calculated_amount_used_sum,
+                           'effective_amount_sum', OLD.effective_amount_sum,
+                           'amount_source', OLD.amount_source, 'amount_status', OLD.amount_status,
+                           'ab_diff', OLD.ab_diff, 'ab_status', OLD.ab_status,
+                           'control_diff', OLD.control_diff, 'control_status', OLD.control_status,
+                           'verification_level', OLD.verification_level,
+                           'run_signature', OLD.run_signature, 'run_id', OLD.run_id
+                       ), datetime('now'), 'deleted'
+                   );
+               END""",
+        ],
+    ),
+    (
+        # v20: 覆盖证明也必须绑定独立运行身份。
+        # v13 仅保存 run_signature，无法区分同一输入签名下的不同不可变运行；
+        # 新列与 Run Contract 的 run_id 一起使用，历史 NULL 行在当前读取面中
+        # 继续 fail-closed，不得被误当作本次运行的覆盖证明。
+        20,
+        [
+            "ALTER TABLE sheet_coverage_proofs ADD COLUMN run_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_sheet_coverage_proofs_run "
+            "ON sheet_coverage_proofs(project_id, run_id, sheet_id, id)",
+        ],
+    ),
+    (
+        # v21: 收紧 Run Contract 失效时间，并隔离迁移前的旧校核 Evidence。
+        # 仅允许 NULL → 合法、非空、可由 SQLite 解析的时间戳；空字符串或
+        # 任意占位文本不能作为“已失效”证据。历史 cross_check 证据没有可靠
+        # 运行身份时明确标记为 historical，不能因 v16 的默认 source 范围
+        # 重新进入当前证据读取面。
+        21,
+        [
+            "DROP TRIGGER IF EXISTS trg_run_contracts_immutable_update",
+            """CREATE TRIGGER IF NOT EXISTS trg_run_contracts_immutable_update
+               BEFORE UPDATE ON run_contracts
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.run_id IS OLD.run_id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.signature IS OLD.signature
+                   AND NEW.components_json IS OLD.components_json
+                   AND NEW.created_at IS OLD.created_at
+                   AND (
+                       NEW.invalidated_at IS OLD.invalidated_at
+                       OR (
+                           OLD.invalidated_at IS NULL
+                           AND typeof(NEW.invalidated_at)='text'
+                           AND length(trim(NEW.invalidated_at)) > 0
+                           AND datetime(NEW.invalidated_at) IS NOT NULL
+                       )
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'run_contract immutable');
+               END""",
+            """UPDATE evidence
+               SET scope='historical',
+                   historical_reason='历史结果——当前数据或运行契约已经变化，不参与当前结论'
+               WHERE kind='cross_check'
+                 AND (run_signature IS NULL OR run_signature IN ('legacy:stale', 'run:invalidated')
+                      OR run_id IS NULL)""",
+        ],
+    ),
+    (
+        # v22: 历史结果快照只允许追加，数据库层拒绝 UPDATE/DELETE，避免
+        # 任何旧脚本或人工 SQL 改写/删除已归档的 A/B/C 与聚合事实。
+        22,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_crosscheck_result_history_immutable_update
+               BEFORE UPDATE ON crosscheck_result_history
+               BEGIN
+                   SELECT RAISE(ABORT, 'crosscheck result history immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_crosscheck_result_history_immutable_delete
+               BEFORE DELETE ON crosscheck_result_history
+               BEGIN
+                   SELECT RAISE(ABORT, 'crosscheck result history immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_period_total_history_immutable_update
+               BEFORE UPDATE ON period_total_history
+               BEGIN
+                   SELECT RAISE(ABORT, 'period total history immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_period_total_history_immutable_delete
+               BEFORE DELETE ON period_total_history
+               BEGIN
+                   SELECT RAISE(ABORT, 'period total history immutable');
+               END""",
+        ],
+    ),
+    (
+        # v23: 清单差异雷达不可变快照。
+        # 比较结果按当前 Run Contract 绑定；旧运行只保留为历史，不更新或删除。
+        # 明细的基准/当前值、分类、来源和确认净影响均使用 JSON/Decimal 字符串
+        # 保存，避免用浮点或再次读取变化后的源数据重建历史结论。
+        23,
+        [
+            """CREATE TABLE IF NOT EXISTS diff_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                run_id TEXT NOT NULL,
+                run_signature TEXT NOT NULL,
+                baseline_period_id INTEGER NOT NULL REFERENCES settlement_periods(id),
+                current_period_id INTEGER NOT NULL REFERENCES settlement_periods(id),
+                baseline_direction TEXT NOT NULL,
+                current_direction TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                confirmed_net_amount_impact TEXT,
+                evidence_id INTEGER REFERENCES evidence(id),
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                CHECK (baseline_period_id <> current_period_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_diff_runs_current "
+            "ON diff_runs(project_id, run_id, run_signature, created_at, id)",
+            """CREATE TABLE IF NOT EXISTS diff_items (
+                id INTEGER PRIMARY KEY,
+                diff_run_id INTEGER NOT NULL REFERENCES diff_runs(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                identity_key TEXT NOT NULL,
+                primary_category TEXT NOT NULL,
+                categories_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                baseline_json TEXT NOT NULL DEFAULT '{}',
+                current_json TEXT NOT NULL DEFAULT '{}',
+                amount_impact TEXT,
+                confirmed_amount_impact TEXT,
+                baseline_sources_json TEXT NOT NULL DEFAULT '[]',
+                current_sources_json TEXT NOT NULL DEFAULT '[]',
+                evidence_id INTEGER REFERENCES evidence(id),
+                created_at TEXT NOT NULL,
+                UNIQUE(diff_run_id, identity_key)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_diff_items_run ON diff_items(diff_run_id, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_diff_runs_immutable_update
+               BEFORE UPDATE ON diff_runs
+               BEGIN
+                   SELECT RAISE(ABORT, 'diff run immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_diff_runs_immutable_delete
+               BEFORE DELETE ON diff_runs
+               BEGIN
+                   SELECT RAISE(ABORT, 'diff run immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_diff_items_immutable_update
+               BEFORE UPDATE ON diff_items
+               BEGIN
+                   SELECT RAISE(ABORT, 'diff item immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_diff_items_immutable_delete
+               BEFORE DELETE ON diff_items
+               BEGIN
+                   SELECT RAISE(ABORT, 'diff item immutable');
+               END""",
+        ],
+    ),
+    (
+        # v24: 字段映射模板库。
+        # 模板是人工确认后的可复用候选，不属于当前清单事实；每条模板保存
+        # 来源 Sheet、表头快照、列映射、创建人和版本。模板只能追加，推荐时
+        # 必须由人工再次检查，不能未经确认直接套用。
+        24,
+        [
+            """CREATE TABLE IF NOT EXISTS mapping_templates (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER REFERENCES projects(id),
+                scope TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                template_name TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                header_signature TEXT NOT NULL,
+                header_labels_json TEXT NOT NULL DEFAULT '[]',
+                col_map_json TEXT NOT NULL,
+                header_row_lo INTEGER NOT NULL,
+                header_row_hi INTEGER NOT NULL,
+                data_row_start INTEGER,
+                data_row_end INTEGER,
+                source_file_id INTEGER REFERENCES source_files(id),
+                source_sheet_id INTEGER NOT NULL REFERENCES raw_sheets(id),
+                source_reference_json TEXT NOT NULL DEFAULT '{}',
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER REFERENCES evidence(id),
+                CHECK (scope IN ('sheet', 'project', 'global')),
+                CHECK (length(trim(template_name)) > 0),
+                CHECK (length(trim(scope_key)) > 0),
+                CHECK (header_row_lo <= header_row_hi),
+                CHECK (data_row_start IS NULL OR data_row_end IS NULL OR data_row_start <= data_row_end),
+                CHECK ((scope='global' AND project_id IS NULL)
+                       OR (scope IN ('sheet', 'project') AND project_id IS NOT NULL))
+            )""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mapping_templates_version "
+            "ON mapping_templates(scope, scope_key, template_name, version)",
+            "CREATE INDEX IF NOT EXISTS idx_mapping_templates_project_scope "
+            "ON mapping_templates(project_id, scope, scope_key, header_signature, id)",
+            "CREATE INDEX IF NOT EXISTS idx_mapping_templates_header "
+            "ON mapping_templates(header_signature, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_mapping_templates_immutable_update
+               BEFORE UPDATE ON mapping_templates
+               BEGIN
+                   SELECT RAISE(ABORT, 'mapping template immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_mapping_templates_immutable_delete
+               BEFORE DELETE ON mapping_templates
+               BEGIN
+                   SELECT RAISE(ABORT, 'mapping template immutable');
+               END""",
+        ],
+    ),
+    (
+        # v25: Finding 闭环状态与重复指纹历史。
+        # 保留旧 ``status`` 作为兼容字段，新增生命周期状态和追加事件；同一
+        # fingerprint 再次出现时保存历史处理摘要，但新发现默认回到“新发现”，
+        # 绝不因为历史上已关闭而自动关闭。
+        25,
+        [
+            "ALTER TABLE anomalies ADD COLUMN lifecycle_status TEXT NOT NULL DEFAULT 'new'",
+            "ALTER TABLE anomalies ADD COLUMN lifecycle_updated_at TEXT",
+            "ALTER TABLE anomalies ADD COLUMN lifecycle_updated_by TEXT",
+            "ALTER TABLE anomalies ADD COLUMN repeat_history_json TEXT NOT NULL DEFAULT '[]'",
+            """UPDATE anomalies
+               SET lifecycle_status=CASE status
+                   WHEN 'open' THEN 'new'
+                   WHEN 'deferred' THEN 'pending_review'
+                   WHEN 'verified_no_issue' THEN 'legitimate_business'
+                   WHEN 'supplemented' THEN 'pending_data'
+                   WHEN 'corrected' THEN 'rectified'
+                   WHEN 'resolved' THEN 'closed'
+                   ELSE 'historical'
+               END
+               WHERE lifecycle_status='new' AND status<>'open'""",
+            "CREATE INDEX IF NOT EXISTS idx_anomalies_fingerprint_history "
+            "ON anomalies(project_id, fingerprint, id)",
+            """CREATE TABLE IF NOT EXISTS finding_status_events (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                anomaly_id INTEGER NOT NULL REFERENCES anomalies(id),
+                finding_id TEXT,
+                fingerprint TEXT,
+                before_status TEXT NOT NULL,
+                after_status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                run_signature TEXT,
+                run_id TEXT,
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_finding_status_events_anomaly "
+            "ON finding_status_events(project_id, anomaly_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_finding_status_events_fingerprint "
+            "ON finding_status_events(project_id, fingerprint, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_finding_status_events_immutable_update
+               BEFORE UPDATE ON finding_status_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'finding status event immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_finding_status_events_immutable_delete
+               BEFORE DELETE ON finding_status_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'finding status event immutable');
+               END""",
+        ],
+    ),
+    (
+        # v26: 项目级异常规则目录配置历史。
+        # 每次启停均追加一行并由 Run Contract 读取最新配置；旧配置和操作
+        # 原因保留，关闭规则不会被解释成“没有问题”。
+        26,
+        [
+            """CREATE TABLE IF NOT EXISTS rule_configurations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                rule_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                config_version INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                name_zh TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'project',
+                severity TEXT NOT NULL,
+                trigger_condition TEXT NOT NULL,
+                evidence_requirements TEXT NOT NULL,
+                impact_algorithm TEXT NOT NULL,
+                limitations TEXT NOT NULL,
+                suggested_review TEXT NOT NULL,
+                allow_disable INTEGER NOT NULL CHECK (allow_disable IN (0, 1)),
+                version TEXT NOT NULL,
+                disabled_reason TEXT,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                UNIQUE(project_id, rule_id, config_version),
+                CHECK (length(trim(rule_id)) > 0),
+                CHECK (length(trim(actor)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_rule_configurations_current "
+            "ON rule_configurations(project_id, rule_id, config_version DESC)",
+            """CREATE TRIGGER IF NOT EXISTS trg_rule_configurations_immutable_update
+               BEFORE UPDATE ON rule_configurations
+               BEGIN
+                   SELECT RAISE(ABORT, 'rule configuration immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_rule_configurations_immutable_delete
+               BEFORE DELETE ON rule_configurations
+               BEGIN
+                   SELECT RAISE(ABORT, 'rule configuration immutable');
+               END""",
+        ],
+    ),
+    (
+        # v27: 本地别名/匹配知识库。
+        # ``item_aliases`` 保留为旧版本兼容读取；新知识库把原始名称、规范
+        # 名称、适用项目/专业、方向、版本和撤销状态作为追加快照保存。撤销
+        # 不 UPDATE 旧行，而是追加一条 revoked 版本并记录不可变事件，避免
+        # 一次项目确认永久污染全部历史项目。
+        27,
+        [
+            """CREATE TABLE IF NOT EXISTS alias_knowledge (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                scope TEXT NOT NULL,
+                applicable_project_id INTEGER REFERENCES projects(id),
+                profession TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                original_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                canonical_key TEXT NOT NULL,
+                canonical_name TEXT NOT NULL DEFAULT '',
+                mapping_basis TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                revoked_by TEXT,
+                revoked_at TEXT,
+                revoke_reason TEXT,
+                supersedes_id INTEGER REFERENCES alias_knowledge(id),
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                CHECK (scope IN ('project', 'global')),
+                CHECK (status IN ('active', 'revoked')),
+                CHECK (version >= 1),
+                CHECK ((scope='global' AND applicable_project_id IS NULL)
+                       OR (scope='project' AND applicable_project_id IS NOT NULL)),
+                CHECK (status='active' OR (
+                       revoked_by IS NOT NULL AND revoked_at IS NOT NULL
+                       AND revoke_reason IS NOT NULL AND length(trim(revoke_reason)) > 0
+                )),
+                CHECK (length(trim(original_name)) > 0),
+                CHECK (length(trim(normalized_name)) > 0),
+                CHECK (length(trim(canonical_key)) > 0),
+                CHECK (length(trim(mapping_basis)) > 0),
+                CHECK (length(trim(created_by)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_alias_knowledge_lookup "
+            "ON alias_knowledge(scope, applicable_project_id, direction, profession, normalized_name, version DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_alias_knowledge_project "
+            "ON alias_knowledge(project_id, applicable_project_id, status, id)",
+            "CREATE INDEX IF NOT EXISTS idx_alias_knowledge_canonical "
+            "ON alias_knowledge(canonical_key, direction, id)",
+            """CREATE TABLE IF NOT EXISTS alias_knowledge_events (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                alias_id INTEGER NOT NULL REFERENCES alias_knowledge(id),
+                event_type TEXT NOT NULL,
+                before_status TEXT,
+                after_status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                run_id TEXT,
+                run_signature TEXT,
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                CHECK (length(trim(reason)) > 0),
+                CHECK (length(trim(actor)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_alias_knowledge_events_alias "
+            "ON alias_knowledge_events(project_id, alias_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_alias_knowledge_events_lookup "
+            "ON alias_knowledge_events(project_id, occurred_at, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_immutable_update
+               BEFORE UPDATE ON alias_knowledge
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_immutable_delete
+               BEFORE DELETE ON alias_knowledge
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_events_immutable_update
+               BEFORE UPDATE ON alias_knowledge_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge event immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_events_immutable_delete
+               BEFORE DELETE ON alias_knowledge_events
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge event immutable');
+               END""",
+            # Finding 本体是当前快照，状态可由受控 API 或系统重跑变更；但
+            # 指纹、原始数值、运行身份和重复历史一旦写入不得被旧脚本覆盖。
+            """CREATE TRIGGER IF NOT EXISTS trg_anomalies_snapshot_immutable_update
+               BEFORE UPDATE ON anomalies
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.rule_id IS OLD.rule_id
+                   AND NEW.severity IS OLD.severity
+                   AND NEW.subject_type IS OLD.subject_type
+                   AND NEW.subject_id IS OLD.subject_id
+                   AND NEW.evidence_id IS OLD.evidence_id
+                   AND NEW.message IS OLD.message
+                   AND NEW.created_at IS OLD.created_at
+                   AND (
+                       (NEW.run_signature IS OLD.run_signature
+                        AND NEW.run_id IS OLD.run_id)
+                       OR (
+                           OLD.run_signature IS NULL AND OLD.run_id IS NULL
+                           AND NEW.run_signature IS NOT NULL AND NEW.run_id IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM run_contracts rc
+                               WHERE rc.project_id=OLD.project_id
+                                 AND rc.run_id=NEW.run_id
+                                 AND rc.signature=NEW.run_signature
+                                 AND rc.invalidated_at IS NULL
+                           )
+                       )
+                   )
+                   AND NEW.finding_id IS OLD.finding_id
+                   AND NEW.fingerprint IS OLD.fingerprint
+                   AND NEW.detection_mode IS OLD.detection_mode
+                   AND NEW.raw_values_json IS OLD.raw_values_json
+                   AND NEW.normalized_values_json IS OLD.normalized_values_json
+                   AND NEW.impact IS OLD.impact
+                   AND NEW.limitations_json IS OLD.limitations_json
+                   AND NEW.recommendation IS OLD.recommendation
+                   AND NEW.suppression_reason IS OLD.suppression_reason
+                   AND NEW.repeat_history_json IS OLD.repeat_history_json
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'anomaly snapshot immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_anomalies_lifecycle_guard
+               BEFORE UPDATE ON anomalies
+               WHEN (
+                   NEW.lifecycle_status IS NOT OLD.lifecycle_status
+                   OR NEW.status IS NOT OLD.status
+               )
+               AND (
+                   NEW.lifecycle_status IS OLD.lifecycle_status
+                   OR NEW.lifecycle_updated_at IS NULL
+                   OR length(trim(COALESCE(NEW.lifecycle_updated_by, ''))) = 0
+                   OR (
+                       NEW.lifecycle_status <> 'new'
+                       AND length(trim(COALESCE(NEW.resolved_note, ''))) = 0
+                   )
+                   OR (NEW.status='resolved' AND NEW.lifecycle_status<>'closed')
+                   OR (NEW.status='corrected' AND NEW.lifecycle_status<>'rectified')
+                   OR (NEW.status='verified_no_issue' AND NEW.lifecycle_status<>'legitimate_business')
+                   OR (NEW.status='deferred' AND NEW.lifecycle_status NOT IN ('pending_review', 'pending_data'))
+                   OR (NEW.status='stale' AND NEW.lifecycle_status<>'historical')
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'finding lifecycle requires actor, time and reason');
+               END""",
+        ],
+    ),
+    (
+        # v28: Finding 生命周期必须由 Evidence/Audit/不可变状态事件共同证明。
+        # v27 已经限制了操作人、时间、原因和旧 status/lifecycle_status 的
+        # 对应关系；本迁移再加一层数据库级证据闸门，防止旧脚本直接 UPDATE
+        # anomalies 绕过应用 API。系统重跑将旧快照转为 historical，属于
+        # 结果保留流程，不应被当作人工处理，故明确排除 historical。
+        28,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_anomalies_lifecycle_evidence_guard
+               BEFORE UPDATE ON anomalies
+               WHEN (
+                   (NEW.lifecycle_status IS NOT OLD.lifecycle_status
+                    OR NEW.status IS NOT OLD.status)
+                   AND NEW.lifecycle_status <> 'historical'
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM finding_status_events fse
+                       JOIN evidence ev
+                         ON ev.id=fse.evidence_id
+                        AND ev.project_id=OLD.project_id
+                       JOIN audit_log al
+                         ON al.id=fse.audit_id
+                        AND al.project_id=OLD.project_id
+                       WHERE fse.project_id=OLD.project_id
+                         AND fse.anomaly_id=OLD.id
+                         AND fse.after_status=NEW.lifecycle_status
+                         AND fse.reason=COALESCE(NEW.resolved_note, '')
+                         AND fse.actor=COALESCE(NEW.lifecycle_updated_by, '')
+                         AND fse.occurred_at=COALESCE(NEW.lifecycle_updated_at, '')
+                         AND fse.evidence_id IS NOT NULL
+                         AND fse.audit_id IS NOT NULL
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'finding lifecycle requires evidence, audit and event');
+               END""",
+        ],
+    ),
+    (
+        # v29: 别名事件的业务内容保持不可变，但允许在同一人工操作的
+        # 最终 Run Contract 确定后，仅重绑 run_id/run_signature。v27 的
+        # 全字段禁止 UPDATE 会把“别名写入先切换、后续确认审计再切换”的
+        # 原子操作卡在历史运行；本迁移把可变范围严格收窄为当前合同身份。
+        29,
+        [
+            "DROP TRIGGER IF EXISTS trg_alias_knowledge_events_immutable_update",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_events_immutable_update
+               BEFORE UPDATE ON alias_knowledge_events
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.alias_id IS OLD.alias_id
+                   AND NEW.event_type IS OLD.event_type
+                   AND NEW.before_status IS OLD.before_status
+                   AND NEW.after_status IS OLD.after_status
+                   AND NEW.reason IS OLD.reason
+                   AND NEW.actor IS OLD.actor
+                   AND NEW.occurred_at IS OLD.occurred_at
+                   AND NEW.evidence_id IS OLD.evidence_id
+                   AND NEW.audit_id IS OLD.audit_id
+                   AND NEW.metadata_json IS OLD.metadata_json
+                   AND (
+                       (NEW.run_id IS OLD.run_id
+                        AND NEW.run_signature IS OLD.run_signature)
+                       OR (
+                           NEW.run_id IS NOT NULL
+                           AND NEW.run_signature IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM run_contracts rc
+                               WHERE rc.project_id=OLD.project_id
+                                 AND rc.run_id=NEW.run_id
+                                 AND rc.signature=NEW.run_signature
+                                 AND rc.invalidated_at IS NULL
+                           )
+                           AND EXISTS (
+                               SELECT 1
+                               FROM alias_knowledge ak
+                               JOIN audit_log al ON al.id=ak.audit_id
+                               WHERE ak.id=OLD.alias_id
+                                 AND al.project_id=OLD.project_id
+                                 AND al.run_id=NEW.run_id
+                                 AND al.run_signature=NEW.run_signature
+                           )
+                       )
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge event immutable');
+               END""",
+        ],
+    ),
+    (
+        # v30: 收紧 Finding 闭环的关联证明。v28 只检查了“有一条事件、
+        # 有一条同项目 Evidence/Audit”，仍可能用无关 source 记录拼接出
+        # 伪事件；现在必须同时命中 Finding 身份、旧/新状态、运行身份、
+        # Evidence 类型/归属和 Audit action/target。
+        30,
+        [
+            "DROP TRIGGER IF EXISTS trg_anomalies_lifecycle_evidence_guard",
+            """CREATE TRIGGER IF NOT EXISTS trg_anomalies_lifecycle_evidence_guard
+               BEFORE UPDATE ON anomalies
+               WHEN (
+                   (NEW.lifecycle_status IS NOT OLD.lifecycle_status
+                    OR NEW.status IS NOT OLD.status)
+                   AND NEW.lifecycle_status <> 'historical'
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM finding_status_events fse
+                       JOIN evidence ev
+                         ON ev.id=fse.evidence_id
+                        AND ev.project_id=OLD.project_id
+                       JOIN audit_log al
+                         ON al.id=fse.audit_id
+                        AND al.project_id=OLD.project_id
+                       WHERE fse.project_id=OLD.project_id
+                         AND fse.anomaly_id=OLD.id
+                         AND fse.finding_id IS OLD.finding_id
+                         AND fse.fingerprint IS OLD.fingerprint
+                         AND fse.before_status=COALESCE(OLD.lifecycle_status, 'new')
+                         AND fse.after_status=NEW.lifecycle_status
+                         AND fse.reason=COALESCE(NEW.resolved_note, '')
+                         AND fse.actor=COALESCE(NEW.lifecycle_updated_by, '')
+                         AND fse.occurred_at=COALESCE(NEW.lifecycle_updated_at, '')
+                         AND fse.run_id IS OLD.run_id
+                         AND fse.run_signature IS OLD.run_signature
+                         AND fse.evidence_id IS NOT NULL
+                         AND fse.audit_id IS NOT NULL
+                         AND ev.kind='finding_status_change'
+                         AND ev.scope='human'
+                         AND ev.finding_id IS OLD.finding_id
+                         AND ev.run_id IS fse.run_id
+                         AND ev.run_signature IS fse.run_signature
+                         AND al.action='update_finding_status'
+                         AND al.target='anomaly:' || CAST(OLD.id AS TEXT)
+                         AND al.run_id IS fse.run_id
+                         AND al.run_signature IS fse.run_signature
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'finding lifecycle requires evidence, audit and linked event');
+               END""",
+        ],
+    ),
+    (
+        # v31: 项目级别名的拥有项目与适用项目必须相同。应用 API 已拒绝
+        # 跨项目写入，但旧脚本仍可能直接 INSERT 一条 ``project_id=P1,
+        # applicable_project_id=P2`` 的行；读取面也再次要求两者相等，确保
+        # 迁移前异常数据不能让 P2 获得未经授权的项目知识。
+        31,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_project_scope_guard
+               BEFORE INSERT ON alias_knowledge
+               WHEN NEW.scope='project'
+                AND NEW.project_id IS NOT NEW.applicable_project_id
+               BEGIN
+                   SELECT RAISE(ABORT, 'project alias owner mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_alias_knowledge_event_project_scope_guard
+               BEFORE INSERT ON alias_knowledge_events
+               WHEN EXISTS (
+                   SELECT 1 FROM alias_knowledge ak
+                    WHERE ak.id=NEW.alias_id
+                      AND ak.project_id IS NOT NEW.project_id
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'alias knowledge event project mismatch');
+               END""",
+        ],
+    ),
+    (
+        # v32: 项目送审/补充/复审/审定版本链。版本与清单快照只允许追加，
+        # 运行身份和 Evidence/Audit 绑定可以在同一人工事务的最终合同确定
+        # 后收口；旧版本不得被覆盖或删除。
+        32,
+        [
+            """CREATE TABLE IF NOT EXISTS project_versions (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                version_no INTEGER NOT NULL,
+                version_kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                source_manifest_id INTEGER REFERENCES import_manifests(id),
+                snapshot_sha256 TEXT NOT NULL,
+                item_count INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                run_id TEXT,
+                run_signature TEXT,
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(project_id, version_no),
+                CHECK (version_no >= 1),
+                CHECK (length(trim(version_kind)) > 0),
+                CHECK (length(trim(title)) > 0),
+                CHECK (length(trim(created_by)) > 0),
+                CHECK (length(trim(reason)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_project_versions_project "
+            "ON project_versions(project_id, version_no DESC, id DESC)",
+            """CREATE TABLE IF NOT EXISTS project_version_items (
+                id INTEGER PRIMARY KEY,
+                version_id INTEGER NOT NULL REFERENCES project_versions(id),
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                identity_key TEXT NOT NULL,
+                occurrence INTEGER NOT NULL,
+                period_id INTEGER,
+                period_no INTEGER,
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                line_item_id INTEGER,
+                code TEXT,
+                name TEXT,
+                feature TEXT,
+                unit TEXT,
+                quantity TEXT,
+                unit_price TEXT,
+                amount TEXT,
+                flags_json TEXT NOT NULL DEFAULT '{}',
+                source_file_id INTEGER,
+                source_sheet_id INTEGER,
+                source_row INTEGER,
+                source_evidence_id INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(version_id, identity_key, occurrence)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_project_version_items_version "
+            "ON project_version_items(version_id, identity_key, occurrence, id)",
+            "CREATE INDEX IF NOT EXISTS idx_project_version_items_project "
+            "ON project_version_items(project_id, period_id, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_immutable_update
+               BEFORE UPDATE ON project_version_items
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_immutable_delete
+               BEFORE DELETE ON project_version_items
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_immutable_delete
+               BEFORE DELETE ON project_versions
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_immutable_update
+               BEFORE UPDATE ON project_versions
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.version_no IS OLD.version_no
+                   AND NEW.version_kind IS OLD.version_kind
+                   AND NEW.title IS OLD.title
+                   AND NEW.description IS OLD.description
+                   AND NEW.source_manifest_id IS OLD.source_manifest_id
+                   AND NEW.snapshot_sha256 IS OLD.snapshot_sha256
+                   AND NEW.item_count IS OLD.item_count
+                   AND NEW.created_by IS OLD.created_by
+                   AND NEW.created_at IS OLD.created_at
+                   AND NEW.reason IS OLD.reason
+                   AND NEW.metadata_json IS OLD.metadata_json
+                   AND (
+                       (NEW.run_id IS OLD.run_id AND NEW.run_signature IS OLD.run_signature)
+                       OR (
+                           NEW.run_id IS NOT NULL AND NEW.run_signature IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM run_contracts rc
+                                WHERE rc.project_id=OLD.project_id
+                                  AND rc.run_id=NEW.run_id
+                                  AND rc.signature=NEW.run_signature
+                                  AND rc.invalidated_at IS NULL
+                           )
+                       )
+                   )
+                   AND (
+                       NEW.evidence_id IS OLD.evidence_id
+                       OR (
+                           OLD.evidence_id IS NULL AND NEW.evidence_id IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM evidence ev
+                                WHERE ev.id=NEW.evidence_id
+                                  AND ev.project_id=OLD.project_id
+                           )
+                       )
+                   )
+                   AND (
+                       NEW.audit_id IS OLD.audit_id
+                       OR (
+                           OLD.audit_id IS NULL AND NEW.audit_id IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM audit_log al
+                                WHERE al.id=NEW.audit_id
+                                  AND al.project_id=OLD.project_id
+                           )
+                       )
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version immutable');
+               END""",
+        ],
+    ),
+    (
+        # v33: 历史综合单价资产与项目关闭闸门。
+        # 历史价格只能从显式关闭、绑定最终审定版本且已有完整 Evidence/Audit
+        # 的项目中追加；价格观察本身只作复核提示，不参与当前项目结论。所有
+        # 来源、维度和 Decimal 文本均保留为不可变快照，避免项目后续重跑覆盖
+        # 或把缺失资料静默补成零。
+        33,
+        [
+            """CREATE TABLE IF NOT EXISTS project_closures (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                final_version_id INTEGER NOT NULL REFERENCES project_versions(id),
+                status TEXT NOT NULL DEFAULT 'closed',
+                region TEXT NOT NULL DEFAULT '',
+                project_type TEXT NOT NULL DEFAULT '',
+                observed_at TEXT,
+                closed_by TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                run_signature TEXT NOT NULL,
+                evidence_id INTEGER REFERENCES evidence(id),
+                audit_id INTEGER REFERENCES audit_log(id),
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(project_id),
+                CHECK (status='closed'),
+                CHECK (length(trim(closed_by)) > 0),
+                CHECK (length(trim(reason)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_project_closures_version "
+            "ON project_closures(project_id, final_version_id, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_closures_insert_guard
+               BEFORE INSERT ON project_closures
+               WHEN NEW.status <> 'closed'
+                 OR NEW.run_id IS NULL OR NEW.run_signature IS NULL
+                 OR NOT EXISTS (
+                       SELECT 1 FROM project_versions pv
+                        WHERE pv.id=NEW.final_version_id
+                          AND pv.project_id=NEW.project_id
+                          AND pv.version_kind='final_approval'
+                   )
+                 OR NOT EXISTS (
+                       SELECT 1 FROM run_contracts rc
+                        WHERE rc.project_id=NEW.project_id
+                          AND rc.run_id=NEW.run_id
+                          AND rc.signature=NEW.run_signature
+                          AND rc.invalidated_at IS NULL
+                   )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project closure requires final approval and current run');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_closures_immutable_update
+               BEFORE UPDATE ON project_closures
+               WHEN NOT (
+                   NEW.id IS OLD.id
+                   AND NEW.project_id IS OLD.project_id
+                   AND NEW.final_version_id IS OLD.final_version_id
+                   AND NEW.status IS OLD.status
+                   AND NEW.region IS OLD.region
+                   AND NEW.project_type IS OLD.project_type
+                   AND NEW.observed_at IS OLD.observed_at
+                   AND NEW.closed_by IS OLD.closed_by
+                   AND NEW.closed_at IS OLD.closed_at
+                   AND NEW.reason IS OLD.reason
+                   AND NEW.run_id IS OLD.run_id
+                   AND NEW.run_signature IS OLD.run_signature
+                   AND NEW.metadata_json IS OLD.metadata_json
+                   AND (
+                       NEW.evidence_id IS OLD.evidence_id
+                       OR (
+                           OLD.evidence_id IS NULL AND NEW.evidence_id IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM evidence ev
+                                WHERE ev.id=NEW.evidence_id
+                                  AND ev.project_id=OLD.project_id
+                           )
+                       )
+                   )
+                   AND (
+                       NEW.audit_id IS OLD.audit_id
+                       OR (
+                           OLD.audit_id IS NULL AND NEW.audit_id IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM audit_log al
+                                WHERE al.id=NEW.audit_id
+                                  AND al.project_id=OLD.project_id
+                           )
+                       )
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project closure immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_closures_immutable_delete
+               BEFORE DELETE ON project_closures
+               BEGIN
+                   SELECT RAISE(ABORT, 'project closure immutable');
+               END""",
+            """CREATE TABLE IF NOT EXISTS historical_unit_prices (
+                id INTEGER PRIMARY KEY,
+                source_project_id INTEGER NOT NULL REFERENCES projects(id),
+                closure_id INTEGER NOT NULL REFERENCES project_closures(id),
+                source_version_id INTEGER NOT NULL REFERENCES project_versions(id),
+                source_version_item_id INTEGER NOT NULL REFERENCES project_version_items(id),
+                raw_project_name TEXT NOT NULL,
+                normalized_project_name TEXT NOT NULL,
+                raw_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                feature TEXT NOT NULL DEFAULT '',
+                normalized_feature TEXT NOT NULL DEFAULT '',
+                unit TEXT NOT NULL DEFAULT '',
+                normalized_unit TEXT NOT NULL DEFAULT '',
+                region TEXT NOT NULL DEFAULT '',
+                observed_at TEXT,
+                project_type TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                unit_price TEXT NOT NULL,
+                quantity TEXT,
+                amount TEXT,
+                source_file_id INTEGER,
+                source_sheet_id INTEGER,
+                source_row INTEGER,
+                source_evidence_id INTEGER,
+                evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                audit_id INTEGER NOT NULL REFERENCES audit_log(id),
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(closure_id, source_version_item_id),
+                CHECK (length(trim(raw_project_name)) > 0),
+                CHECK (length(trim(normalized_project_name)) > 0),
+                CHECK (length(trim(raw_name)) > 0),
+                CHECK (length(trim(normalized_name)) > 0),
+                CHECK (length(trim(unit_price)) > 0),
+                CHECK (direction IN ('upward', 'downward', 'unknown')),
+                CHECK (status IN ('active', 'revoked')),
+                CHECK (length(trim(created_by)) > 0)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_historical_unit_prices_lookup "
+            "ON historical_unit_prices(normalized_name, normalized_feature, normalized_unit, "
+            "direction, status, id)",
+            "CREATE INDEX IF NOT EXISTS idx_historical_unit_prices_project "
+            "ON historical_unit_prices(source_project_id, source_version_id, id)",
+            """CREATE TRIGGER IF NOT EXISTS trg_historical_unit_prices_insert_guard
+               BEFORE INSERT ON historical_unit_prices
+               WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM project_closures pc
+                         JOIN project_versions pv
+                           ON pv.id=pc.final_version_id
+                          AND pv.project_id=pc.project_id
+                          AND pv.version_kind='final_approval'
+                         JOIN project_version_items pvi
+                           ON pvi.id=NEW.source_version_item_id
+                          AND pvi.version_id=pv.id
+                          AND pvi.project_id=pc.project_id
+                        WHERE pc.id=NEW.closure_id
+                          AND pc.project_id=NEW.source_project_id
+                          AND pc.final_version_id=NEW.source_version_id
+                          AND pc.status='closed'
+                          AND pc.evidence_id IS NOT NULL
+                          AND pc.audit_id IS NOT NULL
+                   )
+                 OR NEW.evidence_id IS NULL
+                 OR NEW.audit_id IS NULL
+                 OR NOT EXISTS (
+                       SELECT 1 FROM evidence ev
+                        WHERE ev.id=NEW.evidence_id
+                          AND ev.project_id=NEW.source_project_id
+                          AND ev.kind='historical_unit_price'
+                          AND ev.scope='historical'
+                   )
+                 OR NOT EXISTS (
+                       SELECT 1 FROM audit_log al
+                        WHERE al.id=NEW.audit_id
+                          AND al.project_id=NEW.source_project_id
+                   )
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical unit price requires closed project evidence');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_historical_unit_prices_immutable_update
+               BEFORE UPDATE ON historical_unit_prices
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical unit price immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_historical_unit_prices_immutable_delete
+               BEFORE DELETE ON historical_unit_prices
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical unit price immutable');
+               END""",
+        ],
+    ),
+    (
+        # v34: 版本快照和历史证据的数据库级归属边界。
+        # 应用 API 已经执行同样的校验；这里再挡住旧脚本/手工 SQL 的
+        # 跨项目写入，避免一条错误快照把别的项目清单或来源 Evidence
+        # 带进当前版本。历史 Evidence 一旦退出 current 只能继续留在
+        # historical，不允许通过 UPDATE 复活成当前证据。
+        34,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_insert_guard
+               BEFORE INSERT ON project_versions
+               WHEN NEW.version_kind NOT IN (
+                        'initial_submission', 'supplement',
+                        'resubmission', 'final_approval'
+                    )
+                 OR (
+                       NEW.source_manifest_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM import_manifests im
+                            WHERE im.id=NEW.source_manifest_id
+                              AND im.project_id=NEW.project_id
+                       )
+                    )
+                 OR (
+                       (NEW.run_id IS NOT NULL OR NEW.run_signature IS NOT NULL)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM run_contracts rc
+                            WHERE rc.project_id=NEW.project_id
+                              AND rc.run_id=NEW.run_id
+                              AND rc.signature=NEW.run_signature
+                              AND rc.invalidated_at IS NULL
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version source or run mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_insert_guard
+               BEFORE INSERT ON project_version_items
+               WHEN NEW.direction NOT IN ('upward', 'downward', 'unknown')
+                 OR NOT EXISTS (
+                       SELECT 1 FROM project_versions pv
+                        WHERE pv.id=NEW.version_id
+                          AND pv.project_id=NEW.project_id
+                   )
+                 OR (
+                       NEW.line_item_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM line_items li
+                             JOIN settlement_periods sp ON sp.id=li.period_id
+                            WHERE li.id=NEW.line_item_id
+                              AND sp.project_id=NEW.project_id
+                              AND (NEW.period_id IS NULL OR NEW.period_id=li.period_id)
+                       )
+                    )
+                 OR (
+                       NEW.source_file_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM source_files sf
+                            WHERE sf.id=NEW.source_file_id
+                              AND sf.project_id=NEW.project_id
+                       )
+                    )
+                 OR (
+                       NEW.source_sheet_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM raw_sheets rs
+                             JOIN parse_batches pb ON pb.id=rs.batch_id
+                             JOIN source_files sf ON sf.id=pb.file_id
+                            WHERE rs.id=NEW.source_sheet_id
+                              AND sf.project_id=NEW.project_id
+                              AND (NEW.source_file_id IS NULL OR sf.id=NEW.source_file_id)
+                       )
+                    )
+                 OR (
+                       NEW.source_evidence_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.source_evidence_id
+                              AND ev.project_id=NEW.project_id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item source mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_evidence_historical_immutable_scope
+               BEFORE UPDATE ON evidence
+               WHEN OLD.scope='historical' AND NEW.scope<>'historical'
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical evidence cannot be revived');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_evidence_historical_immutable_delete
+               BEFORE DELETE ON evidence
+               WHEN OLD.scope='historical'
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical evidence cannot be deleted');
+               END""",
+        ],
+    ),
+    (
+        # v35: 收口“版本—Evidence—Audit—Run Contract”同一责任链，并校验
+        # 快照期次直接归属当前项目。v34 已挡跨项目来源；本版继续拒绝
+        # 同项目但拿另一运行的 Evidence/Audit 拼接到新版本的情况。
+        35,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_evidence_chain_guard
+               BEFORE INSERT ON project_versions
+               WHEN (
+                       NEW.evidence_id IS NOT NULL
+                       OR NEW.audit_id IS NOT NULL
+                     )
+                 AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_version'
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                       )
+                       OR NEW.run_id IS NULL
+                       OR NEW.run_signature IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.run_id=NEW.run_id
+                              AND ev.run_signature=NEW.run_signature
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.run_id=NEW.run_id
+                              AND al.run_signature=NEW.run_signature
+                       )
+                     )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version evidence chain mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_evidence_chain_update_guard
+               BEFORE UPDATE ON project_versions
+               WHEN (
+                       NEW.evidence_id IS NOT NULL
+                       OR NEW.audit_id IS NOT NULL
+                     )
+                 AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_version'
+                              AND ev.run_id=NEW.run_id
+                              AND ev.run_signature=NEW.run_signature
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                              AND al.run_id=NEW.run_id
+                              AND al.run_signature=NEW.run_signature
+                       )
+                     )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version evidence chain mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_period_scope_guard
+               BEFORE INSERT ON project_version_items
+               WHEN NEW.period_id IS NOT NULL
+                AND NOT EXISTS (
+                       SELECT 1 FROM settlement_periods sp
+                        WHERE sp.id=NEW.period_id
+                          AND sp.project_id=NEW.project_id
+                          AND COALESCE(sp.period_no, -1)=COALESCE(NEW.period_no, -1)
+                          AND COALESCE(sp.direction, 'unknown')=COALESCE(NEW.direction, 'unknown')
+                   )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item period mismatch');
+               END""",
+        ],
+    ),
+    (
+        # v36: Sheet 覆盖证明和逐行分类是 P0-01 的不可变事实快照。旧版只在
+        # API 层约定“追加不更新”，手工 SQL 仍可改状态、计数、方向或删行，
+        # 进而让摘要看到被篡改的 complete 证明。本版补数据库级归属、证据
+        # 和不可变触发器；修正后的证明只能追加新快照。
+        36,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_coverage_proofs_insert_guard
+               BEFORE INSERT ON sheet_coverage_proofs
+               WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM raw_sheets rs
+                         JOIN parse_batches pb ON pb.id=rs.batch_id
+                         JOIN source_files sf ON sf.id=pb.file_id
+                        WHERE rs.id=NEW.sheet_id
+                          AND sf.project_id=NEW.project_id
+                          AND (NEW.file_id IS NULL OR NEW.file_id=sf.id)
+                          AND (NEW.batch_id IS NULL OR NEW.batch_id=pb.id)
+                          AND (NEW.period_id IS NULL OR NEW.period_id=rs.period_id)
+                   )
+                 OR (
+                       NEW.period_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM settlement_periods sp
+                            WHERE sp.id=NEW.period_id
+                              AND sp.project_id=NEW.project_id
+                       )
+                    )
+                 OR (
+                       NEW.evidence_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='sheet_coverage_proof'
+                       )
+                    )
+                 OR (
+                       NEW.c_control_evidence_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.c_control_evidence_id
+                              AND ev.project_id=NEW.project_id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'sheet coverage proof source mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_coverage_proofs_immutable_update
+               BEFORE UPDATE ON sheet_coverage_proofs
+               BEGIN
+                   SELECT RAISE(ABORT, 'sheet coverage proof immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_coverage_proofs_immutable_delete
+               BEFORE DELETE ON sheet_coverage_proofs
+               BEGIN
+                   SELECT RAISE(ABORT, 'sheet coverage proof immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_row_classifications_insert_guard
+               BEFORE INSERT ON row_classifications
+               WHEN NOT EXISTS (
+                       SELECT 1 FROM sheet_coverage_proofs p
+                        WHERE p.id=NEW.proof_id
+                          AND p.project_id=NEW.project_id
+                          AND p.sheet_id=NEW.sheet_id
+                   )
+                 OR (
+                       NEW.evidence_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'row classification source mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_row_classifications_immutable_update
+               BEFORE UPDATE ON row_classifications
+               BEGIN
+                   SELECT RAISE(ABORT, 'row classification immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_row_classifications_immutable_delete
+               BEFORE DELETE ON row_classifications
+               BEGIN
+                   SELECT RAISE(ABORT, 'row classification immutable');
+               END""",
+        ],
+    ),
+    (
+        # v37: 版本快照必须保留业务范围和责任链定位。v35 只校验了项目/期次
+        # 归属，仍允许 period_id、方向和全部来源字段同时为空；同一运行下的
+        # 另一版本 Evidence/Audit 也可能被直接 SQL 拼到 final_approval。该版
+        # 在数据库层拒绝无期次/无方向/无来源的快照，并要求版本 Evidence 的
+        # steps/sources 与 Audit 的 target/after_json 指向同一个 version_id。
+        37,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_scope_guard
+               BEFORE INSERT ON project_version_items
+               WHEN NEW.period_id IS NULL
+                 OR NEW.period_no IS NULL
+                 OR NEW.direction NOT IN ('upward', 'downward')
+                 OR (
+                       NEW.line_item_id IS NULL
+                       AND NOT (
+                           NEW.source_file_id IS NOT NULL
+                           AND NEW.source_sheet_id IS NOT NULL
+                           AND NEW.source_row IS NOT NULL
+                           AND NEW.source_evidence_id IS NOT NULL
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item scope incomplete');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_evidence_target_guard
+               BEFORE INSERT ON project_versions
+               WHEN (NEW.evidence_id IS NOT NULL OR NEW.audit_id IS NOT NULL)
+                AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_version'
+                              AND json_valid(ev.sources_json)=1
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM json_each(
+                                        CASE WHEN json_valid(ev.sources_json)=1
+                                             THEN ev.sources_json ELSE '[]' END
+                                    ) AS source_entry
+                                   WHERE json_extract(source_entry.value, '$.version_id')=NEW.id
+                              )
+                              AND json_valid(ev.steps_json)=1
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM json_each(
+                                        CASE WHEN json_valid(ev.steps_json)=1
+                                             THEN ev.steps_json ELSE '[]' END
+                                    ) AS step_entry
+                                   WHERE json_extract(step_entry.value, '$.version_id')=NEW.id
+                              )
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                              AND al.action='create_project_version'
+                              AND al.target='project_version:' || NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.version_id'
+                              )=NEW.id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version evidence target mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_versions_evidence_target_update_guard
+               BEFORE UPDATE ON project_versions
+               WHEN (NEW.evidence_id IS NOT NULL OR NEW.audit_id IS NOT NULL)
+                AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_version'
+                              AND json_valid(ev.sources_json)=1
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM json_each(
+                                        CASE WHEN json_valid(ev.sources_json)=1
+                                             THEN ev.sources_json ELSE '[]' END
+                                    ) AS source_entry
+                                   WHERE json_extract(source_entry.value, '$.version_id')=NEW.id
+                              )
+                              AND json_valid(ev.steps_json)=1
+                              AND EXISTS (
+                                  SELECT 1
+                                    FROM json_each(
+                                        CASE WHEN json_valid(ev.steps_json)=1
+                                             THEN ev.steps_json ELSE '[]' END
+                                    ) AS step_entry
+                                   WHERE json_extract(step_entry.value, '$.version_id')=NEW.id
+                              )
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                              AND al.action='create_project_version'
+                              AND al.target='project_version:' || NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.version_id'
+                              )=NEW.id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version evidence target mismatch');
+               END""",
+        ],
+    ),
+    (
+        # v38: 覆盖证明的数据库入口还必须绑定真实文件/批次并落在原始
+        # Sheet 的尺寸内；逐行分类不能脱离证明范围或使用未知分类码。行数
+        # 与金额的完整勾稽仍在只读摘要执行，因为证明 INSERT 后才会追加其
+        # row_classifications，不能用即时 AFTER trigger 在中间事务误拒绝合法
+        # 的“先证明、后逐行分类”原子写入。
+        38,
+        [
+            "DROP TRIGGER IF EXISTS trg_project_version_items_scope_guard",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_scope_guard
+               BEFORE INSERT ON project_version_items
+               WHEN NEW.period_id IS NULL
+                 OR NEW.period_no IS NULL
+                 OR NEW.direction NOT IN ('upward', 'downward')
+                 OR (
+                       NEW.line_item_id IS NULL
+                       AND NOT (
+                           NEW.source_file_id IS NOT NULL
+                           AND NEW.source_sheet_id IS NOT NULL
+                           AND NEW.source_row IS NOT NULL
+                           AND NEW.source_evidence_id IS NOT NULL
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item scope incomplete');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_closures_evidence_target_guard
+               BEFORE INSERT ON project_closures
+               WHEN (NEW.evidence_id IS NOT NULL OR NEW.audit_id IS NOT NULL)
+                AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_closure'
+                              AND json_valid(ev.sources_json)=1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(ev.sources_json)=1
+                                           THEN ev.sources_json ELSE '[]' END
+                                  ) AS source_entry
+                                  WHERE json_extract(source_entry.value, '$.closure_id')=NEW.id
+                                    AND json_extract(source_entry.value, '$.final_version_id')=NEW.final_version_id
+                              )
+                              AND json_valid(ev.steps_json)=1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(ev.steps_json)=1
+                                           THEN ev.steps_json ELSE '[]' END
+                                  ) AS step_entry
+                                  WHERE json_extract(step_entry.value, '$.closure_id')=NEW.id
+                                    AND json_extract(step_entry.value, '$.final_version_id')=NEW.final_version_id
+                              )
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                              AND al.action='close_project_for_history'
+                              AND al.target='project_closure:' || NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.closure_id'
+                              )=NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.final_version_id'
+                              )=NEW.final_version_id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project closure evidence target mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_project_closures_evidence_target_update_guard
+               BEFORE UPDATE ON project_closures
+               WHEN (NEW.evidence_id IS NOT NULL OR NEW.audit_id IS NOT NULL)
+                AND (
+                       NEW.evidence_id IS NULL
+                       OR NEW.audit_id IS NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM evidence ev
+                            WHERE ev.id=NEW.evidence_id
+                              AND ev.project_id=NEW.project_id
+                              AND ev.kind='project_closure'
+                              AND json_valid(ev.sources_json)=1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(ev.sources_json)=1
+                                           THEN ev.sources_json ELSE '[]' END
+                                  ) AS source_entry
+                                  WHERE json_extract(source_entry.value, '$.closure_id')=NEW.id
+                                    AND json_extract(source_entry.value, '$.final_version_id')=NEW.final_version_id
+                              )
+                              AND json_valid(ev.steps_json)=1
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(
+                                      CASE WHEN json_valid(ev.steps_json)=1
+                                           THEN ev.steps_json ELSE '[]' END
+                                  ) AS step_entry
+                                  WHERE json_extract(step_entry.value, '$.closure_id')=NEW.id
+                                    AND json_extract(step_entry.value, '$.final_version_id')=NEW.final_version_id
+                              )
+                       )
+                       OR NOT EXISTS (
+                           SELECT 1 FROM audit_log al
+                            WHERE al.id=NEW.audit_id
+                              AND al.project_id=NEW.project_id
+                              AND al.action='close_project_for_history'
+                              AND al.target='project_closure:' || NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.closure_id'
+                              )=NEW.id
+                              AND json_extract(
+                                  CASE WHEN json_valid(al.after_json)=1
+                                       THEN al.after_json ELSE '{}' END,
+                                  '$.final_version_id'
+                              )=NEW.final_version_id
+                       )
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project closure evidence target mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_coverage_proofs_scope_guard
+               BEFORE INSERT ON sheet_coverage_proofs
+               WHEN NEW.file_id IS NULL
+                 OR NEW.batch_id IS NULL
+                 OR NEW.raw_row_start < 1
+                 OR NEW.raw_row_end < NEW.raw_row_start
+                 OR NEW.raw_col_start < 1
+                 OR NEW.raw_col_end < NEW.raw_col_start
+                 OR NEW.raw_data_row_count <> NEW.raw_row_end - NEW.raw_row_start + 1
+                 OR NEW.classified_row_count < 0
+                 OR NEW.business_rows_used < 0
+                 OR (NEW.raw_row_end > (
+                         SELECT COALESCE(rs.n_rows, 0) FROM raw_sheets rs WHERE rs.id=NEW.sheet_id
+                     ) AND (
+                         SELECT COALESCE(rs.n_rows, 0) FROM raw_sheets rs WHERE rs.id=NEW.sheet_id
+                     ) > 0)
+                 OR (NEW.raw_col_end > (
+                         SELECT COALESCE(rs.n_cols, 0) FROM raw_sheets rs WHERE rs.id=NEW.sheet_id
+                     ) AND (
+                         SELECT COALESCE(rs.n_cols, 0) FROM raw_sheets rs WHERE rs.id=NEW.sheet_id
+                     ) > 0)
+               BEGIN
+                   SELECT RAISE(ABORT, 'sheet coverage proof scope incomplete');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_row_classifications_scope_guard
+               BEFORE INSERT ON row_classifications
+               WHEN NOT EXISTS (
+                       SELECT 1 FROM sheet_coverage_proofs p
+                        WHERE p.id=NEW.proof_id
+                          AND p.project_id=NEW.project_id
+                          AND p.sheet_id=NEW.sheet_id
+                          AND NEW.row_number BETWEEN p.raw_row_start AND p.raw_row_end
+                   )
+                 OR NEW.class_code NOT IN (
+                       'blank', 'detail', 'subtotal', 'grand_total', 'title', 'note',
+                       'tail_note', 'orphan_numeric', 'parse_failed',
+                       'pending_review', 'unrecognized'
+                   )
+               BEGIN
+                   SELECT RAISE(ABORT, 'row classification scope incomplete');
+               END""",
+        ],
+    ),
+    (
+        # v39: 原始网格是所有范围证明的证据根。解析完成后禁止通过直接 SQL
+        # 改写/删除 raw_cells，使“同时伪造原始值、覆盖证明和 A/B 结果”不再
+        # 能绕过只读摘要的来源一致性检查；合法导入仍只执行 INSERT。
+        39,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_raw_cells_immutable_update
+               BEFORE UPDATE ON raw_cells
+               BEGIN
+                   SELECT RAISE(ABORT, 'raw cell immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_raw_cells_immutable_delete
+               BEFORE DELETE ON raw_cells
+               BEGIN
+                   SELECT RAISE(ABORT, 'raw cell immutable');
+               END""",
+        ],
+    ),
+    (
+        # v40: 版本/历史价格的不可变快照不仅要“指向同一个 ID”，还必须
+        # 与该 ID 在写入时的核心字段和来源定位一致。否则旧脚本可以挂接
+        # 一个真实 line_item/source_version_item_id，却把名称、数量、单价、
+        # 合价或文件行列改成伪造值，再由摘要/导出原样传播。快照写入后仍
+        # 允许当前 line_items 变化，历史版本不会随当前清单回写；本闸门只
+        # 约束 INSERT 时的来源一致性。
+        40,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_snapshot_source_guard
+               BEFORE INSERT ON project_version_items
+               WHEN NEW.line_item_id IS NOT NULL
+                AND NOT EXISTS (
+                       SELECT 1
+                         FROM line_items li
+                         JOIN settlement_periods sp ON sp.id=li.period_id
+                        WHERE li.id=NEW.line_item_id
+                          AND li.period_id=NEW.period_id
+                          AND sp.project_id=NEW.project_id
+                          AND COALESCE(sp.period_no, -1)=COALESCE(NEW.period_no, -1)
+                          AND COALESCE(sp.direction, 'unknown')=COALESCE(NEW.direction, 'unknown')
+                          AND COALESCE(li.code, '') IS COALESCE(NEW.code, '')
+                          AND li.name IS NEW.name
+                          AND COALESCE(li.feature, '') IS COALESCE(NEW.feature, '')
+                          AND COALESCE(li.unit, '') IS COALESCE(NEW.unit, '')
+                          AND li.quantity IS NEW.quantity
+                          AND li.unit_price IS NEW.unit_price
+                          AND li.amount IS NEW.amount
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item snapshot source mismatch');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_historical_unit_prices_snapshot_source_guard
+               BEFORE INSERT ON historical_unit_prices
+               WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM project_version_items pvi
+                         JOIN project_versions pv
+                           ON pv.id=pvi.version_id
+                          AND pv.project_id=pvi.project_id
+                         JOIN projects p ON p.id=pvi.project_id
+                        WHERE pvi.id=NEW.source_version_item_id
+                          AND pvi.version_id=NEW.source_version_id
+                          AND pvi.project_id=NEW.source_project_id
+                          AND NEW.raw_project_name IS p.name
+                          AND NEW.raw_name IS pvi.name
+                          AND NEW.feature IS pvi.feature
+                          AND NEW.unit IS pvi.unit
+                          AND NEW.direction IS pvi.direction
+                          AND CAST(NEW.unit_price AS NUMERIC)=CAST(pvi.unit_price AS NUMERIC)
+                          AND (
+                              (NEW.quantity IS NULL AND pvi.quantity IS NULL)
+                              OR CAST(NEW.quantity AS NUMERIC)=CAST(pvi.quantity AS NUMERIC)
+                          )
+                          AND (
+                              (NEW.amount IS NULL AND pvi.amount IS NULL)
+                              OR CAST(NEW.amount AS NUMERIC)=CAST(pvi.amount AS NUMERIC)
+                          )
+                          AND NEW.source_file_id IS pvi.source_file_id
+                          AND NEW.source_sheet_id IS pvi.source_sheet_id
+                          AND NEW.source_row IS pvi.source_row
+                          AND NEW.source_evidence_id IS pvi.source_evidence_id
+                    )
+               BEGIN
+                   SELECT RAISE(ABORT, 'historical unit price snapshot source mismatch');
+               END""",
+        ],
+    ),
+    (
+        # v41: 版本项的 source_sheet 必须绑定到同一项目、同一期次、同一
+        # 方向和同一源文件；如果同时挂有 line_item_id，还必须与该清单行
+        # 的实际来源 Sheet/文件一致。v40 只校验了 line_item 的核心字段，
+        # 新闸门阻止把其他期次的原始单元格包装成当前期版本项。
+        41,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_project_version_items_explicit_source_scope_guard
+               BEFORE INSERT ON project_version_items
+               WHEN (
+                       (
+                              NEW.line_item_id IS NULL
+                              AND (
+                                     NEW.source_file_id IS NULL
+                                  OR NEW.source_sheet_id IS NULL
+                                  OR NEW.source_row IS NULL
+                                  OR NEW.source_evidence_id IS NULL
+                                  OR NOT EXISTS (
+                                      SELECT 1
+                                        FROM raw_sheets rs
+                                        JOIN parse_batches pb ON pb.id=rs.batch_id
+                                        JOIN settlement_periods sp ON sp.id=rs.period_id
+                                       WHERE rs.id=NEW.source_sheet_id
+                                         AND pb.file_id=NEW.source_file_id
+                                         AND rs.period_id=NEW.period_id
+                                         AND sp.project_id=NEW.project_id
+                                         AND COALESCE(sp.period_no, -1)=COALESCE(NEW.period_no, -1)
+                                         AND COALESCE(sp.direction, 'unknown')=COALESCE(NEW.direction, 'unknown')
+                                  )
+                              )
+                       )
+                    OR (
+                           NEW.line_item_id IS NOT NULL
+                           AND (
+                                  NEW.source_file_id IS NOT NULL
+                               OR NEW.source_sheet_id IS NOT NULL
+                           )
+                           AND (
+                                  NEW.source_file_id IS NULL
+                               OR NEW.source_sheet_id IS NULL
+                               OR NOT EXISTS (
+                            SELECT 1
+                              FROM raw_sheets rs
+                              JOIN parse_batches pb ON pb.id=rs.batch_id
+                             JOIN settlement_periods sp ON sp.id=rs.period_id
+                            WHERE rs.id=NEW.source_sheet_id
+                              AND pb.file_id=NEW.source_file_id
+                              AND rs.period_id=NEW.period_id
+                              AND sp.project_id=NEW.project_id
+                              AND COALESCE(sp.period_no, -1)=COALESCE(NEW.period_no, -1)
+                              AND COALESCE(sp.direction, 'unknown')=COALESCE(NEW.direction, 'unknown')
+                               )
+                           )
+                       )
+                    OR (
+                           NEW.line_item_id IS NOT NULL
+                           AND (
+                                  NEW.source_file_id IS NOT NULL
+                               OR NEW.source_sheet_id IS NOT NULL
+                           )
+                           AND NOT EXISTS (
+                           SELECT 1
+                             FROM line_items li
+                             LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
+                             LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
+                            WHERE li.id=NEW.line_item_id
+                              AND (
+                                     (NEW.source_sheet_id IS NULL AND li.sheet_id IS NULL)
+                                  OR (NEW.source_sheet_id IS NOT NULL AND li.sheet_id=NEW.source_sheet_id)
+                              )
+                              AND (
+                                     (NEW.source_file_id IS NULL AND pb.file_id IS NULL)
+                                  OR (NEW.source_file_id IS NOT NULL AND pb.file_id=NEW.source_file_id)
+                              )
+                       )
+                   )
+               )
+               BEGIN
+                   SELECT RAISE(ABORT, 'project version item scope incomplete (explicit source scope mismatch)');
+               END""",
+        ],
+    ),
+    (
+        # v42: 原始网格尺寸/布局和已确认表头属于证据范围事实，不能通过
+        # UPDATE 直接把新增原始行吞进表头或缩窄 Sheet。业务状态（period_id、
+        # sheet_status 等）仍由受控 API 更新；网格本身只能由导入时 INSERT。
+        42,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_raw_sheets_grid_immutable_update
+               BEFORE UPDATE ON raw_sheets
+               WHEN NEW.n_rows IS NOT OLD.n_rows
+                 OR NEW.n_cols IS NOT OLD.n_cols
+                 OR NEW.merged_ranges_json IS NOT OLD.merged_ranges_json
+                 OR NEW.hidden_rows_json IS NOT OLD.hidden_rows_json
+                 OR NEW.hidden_cols_json IS NOT OLD.hidden_cols_json
+               BEGIN
+                   SELECT RAISE(ABORT, 'raw sheet grid immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_table_headers_immutable_update
+               BEFORE UPDATE ON table_headers
+               BEGIN
+                   SELECT RAISE(ABORT, 'table header immutable');
+               END""",
+        ],
+    ),
+    (
+        # v43: 原始文件身份和原始网格坐标是 Run Contract 的输入根，不能
+        # 通过直接 SQL 改写后继续复用旧运行。source_files 允许受控更新
+        # stored_path（例如恢复副本位置），但文件身份、项目归属和导入
+        # 时间一经登记即不可变；raw_cells 只能写入导入时声明的 Sheet 网格。
+        43,
+        [
+            """CREATE TRIGGER IF NOT EXISTS trg_source_files_identity_immutable_update
+               BEFORE UPDATE ON source_files
+               WHEN NEW.project_id IS NOT OLD.project_id
+                 OR NEW.original_path IS NOT OLD.original_path
+                 OR NEW.original_name IS NOT OLD.original_name
+                 OR NEW.sha256 IS NOT OLD.sha256
+                 OR NEW.size_bytes IS NOT OLD.size_bytes
+                 OR NEW.file_type IS NOT OLD.file_type
+                 OR NEW.imported_at IS NOT OLD.imported_at
+               BEGIN
+                   SELECT RAISE(ABORT, 'source file identity immutable');
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_raw_cells_grid_scope_guard
+               BEFORE INSERT ON raw_cells
+               WHEN NOT EXISTS (
+                       SELECT 1
+                         FROM raw_sheets rs
+                        WHERE rs.id=NEW.sheet_id
+                          AND NEW.row BETWEEN 1 AND rs.n_rows
+                          AND NEW.col BETWEEN 1 AND rs.n_cols
+                   )
+               BEGIN
+                   SELECT RAISE(ABORT, 'raw cell outside sheet grid');
+               END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

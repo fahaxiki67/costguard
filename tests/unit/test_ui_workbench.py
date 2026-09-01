@@ -2,6 +2,7 @@
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,7 +43,14 @@ def wb_page(tmp_path, app):
 class TestWorkbench:
     def test_tabs_present(self, wb_page):
         names = [wb_page.tabs.tabText(i) for i in range(wb_page.tabs.count())]
-        assert names == ["期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出"]
+        assert names == ["期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出", "版本与历史资产"]
+
+    def test_version_history_tab_is_readable_before_assets_exist(self, wb_page):
+        wb_page.refresh_version_assets()
+        assert wb_page.version_chain_table.rowCount() == 0
+        assert wb_page.historical_price_table.rowCount() == 0
+        assert "尚未形成两个可比较版本" in wb_page.version_compare_label.text()
+        assert "历史单价" in wb_page.version_asset_status_label.text()
 
     def test_period_overview_populated(self, wb_page):
         wb_page.refresh_periods()
@@ -178,6 +186,26 @@ class TestWorkbench:
             "规则完全匹配（待人工确认）", "高概率匹配", "疑似匹配", "不可比", "待补资料"
         }
 
+    def test_match_mirror_filters_keep_rows_and_search(self, wb_page):
+        from jiadun.core.matching import matching
+
+        groups = matching.match_items(wb_page.conn, wb_page.project.project_id)
+        matching.save_matches(wb_page.conn, wb_page.project.project_id, groups)
+        wb_page.refresh_matches()
+        assert wb_page.match_search.placeholderText() == "搜索编码、名称或匹配理由"
+        total = wb_page.match_table.rowCount()
+        assert total > 0
+        wb_page.match_search.setText("不存在的关键词")
+        assert all(wb_page.match_table.isRowHidden(row) for row in range(total))
+        wb_page.match_search.clear()
+        wb_page.match_filter.setCurrentIndex(
+            wb_page.match_filter.findData("pending")
+        )
+        assert any(
+            not wb_page.match_table.isRowHidden(row)
+            for row in range(total)
+        )
+
     def test_reason_dialog_requires_reason(self, app, wb_page, monkeypatch):
         """空原因拒绝接受； QMessageBox 打桩避免 offscreen 模态阻塞。"""
         from PySide6.QtWidgets import QDialog, QMessageBox
@@ -203,6 +231,75 @@ class TestWorkbench:
         path = excel_export.export_workbook(
             wb_page.conn, wb_page.project.project_id, Path(wb_page.project_dir) / "exports")
         assert path.exists()
+
+    def test_export_status_obeys_shared_project_state(self, wb_page, monkeypatch):
+        """共享摘要判定不可形成结论时，成果页不得自行拼出绿色状态。"""
+        from jiadun.ui import workbench
+
+        summary = SimpleNamespace(
+            run_availability={"available": True, "reason": None},
+            source_files=1,
+            directions={"upward": 1},
+            pending={
+                "sheets": 0,
+                "high_risk": 0,
+                "anomalies": 0,
+                "matches": 0,
+                "manifest_status": "complete",
+            },
+            verification={
+                "levels": {"sufficient": 1, "findings": 0, "insufficient": 0},
+                "periods_checked": 1,
+                "range_unproven_sheets": 0,
+                "evidence_complete": False,
+            },
+            risk={"status": {"deferred": 0}},
+            detection_coverage={"status": "complete"},
+            aggregate_coverage={"status": "complete"},
+            statuses={
+                "project_status_code": "cannot_conclude",
+                "project_status": "不可形成项目结论",
+                "project_status_reason_codes": ["evidence_incomplete"],
+                "period_status_code": "insufficient",
+            },
+        )
+        monkeypatch.setattr(
+            workbench,
+            "build_report_model",
+            lambda *_args, **_kwargs: SimpleNamespace(project_summary=summary),
+        )
+
+        wb_page.refresh_export_status()
+
+        status = wb_page.export_status_label.text()
+        assert "项目状态：不可形成项目结论" in status
+        assert "审核完成度：当前未发现主要待处理事项" not in status
+
+    def test_export_status_reads_registered_file_by_file_kind(
+        self, wb_page, monkeypatch
+    ):
+        """已有成果文件时应按各自类型读取登记状态，不得引用未定义变量。"""
+        from jiadun.core.contracts import run_contract
+
+        export_dir = Path(wb_page.project_dir) / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        excel_path = export_dir / "价盾审核底稿_20260901_120000.xlsx"
+        docx_path = export_dir / "价盾管理层摘要_20260901_120000.docx"
+        excel_path.write_bytes(b"xlsx")
+        docx_path.write_bytes(b"docx")
+
+        def _status(_conn, _project_id, export_kind):
+            path = excel_path if export_kind == "excel_workbook" else docx_path
+            return [{"status": "current", "path": str(path)}]
+
+        monkeypatch.setattr(run_contract, "export_status", _status)
+
+        wb_page.refresh_export_status()
+
+        assert "可用" in wb_page.export_card_values["excel"]["status"].text()
+        assert excel_path.name in wb_page.export_card_values["excel"]["status"].text()
+        assert "可用" in wb_page.export_card_values["docx"]["status"].text()
+        assert docx_path.name in wb_page.export_card_values["docx"]["status"].text()
 
     def test_fail_closed_state_is_visible_in_workbench_and_export_cards(self, wb_page):
         from jiadun.core.contracts import run_contract
@@ -255,6 +352,54 @@ class TestWorkbench:
 
 
 class TestMainWindow:
+    def test_project_snapshot_does_not_show_historical_risk_or_matches(
+        self, app, tmp_path, monkeypatch
+    ):
+        """项目列表卡片的待办计数必须与共享摘要使用同一 current run。"""
+        from jiadun.core.contracts import run_contract
+        from jiadun.core.models import project as pm
+        from jiadun.ui.main_window import MainWindow
+
+        monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
+        monkeypatch.setattr(
+            pm.platform_paths, "default_workspace_root", lambda: tmp_path / "ws"
+        )
+        info = pm.create_project("历史待办不串入卡片", tmp_path / "ws")
+        info, conn = pm.open_project(Path(info.workspace_path))
+        try:
+            old = run_contract.ensure_run_contract(conn, info.project_id)
+            with conn:
+                conn.execute(
+                    """INSERT INTO anomalies(
+                           project_id, rule_id, severity, subject_type, subject_id,
+                           message, status, created_at, run_signature, run_id
+                       ) VALUES (?, 'historical_probe', 'high', 'project', ?,
+                                 '历史高风险', 'open', '2026', ?, ?)""",
+                    (info.project_id, info.project_id, old.signature, old.run_id),
+                )
+                conn.execute(
+                    """INSERT INTO matches(
+                           project_id, group_key, item_ids_json, level, method,
+                           status, run_signature, run_id
+                       ) VALUES (?, 'historical-group', '[]', 'suspected', 'none',
+                                 'pending', ?, ?)""",
+                    (info.project_id, old.signature, old.run_id),
+                )
+                conn.execute(
+                    """INSERT INTO settlement_periods(
+                           project_id, period_no, title, direction
+                       ) VALUES (?, 1, '第1期', 'downward')""",
+                    (info.project_id,),
+                )
+            new = run_contract.ensure_run_contract(conn, info.project_id)
+            assert new.run_id != old.run_id
+        finally:
+            conn.close()
+
+        snapshot = MainWindow._project_snapshot(info)
+        assert snapshot["high"] == 0
+        assert snapshot["matches"] == 0
+
     def test_two_pages_and_switch(self, app, tmp_path, monkeypatch):
         from jiadun.core.models import project as pm
         from jiadun.ui.main_window import PAGE_PROJECTS, PAGE_WORKBENCH, MainWindow

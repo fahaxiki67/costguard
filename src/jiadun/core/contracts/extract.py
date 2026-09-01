@@ -16,6 +16,7 @@ from pathlib import Path
 
 from jiadun.core.contracts import docx_parser, run_contract
 from jiadun.core.evidence import evidence as evidence_api
+from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.evidence.finding import Finding
 
 _MONEY = r"([¥￥]\s*[\d,，]+(?:\s*\.\s*\d+)?\s*(?:万元|亿元|元)?|\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?\s*(?:万元|亿元|元)?|\d{4,}(?:\.\d+)?\s*(?:万元|亿元|元)?)"
@@ -106,6 +107,7 @@ def import_contract(
     """导入并解析一份合同/补充协议/纪要等。返回 contract_docs.id。"""
     from jiadun.core.models.source_file import import_file
 
+    previous_contract = run_contract.get_current_contract(conn, project_id)
     sf = import_file(conn, project_id, project_dir, src)
     ftype = sf.file_type
     if ftype == "xlsx":  # 文本类导入兜底：txt 归入合同文本
@@ -135,7 +137,21 @@ def import_contract(
             )
     # 合同事实是运行输入的一部分；已有计算结果的项目在合同资料变化后
     # 立即切换到新签名，旧成果保留但不再作为当前结论使用。
-    run_contract.ensure_if_materialized(conn, project_id)
+    current_contract = run_contract.ensure_if_materialized(conn, project_id)
+    if current_contract is not None and previous_contract is not None:
+        # 合同事实会使 Run Contract 产生新运行，但不改变既有结算工作表、
+        # 原始网格或逐行覆盖分类。旧 proof Evidence 先历史化，再以新运行
+        # 身份追加不可变副本，避免用户随后重跑 A/B/C 时因契约切换而失去
+        # 对取数范围的证明。
+        from jiadun.core.engine import settlement_io
+
+        settlement_io._rebind_coverage_proofs_for_run(
+            conn,
+            project_id,
+            previous_contract,
+            current_contract,
+            reason="合同资料进入运行契约；结算 Sheet 原始网格和逐行覆盖分类未改变",
+        )
     return doc_id
 
 
@@ -174,23 +190,86 @@ def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
 def persist_risks(conn: sqlite3.Connection, project_id: int, risks: list[dict]) -> int:
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     now = datetime.now().isoformat(timespec="seconds")
+    findings = [
+        Finding(
+            "contract_risk",
+            risk["severity"],
+            "contract_doc",
+            risk["doc_id"],
+            risk["message"],
+            {"missing": risk["fact_key"], "doc_title": risk["doc_title"]},
+        )
+        for risk in risks
+    ]
+    fingerprints = {finding.fingerprint for finding in findings if finding.fingerprint}
+    repeated_history: dict[str, list[dict]] = {}
+    if fingerprints:
+        placeholders = ",".join("?" for _ in fingerprints)
+        for row in conn.execute(
+            f"""SELECT id, finding_id, fingerprint, status, lifecycle_status,
+                       resolved_note, created_at, run_signature, run_id
+                FROM anomalies
+                WHERE project_id=? AND rule_id='contract_risk'
+                  AND fingerprint IN ({placeholders}) ORDER BY id""",
+            (project_id, *sorted(fingerprints)),
+        ).fetchall():
+            repeated_history.setdefault(row["fingerprint"], []).append({
+                "anomaly_id": int(row["id"]),
+                "finding_id": row["finding_id"],
+                "legacy_status": row["status"],
+                "lifecycle_status": row["lifecycle_status"],
+                "reason": row["resolved_note"],
+                "created_at": row["created_at"],
+                "run_signature": row["run_signature"],
+                "run_id": row["run_id"],
+            })
     n = 0
     with run_contract._transaction(conn, "persist_contract_risks"):
-        conn.execute(
-            """DELETE FROM anomalies
-               WHERE project_id=? AND rule_id='contract_risk' AND status='open'
-                 AND run_signature=?""",
-            (project_id, active_contract.signature),
+        old_rows = conn.execute(
+            """SELECT id, finding_id, fingerprint, lifecycle_status, status,
+                      evidence_id, run_signature, run_id
+               FROM anomalies
+               WHERE project_id=? AND rule_id='contract_risk'
+                 AND COALESCE(lifecycle_status, 'new') <> 'historical'""",
+            (project_id,),
+        ).fetchall()
+        evidence_api.mark_historical(
+            conn,
+            project_id,
+            {
+                int(row["evidence_id"])
+                for row in old_rows if row["evidence_id"] is not None
+            },
+            "本次合同风险检查已生成新的快照，旧 Finding 保留为历史",
+            actor="system",
+            commit=False,
         )
-        for r in risks:
-            finding = Finding(
-                "contract_risk",
-                r["severity"],
-                "contract_doc",
-                r["doc_id"],
-                r["message"],
-                {"missing": r["fact_key"], "doc_title": r["doc_title"]},
+        for row in old_rows:
+            conn.execute(
+                """UPDATE anomalies
+                   SET status='stale', lifecycle_status='historical',
+                       resolved_note=COALESCE(
+                           resolved_note,
+                           '本次合同风险检查已生成新的快照，旧 Finding 保留为历史'
+                       ), lifecycle_updated_at=?, lifecycle_updated_by='system'
+                   WHERE id=? AND project_id=?""",
+                (now, int(row["id"]), project_id),
             )
+            conn.execute(
+                """INSERT INTO finding_status_events(
+                       project_id, anomaly_id, finding_id, fingerprint,
+                       before_status, after_status, reason, actor, occurred_at,
+                       run_signature, run_id, evidence_id, audit_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    project_id, int(row["id"]), row["finding_id"], row["fingerprint"],
+                    finding_lifecycle.lifecycle_status(row), "historical",
+                    "本次合同风险检查已生成新的快照，旧 Finding 保留为历史",
+                    "system", now, row["run_signature"], row["run_id"],
+                    row["evidence_id"], None,
+                ),
+            )
+        for finding, risk in zip(findings, risks, strict=True):
             ev_id = evidence_api.add_evidence(
                 conn,
                 project_id,
@@ -198,35 +277,43 @@ def persist_risks(conn: sqlite3.Connection, project_id: int, risks: list[dict]) 
                 finding.message,
                 steps=[{
                     "step": "风险检查",
-                    "missing": r["fact_key"],
+                    "missing": risk["fact_key"],
                     "finding_id": finding.finding_id,
                     "fingerprint": finding.fingerprint,
                     "impact": finding.impact,
                     "limitations": finding.limitations,
                     "recommendation": finding.recommendation,
                 }],
-                sources=[{"doc": r["doc_title"], "doc_id": r["doc_id"]}],
+                sources=[{"doc": risk["doc_title"], "doc_id": risk["doc_id"]}],
                 commit=False,
                 run_signature=active_contract.signature,
+                run_id=active_contract.run_id,
                 finding_id=finding.finding_id,
+                scope="current",
             )
             conn.execute(
                 """INSERT INTO anomalies(
                        project_id, rule_id, severity, subject_type, subject_id,
-                       evidence_id, message, status, created_at, run_signature,
+                       evidence_id, message, status, created_at, run_signature, run_id,
                        finding_id, fingerprint, confidence, detection_mode,
                        raw_values_json, normalized_values_json, impact,
-                       limitations_json, recommendation)
-                   VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?)""",
-                (project_id, "contract_risk", r["severity"], "contract_doc", r["doc_id"],
-                 ev_id, r["message"], now, active_contract.signature,
+                       limitations_json, recommendation, lifecycle_status,
+                       repeat_history_json)
+                   VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (project_id, "contract_risk", risk["severity"], "contract_doc", risk["doc_id"],
+                 ev_id, risk["message"], now, active_contract.signature, active_contract.run_id,
                  finding.finding_id, finding.fingerprint, finding.confidence,
                  finding.detection_mode,
                  json.dumps(finding.raw_values, ensure_ascii=False, default=str),
                  json.dumps(finding.normalized_values, ensure_ascii=False, default=str),
                  finding.impact,
                  json.dumps(finding.limitations, ensure_ascii=False, default=str),
-                 finding.recommendation),
+                 finding.recommendation, "new",
+                 json.dumps(
+                     repeated_history.get(finding.fingerprint, []),
+                     ensure_ascii=False,
+                     default=str,
+                 )),
             )
             n += 1
     return n

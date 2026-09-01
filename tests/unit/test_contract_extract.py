@@ -1,8 +1,10 @@
 """合同条款提取测试：原文引用必须随身携带。"""
 
+import json
+
 import pytest
 
-from jiadun.core.contracts import docx_parser, extract
+from jiadun.core.contracts import docx_parser, extract, run_contract
 from jiadun.core.db import migrations
 
 SAMPLE_CONTRACT = """
@@ -137,8 +139,46 @@ class TestImportAndRisk:
         assert {"payment_clause", "settlement_clause", "duration", "contract_amount"} <= keys
         n = extract.persist_risks(conn, pid, risks)
         assert n == len(risks)
+        active = run_contract.get_current_contract(conn, pid)
+        assert active is not None
+        current_scope, scope_params = run_contract.current_scope(conn, pid, "a")
+        current_risks = conn.execute(
+            f"SELECT COUNT(*) FROM anomalies a WHERE a.project_id=? AND a.rule_id='contract_risk' AND {current_scope}",
+            (pid, *scope_params),
+        ).fetchone()[0]
+        assert current_risks == n
+        assert conn.execute(
+            "SELECT COUNT(*) FROM evidence WHERE project_id=? AND kind='contract_risk' "
+            "AND run_id=?", (pid, active.run_id)
+        ).fetchone()[0] == n
         ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (pid,)).fetchone()["c"]
         assert ev >= n
+
+        first = conn.execute(
+            "SELECT id, evidence_id FROM anomalies WHERE project_id=? AND rule_id='contract_risk' "
+            "ORDER BY id LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert first is not None
+        assert extract.persist_risks(conn, pid, []) == 0
+        historical = conn.execute(
+            "SELECT status, lifecycle_status FROM anomalies WHERE id=?", (first["id"],)
+        ).fetchone()
+        assert tuple(historical) == ("stale", "historical")
+        assert conn.execute(
+            "SELECT scope FROM evidence WHERE id=?", (first["evidence_id"],)
+        ).fetchone()["scope"] == "historical"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM finding_status_events WHERE anomaly_id=? AND after_status='historical'",
+            (first["id"],),
+        ).fetchone()[0] == 1
+        assert extract.persist_risks(conn, pid, risks) == n
+        current = conn.execute(
+            "SELECT repeat_history_json FROM anomalies WHERE project_id=? AND rule_id='contract_risk' "
+            "AND lifecycle_status='new' ORDER BY id DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert current is not None and json.loads(current["repeat_history_json"])
 
     def test_txt_contract(self, db, tmp_path):
         conn, pid, pdir = db
@@ -147,3 +187,35 @@ class TestImportAndRisk:
         doc_id = extract.import_contract(conn, pid, pdir, src)
         keys = {r["fact_key"] for r in conn.execute("SELECT fact_key FROM contract_facts WHERE doc_id=?", (doc_id,))}
         assert "payment_clause" in keys
+
+    def test_anomaly_rerun_does_not_hide_current_contract_risks(self, db, tmp_path):
+        """通用异常快照重跑不能把合同风险误历史化。"""
+        from jiadun.core.anomalies import engine as anomaly_engine
+
+        conn, pid, pdir = db
+        src = tmp_path / "简短协议-异常边界.docx"
+        import docx as docx_lib
+
+        document = docx_lib.Document()
+        document.add_paragraph("发包人：甲公司")
+        document.add_paragraph("承包人：乙公司")
+        document.save(str(src))
+        extract.import_contract(conn, pid, pdir, src)
+        risks = extract.contract_risks(conn, pid)
+        assert extract.persist_risks(conn, pid, risks) == len(risks)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM anomalies WHERE project_id=? AND rule_id='contract_risk' "
+            "AND lifecycle_status<>'historical'",
+            (pid,),
+        ).fetchone()[0]
+        assert before == len(risks)
+
+        anomaly_engine.run_anomalies(conn, pid, rules=[])
+
+        current_scope, scope_params = run_contract.current_scope(conn, pid, "a")
+        after = conn.execute(
+            f"SELECT COUNT(*) FROM anomalies a WHERE a.project_id=? "
+            f"AND a.rule_id='contract_risk' AND {current_scope}",
+            (pid, *scope_params),
+        ).fetchone()[0]
+        assert after == before

@@ -91,11 +91,22 @@ def test_manual_binding_is_atomic_and_audited(tmp_path):
     ).fetchone()[0] == 1
     current = run_contract.get_current_contract(conn, info.project_id)
     evidence = conn.execute(
-        "SELECT run_signature FROM evidence WHERE project_id=? AND kind='manifest_binding'",
+        "SELECT run_id, run_signature, scope FROM evidence "
+        "WHERE project_id=? AND kind='manifest_binding'",
+        (info.project_id,),
+    ).fetchone()
+    audit = conn.execute(
+        "SELECT run_id, run_signature FROM audit_log "
+        "WHERE project_id=? AND action='bind_manifest_entry'",
         (info.project_id,),
     ).fetchone()
     assert current is not None
-    assert evidence["run_signature"] == current.signature
+    assert (evidence["run_id"], evidence["run_signature"], evidence["scope"]) == (
+        current.run_id,
+        current.signature,
+        "human",
+    )
+    assert (audit["run_id"], audit["run_signature"]) == (current.run_id, current.signature)
     conn.close()
 
 

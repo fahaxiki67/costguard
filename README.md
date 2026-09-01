@@ -11,13 +11,13 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.9 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.9
-> candidate carries the evidence-gated verification levels, full-list pagination,
-> dual-value audit worksheets and the Jiadun（价盾）rename. Real WPS/Excel environment
-> verification and production signing remain open release gates. The v0.1.9 release
-> carries the Jiadun（价盾）rename and compatibility updates on top of the v0.1.8
-> candidate. See the [release notes](docs/RELEASE_NOTES_v0.1.9.md) and the
+> **Status: v0.1.10 preview.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.10
+> candidate adds immutable run identities, per-sheet coverage proofs, a shared
+> fail-closed status model, controlled mapping/rule/alias knowledge, project versions,
+> BOQ differences and historical price hints. Real WPS/Excel environment verification,
+> sanitized real-case regression and production signing remain open release gates.
+> See the [release notes](docs/RELEASE_NOTES_v0.1.10.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -107,7 +107,7 @@ uv run python scripts/release_consistency_check.py
 
 The target-machine performance measurements, WPS/Excel checks, signing and
 notarization, recovery tests and real-case regression remain open release
-gates for v0.1.9.
+gates for v0.1.10.
 
 ## Rename and compatibility
 

@@ -169,6 +169,120 @@ class TestHumanReview:
         assert not alias["canonical_key"].startswith("upward:")
         assert alias["direction"] == "upward"
 
+    def test_alias_confirmation_creates_current_match_snapshot_after_contract_change(self, db):
+        """别名改变运行输入时，确认结果必须仍属于新当前运行。"""
+        conn, pid, (p1, p2) = db
+        with conn:
+            conn.execute(
+                "UPDATE settlement_periods SET direction='upward' WHERE id IN (?, ?)",
+                (p1, p2),
+            )
+        add(conn, p1, None, "C25混凝土垫层")
+        add(conn, p2, None, "C25砼垫层")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        row = conn.execute(
+            "SELECT id, run_id, run_signature, group_key FROM matches WHERE project_id=? LIMIT 1",
+            (pid,),
+        ).fetchone()
+        with conn:
+            conn.execute(
+                "UPDATE matches SET level=? WHERE id=?",
+                (matching_mod.SUSPECTED, row["id"]),
+            )
+        old_run_id, old_signature = row["run_id"], row["run_signature"]
+
+        matching_mod.confirm_match(
+            conn,
+            pid,
+            row["id"],
+            "王工",
+            "名称差异经签认属于同一项目",
+            alias_name="C25砼垫层",
+        )
+
+        current = run_contract.get_current_contract(conn, pid)
+        assert current is not None
+        assert (current.run_id, current.signature) != (old_run_id, old_signature)
+        scope, params = run_contract.current_scope(conn, pid, "m")
+        current_rows = conn.execute(
+            f"SELECT id, status, level, run_id, run_signature FROM matches m "
+            f"WHERE project_id=? AND {scope}",
+            (pid, *params),
+        ).fetchall()
+        assert len(current_rows) == 1
+        assert tuple(current_rows[0][1:]) == (
+            "confirmed", matching_mod.CONFIRMED, current.run_id, current.signature
+        )
+        old = conn.execute(
+            "SELECT status, run_id, run_signature FROM matches WHERE id=?",
+            (row["id"],),
+        ).fetchone()
+        assert tuple(old) == ("pending", old_run_id, old_signature)
+        evidence = conn.execute(
+            "SELECT run_id, run_signature FROM evidence "
+            "WHERE project_id=? AND kind='match_confirmation' ORDER BY id DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert tuple(evidence) == (current.run_id, current.signature)
+        # 确认完成后外围摘要/下一次入口再次 ensure 不得把刚形成的
+        # Evidence、Audit 和当前匹配一起移出读取面。
+        stable = run_contract.ensure_run_contract(conn, pid)
+        assert stable.run_id == current.run_id
+        scope, params = run_contract.current_scope(conn, pid, "m")
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM matches m WHERE m.project_id=? AND {scope}",
+            (pid, *params),
+        ).fetchone()[0] == 1
+        audit = conn.execute(
+            "SELECT run_id, run_signature FROM audit_log "
+            "WHERE project_id=? AND action='confirm_match' ORDER BY id DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert tuple(audit) == (stable.run_id, stable.signature)
+
+    def test_confirming_existing_alias_does_not_rebind_historical_alias_event(self, db):
+        """后续匹配确认只能重绑本次新建事件，不能改写旧知识的运行身份。"""
+        from jiadun.core.matching import knowledge
+
+        conn, pid, (p1, p2) = db
+        entry = knowledge.add_alias(
+            conn,
+            pid,
+            original_name="C25砼垫层",
+            canonical_key="name:c25混凝土垫层",
+            canonical_name="C25混凝土垫层",
+            mapping_basis="先前项目签认单",
+            actor="历史复核人",
+            reason="历史别名已单独确认",
+            direction="unknown",
+        )
+        before = conn.execute(
+            "SELECT id, run_id, run_signature FROM alias_knowledge_events WHERE alias_id=?",
+            (entry.alias_id,),
+        ).fetchone()
+        add(conn, p1, None, "C25混凝土垫层")
+        add(conn, p2, None, "C25砼垫层")
+        matching_mod.save_matches(conn, pid, matching_mod.match_items(conn, pid))
+        row = conn.execute("SELECT id FROM matches LIMIT 1").fetchone()
+        with conn:
+            conn.execute(
+                "UPDATE matches SET level=? WHERE id=?",
+                (matching_mod.SUSPECTED, row["id"]),
+            )
+        matching_mod.confirm_match(
+            conn,
+            pid,
+            row["id"],
+            "当前复核人",
+            "本次仅确认当前匹配",
+            alias_name="C25砼垫层",
+        )
+        after = conn.execute(
+            "SELECT id, run_id, run_signature FROM alias_knowledge_events WHERE id=?",
+            (before["id"],),
+        ).fetchone()
+        assert tuple(after) == tuple(before)
+
     def test_upward_alias_never_applies_to_downward_items(self, db):
         """对上的人工别名是方向性业务结论，不得自动合并对下同名行。"""
         conn, pid, (p1, p2) = db
@@ -244,6 +358,18 @@ class TestHumanReview:
         assert any(a.action == "confirm_match" for a in audits)
         ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (pid,)).fetchone()["c"]
         assert ev >= 1
+        stable = run_contract.ensure_run_contract(conn, pid)
+        current_scope, scope_params = run_contract.current_scope(conn, pid, "m")
+        assert conn.execute(
+            f"SELECT COUNT(*) FROM matches m WHERE m.project_id=? AND {current_scope}",
+            (pid, *scope_params),
+        ).fetchone()[0] == 1
+        audit = conn.execute(
+            "SELECT run_id, run_signature FROM audit_log "
+            "WHERE project_id=? AND action='confirm_match' ORDER BY id DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert tuple(audit) == (stable.run_id, stable.signature)
 
     def test_confirm_is_atomic_when_evidence_write_fails(self, db, monkeypatch):
         """证据写入失败时，匹配状态不得先提交。"""
@@ -444,3 +570,10 @@ class TestHumanReview:
         row = conn.execute("SELECT * FROM item_aliases WHERE project_id=?", (pid,)).fetchone()
         assert row and row["alias_text"] == "C25砼垫层"
         assert "match#" in row["mapping_basis"]
+        knowledge_row = conn.execute(
+            "SELECT original_name, canonical_key, scope, status FROM alias_knowledge "
+            "WHERE project_id=? ORDER BY id DESC LIMIT 1",
+            (pid,),
+        ).fetchone()
+        assert knowledge_row is not None
+        assert tuple(knowledge_row) == ("C25砼垫层", row["canonical_key"], "project", "active")

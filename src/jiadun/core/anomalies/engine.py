@@ -9,9 +9,10 @@ from jiadun.core.anomalies.coverage import (
     coverage_from_values,
     record_detection_run,
 )
-from jiadun.core.anomalies.rules import ALL_RULES, Finding
+from jiadun.core.anomalies.rules import Finding
 from jiadun.core.contracts import run_contract
 from jiadun.core.evidence import evidence as evidence_api
+from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.labels import direction_label
 
 
@@ -141,7 +142,12 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
     active_contract = run_contract.ensure_run_contract(conn, project_id)
     findings: list[Finding] = []
     technical_findings: list[Finding] = []
-    selected_rules = list(ALL_RULES if rules is None else rules)
+    if rules is None:
+        from jiadun.core.anomalies import catalog
+
+        selected_rules = list(catalog.enabled_rule_functions(conn, project_id))
+    else:
+        selected_rules = list(rules)
     expected = [getattr(rule, "__name__", rule.__class__.__name__) for rule in selected_rules]
     executed: list[str] = []
     failed: dict[str, str] = {}
@@ -172,21 +178,108 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
         failed=failed,
         critical_failed=list(failed),
     )
+    # 在清理同一运行的自动缓存前，保留相同 fingerprint 的历史处理摘要。
+    # 新 Finding 仍从“新发现”开始，历史状态只作为参考，绝不自动关闭。
+    repeated_history: dict[str, list[dict]] = {}
+    fingerprints = {
+        finding.fingerprint for finding in findings if finding.fingerprint
+    }
+    if fingerprints:
+        placeholders = ",".join("?" for _ in fingerprints)
+        history_rows = conn.execute(
+            f"""SELECT id, finding_id, fingerprint, status, lifecycle_status,
+                       resolved_note, created_at, run_signature, run_id
+                FROM anomalies
+                WHERE project_id=? AND fingerprint IN ({placeholders})
+                ORDER BY id""",
+            (project_id, *sorted(fingerprints)),
+        ).fetchall()
+        for row in history_rows:
+            repeated_history.setdefault(row["fingerprint"], []).append({
+                "anomaly_id": int(row["id"]),
+                "finding_id": row["finding_id"],
+                "legacy_status": row["status"],
+                "lifecycle_status": row["lifecycle_status"] if "lifecycle_status" in row.keys() else None,
+                "reason": row["resolved_note"],
+                "created_at": row["created_at"],
+                "run_signature": row["run_signature"],
+                "run_id": row["run_id"] if "run_id" in row.keys() else None,
+            })
     with run_contract._transaction(conn, "run_anomalies"):
-        # 同一签名重跑时清掉当前自动缓存，保留 evidence 历史；签名变化时
-        # 旧未处理项只标记 stale，不能继续混入当前结果，也不能丢失处理轨迹。
-        conn.execute(
-            """UPDATE anomalies SET status='stale'
-               WHERE project_id=? AND status='open'
-                 AND (run_signature IS NULL OR run_signature<>?)""",
-            (project_id, active_contract.signature),
+        # 技术失败证据挂在 detection_runs.metadata_json 而不在 anomalies
+        # 表中，不能只靠 Finding 历史化覆盖。每次新检测开始时先把旧的
+        # detection_failure Evidence 移出 current；失败重跑也会留下独立
+        # 的历史事件，最新一条才代表本次覆盖率状态。
+        old_failure_evidence_ids = {
+            int(row["id"])
+            for row in conn.execute(
+                """SELECT id FROM evidence
+                   WHERE project_id=? AND kind='detection_failure'
+                     AND scope<>'historical'""",
+                (project_id,),
+            ).fetchall()
+        }
+        evidence_api.mark_historical(
+            conn,
+            project_id,
+            old_failure_evidence_ids,
+            "本次异常检测已重新执行，上一轮技术失败证据保留为历史",
+            actor="system",
+            commit=False,
         )
-        conn.execute(
-            """DELETE FROM anomalies
-               WHERE project_id=? AND status='open' AND resolved_note IS NULL
-                 AND run_signature=?""",
-            (project_id, active_contract.signature),
+        # 每次检测都是一个新的不可变检测快照。旧自动 Finding 无论本次是否
+        # 仍然命中，都必须保留为历史，不能 DELETE 后丢失关闭/复核轨迹；新
+        # Finding 通过 repeat_history_json 引用这些历史行，但不得继承其状态。
+        old_rows = conn.execute(
+            """SELECT id, finding_id, fingerprint, lifecycle_status, status,
+                      evidence_id, run_signature, run_id
+            FROM anomalies
+            WHERE project_id=? AND detection_mode IN ('automated', 'technical_failure')
+                 AND rule_id <> 'contract_risk'
+                 AND (run_signature IS NOT NULL OR run_id IS NOT NULL)
+                 AND COALESCE(lifecycle_status, 'new') <> 'historical'""",
+            (project_id,),
+        ).fetchall()
+        old_evidence_ids = {
+            int(row["evidence_id"])
+            for row in old_rows
+            if row["evidence_id"] is not None
+        }
+        evidence_api.mark_historical(
+            conn,
+            project_id,
+            old_evidence_ids,
+            "本次异常检测已生成新的快照，旧 Finding 保留为历史，不参与当前结论",
+            actor="system",
+            commit=False,
         )
+        historical_at = now
+        for row in old_rows:
+            before_status = finding_lifecycle.lifecycle_status(row)
+            conn.execute(
+                """UPDATE anomalies
+                   SET status='stale', lifecycle_status='historical',
+                       resolved_note=COALESCE(
+                           resolved_note,
+                           '本次异常检测已生成新的快照，旧 Finding 保留为历史'
+                       ), lifecycle_updated_at=?, lifecycle_updated_by='system'
+                   WHERE id=? AND project_id=?""",
+                (historical_at, int(row["id"]), project_id),
+            )
+            conn.execute(
+                """INSERT INTO finding_status_events(
+                       project_id, anomaly_id, finding_id, fingerprint,
+                       before_status, after_status, reason, actor, occurred_at,
+                       run_signature, run_id, evidence_id, audit_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    project_id, int(row["id"]), row["finding_id"], row["fingerprint"],
+                    before_status, "historical",
+                    "本次异常检测已生成新的快照，旧 Finding 保留为历史",
+                    "system", historical_at, row["run_signature"], row["run_id"],
+                    row["evidence_id"], None,
+                ),
+            )
         for f in findings:
             record = f.as_record()
             ev_id = evidence_api.add_evidence(
@@ -207,19 +300,22 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
                 sources=_finding_sources(conn, project_id, f),
                 commit=False,
                 run_signature=active_contract.signature,
+                run_id=active_contract.run_id,
                 finding_id=f.finding_id,
             )
             conn.execute(
                 """INSERT INTO anomalies(
                        project_id, rule_id, severity, subject_type, subject_id,
                        evidence_id, message, status, created_at, run_signature,
+                       run_id,
                        finding_id, fingerprint, confidence, detection_mode,
                        raw_values_json, normalized_values_json, impact,
-                       limitations_json, recommendation, suppression_reason)
-                   VALUES (?,?,?,?,?,?,?, 'open', ?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       limitations_json, recommendation, suppression_reason,
+                       lifecycle_status, repeat_history_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     project_id, f.rule_id, f.severity, f.subject_type, f.subject_id,
-                    ev_id, f.message, now, active_contract.signature,
+                    ev_id, f.message, "open", now, active_contract.signature, active_contract.run_id,
                     record["finding_id"], record["fingerprint"], record["confidence"],
                     record["detection_mode"],
                     json.dumps(record["raw_values"], ensure_ascii=False, default=str),
@@ -227,6 +323,12 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
                     record["impact"],
                     json.dumps(record["limitations"], ensure_ascii=False, default=str),
                     record["recommendation"], record["suppression_reason"],
+                    "new",
+                    json.dumps(
+                        repeated_history.get(record["fingerprint"], []),
+                        ensure_ascii=False,
+                        default=str,
+                    ),
                 ),
             )
         technical_evidence_id = None
@@ -247,6 +349,7 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
                 sources=[{"run_signature": active_contract.signature}],
                 commit=False,
                 run_signature=active_contract.signature,
+                run_id=active_contract.run_id,
             )
         record_detection_run(
             conn,
@@ -255,6 +358,7 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
             started_at=started_at,
             completed_at=now,
             run_signature=active_contract.signature,
+            run_id=active_contract.run_id,
             error_summary=(
                 f"{len(failed)} 条规则失败；技术证据 Evidence ID {technical_evidence_id}"
                 if failed else None

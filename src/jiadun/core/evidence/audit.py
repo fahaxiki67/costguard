@@ -31,6 +31,8 @@ def record_audit(
     after: dict[str, Any] | None,
     reason: str,
     commit: bool = True,
+    run_id: str | None = None,
+    run_signature: str | None = None,
 ) -> int:
     """记录一次人工修改。reason 为空直接拒绝。
 
@@ -42,12 +44,12 @@ def record_audit(
     now = datetime.now().isoformat(timespec="seconds")
     def _insert() -> int:
         cur = conn.execute(
-            """INSERT INTO audit_log(project_id, ts, actor, action, target, before_json, after_json, reason)
-               VALUES (?,?,?,?,?,?,?,?)""",
+            """INSERT INTO audit_log(project_id, ts, actor, action, target, before_json, after_json, reason, run_id, run_signature)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (project_id, now, actor, action, target,
              json.dumps(before, ensure_ascii=False, default=str) if before else None,
              json.dumps(after, ensure_ascii=False, default=str) if after else None,
-             reason.strip()),
+             reason.strip(), run_id, run_signature),
         )
         return int(cur.lastrowid)
     if commit:

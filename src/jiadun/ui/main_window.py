@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 from jiadun import branding
 from jiadun.core import demo as demo_core
 from jiadun.core.models import project as project_model
+from jiadun.core.reporting import build_project_summary
 from jiadun.ui.widgets import empty_state, section_header
 from jiadun.ui.workbench import WorkbenchPage
 
@@ -243,6 +244,7 @@ class MainWindow(QMainWindow):
             period_line.setStyleSheet("color: #667085; background: transparent;")
             card_layout.addWidget(period_line)
             status_line = QLabel(
+                f"项目状态：{snapshot['project_status']}　·　"
                 f"待确认事项：工作表 {snapshot['pending_sheets']}　·　"
                 f"高风险 {snapshot['high']}　·　待确认匹配 {snapshot['matches']}　·　"
                 f"最新校核：{snapshot['latest']}"
@@ -261,15 +263,27 @@ class MainWindow(QMainWindow):
         fallback: dict[str, str | int] = {
             "upward": 0, "downward": 0, "pending_sheets": 0,
             "high": 0, "matches": 0, "latest": "尚未校核",
+            "project_status": "不可形成项目结论",
         }
         db = Path(info.workspace_path) / "project.db"
         if not db.is_file():
             return fallback
         conn = None
         try:
-            uri = f"{db.resolve().as_uri()}?immutable=1&mode=ro"
+            # ``immutable=1`` 会忽略仍开放的 WAL，导致项目列表在写连接提交
+            # 后短暂旧读。普通 SQLite mode=ro 仍然禁止写入，但会按 WAL 读取
+            # 已提交快照；摘要本身通过 read_only 闸门不清理侧车。
+            uri = f"{db.resolve().as_uri()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
             conn.row_factory = sqlite3.Row
+            # 项目列表和工作台必须共享同一摘要状态，不能按时间直接读取
+            # crosscheck_results 的历史行。摘要只读当前 Run Contract 范围。
+            summary = build_project_summary(conn, info.project_id, read_only=True)
+            fallback["project_status"] = summary.statuses["project_status"]
+            if not summary.run_availability["available"]:
+                fallback["latest"] = "不可形成项目结论"
+            else:
+                fallback["latest"] = summary.verification["period_status"]
             periods = conn.execute(
                 """SELECT COALESCE(direction, 'unknown') AS direction, COUNT(*) AS c
                    FROM settlement_periods WHERE project_id=? GROUP BY COALESCE(direction, 'unknown')""",
@@ -278,37 +292,11 @@ class MainWindow(QMainWindow):
             counts = {row["direction"]: int(row["c"]) for row in periods}
             fallback["upward"] = counts.get("upward", 0)
             fallback["downward"] = counts.get("downward", 0)
-            fallback["high"] = int(conn.execute(
-                """SELECT COUNT(*) AS c FROM anomalies
-                   WHERE project_id=? AND severity='high' AND status IN ('open', 'deferred')""",
-                (info.project_id,),
-            ).fetchone()["c"])
-            fallback["matches"] = int(conn.execute(
-                "SELECT COUNT(*) AS c FROM matches WHERE project_id=? AND status='pending'",
-                (info.project_id,),
-            ).fetchone()["c"])
-            fallback["pending_sheets"] = int(conn.execute(
-                """SELECT COUNT(*) AS c
-                   FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
-                   JOIN source_files sf ON sf.id=pb.file_id
-                   WHERE sf.project_id=? AND rs.period_id IS NULL
-                     AND NOT EXISTS (
-                         SELECT 1 FROM audit_log al
-                         WHERE al.project_id=sf.project_id
-                           AND al.target='sheet:'||rs.id
-                           AND al.action='confirm_sheet_non_settlement_role'
-                     )""", (info.project_id,),
-            ).fetchone()["c"])
-            latest = conn.execute(
-                """SELECT verification_level FROM crosscheck_results
-                   WHERE project_id=? ORDER BY checked_at DESC, id DESC LIMIT 1""",
-                (info.project_id,),
-            ).fetchone()
-            level_zh = {
-                "sufficient": "校核充分", "findings": "校核有发现", "insufficient": "校核不充分",
-            }
-            if latest:
-                fallback["latest"] = level_zh.get(latest["verification_level"], "待复核")
+            # 待办计数必须和共享摘要使用相同的 current run；不能在这里按
+            # project_id 直接读历史异常/匹配，再与当前项目状态拼接。
+            fallback["high"] = int(summary.pending["high_risk"])
+            fallback["matches"] = int(summary.pending["matches"])
+            fallback["pending_sheets"] = int(summary.pending["sheets"])
         except (OSError, sqlite3.Error):
             pass
         finally:

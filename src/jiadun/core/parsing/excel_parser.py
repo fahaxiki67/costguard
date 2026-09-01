@@ -70,7 +70,10 @@ def parse_xlsx(path: Path) -> ParseResult:
     import openpyxl
 
     wb_formula = openpyxl.load_workbook(path, data_only=False, read_only=False)
-    wb_cached = openpyxl.load_workbook(path, data_only=True, read_only=False)
+    # 缓存值只用于逐格证据比对，不需要第二份可编辑工作簿。只读缓存必须
+    # 与公式视图按行并行迭代；禁止对 ReadOnlyWorksheet 逐格调用 ``cell``，
+    # 那会退化为大文件上的 O(n²) 扫描。
+    wb_cached = openpyxl.load_workbook(path, data_only=True, read_only=True)
     result = ParseResult(parser="openpyxl", status="ok")
     stats = {"n_sheets": 0, "n_cells": 0, "n_formulas": 0, "n_text_numbers": 0, "error_cells": []}
 
@@ -90,12 +93,15 @@ def parse_xlsx(path: Path) -> ParseResult:
                     if dim.hidden
                 ),
             )
-            for row in ws.iter_rows():
+            for row, cached_row in zip(ws.iter_rows(), ws_c.iter_rows(), strict=False):
                 for cell in row:
                     v = cell.value
                     if v is None and cell.number_format in ("General", ""):
                         continue
-                    cached = ws_c.cell(row=cell.row, column=cell.column).value
+                    cached = (
+                        cached_row[cell.column - 1].value
+                        if cell.column <= len(cached_row) else None
+                    )
                     is_formula = cell.data_type == "f"
                     rec = CellRecord(
                         row=cell.row,

@@ -807,8 +807,10 @@ def run_benchmark(
         "output_files": {"json": JSON_NAME, "markdown": MARKDOWN_NAME},
     }
     tracemalloc.start()
+    active_size: int | None = None
     try:
         for index, size in enumerate(parsed_sizes, start=1):
+            active_size = size
             _emit(f"规模 {index}/{len(parsed_sizes)}：{size:,} 行项目", progress)
             result = _run_size(
                 size,
@@ -818,23 +820,38 @@ def run_benchmark(
                 cancel_check=cancel_check,
             )
             report["results"].append(result)
+            # 先写入该规模的终态，再落盘。否则取消发生在规模收束后，
+            # 旧报告会短暂保留 ``running``，让恢复工具无法区分已取消现场。
+            if result.get("status") != "completed":
+                report["status"] = result.get("status", "failed")
             # 每个规模完成即落盘，Ctrl-C 或进程异常时至少保留已完成规模。
             report["generated_at"] = _now()
             _write_reports(report, report_dir)
             if result.get("status") != "completed":
-                report["status"] = result.get("status", "failed")
                 break
+            active_size = None
         else:
             report["status"] = "completed"
     except KeyboardInterrupt:
         report["status"] = "cancelled"
         report["cancelled_at"] = _now()
+        if active_size is not None:
+            # 中断可能发生在 _run_size 尚未返回时（例如解析器逐格落库中）。
+            # 记录规模和现场入口，避免报告只显示前一规模而掩盖半成品现场。
+            report["cancelled_size"] = active_size
     except Exception as exc:
         report["status"] = "failed"
         report["fatal_error"] = _safe_error(exc)
     finally:
         if tracemalloc.is_tracing():
-            tracemalloc.stop()
+            # Ctrl-C 可能在阶段返回后才被解释；清理阶段不得再次把已捕获
+            # 的取消升级为未写报告的 traceback。停用失败不影响现场报告。
+            try:
+                tracemalloc.stop()
+            except BaseException as exc:  # noqa: BLE001 - 终态报告优先于清理异常
+                report["finalization_warning"] = _safe_error(exc)
+                report["status"] = "cancelled"
+                report.setdefault("cancelled_at", _now())
         report["generated_at"] = _now()
         # 先在现场仍存在时计算输入/输出哈希，再按成功/保留设置清理精确目录。
         flattened_stages = []

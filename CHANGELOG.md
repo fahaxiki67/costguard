@@ -9,11 +9,42 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-The next development stage after v0.1.9 is the P0 hardening program described
-in the project handoff: unified fail-closed state semantics, complete range
-coverage evidence, immutable Run Contracts, golden real-case regression,
-target-environment Office acceptance, and cancellable large-project jobs.
-These items are not silently treated as completed by the v0.1.9 preview release.
+No changes recorded after v0.1.10.
+
+## [0.1.10] - 2026-09-01
+
+Preview release for evidence-gated settlement review and controlled local knowledge assets.
+
+### Added
+- Per-Sheet coverage proofs and immutable row classifications that bridge raw ranges,
+  excluded rows, pending rows, business rows and A/B/C totals.
+- Immutable run IDs and expanded Run Contracts covering source identity, sheet scope,
+  mappings, periods, rules, Decimal policy, aliases, confirmations and project versions.
+- Shared Sheet, period, direction and project status semantics for the UI, Excel and Word.
+- BOQ difference radar, mirrored matching review, field mapping templates, versioned alias
+  knowledge, configurable rule catalog and Finding lifecycle events.
+- Project version chains, final-approval snapshots and traceable historical unit-price hints.
+- Golden regression and release-checklist runners, plus staged 10k/50k/200k performance tooling.
+
+### Changed
+- Current-result reads fail closed when source files, raw grids, mappings, periods, rules,
+  evidence or the Run Contract no longer match.
+- Historical results and Evidence remain readable but are explicitly excluded from current
+  project conclusions.
+- Export status cards, Excel covers and Word summaries use the shared project status instead
+  of recomputing a local green result.
+
+### Fixed
+- Prevented a historical Run Contract with a repeated signature from being reactivated.
+- Prevented semantically identical Decimal/set rule snapshots from being reported as changed
+  after canonical JSON persistence.
+- Prevented registered export cards from referencing an undefined file-type variable.
+- Rejected non-finite or malformed historical price values without replacing them with zero.
+
+### Release boundary
+- This remains a Preview/Prerelease. Sanitized real-case golden regression, four Office
+  environments, complete target-machine performance evidence, Developer ID signing and
+  notarization remain open production gates.
 
 ## [0.1.9] - 2026-08-31
 
