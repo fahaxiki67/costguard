@@ -10,7 +10,7 @@ from scripts import release_consistency_check
 
 def test_release_documents_match_current_preview_version():
     result = release_consistency_check.check_release_consistency(
-        Path(__file__).parents[2], expected_version="0.1.12"
+        Path(__file__).parents[2], expected_version="0.1.13"
     )
     assert result["ok"], result["issues"]
 

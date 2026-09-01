@@ -76,8 +76,19 @@ def _normalize_zip(path: Path) -> None:
             info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o600 << 16
+            info.create_system = 3  # 固定为 Unix，否则 Windows 生成字节与 macOS 不一致
             dst.writestr(info, data)
-    tmp.replace(path)
+    # Windows：杀毒软件可能短暂锁定刚写完的文件，os.replace 会 WinError 5，退避重试
+    import time
+
+    for attempt in range(6):
+        try:
+            tmp.replace(path)
+            break
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.2 * (attempt + 1))
 
 
 def _style_table(ws: openpyxl.Worksheet, header_row: int, last_row: int,

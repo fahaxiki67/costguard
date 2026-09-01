@@ -9,7 +9,20 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-The v0.1.12 preview focuses on a clean startup and a usable local intake flow.
+The v0.1.13 preview continues the v0.1.12 intake flow with Windows test
+compatibility and demo cross-platform determinism.
+
+## [0.1.13] - 2026-09-02
+
+Windows compatibility follow-up to the v0.1.12 preview; no parsing or
+calculation behavior changes.
+
+### Fixed
+- Symlink-dependent tests (workspace dedup, stored-copy loop downgrade,
+  import-path scan) now skip gracefully on Windows hosts without symlink
+  privilege instead of failing with WinError 1314.
+- Demo data generation is byte-stable across platforms: zip entries use
+  create_system=3 (Unix), and antivirus-locked os.replace retries with backoff.
 
 ## [0.1.12] - 2026-09-01
 

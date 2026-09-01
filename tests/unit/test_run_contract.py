@@ -545,8 +545,11 @@ def test_symlink_loop_is_reported_as_unavailable(tmp_path):
             (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
         )
         run_contract.ensure_run_contract(conn, info.project_id)
-        loop_a.symlink_to(loop_b)
-        loop_b.symlink_to(loop_a)
+        try:
+            loop_a.symlink_to(loop_b)
+            loop_b.symlink_to(loop_a)
+        except OSError as exc:
+            pytest.skip(f"当前环境无法创建符号链接（Windows 需管理员或开发者模式）：{exc}")
         conn.execute("DROP TRIGGER trg_source_files_identity_immutable_update")
         conn.execute(
             "UPDATE source_files SET stored_path=? WHERE project_id=?",
