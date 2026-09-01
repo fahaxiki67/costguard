@@ -240,13 +240,29 @@ def parse_file(path: Path, file_type: str) -> ParseResult:
         return ParseResult(parser="unknown", status="failed", error=f"{type(exc).__name__}: {exc}")
 
 
-def persist_parse_result(conn: sqlite3.Connection, file_id: int, result: ParseResult) -> int:
-    """把解析结果落库。返回 batch_id。"""
+def persist_parse_result(
+    conn: sqlite3.Connection,
+    file_id: int,
+    result: ParseResult,
+    *,
+    commit: bool = True,
+) -> int:
+    """把解析结果落库。返回 batch_id。
+
+    ``failed``/``unsupported`` 解析批次也必须落库；调用方可以传
+    ``commit=False``，把批次和对应的 Evidence 放在同一个外层事务内。
+    """
     now = datetime.now().isoformat(timespec="seconds")
-    with conn:
+    stats = dict(result.stats)
+    if result.error:
+        # 解析错误是输入证据的一部分；不要只放在内存 ImportReport 里，
+        # 否则项目重新打开后无法解释为何该文件没有 Sheet。
+        stats["error"] = result.error
+
+    def _insert() -> int:
         cur = conn.execute(
             "INSERT INTO parse_batches(file_id, parser, parsed_at, status, stats_json) VALUES (?,?,?,?,?)",
-            (file_id, result.parser, now, result.status, _dumps(result.stats)),
+            (file_id, result.parser, now, result.status, _dumps(stats)),
         )
         batch_id = cur.lastrowid
         for sheet in result.sheets:
@@ -266,7 +282,12 @@ def persist_parse_result(conn: sqlite3.Connection, file_id: int, result: ParseRe
                     for c in sheet.cells
                 ],
             )
-    return batch_id
+        return int(batch_id)
+
+    if commit:
+        with conn:
+            return _insert()
+    return _insert()
 
 
 def _dumps(obj) -> str:

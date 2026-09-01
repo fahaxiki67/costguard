@@ -11,13 +11,14 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.11 preview.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.11
-> candidate adds immutable run identities, per-sheet coverage proofs, a shared
+> **Status: v0.1.12 preview.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) are available. The v0.1.12
+> candidate adds a blank-by-default startup page, direct file/folder import and
+> drag-and-drop intake while retaining immutable run identities, per-sheet coverage proofs, a shared
 > fail-closed status model, controlled mapping/rule/alias knowledge, project versions,
 > BOQ differences and historical price hints. Real WPS/Excel environment verification,
 > sanitized real-case regression and production signing remain open release gates.
-> See the [release notes](docs/RELEASE_NOTES_v0.1.11.md) and the
+> See the [release notes](docs/RELEASE_NOTES_v0.1.12.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -63,9 +64,12 @@ may ask you to right-click the app and choose **Open** — this is expected and
 documented in the [quick start](docs/QUICKSTART_zh-CN.md). Verify downloads with
 the published `SHA256SUMS.txt`.
 
-First run: click **体验匿名演示** (Try the anonymous demo) to walk the full
-workflow — import → standardize → Decimal checks → matching → up/down
-differences → anomalies → Excel/Word export — with fully synthetic demo data.
+First run: the project page starts empty. Drag a settlement/contract file or
+folder into the intake area, or use **导入资料文件…** / **导入资料文件夹…**;
+Jiadun creates a named project and imports read-only copies. Use
+**体验匿名演示** (Try the anonymous demo) only when you explicitly want the
+synthetic walkthrough. To reopen an existing project, choose
+**打开已有项目…** and select the directory containing `project.db`.
 
 ![导出的Excel审核底稿](examples/screenshots/08-导出-Excel审核底稿.png)
 
@@ -107,7 +111,7 @@ uv run python scripts/release_consistency_check.py
 
 The target-machine performance measurements, WPS/Excel checks, signing and
 notarization, recovery tests and real-case regression remain open release
-gates for v0.1.11.
+gates for v0.1.12.
 
 ## Rename and compatibility
 

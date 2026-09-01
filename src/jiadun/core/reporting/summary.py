@@ -1989,33 +1989,92 @@ def _pending(
 
 
 def _sheet_states(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
-    """读取持久化 Sheet 状态；未知状态保持可见并由项目门控降级。"""
-    rows = conn.execute(
-        """SELECT rs.id, rs.sheet_name, rs.period_id, rs.sheet_status,
-                  rs.sheet_status_reason, rs.sheet_status_updated_at,
-                  rs.sheet_status_actor, sf.original_name
-           FROM raw_sheets rs
-           JOIN parse_batches pb ON pb.id=rs.batch_id
+    """读取最新解析批次的持久化 Sheet 状态。
+
+    同一源文件可以因为修复、重试或重新打开而产生多个 ``parse_batches``；
+    旧批次仍是审计历史，但不能继续以“待确认/解析失败”污染当前项目状态。
+    当最新批次没有可落库的 Sheet（例如损坏工作簿或未实现的文件类型）时，
+    追加一个明确标注为 ``parse_batch`` 的解析失败状态，保持错误可追溯而不
+    虚构一个不存在的源 Sheet。
+    """
+    batch_rows = conn.execute(
+        """SELECT pb.id AS batch_id, pb.file_id, pb.parser, pb.parsed_at,
+                  pb.status AS batch_status, pb.stats_json, sf.original_name
+           FROM parse_batches pb
            JOIN source_files sf ON sf.id=pb.file_id
-           WHERE sf.project_id=? ORDER BY rs.id""",
+          WHERE sf.project_id=?
+            AND pb.id=(
+                SELECT latest.id FROM parse_batches latest
+                WHERE latest.file_id=pb.file_id
+                ORDER BY latest.parsed_at DESC, latest.id DESC LIMIT 1
+            )
+          ORDER BY sf.id, pb.id""",
         (project_id,),
     ).fetchall()
-    return [
-        {
-            "sheet_id": int(row["id"]),
-            "sheet_name": row["sheet_name"],
-            "original_name": row["original_name"],
-            "period_id": int(row["period_id"]) if row["period_id"] is not None else None,
-            "code": row["sheet_status"] or "pending",
-            "label": reporting_state.SHEET_LABELS.get(
-                row["sheet_status"] or "pending", "待确认"
-            ),
-            "reason": row["sheet_status_reason"] or "",
-            "updated_at": row["sheet_status_updated_at"],
-            "actor": row["sheet_status_actor"],
-        }
-        for row in rows
-    ]
+    states: list[dict[str, Any]] = []
+    for batch in batch_rows:
+        sheets = conn.execute(
+            """SELECT id, sheet_name, period_id, sheet_status,
+                      sheet_status_reason, sheet_status_updated_at, sheet_status_actor
+                 FROM raw_sheets WHERE batch_id=? ORDER BY id""",
+            (int(batch["batch_id"]),),
+        ).fetchall()
+        for row in sheets:
+            raw_code = row["sheet_status"] or "pending"
+            # 旧库或外部 SQL 可能写入未来状态；保留原码，同时用 pending
+            # 的中文标签提示人工，不把未知值包装成已确认。
+            canonical_code = (
+                raw_code if raw_code in reporting_state.SHEET_STATE_CODES else "pending"
+            )
+            label = reporting_state.SHEET_LABELS[canonical_code]
+            reason = row["sheet_status_reason"] or ""
+            if canonical_code != raw_code:
+                reason = (
+                    f"数据库状态码 {raw_code!r} 未定义，已按待确认处理"
+                    + (f"；{reason}" if reason else "")
+                )
+            states.append(
+                {
+                    "key": f"sheet:{int(row['id'])}",
+                    "entity_type": "sheet",
+                    "sheet_id": int(row["id"]),
+                    "batch_id": int(batch["batch_id"]),
+                    "file_id": int(batch["file_id"]),
+                    "sheet_name": row["sheet_name"],
+                    "original_name": batch["original_name"],
+                    "period_id": int(row["period_id"]) if row["period_id"] is not None else None,
+                    "code": canonical_code,
+                    "raw_code": raw_code,
+                    "label": label,
+                    "reason": reason,
+                    "updated_at": row["sheet_status_updated_at"],
+                    "actor": row["sheet_status_actor"],
+                }
+            )
+        if batch["batch_status"] != "ok":
+            try:
+                stats = json.loads(batch["stats_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                stats = {}
+            reason = stats.get("error") if isinstance(stats, dict) else None
+            states.append(
+                {
+                    "key": f"batch:{int(batch['batch_id'])}",
+                    "entity_type": "parse_batch",
+                    "sheet_id": None,
+                    "batch_id": int(batch["batch_id"]),
+                    "file_id": int(batch["file_id"]),
+                    "sheet_name": "文件级解析",
+                    "original_name": batch["original_name"],
+                    "period_id": None,
+                    "code": "parse_failed",
+                    "label": reporting_state.SHEET_LABELS["parse_failed"],
+                    "reason": reason or f"解析批次状态：{batch['batch_status']}",
+                    "updated_at": batch["parsed_at"],
+                    "actor": "system",
+                }
+            )
+    return states
 
 
 def _statuses(

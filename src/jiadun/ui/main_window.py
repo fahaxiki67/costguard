@@ -1,6 +1,7 @@
 """Jiadun 主窗口：项目列表页 ↔ 工作台页（QStackedWidget）。"""
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,11 @@ from jiadun import branding
 from jiadun.core import demo as demo_core
 from jiadun.core.models import project as project_model
 from jiadun.core.reporting import build_project_summary
+from jiadun.ui.file_selection import (
+    FileDropZone,
+    preferred_project_name,
+    scan_import_paths,
+)
 from jiadun.ui.widgets import empty_state, section_header
 from jiadun.ui.workbench import WorkbenchPage
 
@@ -37,6 +43,7 @@ PAGE_PROJECTS = 0
 PAGE_WORKBENCH = 1
 
 _GEOMETRY_KEY = "main/geometry"
+_LOG = logging.getLogger(__name__)
 
 
 def _settings() -> QSettings:
@@ -94,7 +101,9 @@ class NewProjectDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("新建项目")
         self.name_edit = QLineEdit()
-        self.root_label = QLabel(str(project_model.workspace_root()))
+        self.root_label = QLabel(
+            str(project_model.workspace_roots(include_known=False, include_legacy=False)[0])
+        )
         change_btn = QPushButton("更改工作空间…")
         change_btn.clicked.connect(self._change_root)
         row = QHBoxLayout()
@@ -134,6 +143,7 @@ class MainWindow(QMainWindow):
             self.resize(1080, 680)
         self._conn = None
         self._project = None
+        self.setAcceptDrops(True)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._projects_page())
@@ -165,24 +175,44 @@ class MainWindow(QMainWindow):
         self.project_list.itemDoubleClicked.connect(self._on_open)
         layout.addWidget(self.project_list, 1)
 
+        self.empty_drop_zone = FileDropZone(
+            "将结算或合同资料拖到这里\n支持单个文件和文件夹，原文件不会被修改"
+        )
+        self.empty_drop_zone.paths_dropped.connect(self._handle_source_paths)
+        layout.addWidget(self.empty_drop_zone)
+
         self.empty_box = empty_state(
             "还没有工程项目",
-            "新建项目开始核对，或先体验匿名演示熟悉完整流程",
+            "选择资料后会先创建一个新项目，再把资料只读复制到项目中",
             # 页面底部保留唯一主按钮；空状态中的快捷入口使用默认次级样式，
             # 避免同一页出现两个同等权重的“新建项目”主操作。
-            [("新建项目", "")])
+            [("导入资料文件…", ""), ("导入资料文件夹…", ""), ("新建项目", "")])
         layout.addWidget(self.empty_box)
         for btn in self.empty_box.findChildren(QPushButton):
             if btn.text() == "新建项目":
                 btn.clicked.connect(self._on_new)
+            elif btn.text() == "导入资料文件…":
+                btn.clicked.connect(self._choose_source_files)
+            elif btn.text() == "导入资料文件夹…":
+                btn.clicked.connect(self._choose_source_folder)
 
         btn_row = QHBoxLayout()
-        open_btn = QPushButton("打开项目目录…")
+        import_files_btn = QPushButton("导入资料文件…")
+        import_files_btn.setObjectName("btnTertiary")
+        import_files_btn.clicked.connect(self._choose_source_files)
+        import_folder_btn = QPushButton("导入资料文件夹…")
+        import_folder_btn.setObjectName("btnTertiary")
+        import_folder_btn.clicked.connect(self._choose_source_folder)
+        open_btn = QPushButton("打开已有项目…")
         open_btn.setObjectName("btnTertiary")
         open_btn.clicked.connect(self._on_open_dir)
         refresh_btn = QPushButton("刷新")
         refresh_btn.setObjectName("btnTertiary")
-        refresh_btn.clicked.connect(self.refresh_projects)
+        refresh_btn.clicked.connect(
+            lambda: self.refresh_projects(include_known=False, include_legacy=False)
+        )
+        btn_row.addWidget(import_files_btn)
+        btn_row.addWidget(import_folder_btn)
         btn_row.addWidget(open_btn)
         btn_row.addWidget(refresh_btn)
         btn_row.addStretch(1)
@@ -199,7 +229,10 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.refresh_projects()
+        # 启动页只显示当前默认工作空间中明确存在的项目；历史/临时工作空间
+        # 不在启动时隐式汇总，避免测试目录或旧记忆目录把首页灌满。用户仍
+        # 可用“打开已有项目…”明确选择任意项目目录。
+        self.refresh_projects(include_known=False, include_legacy=False)
 
     def closeEvent(self, event):
         settings = _settings()
@@ -209,9 +242,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # ---- 动作 ----
-    def refresh_projects(self):
+    def refresh_projects(self, *, include_known: bool = True, include_legacy: bool = True):
         self.project_list.clear()
-        for info in project_model.list_projects():
+        for info in project_model.list_projects(
+            include_known=include_known, include_legacy=include_legacy
+        ):
             # 列表项保留项目名作为 UserRole/双击入口；卡片补充审核摘要。
             item = QListWidgetItem(info.name)
             item.setToolTip(str(info.path))
@@ -256,6 +291,7 @@ class MainWindow(QMainWindow):
         has_items = self.project_list.count() > 0
         self.project_list.setVisible(has_items)
         self.empty_box.setVisible(not has_items)
+        self.empty_drop_zone.setVisible(not has_items)
 
     @staticmethod
     def _project_snapshot(info: project_model.ProjectInfo) -> dict[str, str | int]:
@@ -298,7 +334,16 @@ class MainWindow(QMainWindow):
             fallback["matches"] = int(summary.pending["matches"])
             fallback["pending_sheets"] = int(summary.pending["sheets"])
         except (OSError, sqlite3.Error):
-            pass
+            fallback["latest"] = "不可形成项目结论"
+        except Exception:  # noqa: BLE001 — 单个项目摘要异常也不得阻断首页
+            # 摘要是首页的提示性信息；任何未预期错误都降级为安全状态，
+            # 同时保留日志供排查，避免把坏项目误显示成“校核充分”。
+            _LOG.warning(
+                "读取项目摘要失败，项目降级为不可形成项目结论：project_id=%s",
+                info.project_id,
+                exc_info=True,
+            )
+            fallback["latest"] = "不可形成项目结论"
         finally:
             if conn is not None:
                 conn.close()
@@ -354,11 +399,125 @@ class MainWindow(QMainWindow):
             )
         self._open(info)
 
+    # ---- 资料导入入口 ----
+    def _choose_source_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择要导入的资料文件",
+            "",
+            "价盾可导入资料 (*.xlsx *.xlsm *.xls *.csv *.docx *.pdf *.txt)",
+        )
+        if files:
+            self._handle_source_paths(files)
+
+    def _choose_source_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择要导入的资料文件夹",
+            str(project_model.workspace_roots(include_known=False, include_legacy=False)[0]),
+        )
+        if folder:
+            self._handle_source_paths([folder])
+
+    def _handle_source_paths(self, paths):
+        """把用户选中的文件/文件夹导入当前项目或新建项目。"""
+        original_paths = [Path(path) for path in paths]
+        selection = scan_import_paths(original_paths)
+        if not selection.files:
+            extra = ""
+            if selection.skipped_reasons:
+                extra = "\n未导入：" + "、".join(
+                    f"{path.name}（{reason}）"
+                    for path, reason in selection.skipped_reasons[:8]
+                )
+                if len(selection.skipped_reasons) > 8:
+                    extra += f"等 {len(selection.skipped_reasons)} 项"
+            elif selection.skipped:
+                extra = "\n未支持的文件类型：" + "、".join(
+                    path.name for path in selection.skipped[:8]
+                )
+                if len(selection.skipped) > 8:
+                    extra += f"等 {len(selection.skipped)} 个文件"
+            QMessageBox.warning(
+                self,
+                "没有可导入的资料",
+                "所选内容中没有价盾支持的结算表或合同/纪要文件。"
+                "\n支持：XLSX、XLSM、XLS、CSV、DOCX、PDF、TXT。" + extra,
+            )
+            return
+
+        # 在工作台内拖入/选择资料，直接追加到当前项目；首页才需要创建项目。
+        if self.stack.currentIndex() == PAGE_WORKBENCH:
+            page = self.stack.widget(PAGE_WORKBENCH)
+            if isinstance(page, WorkbenchPage):
+                page.import_paths(
+                    selection.files,
+                    skipped=selection.skipped,
+                    skipped_reasons=selection.skipped_reasons,
+                )
+            return
+
+        dlg = NewProjectDialog(self)
+        dlg.name_edit.setText(preferred_project_name(original_paths, selection.files))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        name, root = dlg.values()
+        if not name:
+            QMessageBox.warning(self, "新建项目", "项目名称不能为空")
+            return
+        try:
+            info = project_model.create_project(name, root)
+        except project_model.ProjectError as exc:
+            QMessageBox.warning(self, "导入资料", _project_error_text(exc))
+            return
+        except OSError:
+            QMessageBox.warning(
+                self,
+                "工作空间未记住",
+                "项目创建失败，请检查工作空间目录权限后重试。",
+            )
+            return
+        try:
+            project_model.set_workspace_root(root)
+        except OSError:
+            QMessageBox.warning(
+                self,
+                "工作空间未记住",
+                f"项目已经安全创建在：\n{info.workspace_path}\n\n"
+                "但工作空间配置保存失败；本次仍可继续导入。",
+            )
+        self._open(info)
+        page = self.stack.widget(PAGE_WORKBENCH)
+        if isinstance(page, WorkbenchPage):
+            page.import_paths(
+                selection.files,
+                skipped=selection.skipped,
+                skipped_reasons=selection.skipped_reasons,
+            )
+
+    def dragEnterEvent(self, event):  # noqa: N802 - Qt override
+        if FileDropZone.paths_from_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # noqa: N802 - Qt override
+        paths = FileDropZone.paths_from_mime(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        self._handle_source_paths(paths)
+        event.acceptProposedAction()
+
     def _on_open(self, item: QListWidgetItem):
         self._open(item.data(Qt.UserRole))
 
     def _on_open_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "选择项目目录", str(project_model.workspace_root()))
+        d = QFileDialog.getExistingDirectory(
+            self,
+            "选择已有价盾项目目录（目录内应有 project.db）",
+            str(project_model.workspace_roots(include_known=False, include_legacy=False)[0]),
+        )
         if not d:
             return
         try:
@@ -406,7 +565,7 @@ class MainWindow(QMainWindow):
 
     def _back_to_projects(self):
         self.stack.setCurrentIndex(PAGE_PROJECTS)
-        self.refresh_projects()
+        self.refresh_projects(include_known=False, include_legacy=False)
         self.statusBar().showMessage("已返回项目列表")
 
 

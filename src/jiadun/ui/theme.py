@@ -10,6 +10,10 @@
 """
 from __future__ import annotations
 
+import sys
+
+from PySide6.QtGui import QFont, QFontDatabase
+
 # ---- 颜色 token ----
 BG = "#F6F7F9"          # 页面背景
 SURFACE = "#FFFFFF"     # 内容面板背景
@@ -40,6 +44,46 @@ ROW_HEIGHT = 32
 BADGE_HEIGHT = 20
 
 
+def preferred_font_family() -> str:
+    """选择当前平台实际存在的统一界面字体。
+
+    不把某一个中文字体硬编码进 QSS：不同系统可用字体不同，由这里按
+    平台优先级选择并交给 Qt 继承到所有控件。找不到候选时使用系统字体
+    列表中的第一个可用族，避免落到不存在的 ``Sans Serif`` 别名。
+    """
+    available = set(QFontDatabase.families())
+    if sys.platform == "darwin":
+        candidates = (
+            "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Noto Sans CJK SC",
+            "Arial Unicode MS", "Helvetica Neue",
+        )
+    elif sys.platform.startswith("win"):
+        candidates = (
+            "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC",
+            "Segoe UI", "SimSun",
+        )
+    else:
+        candidates = (
+            "Noto Sans CJK SC", "Noto Sans SC", "WenQuanYi Zen Hei",
+            "DejaVu Sans", "Liberation Sans",
+        )
+    for family in candidates:
+        if family in available:
+            return family
+    if available:
+        return sorted(available, key=str.casefold)[0]
+    return QFont().family()
+
+
+def apply_app_font(app) -> str:
+    """设置 QApplication 级字体并返回实际选中的字体族。"""
+    family = preferred_font_family()
+    font = QFont(family)
+    font.setPointSize(13)
+    app.setFont(font)
+    return family
+
+
 def build_qss() -> str:
     """全局样式表。所有规则集中于此；objectName 级语义样式见个页面说明。"""
     return f"""
@@ -54,6 +98,21 @@ QToolTip {{
     color: #FFFFFF;
     border: none;
     padding: 4px 8px;
+}}
+
+QFrame#fileDropZone {{
+    background: {SURFACE};
+    color: {TEXT_SECONDARY};
+    border: 1px dashed #B8C4D6;
+    border-radius: 8px;
+}}
+QFrame#fileDropZone[dragActive="true"] {{
+    background: {PRIMARY_SOFT};
+    border: 2px dashed {PRIMARY};
+}}
+QLabel#fileDropZoneLabel {{
+    color: {TEXT_SECONDARY};
+    background: transparent;
 }}
 
 /* ---- 按钮：Primary / Secondary(默认) / Tertiary / Danger ---- */
@@ -187,4 +246,5 @@ QStatusBar {{ background: {SURFACE}; border-top: 1px solid {BORDER}; color: {TEX
 
 def apply_theme(app) -> None:
     """应用全局主题。仅在 QApplication 创建后调用一次。"""
+    apply_app_font(app)
     app.setStyleSheet(build_qss())

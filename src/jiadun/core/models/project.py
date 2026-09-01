@@ -102,7 +102,7 @@ def _path_key(path: Path) -> str:
     return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
 
 
-def workspace_roots() -> list[Path]:
+def workspace_roots(*, include_known: bool = True, include_legacy: bool = True) -> list[Path]:
     """返回需要扫描的全部工作空间，首项是当前默认空间。
 
     旧版本只保存一个 ``workspace_root``，并且 UI 创建/打开自定义项目时没有
@@ -117,17 +117,32 @@ def workspace_roots() -> list[Path]:
 
     default_root = platform_paths.default_workspace_root()
     configured_root = Path(configured) if isinstance(configured, str) and configured else None
+    # ``workspace_root`` historically也可能由 core.create_project 的隐式登记
+    # 写入。启动页的窄范围扫描只采用用户明确选择/确认过的根目录；完整兼容
+    # 扫描（include_known=True）仍保留旧值，用户可通过“打开已有项目”恢复。
+    configured_explicit = settings.get("workspace_root_explicit") is True
     known_roots = [Path(item) for item in known if isinstance(item, str) and item]
     if _legacy_settings_are_active():
         # legacy: 旧设置仅用于发现历史项目；新建项目默认落在 JiadunProjects，
         # 防止首次启动时把新数据写入旧 CostGuard 空间。
-        candidates = [default_root, configured_root, *known_roots]
+        candidates = [default_root]
+        if configured_explicit:
+            candidates.insert(0, configured_root)
+        if include_known:
+            candidates.extend(known_roots)
     else:
-        candidates = [configured_root, default_root, *known_roots]
+        candidates = [default_root]
+        if configured_explicit:
+            candidates.insert(0, configured_root)
+        elif include_known:
+            # 旧设置兼容：完整历史扫描仍可看到原配置空间；启动窄扫描不自动带入。
+            candidates.insert(0, configured_root)
+        if include_known:
+            candidates.extend(known_roots)
     # legacy: 旧 CostGuardProjects 只读发现；创建和设置始终写入用户选定的
     # 新工作空间，不自动搬迁旧项目。
     legacy_root = platform_paths.legacy_workspace_root()
-    if legacy_root.is_dir():
+    if include_legacy and legacy_root.is_dir():
         candidates.append(legacy_root)
     roots: list[Path] = []
     seen: set[str] = set()
@@ -144,10 +159,16 @@ def workspace_roots() -> list[Path]:
 
 
 def workspace_root() -> Path:
-    return workspace_roots()[0]
+    return workspace_roots(include_known=True, include_legacy=True)[0]
 
 
-def remember_workspace(path: Path, *, make_default: bool = False) -> None:
+def remember_workspace(
+    path: Path,
+    *,
+    make_default: bool = False,
+    set_default_if_missing: bool = True,
+    explicit: bool = False,
+) -> None:
     """持久登记用户选择的工作空间，不移动也不修改其中的工程数据。"""
     root = Path(path).expanduser()
     settings = load_settings()
@@ -166,13 +187,15 @@ def remember_workspace(path: Path, *, make_default: bool = False) -> None:
         deduped.append(value)
 
     settings["known_workspaces"] = deduped
-    if make_default or not settings.get("workspace_root"):
+    if make_default or (set_default_if_missing and not settings.get("workspace_root")):
         settings["workspace_root"] = str(root)
+    if make_default or explicit:
+        settings["workspace_root_explicit"] = True
     save_settings(settings)
 
 
 def set_workspace_root(path: Path) -> None:
-    remember_workspace(path, make_default=True)
+    remember_workspace(path, make_default=True, explicit=True)
 
 
 def _project_dir(root: Path, name: str) -> Path:
@@ -251,11 +274,20 @@ def _read_project_info(project_dir: Path) -> ProjectInfo | None:
     )
 
 
-def list_projects() -> list[ProjectInfo]:
-    """扫描默认及已登记工作空间下的全部有效项目。"""
+def list_projects(
+    *, include_known: bool = True, include_legacy: bool = True
+) -> list[ProjectInfo]:
+    """扫描指定范围内的有效项目。
+
+    默认兼容旧版行为，扫描默认、已配置、已登记和旧版工作空间。UI 启动
+    页可传 ``include_known=False, include_legacy=False``，只显示当前默认/
+    已配置工作空间，避免把历史临时目录隐式带入首页。
+    """
     result: list[ProjectInfo] = []
     seen: set[str] = set()
-    for root in workspace_roots():
+    for root in workspace_roots(
+        include_known=include_known, include_legacy=include_legacy
+    ):
         if not root.exists() or not root.is_dir():
             continue
         try:
@@ -279,7 +311,9 @@ def list_projects() -> list[ProjectInfo]:
 def _remember_workspace_quietly(path: Path) -> None:
     """核心入口的持久登记：配置不可写时不阻断项目操作（UI 层另有提示）。"""
     try:
-        remember_workspace(path)
+        # core 导入/测试可能使用临时目录；只登记为可供显式恢复的历史空间，
+        # 不把它悄悄设为启动页当前空间。
+        remember_workspace(path, set_default_if_missing=False)
     except OSError:
         pass
 

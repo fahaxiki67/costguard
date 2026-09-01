@@ -25,6 +25,10 @@ class SheetReport:
     n_subtotal: int = 0
     confidence: float = 0.0
     notes: list[str] = field(default_factory=list)
+    # ``status`` 保留导入过程兼容值；``state_code`` 是对外统一四级 Sheet
+    # 状态（confirmed/pending/non_business/parse_failed），避免把“已解析”
+    # 误当成“已确认”。
+    state_code: str = "pending"
 
 
 @dataclass
@@ -59,6 +63,11 @@ JOIN parse_batches pb ON pb.id = rs.batch_id
 JOIN source_files sf ON sf.id = pb.file_id
 LEFT JOIN table_headers th ON th.sheet_id = rs.id
 WHERE sf.project_id=? AND rs.sheet_status='pending'
+  AND pb.id=(
+      SELECT latest.id FROM parse_batches latest
+      WHERE latest.file_id=pb.file_id
+      ORDER BY latest.parsed_at DESC, latest.id DESC LIMIT 1
+  )
 ORDER BY sf.id, rs.id"""
 
 
@@ -98,7 +107,12 @@ def pending_sheet_count(conn: sqlite3.Connection, project_id: int) -> int:
            FROM raw_sheets rs
            JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
-           WHERE sf.project_id=? AND rs.sheet_status='pending'""",
+           WHERE sf.project_id=? AND rs.sheet_status='pending'
+             AND pb.id=(
+                 SELECT latest.id FROM parse_batches latest
+                 WHERE latest.file_id=pb.file_id
+                 ORDER BY latest.parsed_at DESC, latest.id DESC LIMIT 1
+             )""",
         (project_id,),
     ).fetchone()
     return int(row["c"] if row else 0)
@@ -1059,11 +1073,57 @@ def import_settlement_file(
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
     if result.status != "ok":
-        # 文件登记已经发生；即使解析失败，已有项目的旧结果也不能继续作为
-        # 当前输入下的成果。首次导入仍不创建空运行契约。
+        # 文件登记已经发生；解析失败也必须形成持久化批次和来源 Evidence，
+        # 否则重新打开项目后只剩 source_files，无法知道该文件为何没有进入
+        # raw_sheets，也无法让统一 Sheet 状态机阻断项目级结论。
+        with run_contract._transaction(conn, "persist_parse_failure"):
+            batch_id = excel_parser.persist_parse_result(
+                conn, sf.file_id, result, commit=False
+            )
+            evidence_api.add_evidence(
+                conn,
+                project_id,
+                "parse_failure",
+                f"文件「{sf.original_name}」解析失败：{result.error or result.status}",
+                steps=[
+                    {
+                        "step": "文件解析",
+                        "parser": result.parser,
+                        "status": result.status,
+                        "error": result.error,
+                    }
+                ],
+                sources=[
+                    {
+                        "file_id": sf.file_id,
+                        "batch_id": batch_id,
+                        "location": "文件级解析",
+                        "original_name": sf.original_name,
+                    }
+                ],
+                commit=False,
+                scope="source",
+            )
+        # 即使解析失败，已有项目的旧结果也不能继续作为当前输入下的成果。
+        # 首次导入仍不创建空运行契约。
         run_contract.ensure_if_materialized(conn, project_id)
         fallback = file_period or next_period_no(conn, project_id, direction)
-        return ImportReport(sf.file_id, None, fallback, -1, "failed", message=result.error)
+        return ImportReport(
+            sf.file_id,
+            batch_id,
+            fallback,
+            -1,
+            "failed",
+            sheets=[
+                SheetReport(
+                    sf.original_name,
+                    "parse_failed",
+                    state_code="parse_failed",
+                    notes=[result.error or result.status],
+                )
+            ],
+            message=result.error,
+        )
 
     from jiadun.core.parsing.excel_parser import persist_parse_result
 
@@ -1098,7 +1158,8 @@ def import_settlement_file(
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "non_settlement_form",
                 notes=["检测为键值对表单（非结算清单）：已按待人工复核的表单字段候选记录，"
-                       "保留原 Sheet 与单元格；请人工确认后使用通用 evidence 人工复核入口"]))
+                       "保留原 Sheet 与单元格；请人工确认后使用通用 evidence 人工复核入口"],
+                state_code="pending"))
             form_routed = True
             continue
         # 语义门控：sheet 名含汇总/核销/台账 → 无论表头多强都需角色确认
@@ -1117,7 +1178,8 @@ def import_settlement_file(
                 sheet.sheet_name, "needs_role_review",
                 notes=[f"{reason}：未经人工确认角色前不写入结算模型；"
                        "字段候选已存 evidence，请人工选择角色"
-                       "（confirm_sheet_role_and_extract）"]))
+                       "（confirm_sheet_role_and_extract）"],
+                state_code="pending"))
             role_gated = True
             continue
         if det is None:
@@ -1131,6 +1193,7 @@ def import_settlement_file(
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "no_header",
                 notes=["未识别到可靠表头，保留原始网格，需人工指定角色、表头和字段映射"],
+                state_code="pending",
             ))
             role_gated = True
             continue
@@ -1191,7 +1254,9 @@ def import_settlement_file(
                 "proof": proof_draft,
                 "rows": proof_rows,
             })
-            report.sheets.append(SheetReport(sheet.sheet_name, "no_header", notes=notes))
+            report.sheets.append(
+                SheetReport(sheet.sheet_name, "no_header", notes=notes, state_code="pending")
+            )
             continue
 
         # ---- 逐 Sheet 期次判定 ----
@@ -1250,6 +1315,7 @@ def import_settlement_file(
                 n_items=len([i for i in items if not i.flags.get("subtotal")]),
                 n_subtotal=len([i for i in items if i.flags.get("subtotal")]),
                 confidence=det.confidence, notes=det.notes + notes + skip_notes,
+                state_code="confirmed",
             )
         )
     report.period_id = next(iter(period_ids), -1)

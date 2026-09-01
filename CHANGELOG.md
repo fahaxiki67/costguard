@@ -9,7 +9,44 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-No changes recorded after v0.1.11.
+The v0.1.12 preview focuses on a clean startup and a usable local intake flow.
+
+## [0.1.12] - 2026-09-01
+
+Preview usability release for the Jiadun（价盾）local workbench.
+
+### Added
+- A blank-by-default project page that does not implicitly enumerate remembered
+  temporary or legacy workspaces at startup; existing project files remain intact
+  and can be reopened explicitly.
+- Separate **打开已有项目…**, **导入资料文件…** and **导入资料文件夹…**
+  actions so the project-directory picker no longer appears to be a source-file
+  importer.
+- Finder/Explorer drag-and-drop intake, recursive folder scanning, deterministic
+  de-duplication and visible skipped-file reporting for unsupported types.
+- Mixed-folder routing: XLSX/XLSM/XLS/CSV go to settlement import while DOCX/PDF/TXT
+  go to contract/meeting-note extraction.
+- Import feedback now separates successful, partial and failed workbooks; corrupt
+  settlement files are never presented as a successful import.
+- Folder intake refuses symlink roots, symlink files and broken links, with a visible
+  skip reason so the imported scope stays inside the user-selected directory.
+- A platform-aware application font selected once at QApplication level, with
+  PingFang SC / Microsoft YaHei UI / Noto Sans CJK SC fallbacks as available.
+- Persistent parse-failure batches and parse-failure Evidence for corrupt or
+  unsupported settlement workbooks, keeping the project fail-closed.
+
+### Changed
+- Core project creation/opening only remembers a workspace for explicit recovery;
+  it no longer silently makes an arbitrary programmatic temporary directory the
+  startup workspace. Explicit UI selection still becomes the current workspace.
+- The workbench keeps the existing Decimal, read-only-original and Evidence rules;
+  this release changes only intake and presentation paths.
+
+### Validation boundary
+- This remains a Preview/Prerelease. WPS macOS, WPS Windows, macOS Excel,
+  Windows Excel, 1万/5万/20万-row performance and cancellation, sanitized real-case
+  golden regression, Developer ID signing, notarization and cross-platform install
+  evidence remain open production gates.
 
 ## [0.1.11] - 2026-09-01
 

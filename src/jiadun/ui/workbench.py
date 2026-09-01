@@ -54,6 +54,11 @@ from jiadun.core.reporting import build_report_model
 from jiadun.core.versions import project as project_versions
 from jiadun.platform import paths as platform_paths
 from jiadun.ui import theme
+from jiadun.ui.file_selection import (
+    FileDropZone,
+    classify_import_file,
+    scan_import_paths,
+)
 from jiadun.ui.labels import (
     DIRECTION_ZH,
     LEVEL_ZH,
@@ -479,9 +484,11 @@ class WorkbenchPage(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         btn_row = QHBoxLayout()
-        import_btn = QPushButton("导入结算文件…")
+        import_btn = QPushButton("选择结算文件…")
         import_btn.setObjectName("btnPrimary")
         import_btn.clicked.connect(self._import_files)
+        folder_btn = QPushButton("导入资料文件夹…")
+        folder_btn.clicked.connect(self._import_folder)
         contract_btn = QPushButton("导入合同/纪要…")
         contract_btn.clicked.connect(self._import_contract)
         detect_btn = QPushButton("运行异常检测")
@@ -490,13 +497,18 @@ class WorkbenchPage(QWidget):
         check_btn.clicked.connect(self._run_crosscheck)
         confirm_btn = QPushButton("人工确认清单页…")
         confirm_btn.clicked.connect(self._open_sheet_confirm)
-        for b, name in ((import_btn, "btnPrimary"), (contract_btn, None),
+        for b, name in ((import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
                         (confirm_btn, None), (detect_btn, None), (check_btn, None)):
             if name:
                 b.setObjectName(name)
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
+        self.import_drop_zone = FileDropZone(
+            "将结算表、合同/纪要文件或资料文件夹拖到这里（支持递归导入）"
+        )
+        self.import_drop_zone.paths_dropped.connect(self.import_paths)
+        v.addWidget(self.import_drop_zone)
         self.period_table = _make_table(
             ["期次", "标题", "方向", "明细行数", "小计行", "合同单位"],
             stretch_cols=(1,), center_cols=(2,), right_cols=(3, 4),
@@ -544,26 +556,100 @@ class WorkbenchPage(QWidget):
             self, "选择结算文件", "", "结算文件 (*.xlsx *.xlsm *.xls *.csv)")
         if not files:
             return
-        ok, fail = 0, []
-        pending = 0
-        for f in files:
+        self.import_paths(files)
+
+    def _import_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择要导入的资料文件夹", str(self.project_dir)
+        )
+        if folder:
+            self.import_paths([folder])
+
+    def import_paths(self, paths, *, skipped=(), skipped_reasons=()):
+        """导入一组文件或文件夹中的资料，并按扩展名路由到对应解析器。"""
+        selection = scan_import_paths(paths)
+        skipped_paths = tuple(skipped) + selection.skipped
+        skipped_details = tuple(skipped_reasons) + selection.skipped_reasons
+        if not selection.files:
+            detail = ""
+            if skipped_details:
+                detail = "\n未导入：" + "、".join(
+                    f"{path.name}（{reason}）"
+                    for path, reason in skipped_details[:8]
+                )
+            elif skipped_paths:
+                detail = "\n未导入：" + "、".join(
+                    path.name for path in skipped_paths[:8]
+                )
+            QMessageBox.warning(
+                self,
+                "没有可导入的资料",
+                "所选内容中没有价盾支持的结算表或合同/纪要文件。"
+                "\n支持：XLSX、XLSM、XLS、CSV、DOCX、PDF、TXT。" + detail,
+            )
+            return
+
+        from jiadun.core.contracts import extract as contract_extract
+
+        ok, partial, fail, pending = 0, [], [], 0
+        for path in selection.files:
+            kind = classify_import_file(path)
             try:
-                report = settlement_io.import_settlement_file(
-                    self.conn, self.project.project_id, self.project_dir, f)
-                ok += 1
-                pending += sum(
-                    1 for s in report.sheets
-                    if s.status in ("needs_role_review", "no_header", "non_settlement_form"))
+                if kind == "settlement":
+                    report = settlement_io.import_settlement_file(
+                        self.conn, self.project.project_id, self.project_dir, path
+                    )
+                    pending += sum(
+                        1
+                        for sheet in report.sheets
+                        if sheet.status
+                        in ("needs_role_review", "no_header", "non_settlement_form")
+                    )
+                    if report.status == "ok":
+                        ok += 1
+                    elif report.status == "partial":
+                        partial.append(
+                            f"{path.name}：部分工作表已导入，其余待人工确认"
+                            + (f"（{report.message}）" if report.message else "")
+                        )
+                    else:
+                        fail.append(
+                            f"{path.name}：结算文件导入失败"
+                            + (f"（{report.message}）" if report.message else "")
+                        )
+                elif kind == "contract":
+                    contract_extract.import_contract(
+                        self.conn, self.project.project_id, self.project_dir, path
+                    )
+                    risks = contract_extract.contract_risks(
+                        self.conn, self.project.project_id
+                    )
+                    contract_extract.persist_risks(
+                        self.conn, self.project.project_id, risks
+                    )
+                    ok += 1
+                else:
+                    # scan_import_paths 已过滤；保留显式分支防止未来扩展时静默成功。
+                    raise ValueError("unsupported file type")
             except Exception:  # noqa: BLE001 — UI 层兜底提示
-                fail.append(f"{Path(f).name}：导入失败，请检查文件格式、权限或数据完整性")
-        self._notify_import(ok, fail, pending)
+                fail.append(f"{path.name}：导入失败，请检查文件格式、权限或数据完整性")
+        self._notify_import(
+            ok,
+            fail,
+            pending,
+            skipped=len(skipped_paths),
+            partial=partial,
+            skipped_details=skipped_details,
+        )
         self.refresh_all()
         if pending:
             ret = QMessageBox.question(
-                self, "待人工确认",
+                self,
+                "待人工确认",
                 f"有 {pending} 个工作表因表头歧义/无表头/表单结构待人工确认，"
                 "未进入结算模型。\n现在打开「人工确认清单页」处理吗？",
-                QMessageBox.Yes | QMessageBox.No)
+                QMessageBox.Yes | QMessageBox.No,
+            )
             if ret == QMessageBox.Yes:
                 self._open_sheet_confirm()
 
@@ -577,20 +663,7 @@ class WorkbenchPage(QWidget):
             self, "选择合同/补充协议/纪要", "", "文档 (*.docx *.pdf *.txt)")
         if not files:
             return
-        from jiadun.core.contracts import extract as contract_extract
-
-        ok, fail = 0, []
-        for f in files:
-            try:
-                contract_extract.import_contract(
-                    self.conn, self.project.project_id, self.project_dir, f)
-                risks = contract_extract.contract_risks(self.conn, self.project.project_id)
-                contract_extract.persist_risks(self.conn, self.project.project_id, risks)
-                ok += 1
-            except Exception:  # noqa: BLE001
-                fail.append(f"{Path(f).name}：导入失败，请检查文件格式、权限或数据完整性")
-        self._notify_import(ok, fail)
-        self.refresh_all()
+        self.import_paths(files)
 
     def _run_anomalies(self):
         findings = anomaly_engine.run_anomalies(self.conn, self.project.project_id)
@@ -2284,10 +2357,41 @@ class WorkbenchPage(QWidget):
         self.refresh_export_status()
         self.refresh_version_assets()
 
-    def _notify_import(self, ok: int, fail: list[str], pending: int = 0):
-        msg = f"成功导入 {ok} 个文件（原文件未改动）。"
+    def _notify_import(
+        self,
+        ok: int,
+        fail: list[str],
+        pending: int = 0,
+        skipped: int = 0,
+        *,
+        partial: list[str] | None = None,
+        skipped_details=(),
+    ):
+        partial = partial or []
+        outcome: list[str] = []
+        if ok:
+            outcome.append(f"成功导入 {ok} 个文件")
+        if partial:
+            outcome.append(f"部分导入 {len(partial)} 个文件")
+        if fail:
+            outcome.append(f"失败 {len(fail)} 个文件")
+        msg = "；".join(outcome) if outcome else "没有文件完成导入"
+        if ok or partial:
+            msg += "（原文件未改动）。"
+        else:
+            msg += "。"
+        if skipped_details:
+            msg += "\n未导入：\n" + "\n".join(
+                f"{path.name}（{reason}）" for path, reason in skipped_details[:8]
+            )
+            if len(skipped_details) > 8:
+                msg += f"\n等 {len(skipped_details)} 项"
+        elif skipped:
+            msg += f"\n已跳过 {skipped} 个不支持的文件。"
         if pending:
             msg += f"\n其中 {pending} 个工作表待人工确认（表头歧义/无表头/表单），可用「人工确认清单页…」处理。"
+        if partial:
+            msg += "\n部分导入：\n" + "\n".join(partial)
         if fail:
             msg += "\n失败：\n" + "\n".join(fail)
         QMessageBox.information(self, "导入", msg)
