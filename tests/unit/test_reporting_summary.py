@@ -70,6 +70,32 @@ def test_summary_prioritizes_run_unavailable_over_historical_success(tmp_path: P
         conn.close()
 
 
+def test_verification_rejects_stored_copy_content_drift(tmp_path: Path):
+    """摘要读取层必须校验解析器实际消费的存储副本内容。"""
+    info = project_model.create_project("源文件副本漂移", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"source-before")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name, sha256,
+                   size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        run_contract.ensure_run_contract(conn, info.project_id)
+        stored.write_bytes(b"source-after")
+
+        verification = _verification(conn, info.project_id)
+
+        assert verification["status"] != "sufficient"
+        assert any("存储副本内容" in gap for gap in verification["evidence_gaps"])
+    finally:
+        conn.close()
+
+
 def test_summary_never_marks_findings_or_unchecked_periods_complete():
     complete_coverage = {"status": coverage.COMPLETE}
     pending = {
@@ -370,7 +396,7 @@ def test_verification_rejects_source_file_identity_drift_if_trigger_is_bypassed(
             (value, info.project_id),
         )
         verification = _verification(conn, info.project_id)
-        assert verification["status"] == "insufficient"
+        assert verification["status"] in {"insufficient", "unavailable"}
         assert any("源文件身份与当前 Run Contract 不一致" in gap for gap in verification["evidence_gaps"])
     finally:
         conn.close()
@@ -390,7 +416,7 @@ def test_verification_rejects_unbound_source_file(tmp_path: Path):
             (info.project_id, f"extra-digest-{info.project_id}"),
         )
         verification = _verification(conn, info.project_id)
-        assert verification["status"] == "insufficient"
+        assert verification["status"] in {"insufficient", "unavailable"}
         assert verification["evidence_complete"] is False
         assert any("未纳入 Run Contract" in gap for gap in verification["evidence_gaps"])
     finally:
@@ -793,13 +819,16 @@ def _coverage_gate_fixture(tmp_path: Path):
            VALUES (?, 1, '第1期', 'upward') RETURNING id""",
         (info.project_id,),
     ).fetchone()[0]
+    stored = tmp_path / "source.xlsx"
+    stored.write_bytes(b"synthetic coverage fixture source")
+    stored_digest = hashlib.sha256(stored.read_bytes()).hexdigest()
     source_file_id = conn.execute(
         """INSERT INTO source_files(
                project_id, original_path, stored_path, original_name, sha256,
                size_bytes, file_type, imported_at)
-           VALUES (?, '/source.xlsx', '/source.xlsx', 'source.xlsx', ?, 1, 'xlsx', '2026')
+           VALUES (?, '/source.xlsx', ?, 'source.xlsx', ?, ?, 'xlsx', '2026')
            RETURNING id""",
-        (info.project_id, f"digest-{info.project_id}"),
+        (info.project_id, str(stored), stored_digest, stored.stat().st_size),
     ).fetchone()[0]
     batch_id = conn.execute(
         """INSERT INTO parse_batches(file_id, parser, parsed_at, status)
@@ -1522,12 +1551,14 @@ def test_read_only_summary_has_no_manifest_or_derived_flag_writes(tmp_path: Path
         )
         payload = b"readonly manifest source"
         digest = hashlib.sha256(payload).hexdigest()
+        stored = tmp_path / "source.xlsx"
+        stored.write_bytes(payload)
         conn.execute(
             """INSERT INTO source_files(
-                   project_id, original_path, stored_path, original_name, sha256,
-                   size_bytes, file_type, imported_at
-               ) VALUES (?, '/source.xlsx', '/source.xlsx', 'source.xlsx', ?, ?, 'xlsx', '2026')""",
-            (info.project_id, digest, len(payload)),
+                       project_id, original_path, stored_path, original_name, sha256,
+                       size_bytes, file_type, imported_at
+                   ) VALUES (?, '/source.xlsx', ?, 'source.xlsx', ?, ?, 'xlsx', '2026')""",
+                (info.project_id, str(stored), digest, len(payload)),
         )
         create_manifest(
             conn,
@@ -1546,7 +1577,8 @@ def test_read_only_summary_has_no_manifest_or_derived_flag_writes(tmp_path: Path
     ro = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
     ro.row_factory = sqlite3.Row
     try:
-        summary = build_project_summary(ro, info.project_id, read_only=True)
+        model = build_report_model(ro, info.project_id, read_only=True)
+        summary = model.project_summary
         assert summary.run_id == active.run_id
         assert summary.pending["manifest_status"] in {"complete", "incomplete", "mismatch", "not_available"}
     finally:

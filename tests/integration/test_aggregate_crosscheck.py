@@ -1,4 +1,5 @@
 """Phase 3 结算累计与双向校核测试。"""
+import hashlib
 import json
 import sqlite3
 import sys
@@ -25,6 +26,9 @@ def _make_amount_case(tmp_path, raw_amount=None):
 
     info = pm.create_project("金额计算反例", tmp_path / "ws")
     info, conn = pm.open_project(Path(info.workspace_path))
+    stored = tmp_path / "amount-case.xlsx"
+    stored.write_bytes(b"synthetic amount-case source")
+    stored_digest = hashlib.sha256(stored.read_bytes()).hexdigest()
     with conn:
         period_id = conn.execute(
             """INSERT INTO settlement_periods(project_id, period_no, title, direction)
@@ -35,8 +39,8 @@ def _make_amount_case(tmp_path, raw_amount=None):
             """INSERT INTO source_files(project_id, original_path, stored_path,
                original_name, sha256, size_bytes, file_type, imported_at)
                VALUES (?,?,?,?,?,?,?,?)""",
-            (info.project_id, "/amount-case.xlsx", "/amount-case.xlsx", "amount-case.xlsx",
-             f"amount-case-{raw_amount}", 1, "xlsx", "2026"),
+            (info.project_id, "/amount-case.xlsx", str(stored), "amount-case.xlsx",
+             stored_digest, stored.stat().st_size, "xlsx", "2026"),
         ).lastrowid
         batch_id = conn.execute(
             """INSERT INTO parse_batches(file_id, parser, parsed_at, status)

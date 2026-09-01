@@ -1,6 +1,7 @@
 """P2-01 历史综合单价库的证据、Decimal 和不可比闸门测试。"""
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
@@ -26,13 +27,16 @@ def _version_fixture(tmp_path: Path):
            VALUES (?, 1, '第1期', 'upward') RETURNING id""",
         (info.project_id,),
     ).fetchone()[0]
+    stored = tmp_path / "history.xlsx"
+    stored.write_bytes(b"synthetic historical-price source")
+    stored_digest = hashlib.sha256(stored.read_bytes()).hexdigest()
     file_id = conn.execute(
         """INSERT INTO source_files(
                project_id, original_path, stored_path, original_name, sha256,
                size_bytes, file_type, imported_at)
-           VALUES (?, '/history.xlsx', '/history.xlsx', 'history.xlsx', ?, 1, 'xlsx', '2026')
+           VALUES (?, '/history.xlsx', ?, 'history.xlsx', ?, ?, 'xlsx', '2026')
            RETURNING id""",
-        (info.project_id, f"history-digest-{info.project_id}"),
+        (info.project_id, str(stored), stored_digest, stored.stat().st_size),
     ).fetchone()[0]
     batch_id = conn.execute(
         """INSERT INTO parse_batches(file_id, parser, parsed_at, status)

@@ -199,7 +199,7 @@ def _make_table(headers: list[str], **spec) -> QTableWidget:
 
 def project_status_summary(conn, project_id: int) -> str:
     """工作台顶部状态信息：集中显示当前待处理事项和最近校核级别。"""
-    summary = build_report_model(conn, project_id).project_summary
+    summary = build_report_model(conn, project_id, read_only=True).project_summary
     if not summary.run_availability["available"]:
         # 运行级边界优先于所有历史统计；不要把 current_scope 的空集显示成
         # “尚未校核”，也不要让旧成功结果继续成为工作台的当前状态。
@@ -398,7 +398,7 @@ class WorkbenchPage(QWidget):
 
     def refresh_overview(self):
         pid = self.project.project_id
-        summary = build_report_model(self.conn, pid).project_summary
+        summary = build_report_model(self.conn, pid, read_only=True).project_summary
         files = summary.source_files
         period_counts = summary.directions
         pending_sheets = summary.pending["sheets"]
@@ -1865,7 +1865,7 @@ class WorkbenchPage(QWidget):
         """刷新版本链和历史单价，保留失效/撤销记录并显示证据状态。"""
         pid = self.project.project_id
         try:
-            summary = build_report_model(self.conn, pid).project_summary
+            summary = build_report_model(self.conn, pid, read_only=True).project_summary
             versions = project_versions.list_project_versions(self.conn, pid)
             prices = pricing_history.list_historical_unit_prices(
                 self.conn, source_project_id=pid, include_revoked=True
@@ -2137,7 +2137,7 @@ class WorkbenchPage(QWidget):
 
     def refresh_export_status(self):
         pid = self.project.project_id
-        summary = build_report_model(self.conn, pid).project_summary
+        summary = build_report_model(self.conn, pid, read_only=True).project_summary
         availability = summary.run_availability
         if not availability["available"]:
             reason = availability.get("reason")

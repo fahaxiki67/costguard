@@ -1331,7 +1331,9 @@ def export_management_summary(
         count for direction, count in summary.directions.items()
         if direction not in {"upward", "downward"}
     )
-    n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
+    n_ev = conn.execute(
+        "SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)
+    ).fetchone()["c"]
     current_evidence_scope, current_evidence_params = run_contract.current_scope(
         conn, project_id, "e"
     )
@@ -1541,7 +1543,20 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     n_up = summary.directions.get("upward", 0)
     n_down = summary.directions.get("downward", 0)
     n_none = summary.directions.get("unknown", 0)
-    n_ev = conn.execute("SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)).fetchone()["c"]
+    n_ev = conn.execute(
+        "SELECT COUNT(*) c FROM evidence WHERE project_id=?", (project_id,)
+    ).fetchone()["c"]
+    evidence_scope, evidence_params = run_contract.current_scope(
+        conn, project_id, "e"
+    )
+    current_evidence_count = conn.execute(
+        f"SELECT COUNT(*) c FROM evidence e WHERE e.project_id=? AND {evidence_scope}",
+        (project_id, *evidence_params),
+    ).fetchone()["c"]
+    historical_evidence_count = conn.execute(
+        "SELECT COUNT(*) c FROM evidence WHERE project_id=? AND scope='historical'",
+        (project_id,),
+    ).fetchone()["c"]
     level_counts = summary.verification["levels"]
     gates = _review_gate_counts(conn, project_id, summary=summary)
     unchecked = max(0, gates["period_count"] - gates["checked_count"])
@@ -1798,7 +1813,9 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(
         "追溯说明：本 Word 摘要不包含证据入口按钮；正文管理结论均标注 Evidence ID，"
         "待生成或无法确认处不会伪造证据。逐单元格证据链与证据索引"
-        f"（当前共 {n_ev} 条证据记录）请查阅{branding.PRODUCT_DISPLAY_NAME}导出的 Excel 审核底稿工作簿"
+        f"（当前范围共 {current_evidence_count} 条；全部存档 {n_ev} 条，其中历史 {historical_evidence_count} 条，"
+        "历史证据不参与当前结论）请查阅"
+        f"{branding.PRODUCT_DISPLAY_NAME}导出的 Excel 审核底稿工作簿"
         "《证据索引》工作表，按证据 ID 查询。"
     )
     doc.add_paragraph(

@@ -69,6 +69,501 @@ def test_contract_input_gaps_use_canonical_component_values(tmp_path):
         conn.close()
 
 
+def test_source_copy_content_drift_invalidates_current_contract(tmp_path):
+    """解析器实际读取的存储副本被覆盖时，当前运行不得继续有效。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"original-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        assert run_contract.source_file_contract_gaps(conn, info.project_id, active) == []
+
+        stored.write_bytes(b"tampered-content")
+        gaps = run_contract.source_file_contract_gaps(conn, info.project_id, active)
+        assert any("存储副本内容" in gap for gap in gaps)
+    finally:
+        conn.close()
+
+
+def test_source_copy_drift_removes_old_rows_from_current_scope(tmp_path):
+    """源副本内容漂移时，详情读取面不得继续返回旧运行记录。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"original-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        with conn:
+            conn.execute(
+                """INSERT INTO matches(
+                       project_id, group_key, item_ids_json, level, method,
+                       score, status, run_signature, run_id)
+                   VALUES (?, 'drift-sentinel', '[]', 'probable', 'test',
+                           0.5, 'pending', ?, ?)""",
+                (info.project_id, active.signature, active.run_id),
+            )
+        stored.write_bytes(b"tampered-content")
+
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        scope, params = run_contract.current_scope(conn, info.project_id, "m")
+        count = conn.execute(
+            f"SELECT COUNT(*) AS c FROM matches m WHERE m.project_id=? AND {scope}",
+            (info.project_id, *params),
+        ).fetchone()["c"]
+        assert count == 0
+        for alias in ("cr", "pt", "m", "a", "e"):
+            assert run_contract.current_scope(
+                conn, info.project_id, alias
+            ) == ("1=0", ())
+    finally:
+        conn.close()
+
+
+def test_source_metadata_must_match_copy_at_contract_creation(tmp_path):
+    """初次建合同必须同时核验登记 SHA-256 和文件大小。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"content")
+    actual_digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (
+                info.project_id,
+                str(stored),
+                str(stored),
+                "not-a-sha256",
+                1,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        assert "SHA-256" in (availability["reason"] or "")
+
+        conn.execute("DELETE FROM source_files WHERE project_id=?", (info.project_id,))
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (
+                info.project_id,
+                str(stored),
+                str(stored),
+                actual_digest,
+                1,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        assert "文件大小" in (availability["reason"] or "")
+    finally:
+        conn.close()
+
+
+def test_non_integer_source_size_is_fail_closed_for_initial_and_existing_contract(
+    tmp_path,
+):
+    """6.9 等可被 int() 截断的大小值不得形成当前合同。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"123456")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, 6.9),
+        )
+        with pytest.raises(RuntimeError, match="文件大小无效"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+        assert run_contract.current_results_available(
+            conn, info.project_id
+        )["available"] is False
+
+        conn.execute("DELETE FROM source_files WHERE project_id=?", (info.project_id,))
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        conn.execute("DROP TRIGGER trg_source_files_identity_immutable_update")
+        conn.execute(
+            "UPDATE source_files SET size_bytes=? WHERE project_id=?",
+            (6.9, info.project_id),
+        )
+        gaps = run_contract.source_file_contract_gaps(
+            conn, info.project_id, active
+        )
+        assert any("文件大小无效" in gap for gap in gaps)
+        assert run_contract.current_results_available(
+            conn, info.project_id
+        )["available"] is False
+    finally:
+        conn.close()
+
+
+def test_source_copy_path_redirection_invalidates_current_contract(tmp_path):
+    """存储副本被重定向到另一文件时，旧运行必须退出 current。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    redirected = tmp_path / "redirected.xlsx"
+    stored.write_bytes(b"original-content")
+    redirected.write_bytes(b"original-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        conn.execute("DROP TRIGGER trg_source_files_identity_immutable_update")
+        conn.execute(
+            "UPDATE source_files SET stored_path=? WHERE project_id=?",
+            (str(redirected), info.project_id),
+        )
+        gaps = run_contract.source_file_contract_gaps(conn, info.project_id, active)
+        assert any("存储副本路径" in gap for gap in gaps)
+    finally:
+        conn.close()
+
+
+def test_source_copy_path_relocation_creates_new_run_when_content_is_unchanged(tmp_path):
+    """受控项目搬迁只改变副本路径时，旧结果失效并形成新运行。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    relocated = tmp_path / "relocated.xlsx"
+    stored.write_bytes(b"same-content")
+    relocated.write_bytes(b"same-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        first = run_contract.ensure_run_contract(conn, info.project_id)
+        conn.execute("DROP TRIGGER trg_source_files_identity_immutable_update")
+        conn.execute(
+            "UPDATE source_files SET stored_path=? WHERE project_id=?",
+            (str(relocated), info.project_id),
+        )
+
+        second = run_contract.ensure_run_contract(conn, info.project_id)
+
+        assert second.run_id != first.run_id
+        assert second.signature != first.signature
+        assert conn.execute(
+            "SELECT invalidated_at FROM run_contracts WHERE id=?",
+            (first.contract_id,),
+        ).fetchone()[0]
+        assert run_contract.source_file_contract_gaps(
+            conn, info.project_id, second
+        ) == []
+    finally:
+        conn.close()
+
+
+def test_legacy_contract_without_stored_path_is_not_current_but_can_be_rebound(tmp_path):
+    """升级旧合同先降级当前读取，再由受控重跑写入副本路径。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"legacy-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        legacy_components = json.loads(
+            conn.execute(
+                "SELECT components_json FROM run_contracts WHERE id=?",
+                (active.contract_id,),
+            ).fetchone()[0]
+        )
+        legacy_components["source_files"][0].pop("stored_path", None)
+        legacy_signature = run_contract.compute_run_signature(legacy_components)
+        conn.execute("DROP TRIGGER trg_run_contracts_immutable_update")
+        conn.execute(
+            "UPDATE run_contracts SET signature=?, components_json=? WHERE id=?",
+            (
+                legacy_signature,
+                json.dumps(legacy_components, ensure_ascii=False),
+                active.contract_id,
+            ),
+        )
+        legacy = run_contract.get_current_contract(conn, info.project_id)
+        assert legacy is not None
+        assert any(
+            "缺少存储副本路径" in gap
+            for gap in run_contract.source_file_contract_gaps(
+                conn, info.project_id, legacy
+            )
+        )
+
+        rebound = run_contract.ensure_run_contract(conn, info.project_id)
+
+        assert rebound.run_id != legacy.run_id
+        assert "stored_path" in rebound.components["source_files"][0]
+        assert run_contract.source_file_contract_gaps(
+            conn, info.project_id, rebound
+        ) == []
+    finally:
+        conn.close()
+
+
+def test_missing_source_copy_invalidates_current_contract(tmp_path):
+    """已登记的存储副本消失时，当前运行必须 fail-closed。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"original-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        stored.unlink()
+        gaps = run_contract.source_file_contract_gaps(conn, info.project_id, active)
+        assert any("存储副本不存在" in gap for gap in gaps)
+    finally:
+        conn.close()
+
+
+def test_missing_source_copy_at_contract_creation_is_fail_closed(tmp_path):
+    """合同建立时副本已缺失时不得建立当前运行。"""
+    info, conn = _project(tmp_path)
+    missing = tmp_path / "missing.xlsx"
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'missing.xlsx', ?, 1, 'xlsx', '2026')""",
+            (
+                info.project_id,
+                str(missing),
+                str(missing),
+                "a" * 64,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+
+        availability = run_contract.current_results_available(
+            conn, info.project_id
+        )
+
+        assert availability["available"] is False
+        assert "存储副本" in (availability["reason"] or "")
+    finally:
+        conn.close()
+
+
+def test_non_file_source_copy_at_contract_creation_is_fail_closed(tmp_path):
+    """存储路径指向目录等不可读取对象时，合同不得建立当前运行。"""
+    info, conn = _project(tmp_path)
+    stored_directory = tmp_path / "stored-directory"
+    stored_directory.mkdir()
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored-directory.xlsx', ?, 1, 'xlsx', '2026')""",
+            (
+                info.project_id,
+                str(stored_directory),
+                str(stored_directory),
+                "a" * 64,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        assert any(
+            "存储副本不存在或不可读取" in gap
+            for gap in run_contract.source_file_contract_gaps(
+                conn, info.project_id, run_contract.get_current_contract(conn, info.project_id)
+            )
+        )
+    finally:
+        conn.close()
+
+
+def test_invalid_stored_copy_path_at_contract_creation_is_fail_closed(tmp_path):
+    """初次建合同遇到 NUL 等非法路径时，必须返回结构化不可用而非抛出路径异常。"""
+    info, conn = _project(tmp_path)
+    invalid_path = "\x00invalid-source.xlsx"
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'invalid-source.xlsx', ?, 1, 'xlsx', '2026')""",
+            (info.project_id, invalid_path, invalid_path, "a" * 64),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+        availability = run_contract.current_results_available(conn, info.project_id)
+        assert availability["available"] is False
+        assert "路径" in (availability["reason"] or "")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("stored_sha256", [None, "", "not-a-sha256"])
+def test_invalid_stored_copy_hash_in_legacy_contract_is_fail_closed(
+    tmp_path, stored_sha256
+):
+    """旧合同的存储副本哈希缺失、为空或格式非法时必须降级。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    stored.write_bytes(b"legacy-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        components = json.loads(
+            conn.execute(
+                "SELECT components_json FROM run_contracts WHERE id=?",
+                (active.contract_id,),
+            ).fetchone()[0]
+        )
+        components["source_files"][0]["stored_sha256"] = stored_sha256
+        legacy_signature = run_contract.compute_run_signature(components)
+        conn.execute("DROP TRIGGER trg_run_contracts_immutable_update")
+        conn.execute(
+            "UPDATE run_contracts SET signature=?, components_json=? WHERE id=?",
+            (
+                legacy_signature,
+                json.dumps(components, ensure_ascii=False),
+                active.contract_id,
+            ),
+        )
+
+        legacy = run_contract.get_current_contract(conn, info.project_id)
+        gaps = run_contract.source_file_contract_gaps(conn, info.project_id, legacy)
+        availability = run_contract.current_results_available(conn, info.project_id)
+
+        assert any("缺少有效的存储副本 SHA-256" in gap for gap in gaps)
+        assert availability["available"] is False
+        with pytest.raises(RuntimeError, match="源文件身份不一致"):
+            run_contract.ensure_run_contract(conn, info.project_id)
+    finally:
+        conn.close()
+
+
+def test_register_export_cannot_create_current_row_when_source_copy_is_missing(tmp_path):
+    """直接调用成果登记 API 也必须先通过源文件副本闸门。"""
+    info, conn = _project(tmp_path)
+    missing = tmp_path / "missing.xlsx"
+    export_path = tmp_path / "export.xlsx"
+    export_path.write_bytes(b"synthetic export")
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'missing.xlsx', ?, 1, 'xlsx', '2026')""",
+            (info.project_id, str(missing), str(missing), "a" * 64),
+        )
+        with pytest.raises(RuntimeError, match="源文件"):
+            run_contract.register_export(
+                conn, info.project_id, "excel_workbook", export_path
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM export_runs WHERE project_id=?",
+            (info.project_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_symlink_loop_is_reported_as_unavailable(tmp_path):
+    """存储副本符号链接循环必须降级为 unavailable，不得让状态刷新抛异常。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "stored.xlsx"
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    stored.write_bytes(b"original-content")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'stored.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        run_contract.ensure_run_contract(conn, info.project_id)
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        conn.execute("DROP TRIGGER trg_source_files_identity_immutable_update")
+        conn.execute(
+            "UPDATE source_files SET stored_path=? WHERE project_id=?",
+            (str(loop_a), info.project_id),
+        )
+
+        availability = run_contract.current_results_available(conn, info.project_id)
+
+        assert availability["available"] is False
+        assert availability["status"] == run_contract.FAIL_CLOSED_STATUS
+        assert "路径" in (availability["reason"] or "") or "存储副本" in (
+            availability["reason"] or ""
+        )
+    finally:
+        conn.close()
+
+
 def test_run_id_is_propagated_to_detection_and_evidence(tmp_path):
     from jiadun.core.evidence import evidence as evidence_api
 
@@ -720,6 +1215,83 @@ def test_export_registry_detects_file_change_and_contract_staleness(tmp_path):
         stale = run_contract.export_status(conn, info.project_id, "excel_workbook")
         assert stale[0]["status"] == "stale"
         assert export_path.exists(), "失效登记不应删除原导出文件"
+    finally:
+        conn.close()
+
+
+def test_register_export_rejects_non_current_signature_without_staling_current(tmp_path):
+    """导出登记不得接受历史/伪造签名，也不得先使合法成果失效。"""
+    info, conn = _project(tmp_path)
+    try:
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        export_path = tmp_path / "审核底稿.xlsx"
+        export_path.write_bytes(b"current export")
+        export_id = run_contract.register_export(
+            conn,
+            info.project_id,
+            "excel_workbook",
+            export_path,
+            run_signature=active.signature,
+        )
+        with pytest.raises(ValueError, match="必须等于当前活动合同"):
+            run_contract.register_export(
+                conn,
+                info.project_id,
+                "excel_workbook",
+                export_path,
+                run_signature="old-run-signature",
+            )
+        row = conn.execute(
+            "SELECT id, status, run_signature, run_id FROM export_runs WHERE id=?",
+            (export_id,),
+        ).fetchone()
+        assert tuple(row) == (export_id, "current", active.signature, active.run_id)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM export_runs WHERE project_id=?", (info.project_id,)
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_register_export_rechecks_source_gate_inside_transaction(tmp_path, monkeypatch):
+    """前置门控后副本发生变化时，事务内复核不得写入 current 登记。"""
+    info, conn = _project(tmp_path)
+    stored = tmp_path / "source.xlsx"
+    stored.write_bytes(b"source before export")
+    digest = run_contract.sha256_file(stored)
+    try:
+        conn.execute(
+            """INSERT INTO source_files(
+                   project_id, original_path, stored_path, original_name,
+                   sha256, size_bytes, file_type, imported_at)
+               VALUES (?, ?, ?, 'source.xlsx', ?, ?, 'xlsx', '2026')""",
+            (info.project_id, str(stored), str(stored), digest, stored.stat().st_size),
+        )
+        active = run_contract.ensure_run_contract(conn, info.project_id)
+        export_path = tmp_path / "审核底稿.xlsx"
+        export_path.write_bytes(b"export")
+        real_gate = run_contract.require_current_results_available
+
+        def mutate_after_gate(conn_, project_id_, *, operation="当前操作"):
+            result = real_gate(conn_, project_id_, operation=operation)
+            stored.write_bytes(b"source changed after gate")
+            return result
+
+        monkeypatch.setattr(
+            run_contract, "require_current_results_available", mutate_after_gate
+        )
+        with pytest.raises(run_contract.CurrentResultsUnavailableError, match="存储副本"):
+            run_contract.register_export(
+                conn,
+                info.project_id,
+                "excel_workbook",
+                export_path,
+                run_signature=active.signature,
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM export_runs WHERE project_id=?",
+            (info.project_id,),
+        ).fetchone()[0] == 0
     finally:
         conn.close()
 

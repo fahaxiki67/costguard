@@ -2250,8 +2250,20 @@ def build_project_summary(
     )
 
 
-def build_report_model(conn: sqlite3.Connection, project_id: int) -> ReportModel:
-    summary = build_project_summary(conn, project_id)
+def build_report_model(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    read_only: bool = False,
+) -> ReportModel:
+    """构造统一报告模型。
+
+    工作台状态、概览和导出状态刷新属于读取路径，必须显式传入
+    ``read_only=True``，避免摘要计算为了补写派生标记或清除 fail-closed
+    侧车而改变数据库状态。正式导出入口仍使用默认可写模式，由其受控的
+    Run Contract/登记流程负责必要的派生数据落盘。
+    """
+    summary = build_project_summary(conn, project_id, read_only=read_only)
     return ReportModel(
         project_summary=summary,
         management_summary=ManagementSummary(project_summary=summary),

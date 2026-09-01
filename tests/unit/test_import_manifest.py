@@ -22,12 +22,16 @@ def _project(tmp_path: Path):
 
 def _source(conn, project_id: int, name: str, content: bytes) -> int:
     digest = hashlib.sha256(content).hexdigest()
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    stored = db_path.parent / "source_files" / name
+    stored.parent.mkdir(parents=True, exist_ok=True)
+    stored.write_bytes(content)
     cur = conn.execute(
         """INSERT INTO source_files(
                project_id, original_path, stored_path, original_name, sha256,
                size_bytes, file_type, imported_at)
            VALUES (?,?,?,?,?,?,?,?)""",
-        (project_id, f"/{name}", f"/{name}", name, digest, len(content), "xlsx", "2026-08-31"),
+        (project_id, f"/{name}", str(stored), name, digest, len(content), "xlsx", "2026-08-31"),
     )
     return int(cur.lastrowid)
 

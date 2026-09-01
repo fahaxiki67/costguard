@@ -37,6 +37,7 @@ LEGACY_STALE_SIGNATURE = "legacy:stale"
 # 校核尝试失效”。两者都不会匹配当前 Run Contract 签名。
 INVALIDATED_RUN_SIGNATURE = "run:invalidated"
 CONTRACT_FORMAT_VERSION = 1
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _TRANSACTION_COMMIT_FAILURE_ATTR = "_jiadun_transaction_commit_failure"
 FAIL_CLOSED_STATUS = "unavailable"
 _FAIL_CLOSED_FORMAT_VERSION = 1
@@ -79,6 +80,52 @@ def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
         while block := handle.read(chunk_size):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _safe_normalized_stored_path(value: Any) -> tuple[str, str | None]:
+    """规范化存储副本路径，并把异常归类为可审计的路径错误。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", "empty"
+    try:
+        return str(Path(raw).expanduser().resolve(strict=False)), None
+    except RuntimeError:
+        # pathlib 对符号链接循环以 RuntimeError 表示；它仍然属于不可读取
+        # 的输入证据，不能让状态刷新把异常泄漏到 UI 或导出调用方。
+        return "", "symlink_loop"
+    except (OSError, ValueError):
+        # ValueError 覆盖嵌入 NUL 等非法路径；OSError 覆盖权限、ELOOP 等
+        # 文件系统边界。统一交给源文件闸门生成 fail-closed 缺口。
+        return "", "invalid"
+
+
+def _normalized_stored_path(value: Any) -> str:
+    """把受控源文件副本路径规范化为可比较的绝对路径。
+
+    Run Contract 记录的是解析器实际读取的 ``stored_path``，因此比较时不能
+    仅依赖 SQL 中的原始字符串（相对路径、``~`` 和符号链接写法可能不同）。
+    ``resolve(strict=False)`` 不要求路径当前存在；缺失/不可读由读取闸门单独
+    报告，避免把一个无法访问的副本静默变成另一条路径。
+    """
+    normalized, _error = _safe_normalized_stored_path(value)
+    return normalized
+
+
+def _stored_path_error_text(error: str | None) -> str:
+    return {
+        "empty": "路径为空",
+        "invalid": "路径格式无效或不可解析",
+        "symlink_loop": "符号链接循环",
+    }.get(error or "", "路径不可解析")
+
+
+def _strict_size_bytes(value: Any) -> int | None:
+    """只接受数据库中真实的非负整数文件大小，不允许截断浮点值。"""
+    # SQLite 的 INTEGER 列仍可能被外部 SQL 写入 REAL/TEXT；不能用 int(value)
+    # 把 6.9 静默截断为 6，也不能把 bool 当成合法文件大小。
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _now() -> str:
@@ -644,6 +691,30 @@ def current_results_available(
             state = None
     if state is None:
         current = get_current_contract(conn, project_id)
+        try:
+            source_gaps = source_file_contract_gaps(conn, project_id, current)
+        except Exception as error:
+            # 路径损坏、符号链接循环或其他文件系统异常都必须进入统一的
+            # unavailable 状态；读取/导出层不能把异常当作“没有当前结果限制”。
+            source_gaps = [
+                "源文件存储副本闸门检查异常：" + type(error).__name__
+            ]
+        if source_gaps:
+            # 这是输入证据闸门产生的运行级不可用，不等同于数据库侧车；
+            # 不在这里写侧车，避免只读状态查询产生副作用，但所有读取/导出
+            # 调用仍必须看到 fail-closed 结果和具体副本缺口。
+            return {
+                "available": False,
+                "status": FAIL_CLOSED_STATUS,
+                "fail_closed": True,
+                "reason": "源文件存储副本闸门未通过：" + "；".join(source_gaps),
+                "run_signature": current.signature if current else None,
+                "run_id": current.run_id if current else None,
+                "persisted": None,
+                "persistence": None,
+                "physical_limitations": [],
+                "state": None,
+            }
         return {
             "available": True,
             "status": "available",
@@ -678,8 +749,9 @@ def require_current_results_available(
     availability = current_results_available(conn, project_id)
     if not availability["available"]:
         reason = availability.get("reason") or "运行级不可用边界已生效"
+        prefix = "数据库不可写，" if availability.get("state") is not None else ""
         raise CurrentResultsUnavailableError(
-            f"{operation}不可用：数据库不可写，当前结果不可用；{reason}",
+            f"{operation}不可用：{prefix}当前结果不可用；{reason}",
             state=availability.get("state"),
         )
     return availability
@@ -809,7 +881,13 @@ def _source_files(
     ).fetchall()
     result = []
     for row in rows:
-        stored = Path(row["stored_path"])
+        stored_path = _normalized_stored_path(row["stored_path"])
+        stored = Path(stored_path)
+        size_bytes = _strict_size_bytes(row["size_bytes"])
+        if size_bytes is None:
+            raise RuntimeError(
+                f"源文件登记文件大小无效 file_id={int(row['id'])}"
+            )
         actual_sha = None
         if verify_stored_files and stored.is_file():
             try:
@@ -822,7 +900,8 @@ def _source_files(
             "original_name": row["original_name"],
             "sha256": row["sha256"],
             "stored_sha256": actual_sha,
-            "size_bytes": int(row["size_bytes"]),
+            "stored_path": stored_path,
+            "size_bytes": size_bytes,
             "file_type": row["file_type"],
             "imported_at": row["imported_at"],
         })
@@ -848,23 +927,83 @@ def source_file_contract_gaps(
     摘要、导出和其它只读路径保持默认严格模式，将未纳入合同的新文件视为
     当前输入边界缺口；已登记文件的删除或身份变化无论在哪个模式都拒绝。
 
-    ``stored_path`` 是受控恢复字段，故不纳入身份比较；原始副本的内容
-    SHA-256 已在契约组件中保存，后续需要校验副本内容时可另行执行昂贵的
-    文件哈希，不在每次摘要读取中重复扫描大文件。
+    ``stored_path`` 是解析器实际读取的受控副本路径，必须与契约一致；对新
+    建契约还会在每次当前读取时重新计算副本 SHA-256，发现重定向、覆盖或
+    缺失即 fail-closed。哈希按块读取，避免把大文件整体载入内存；即使成本
+    较高也不能为了性能跳过原始证据根的完整性校验。
     """
+    rows = conn.execute(
+        """SELECT id, project_id, original_path, original_name, sha256,
+                         size_bytes, file_type, stored_path, imported_at
+             FROM source_files WHERE project_id=? ORDER BY id""",
+        (int(project_id),),
+    ).fetchall()
+
     if contract is None:
-        return []
+        # 初次建立合同前也必须验证已经登记的源文件副本。空项目没有输入
+        # 边界，可以继续创建空合同；一旦存在 source_files，缺失、目录、空
+        # 路径、非法路径或无法读取的副本都必须阻断合同建立，避免出现带
+        # ``stored_sha256=None`` 的“当前”合同。
+        gaps: list[str] = []
+        for row in rows:
+            file_id = int(row["id"])
+            actual_path, path_error = _safe_normalized_stored_path(row["stored_path"])
+            if path_error:
+                gaps.append(
+                    f"源文件存储副本路径无效（{_stored_path_error_text(path_error)}）"
+                    f" file_id={file_id}"
+                )
+            if not actual_path:
+                gaps.append(f"源文件存储副本不存在或不可读取 file_id={file_id}")
+                continue
+            stored = Path(actual_path)
+            try:
+                is_file = stored.is_file()
+            except (OSError, ValueError, RuntimeError):
+                is_file = False
+            if not is_file:
+                gaps.append(f"源文件存储副本不存在或不可读取 file_id={file_id}")
+                continue
+            try:
+                actual_sha = sha256_file(stored)
+                registered_sha = row["sha256"]
+                if (
+                    not isinstance(registered_sha, str)
+                    or not _SHA256_RE.fullmatch(registered_sha)
+                ):
+                    gaps.append(
+                        f"源文件登记 SHA-256 格式无效 file_id={file_id}"
+                    )
+                elif actual_sha != registered_sha.lower():
+                    gaps.append(
+                        f"源文件登记 SHA-256 与存储副本内容不一致 file_id={file_id}"
+                    )
+                registered_size = _strict_size_bytes(row["size_bytes"])
+                if registered_size is None:
+                    gaps.append(
+                        f"源文件登记文件大小无效 file_id={file_id}"
+                    )
+                else:
+                    try:
+                        actual_size = stored.stat().st_size
+                    except (OSError, ValueError, RuntimeError):
+                        gaps.append(
+                            f"源文件存储副本大小不可读取 file_id={file_id}"
+                        )
+                    else:
+                        if registered_size != actual_size:
+                            gaps.append(
+                                f"源文件登记文件大小与存储副本不一致 file_id={file_id}"
+                            )
+            except (OSError, ValueError, RuntimeError):
+                gaps.append(f"源文件存储副本不存在或不可读取 file_id={file_id}")
+        return gaps
+
     components = contract.components if isinstance(contract.components, dict) else {}
     expected_files = components.get("source_files")
     if not isinstance(expected_files, list):
         return ["Run Contract 缺少 source_files 文件清单"]
 
-    rows = conn.execute(
-        """SELECT id, project_id, original_path, original_name, sha256,
-                         size_bytes, file_type, imported_at
-             FROM source_files WHERE project_id=? ORDER BY id""",
-        (int(project_id),),
-    ).fetchall()
     actual_by_id = {int(row["id"]): row for row in rows}
     gaps: list[str] = []
     seen_ids: set[int] = set()
@@ -900,15 +1039,106 @@ def source_file_contract_gaps(
             actual = row[field]
             wanted = expected[field]
             if field == "size_bytes":
-                try:
-                    actual = int(actual)
-                    wanted = int(wanted)
-                except (TypeError, ValueError):
-                    pass
+                actual_size = _strict_size_bytes(actual)
+                wanted_size = _strict_size_bytes(wanted)
+                if actual_size is None or wanted_size is None:
+                    gaps.append(
+                        f"源文件身份中的文件大小无效 file_id={file_id}"
+                    )
+                    continue
+                actual = actual_size
+                wanted = wanted_size
             if actual != wanted:
                 gaps.append(
                     f"源文件身份与当前 Run Contract 不一致 file_id={file_id} field={field}"
                 )
+        actual_path, actual_path_error = _safe_normalized_stored_path(row["stored_path"])
+        if actual_path_error:
+            gaps.append(
+                f"源文件存储副本路径无效（{_stored_path_error_text(actual_path_error)}）"
+                f" file_id={file_id}"
+            )
+        expected_path = expected.get("stored_path")
+        if expected_path is None:
+            # v0.1.10 以前的合同未绑定解析器实际读取的副本路径；旧结果不能
+            # 继续作为当前证据使用。受控 ensure_run_contract 会在新合同写入
+            # 完整路径后恢复读取，但摘要/导出读取面必须先 fail-closed。
+            gaps.append(
+                f"Run Contract source_files 缺少存储副本路径 file_id={file_id}"
+            )
+        else:
+            wanted_path, expected_path_error = _safe_normalized_stored_path(expected_path)
+            if expected_path_error:
+                gaps.append(
+                    "Run Contract 存储副本路径无效（"
+                    f"{_stored_path_error_text(expected_path_error)}）"
+                    f" file_id={file_id}"
+                )
+            if not actual_path_error and not expected_path_error and actual_path != wanted_path:
+                gaps.append(
+                    f"源文件存储副本路径与当前 Run Contract 不一致 file_id={file_id}"
+                )
+
+        # ``stored_sha256`` 只会在创建契约时成功读取副本的情况下被记录。
+        # 对这类新契约，当前读取必须重新哈希同一副本；不能仅比较 source_files
+        # 表里的元数据，因为解析器实际消费的是 stored_path 指向的文件内容。
+        expected_stored_sha = expected.get("stored_sha256")
+        if not isinstance(expected_stored_sha, str) or not _SHA256_RE.fullmatch(
+            expected_stored_sha
+        ):
+            gaps.append(
+                f"Run Contract 缺少有效的存储副本 SHA-256 file_id={file_id}"
+            )
+        stored = Path(actual_path) if actual_path else None
+        try:
+            is_file = bool(stored and stored.is_file())
+        except (OSError, ValueError, RuntimeError):
+            is_file = False
+        if not is_file:
+            gaps.append(f"源文件存储副本不存在或不可读取 file_id={file_id}")
+        else:
+            try:
+                actual_stored_sha = sha256_file(stored)
+            except (OSError, ValueError, RuntimeError):
+                gaps.append(f"源文件存储副本不存在或不可读取 file_id={file_id}")
+            else:
+                registered_sha = row["sha256"]
+                if (
+                    not isinstance(registered_sha, str)
+                    or not _SHA256_RE.fullmatch(registered_sha)
+                ):
+                    gaps.append(
+                        f"源文件登记 SHA-256 格式无效 file_id={file_id}"
+                    )
+                elif actual_stored_sha != registered_sha.lower():
+                    gaps.append(
+                        f"源文件登记 SHA-256 与存储副本内容不一致 file_id={file_id}"
+                    )
+                registered_size = _strict_size_bytes(row["size_bytes"])
+                if registered_size is None:
+                    gaps.append(
+                        f"源文件登记文件大小无效 file_id={file_id}"
+                    )
+                else:
+                    try:
+                        actual_size = stored.stat().st_size
+                    except (OSError, ValueError, RuntimeError):
+                        gaps.append(
+                            f"源文件存储副本大小不可读取 file_id={file_id}"
+                        )
+                    else:
+                        if registered_size != actual_size:
+                            gaps.append(
+                                f"源文件登记文件大小与存储副本不一致 file_id={file_id}"
+                            )
+                if (
+                    isinstance(expected_stored_sha, str)
+                    and _SHA256_RE.fullmatch(expected_stored_sha)
+                    and actual_stored_sha != expected_stored_sha
+                ):
+                    gaps.append(
+                        f"源文件存储副本内容与当前 Run Contract 不一致 file_id={file_id}"
+                    )
     if not allow_unbound_sources:
         for file_id in sorted(set(actual_by_id) - seen_ids):
             gaps.append(f"当前项目存在未纳入 Run Contract 的源文件 file_id={file_id}")
@@ -1044,8 +1274,9 @@ def contract_input_gaps(
     其余合同组成（项目版本、清洗决定、别名、规则目录、合同事实、权威
     清单和人工审计快照）也必须在外部 SQL/旧库绕过受控 API 时 fail-closed。
     这里使用与建合同相同的确定性序列化重新计算输入签名，并报告发生变化
-    的顶层组成。为避免每次摘要读取重复扫描大文件，比较模式不重算受控
-    stored_path 的文件内容哈希；文件身份和原始网格仍由专用闸门检查。
+    的顶层组成。受控 ``stored_path`` 的路径和文件内容由
+    ``source_file_contract_gaps`` 专用闸门实时校验；本函数只比较其余输入
+    组成，避免在同一次读取中重复扫描文件。
     """
     if contract is None:
         return []
@@ -1060,9 +1291,9 @@ def contract_input_gaps(
     def comparable(value: Any, *, key: str) -> Any:
         if key != "source_files" or not isinstance(value, list):
             return value
-        # stored_sha256 是受控副本内容的昂贵校验值；当前读取层不因省略
-        # 重算而误报，source_files 的身份字段仍由 source_file_contract_gaps
-        # 严格比较，原始网格由 sheet_scope_contract_gaps 比较。
+        # stored_sha256 是受控副本内容校验值；文件路径和内容由
+        # source_file_contract_gaps 专门比较，不能让本函数的签名重算逻辑
+        # 因为避免重复哈希而放松原始证据根闸门。
         return [
             {field: item[field] for field in item if field != "stored_sha256"}
             if isinstance(item, dict) else item
@@ -1569,9 +1800,25 @@ def ensure_run_contract(
     identity_gaps = source_file_contract_gaps(
         conn, project_id, current, allow_unbound_sources=True
     )
-    if identity_gaps:
+    # 受控的项目搬迁只会改变副本路径；路径本身是合同组成的一部分，因而
+    # 必须让旧合同退出 current 并新建 run，但不应阻断用户打开已搬迁项目。
+    # 内容缺失/内容漂移/元数据篡改仍是不可安全自动恢复的阻断项，必须保留
+    # fail-closed，不能把被替换的文件当成一次正常搬迁。
+    if current is None:
+        # 初次建合同没有可供“搬迁重绑”的旧运行；任何源文件副本缺口都必须
+        # 阻断创建，只有空项目或所有副本均可读时才允许形成当前合同。
+        blocking_identity_gaps = identity_gaps
+    else:
+        blocking_identity_gaps = [
+            gap
+            for gap in identity_gaps
+            if "存储副本路径与当前 Run Contract 不一致" not in gap
+            and "Run Contract source_files 缺少存储副本路径" not in gap
+        ]
+    if blocking_identity_gaps:
         raise RuntimeError(
-            "当前 Run Contract 源文件身份不一致：" + "; ".join(identity_gaps)
+            "当前 Run Contract 源文件身份不一致："
+            + "; ".join(blocking_identity_gaps)
         )
     components = build_run_contract_components(
         conn, project_id, config=config, code_version=code_version
@@ -1667,9 +1914,15 @@ def current_scope(
     未产生过运行契约的空/导入中项目只显示新写入的 NULL 签名兼容记录；
     v9 迁移已把真正旧结果标成 ``legacy:stale``。
     """
-    # 运行级不可用边界优先于数据库中仍可能存在的旧成功行。即使失效化
-    # 事务因持续 COMMIT 拒绝而全部回滚，任何当前读取面都必须返回空集。
-    if get_fail_closed_state(conn, project_id) is not None:
+    # 运行级不可用边界优先于数据库中仍可能存在的旧成功行。除了持久化
+    # 侧车，还要在只读路径实时检查源文件副本；否则副本内容漂移时摘要虽
+    # 显示 unavailable，异常/匹配/证据详情仍可能通过旧签名取回历史结果。
+    # ``allow_state_clear=False`` 保持 current_scope 纯读取，不在 SQL 查询
+    # 中隐式删除恢复侧车。
+    availability = current_results_available(
+        conn, project_id, allow_state_clear=False
+    )
+    if not availability["available"]:
         return "1=0", ()
     current = get_current_contract(conn, project_id)
     signature = current.signature if current else None
@@ -1767,14 +2020,44 @@ def register_export(
     metadata: dict[str, Any] | None = None,
 ) -> int:
     """登记一个已落盘的成果文件；同类旧文件只标记 stale，不删除。"""
-    require_current_results_available(conn, project_id, operation="导出成果登记")
     target = Path(path)
+    # 先建立/切换并验证当前 Run Contract，再执行统一读取门控。特别是首次
+    # 登记成果时，项目可能尚无合同；若先门控后建合同，缺失副本会被误当作
+    # “没有限制”并写入 status='current' 的导出登记。
     active_contract = ensure_run_contract(conn, project_id)
-    signature = run_signature or active_contract.signature
-    run_id = active_contract.run_id if signature == active_contract.signature else None
+    require_current_results_available(conn, project_id, operation="导出成果登记")
+    # 签名是当前 Run Contract 的受控身份，不能让调用方把历史或伪造签名
+    # 写成 status='current'。None 表示沿用当前合同；一旦显式传入，必须
+    # 与当前活动合同严格相等，空字符串也不能通过 ``or`` 静默回退。
+    if run_signature is not None and run_signature != active_contract.signature:
+        raise ValueError("导出登记的 Run Contract 签名必须等于当前活动合同")
+    signature = active_contract.signature
+    run_id = active_contract.run_id
     file_sha = sha256_file(target) if target.is_file() else None
     now = _now()
     with _transaction(conn, "register_export"):
+        locked_contract = get_current_contract(conn, project_id)
+        if (
+            locked_contract is None
+            or locked_contract.run_id != active_contract.run_id
+            or locked_contract.signature != active_contract.signature
+        ):
+            raise CurrentResultsUnavailableError(
+                "导出登记不可用：当前 Run Contract 在登记期间发生变化"
+            )
+        # 前置门控与写入之间仍可能发生文件级变化；在同一写事务内再做
+        # 一次只读源副本闸门复核，至少把普通外部覆盖/删除窗口收窄到最后
+        # 一次检查与 SQLite INSERT 之间。真正需要对抗并发替换时仍应使用
+        # 不可变输入快照或已打开的只读文件描述符，见发布限制说明。
+        transaction_availability = current_results_available(
+            conn, project_id, allow_state_clear=False
+        )
+        if not transaction_availability["available"]:
+            raise CurrentResultsUnavailableError(
+                "导出登记不可用：源文件存储副本在登记期间发生变化；"
+                + str(transaction_availability.get("reason") or "当前结果不可用"),
+                state=transaction_availability.get("state"),
+            )
         conn.execute(
             """UPDATE export_runs SET status='stale'
                WHERE project_id=? AND kind=? AND status='current'""",

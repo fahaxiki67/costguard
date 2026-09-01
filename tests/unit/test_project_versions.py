@@ -1,6 +1,7 @@
 """P2-03 项目版本链与不可覆盖清单快照测试。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -437,13 +438,16 @@ def test_version_integrity_rechecks_explicit_source_cells(tmp_path: Path):
                VALUES (?, 1, '第1期', 'downward') RETURNING id""",
             (info.project_id,),
         ).fetchone()[0]
+        stored = tmp_path / "source.xlsx"
+        stored.write_bytes(b"synthetic project-version source")
+        digest = hashlib.sha256(stored.read_bytes()).hexdigest()
         file_id = conn.execute(
             """INSERT INTO source_files(
                    project_id, original_path, stored_path, original_name, sha256,
                    size_bytes, file_type, imported_at)
-               VALUES (?, '/source.xlsx', '/source.xlsx', 'source.xlsx', 'digest', 1, 'xlsx', '2026')
+               VALUES (?, '/source.xlsx', ?, 'source.xlsx', ?, ?, 'xlsx', '2026')
                RETURNING id""",
-            (info.project_id,),
+            (info.project_id, str(stored), digest, stored.stat().st_size),
         ).fetchone()[0]
         batch_id = conn.execute(
             """INSERT INTO parse_batches(file_id, parser, parsed_at, status)
@@ -557,13 +561,16 @@ def test_version_explicit_source_cannot_cross_period_even_with_or_without_line_i
                VALUES (?, 2, '第2期', 'downward') RETURNING id""",
             (info.project_id,),
         ).fetchone()[0]
+        stored_two = tmp_path / "period2.xlsx"
+        stored_two.write_bytes(b"synthetic project-version period-two source")
+        digest_two = hashlib.sha256(stored_two.read_bytes()).hexdigest()
         file_two = conn.execute(
             """INSERT INTO source_files(
                    project_id, original_path, stored_path, original_name, sha256,
                    size_bytes, file_type, imported_at)
-               VALUES (?, '/period2.xlsx', '/period2.xlsx', 'period2.xlsx',
-                       'period2-digest', 1, 'xlsx', '2026') RETURNING id""",
-            (info.project_id,),
+               VALUES (?, '/period2.xlsx', ?, 'period2.xlsx',
+                       ?, ?, 'xlsx', '2026') RETURNING id""",
+            (info.project_id, str(stored_two), digest_two, stored_two.stat().st_size),
         ).fetchone()[0]
         batch_two = conn.execute(
             """INSERT INTO parse_batches(file_id, parser, parsed_at, status)

@@ -9,7 +9,30 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-No changes recorded after v0.1.10.
+No changes recorded after v0.1.11.
+
+## [0.1.11] - 2026-09-01
+
+Preview maintenance release that closes the v0.1.10 review findings around source
+copy integrity, read-only status reads and current/historical Evidence wording.
+
+### Fixed
+- Run Contract source-file components now bind the normalized `stored_path` actually
+  consumed by parsers and re-hash recorded copies on current reads; overwrite,
+  redirection or missing copies fail closed. Legacy contracts missing the path are
+  not current and are rebound only through a new controlled run.
+- Workbench status, overview, version/history and export-status refreshes use the
+  read-only report model and do not persist derived line-item flags or clear a
+  fail-closed sidecar as a side effect of viewing.
+- Word management summaries distinguish current-range Evidence from archived
+  historical Evidence instead of labelling the project-wide count as current.
+- Architecture license decision now matches the accepted Apache-2.0 ADR and keeps
+  the AGPL code-copy review boundary explicit.
+
+### Validation boundary
+- The release remains a Preview/Prerelease. Full target-machine performance,
+  four Office environments, sanitized real-case golden regression, Developer ID
+  signing and notarization remain open production gates.
 
 ## [0.1.10] - 2026-09-01
 

@@ -534,6 +534,50 @@ class TestExcelExport:
         zoom = doc.settings.element.find(qn("w:zoom"))
         assert zoom is not None and zoom.get(qn("w:percent")) == "100"
 
+    def test_docx_evidence_count_separates_current_and_historical(self, full_project):
+        """Word 管理摘要不得把历史 Evidence 计入“当前”数量。"""
+        info, conn, exports = full_project
+        from jiadun.core.evidence import evidence as evidence_api
+
+        active = run_contract.get_current_contract(conn, info.project_id)
+        assert active is not None
+        historical_id = evidence_api.add_evidence(
+            conn,
+            info.project_id,
+            "historical_probe",
+            "历史 Evidence 计数测试",
+            run_signature="historical-run",
+            run_id="run-historical",
+            scope="historical",
+        )
+        assert historical_id
+        current_scope, current_params = run_contract.current_scope(
+            conn, info.project_id, "e"
+        )
+        current_count = conn.execute(
+            f"SELECT COUNT(*) c FROM evidence e WHERE e.project_id=? AND {current_scope}",
+            (info.project_id, *current_params),
+        ).fetchone()["c"]
+        total_count = conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE project_id=?", (info.project_id,)
+        ).fetchone()["c"]
+        historical_count = conn.execute(
+            "SELECT COUNT(*) c FROM evidence WHERE project_id=? AND scope='historical'",
+            (info.project_id,),
+        ).fetchone()["c"]
+
+        path = excel_export.export_management_summary_docx(
+            conn, info.project_id, exports
+        )
+        import docx as docx_lib
+
+        text = "\n".join(p.text for p in docx_lib.Document(str(path)).paragraphs)
+        assert (
+            f"当前范围共 {current_count} 条；全部存档 {total_count} 条，其中历史 "
+            f"{historical_count} 条" in text
+        )
+        assert f"当前共 {total_count} 条证据记录" not in text
+
     def test_workbook_disclaimer_is_valid_for_real_or_synthetic_data(self, full_project):
         info, conn, exports = full_project
         path = excel_export.export_workbook(conn, info.project_id, exports)

@@ -1,6 +1,7 @@
 """P1-03 字段映射模板：来源、作用域、版本和只读推荐。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from decimal import Decimal
@@ -26,13 +27,16 @@ def db(tmp_path: Path):
             " VALUES (?,?,?,?)",
             ("模板测试", migrations.LATEST_SCHEMA_VERSION, str(tmp_path), "2026"),
         ).lastrowid
+        stored = tmp_path / "input.xlsx"
+        stored.write_bytes(b"synthetic mapping-template source")
+        digest = hashlib.sha256(stored.read_bytes()).hexdigest()
         file_id = conn.execute(
             """INSERT INTO source_files(
                    project_id, original_path, stored_path, original_name,
                    sha256, size_bytes, file_type, imported_at)
                VALUES (?,?,?,?,?,?,?,?)""",
-            (project_id, str(tmp_path / "input.xlsx"), str(tmp_path / "input.xlsx"),
-             "input.xlsx", "a" * 64, 10, "xlsx", "2026"),
+            (project_id, str(tmp_path / "input.xlsx"), str(stored),
+             "input.xlsx", digest, stored.stat().st_size, "xlsx", "2026"),
         ).lastrowid
         batch_id = conn.execute(
             "INSERT INTO parse_batches(file_id, parser, parsed_at, status) VALUES (?,?,?,?)",
@@ -100,7 +104,9 @@ def test_save_template_preserves_source_creator_and_audit(db):
     assert template.created_by == "张三"
     assert template.version == 1
     assert template.col_map == _map()
-    assert template.source_reference["file_sha256"] == "a" * 64
+    assert template.source_reference["file_sha256"] == hashlib.sha256(
+        b"synthetic mapping-template source"
+    ).hexdigest()
     assert template.source_reference["header_range"] == [1, 1]
     assert template.evidence_id is not None
     evidence = conn.execute(
