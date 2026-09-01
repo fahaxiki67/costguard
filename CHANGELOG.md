@@ -11,7 +11,7 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续变更将在下一版本单独记录。
 
-## [0.1.13] - 2026-09-01
+## [0.1.14] - 2026-09-02
 
 本轮候选改动优先收紧结算结果可信度和校核独立性，暂不宣称生产门槛已经全部闭合。
 
@@ -53,6 +53,23 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
   验收，以及 1万/5万/20万行性能、取消恢复、签名和公证仍未在本轮执行。
 - 因真实黄金案例和目标环境证据尚未补齐，本版只能作为预发行/预览候选；发布一致性
   和生产发布门禁会明确保留失败或条件状态，不得解释为生产就绪。
+
+### Compatibility carry-over
+
+- 继承 v0.1.13 的 Windows 符号链接测试守卫：无创建符号链接权限时测试跳过并保留原因。
+- 继承 v0.1.13 的 demo 跨平台确定性：固定 ZIP 条目属性并对临时文件替换提供退避重试。
+
+## [0.1.13] - 2026-09-02
+
+Windows compatibility follow-up to the v0.1.12 preview; no parsing or
+calculation behavior changes.
+
+### Fixed
+- Symlink-dependent tests (workspace dedup, stored-copy loop downgrade,
+  import-path scan) now skip gracefully on Windows hosts without symlink
+  privilege instead of failing with WinError 1314.
+- Demo data generation is byte-stable across platforms: zip entries use
+  create_system=3 (Unix), and antivirus-locked os.replace retries with backoff.
 
 ## [0.1.12] - 2026-09-01
 

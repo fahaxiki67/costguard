@@ -45,13 +45,16 @@ def test_scan_import_paths_rejects_symlink_roots_files_and_broken_links(
     outside_file = outside / "目录外.xlsx"
     outside_file.write_bytes(b"xlsx")
     file_link = root / "文件链接.xlsx"
-    file_link.symlink_to(outside_file)
     dir_link = nested / "目录链接"
-    dir_link.symlink_to(outside, target_is_directory=True)
     root_link = tmp_path / "资料目录链接"
-    root_link.symlink_to(root, target_is_directory=True)
     broken = root / "断开链接.xlsx"
-    broken.symlink_to(tmp_path / "不存在.xlsx")
+    try:
+        file_link.symlink_to(outside_file)
+        dir_link.symlink_to(outside, target_is_directory=True)
+        root_link.symlink_to(root, target_is_directory=True)
+        broken.symlink_to(tmp_path / "不存在.xlsx")
+    except OSError as exc:
+        pytest.skip(f"当前环境无法创建符号链接（Windows 需管理员或开发者模式）：{exc}")
 
     selection = scan_import_paths([root, root_link, file_link, broken])
 

@@ -182,7 +182,10 @@ class TestProject:
     def test_symlinked_workspace_root_lists_each_project_once(self, ws, tmp_path):
         project_model.create_project("链接去重项目", ws)
         link_root = tmp_path / "link-root"
-        link_root.symlink_to(ws, target_is_directory=True)
+        try:
+            link_root.symlink_to(ws, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"当前环境无法创建符号链接（Windows 需管理员或开发者模式）：{exc}")
         project_model.remember_workspace(link_root)
 
         names = [p.name for p in project_model.list_projects()]

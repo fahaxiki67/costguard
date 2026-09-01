@@ -10,7 +10,7 @@ from scripts import release_consistency_check
 
 def test_release_documents_without_real_golden_case_are_blocked_by_default():
     result = release_consistency_check.check_release_consistency(
-        Path(__file__).parents[2], expected_version="0.1.13"
+        Path(__file__).parents[2], expected_version="0.1.14"
     )
     assert not result["ok"], result
     golden = next(item for item in result["checks"] if item["name"] == "golden_regression")
@@ -23,7 +23,7 @@ def test_release_documents_without_real_golden_case_are_blocked_by_default():
 def test_release_consistency_allows_no_real_only_with_explicit_development_flag():
     result = release_consistency_check.check_release_consistency(
         Path(__file__).parents[2],
-        expected_version="0.1.13",
+        expected_version="0.1.14",
         allow_no_real=True,
     )
     assert result["ok"], result
