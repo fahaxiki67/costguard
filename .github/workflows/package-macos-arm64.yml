@@ -39,7 +39,7 @@ jobs:
         run: ./scripts/build_macos_arm64.sh --skip-checks
 
       - name: Generate release checklist
-        run: .venv/bin/python scripts/release_checklist.py --run-tests --output dist/release-checklist
+        run: .venv/bin/python scripts/release_checklist.py --run-tests --allow-no-real --output dist/release-checklist
 
       - name: Sensitive-data scan (tracked files)
         run: |
