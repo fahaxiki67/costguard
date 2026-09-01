@@ -9,7 +9,26 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续变更将在下一版本单独记录。
+First Windows x64 deliverables (installer + portable zip) on top of the
+v0.1.14 trust-gate release; no parsing or calculation behavior changes.
+
+## [0.1.15] - 2026-09-02
+
+First Windows deliverables on top of the v0.1.14 trust-gate release; no parsing
+or calculation behavior changes.
+
+### Added
+- Windows x64 delivery pipeline: PyInstaller onedir build, Inno Setup per-user
+  installer, portable zip, PE machine-type check, privacy audit with Windows
+  identity forms, and install/launch/quit/uninstall smoke.
+- Repository packaging assets: windows_x64.spec/.iss, build_windows_x64.ps1,
+  windows_smoke.py, pe_machine.py, icon.ico, and a manual windows-x64 CI workflow.
+
+### Fixed
+- Installer script relative paths (this pipeline had never been exercised
+  end-to-end locally before); privacy audit now accepts the Windows onedir
+  layout and scans backslash HOME forms; smoke e2e adapted to the v0.1.10+
+  period-totals write-back gate.
 
 ## [0.1.14] - 2026-09-02
 
