@@ -1,9 +1,11 @@
 {
   "schema_version": 1,
+  "registry_kind": "synthetic_demo",
   "description": "价盾黄金回归案例登记；金额与数量采用 Decimal 字符串，规格只读，禁止执行器自动更新。",
   "cases": [
     {
       "case_id": "demo_synthetic_v1",
+      "case_version": "1",
       "case_kind": "synthetic_demo",
       "availability": "available",
       "project_name": "黄金回归-匿名演示",
@@ -260,6 +262,7 @@
     },
     {
       "case_id": "sanitized_real_template",
+      "case_version": "1",
       "case_kind": "sanitized_real",
       "availability": "not_available",
       "reason": "尚未登记经过脱敏、授权和哈希核验的真实项目；不得用合成演示数据冒充真实黄金案例。"

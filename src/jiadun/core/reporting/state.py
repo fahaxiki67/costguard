@@ -123,6 +123,9 @@ def project_state(
     manifest_blocked: bool,
     sheet_parse_failed_count: int = 0,
     evidence_complete: bool = True,
+    # 金额单位、尺度、币种和含税口径没有明确确认时必须 fail-closed。调用方
+    # 若省略该参数，不能把未知口径误当成已确认并升级为项目级结论。
+    amount_unit_confirmed: bool = False,
 ) -> dict[str, Any]:
     """推导项目级三档状态。
 
@@ -147,10 +150,40 @@ def project_state(
         # 结果表即使有数值和状态，也不能在主结论缺少 Evidence 时显示为
         # 可形成项目结论；所有正式结论都必须能回溯到运行内证据链。
         reasons.append("evidence_incomplete")
-
     if reasons:
         code = "cannot_conclude"
     else:
+        # 方向快照必须与项目级期次数量勾稽。即使每个已传入方向都显示
+        # complete，也不能用缺失方向或缩窄的 periods_total/checked 形成
+        # can_conclude。这里不推断方向名称，只校验调用方已声明的完整计数。
+        direction_period_totals: list[int] = []
+        direction_period_checked: list[int] = []
+        direction_count_invalid = False
+        for _direction, item in direction_states.items():
+            if not isinstance(item, dict):
+                direction_count_invalid = True
+                continue
+            total = item.get("periods_total")
+            checked = item.get("periods_checked")
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, int)
+                or total < 0
+                or isinstance(checked, bool)
+                or not isinstance(checked, int)
+                or checked < 0
+                or checked > total
+            ):
+                direction_count_invalid = True
+                continue
+            direction_period_totals.append(total)
+            direction_period_checked.append(checked)
+        if direction_count_invalid:
+            reasons.append("direction_period_count_invalid")
+        elif sum(direction_period_totals) != period_count:
+            reasons.append("direction_period_count_mismatch")
+        elif sum(direction_period_checked) != current_periods_checked:
+            reasons.append("direction_checked_count_mismatch")
         invalid_direction_snapshot = any(
             key not in {"upward", "downward"}
             or not isinstance(value, dict)
@@ -180,6 +213,11 @@ def project_state(
             for item in direction_states.values()
         ):
             reasons.append("direction_scope_incomplete")
+        if not amount_unit_confirmed:
+            # 数字可以先按 Decimal 完成技术复算，但金额单位/尺度/币种或
+            # 含税口径未确认时，项目级状态不得升级为无条件结论；这属于
+            # 可补齐的业务口径缺口，因此保留为“有条件结论”。
+            reasons.append("amount_unit_unconfirmed")
         code = "conditional" if reasons else "can_conclude"
 
     return {

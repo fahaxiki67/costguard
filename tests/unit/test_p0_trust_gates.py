@@ -85,6 +85,304 @@ def test_clean_paths_record_independent_scope_and_evidence(tmp_path: Path):
         conn.close()
 
 
+def test_line_item_mutation_cannot_contaminate_raw_b_path_or_green_status(
+    tmp_path: Path,
+):
+    """清洗明细被污染时，B 仍须读取原始网格，项目级结果不得标绿。"""
+    from jiadun.core.engine import crosscheck
+
+    _info, conn, _report, period_id = _import_project(tmp_path)
+    try:
+        detail = conn.execute(
+            """SELECT id, amount FROM line_items
+               WHERE period_id=? AND json_extract(flags_json, '$.subtotal') IS NOT 1
+               ORDER BY id LIMIT 1""",
+            (period_id,),
+        ).fetchone()
+        assert detail is not None
+        original_amount = Decimal(str(detail["amount"]))
+        conn.execute(
+            "UPDATE line_items SET amount='9999.99' WHERE id=?", (detail["id"],)
+        )
+
+        result = crosscheck.check_period(conn, period_id)
+
+        assert result.path_a_total == Decimal("500") - original_amount + Decimal("9999.99")
+        assert result.path_b_total == Decimal("500")
+        assert result.path_a_total != result.path_b_total
+        assert result.status == "diff"
+        assert result.verification_level in {"findings", "insufficient"}
+        assert result.path_scopes["path_b"]["source_kind"] == "raw_cells"
+        assert any("A/B" in note or "差异" in note for note in result.notes)
+    finally:
+        conn.close()
+
+
+def test_raw_layer_synchronous_omission_cannot_become_sufficient(tmp_path: Path):
+    """原始网格与清洗明细同步漏行时，范围证明仍必须阻断绿色结论。"""
+    from jiadun.core.engine import crosscheck
+
+    _info, conn, _report, period_id = _import_project(tmp_path)
+    try:
+        detail = conn.execute(
+            """SELECT id, sheet_id FROM line_items
+               WHERE period_id=? AND json_extract(flags_json, '$.subtotal') IS NOT 1
+               ORDER BY id LIMIT 1""",
+            (period_id,),
+        ).fetchone()
+        assert detail is not None
+        # 仅在隔离测试库中模拟旧库/外部 SQL 绕过不可变触发器的解析层
+        # 同步漏行；生产数据库仍由触发器保护原始证据。
+        conn.execute("DROP TRIGGER IF EXISTS trg_raw_cells_immutable_delete")
+        conn.execute("DELETE FROM line_items WHERE id=?", (detail["id"],))
+        conn.execute(
+            "DELETE FROM raw_cells WHERE sheet_id=? AND row=2",
+            (detail["sheet_id"],),
+        )
+
+        result = crosscheck.check_period(conn, period_id)
+
+        assert result.verification_level in {"insufficient", "findings"}
+        assert result.verification_level != "sufficient"
+        assert result.path_a_total == result.path_b_total == Decimal("300")
+        assert result.raw_subtotal == Decimal("500")
+        assert result.control_status == "diff"
+    finally:
+        conn.close()
+
+
+def test_parser_source_sheet_census_blocks_common_sheet_omission(tmp_path: Path, monkeypatch):
+    """解析器共同漏掉整张 Sheet 时，入口范围证明必须降级而不能三路同绿。"""
+    from jiadun.core.engine import crosscheck, settlement_io
+    from jiadun.core.models import project as pm
+    from jiadun.core.parsing import excel_parser
+
+    src = tmp_path / "两张表.xlsx"
+    wb = openpyxl.Workbook()
+    first = wb.active
+    first.title = "第1期"
+    second = wb.create_sheet("第2期")
+    for ws, amount in ((first, 500), (second, 30)):
+        for col, value in enumerate(("项目编码", "项目名称", "工程量", "综合单价", "合价"), 1):
+            ws.cell(1, col, value=value)
+        ws.append((f"{ws.title}-A", "项目", 1, amount, amount))
+        ws.append((None, "合计", None, None, amount))
+    wb.save(src)
+
+    real_parse = excel_parser.parse_xlsx
+
+    def omit_last_sheet(path: Path):
+        result = real_parse(path)
+        result.sheets.pop()
+        # 保留解析器自己的统计值，模拟“入口统计声称看到了两张表、落库只剩一张”。
+        return result
+
+    monkeypatch.setattr(excel_parser, "parse_xlsx", omit_last_sheet)
+    info = pm.create_project("解析范围证明", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        batch = conn.execute(
+            "SELECT status, stats_json FROM parse_batches WHERE id=?", (report.batch_id,)
+        ).fetchone()
+        assert batch is not None
+        stats = json.loads(batch["stats_json"])
+        assert stats["source_census"]["sheet_count"] == 2
+        assert stats["source_census_status"] == "mismatch"
+        assert batch["status"] == "partial"
+        period_id = conn.execute(
+            "SELECT id FROM settlement_periods WHERE project_id=?", (info.project_id,)
+        ).fetchone()["id"]
+        result = crosscheck.check_period(conn, period_id)
+        assert result.verification_level != "sufficient"
+        assert result.range_unproven_sheets >= 1
+        assert any("源文件" in note or "Sheet" in note for note in result.notes)
+    finally:
+        conn.close()
+
+
+def test_parser_source_dimension_mismatch_blocks_common_range_drift(tmp_path: Path, monkeypatch):
+    """解析器若篡改 Sheet 行列范围元数据，入口也必须降级。"""
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
+    from jiadun.core.parsing import excel_parser
+
+    src = tmp_path / "范围漂移.xlsx"
+    _make_book(src)
+    real_parse = excel_parser.parse_xlsx
+
+    def alter_range(path: Path):
+        result = real_parse(path)
+        # 保留所有 raw cell 均在声明网格内，单独模拟解析器把范围扩大的漂移。
+        result.sheets[0].n_rows += 1
+        return result
+
+    monkeypatch.setattr(excel_parser, "parse_xlsx", alter_range)
+    info = pm.create_project("解析范围漂移", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        stats = json.loads(
+            conn.execute(
+                "SELECT stats_json FROM parse_batches WHERE id=?", (report.batch_id,)
+            ).fetchone()["stats_json"]
+        )
+        assert stats["source_census_status"] == "mismatch"
+        assert report.status == "partial"
+    finally:
+        conn.close()
+
+
+def test_parser_in_sheet_row_omission_blocks_common_row_range(tmp_path: Path, monkeypatch):
+    """同一 Sheet 内漏掉一整行且保留尺寸时，源内容指纹也必须降级。"""
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
+    from jiadun.core.parsing import excel_parser
+
+    src = tmp_path / "Sheet内漏行.xlsx"
+    _make_book(src)
+    real_parse = excel_parser.parse_xlsx
+
+    def omit_middle_row(path: Path):
+        result = real_parse(path)
+        sheet = result.sheets[0]
+        # 保留 n_rows/n_cols，模拟解析器只漏掉物理第 3 行的单元格；
+        # 仅比较 Sheet 尺寸无法发现这种共同漏行。
+        sheet.cells = [cell for cell in sheet.cells if cell.row != 3]
+        result.stats["n_cells"] = sum(len(item.cells) for item in result.sheets)
+        return result
+
+    monkeypatch.setattr(excel_parser, "parse_xlsx", omit_middle_row)
+    info = pm.create_project("Sheet内漏行", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        batch = conn.execute(
+            "SELECT status, stats_json FROM parse_batches WHERE id=?",
+            (report.batch_id,),
+        ).fetchone()
+        assert batch is not None
+        stats = json.loads(batch["stats_json"])
+        assert stats["source_census_status"] == "mismatch"
+        assert any("内容" in difference or "单元格" in difference
+                   for difference in stats["source_census_differences"])
+        assert report.status == "partial"
+    finally:
+        conn.close()
+
+
+def test_source_census_rejects_duplicate_and_noncontiguous_sheet_indices():
+    """Sheet 索引必须是源目录同序的 0-based 连续身份。"""
+    from jiadun.core.parsing.excel_parser import (
+        SheetRecord,
+        _compare_source_census,
+    )
+
+    census = {
+        "status": "available",
+        "sheets": [
+            {"sheet_index": 0, "sheet_name": "A", "range_status": "available", "n_rows": 3, "n_cols": 5},
+            {"sheet_index": 1, "sheet_name": "B", "range_status": "available", "n_rows": 3, "n_cols": 5},
+        ],
+    }
+    for bad_sheets in (
+        [SheetRecord(0, "A", 3, 5), SheetRecord(0, "B", 3, 5)],
+        [SheetRecord(1, "A", 3, 5), SheetRecord(2, "B", 3, 5)],
+    ):
+        status, differences = _compare_source_census(census, bad_sheets)
+        assert status == "mismatch"
+        assert any("索引" in difference for difference in differences)
+
+
+def test_duplicate_sheet_index_is_rejected_before_persist(tmp_path: Path, monkeypatch):
+    """坏索引不得先物化再在 coverage proof 末端留下错误来源现场。"""
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
+    from jiadun.core.parsing import excel_parser
+
+    src = tmp_path / "重复索引.xlsx"
+    wb = openpyxl.Workbook()
+    first = wb.active
+    first.title = "第1期"
+    second = wb.create_sheet("第2期")
+    for ws, amount in ((first, 500), (second, 30)):
+        for col, value in enumerate(("项目编码", "项目名称", "工程量", "综合单价", "合价"), 1):
+            ws.cell(1, col, value=value)
+        ws.append((f"{ws.title}-A", "项目", 1, amount, amount))
+        ws.append((None, "合计", None, None, amount))
+    wb.save(src)
+
+    real_parse = excel_parser.parse_xlsx
+
+    def duplicate_indices(path: Path):
+        result = real_parse(path)
+        result.sheets[1].sheet_index = 0
+        return result
+
+    monkeypatch.setattr(excel_parser, "parse_xlsx", duplicate_indices)
+    info = pm.create_project("重复 Sheet 索引", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        assert report.status == "failed"
+        assert "索引" in report.message
+        batch = conn.execute(
+            "SELECT status FROM parse_batches WHERE id=?", (report.batch_id,)
+        ).fetchone()
+        assert batch["status"] == "failed"
+        assert conn.execute("SELECT COUNT(*) AS c FROM raw_sheets").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM raw_cells").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM settlement_periods").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM line_items").fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+
+def test_import_rolls_back_materialization_when_coverage_proof_fails(
+    tmp_path: Path, monkeypatch
+):
+    """覆盖证明末端失败时，不能留下半套 raw/period/line_items 现场。"""
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as pm
+
+    src = tmp_path / "覆盖证明失败.xlsx"
+    _make_book(src)
+    info = pm.create_project("覆盖证明原子性", tmp_path / "ws")
+    info, conn = pm.open_project(Path(info.workspace_path))
+
+    def fail_after_materialization(*_args, **_kwargs):
+        raise RuntimeError("injected coverage proof failure")
+
+    monkeypatch.setattr(
+        settlement_io, "_persist_coverage_proof", fail_after_materialization
+    )
+    try:
+        report = settlement_io.import_settlement_file(
+            conn, info.project_id, Path(info.workspace_path), src, direction="upward"
+        )
+        assert report.status == "failed"
+        assert "injected coverage proof failure" in report.message
+        assert conn.execute("SELECT COUNT(*) AS c FROM source_files").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) AS c FROM raw_sheets").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM raw_cells").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM settlement_periods").fetchone()["c"] == 0
+        assert conn.execute("SELECT COUNT(*) AS c FROM line_items").fetchone()["c"] == 0
+        batches = conn.execute(
+            "SELECT status FROM parse_batches ORDER BY id"
+        ).fetchall()
+        assert [row["status"] for row in batches] == ["failed"]
+    finally:
+        conn.close()
+
+
 def test_c_control_wraps_source_evidence_for_current_run_without_mutating_source(
     tmp_path: Path,
 ):

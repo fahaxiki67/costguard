@@ -136,6 +136,27 @@ def _safe_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+def _termination_payload(
+    status: str,
+    *,
+    size: int | None,
+    stage: str,
+    reason: str,
+    at: str | None = None,
+) -> dict[str, Any]:
+    """生成可追溯的失败/取消终止证据。"""
+
+    payload: dict[str, Any] = {
+        "status": status,
+        "at": at or _now(),
+        "stage": stage or "未记录阶段",
+        "reason": reason or "未记录原因",
+    }
+    if size is not None:
+        payload["size"] = size
+    return payload
+
+
 @dataclass
 class StageResult:
     name: str
@@ -397,6 +418,30 @@ def _mark_skipped(name: str, reason: str) -> StageResult:
     return StageResult(name=name, status="skipped", details={"reason": reason})
 
 
+def _mark_record_termination(
+    record: dict[str, Any],
+    status: str,
+    *,
+    stage: str,
+    reason: str,
+) -> None:
+    """把单个规模的非完成终态和原因一起写入记录。"""
+
+    at = _now()
+    record["status"] = status
+    record["termination"] = _termination_payload(
+        status,
+        size=record.get("size"),
+        stage=stage,
+        reason=reason,
+        at=at,
+    )
+    if status == "cancelled":
+        record["cancelled_at"] = at
+    elif status == "failed":
+        record["failed_at"] = at
+
+
 def _run_size(
     total_rows: int,
     run_work_dir: Path,
@@ -430,7 +475,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
         record["input"] = generation
 
@@ -481,7 +531,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
         project_id = int(imported["project_id"])
         record["project_id"] = project_id
@@ -503,7 +558,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
 
         def search_operation() -> dict[str, Any]:
@@ -524,7 +584,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
 
         # ---- 异常检测 ----
@@ -543,7 +608,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
 
         # ---- 匹配 ----
@@ -564,7 +634,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
 
         # ---- 聚合 + A/B/C 双向校核 ----
@@ -604,7 +679,12 @@ def _run_size(
         )
         record["stages"].append(stage.as_dict())
         if stage.status != "completed":
-            record["status"] = stage.status
+            _mark_record_termination(
+                record,
+                stage.status,
+                stage=stage.name,
+                reason=stage.error or f"阶段 {stage.name} 未完成",
+            )
             return record
 
         # ---- Excel 导出 ----
@@ -634,7 +714,12 @@ def _run_size(
             )
             record["stages"].append(stage.as_dict())
             if stage.status != "completed":
-                record["status"] = stage.status
+                _mark_record_termination(
+                    record,
+                    stage.status,
+                    stage=stage.name,
+                    reason=stage.error or f"阶段 {stage.name} 未完成",
+                )
                 return record
 
         record["run_contract_signature"] = run_contract.current_run_signature(
@@ -643,8 +728,27 @@ def _run_size(
         record["status"] = "completed"
         return record
     except KeyboardInterrupt:
-        record["status"] = "cancelled"
-        record["cancelled_at"] = _now()
+        # KeyboardInterrupt 不会被阶段级 ``except Exception`` 捕获；补写一个
+        # 明确的“规模执行”终止阶段，避免 termination.stage 指向不存在的步骤。
+        if not any(
+            isinstance(stage, dict) and stage.get("name") == "规模执行"
+            for stage in record.get("stages", [])
+        ):
+            record["stages"].append(
+                StageResult(
+                    name="规模执行",
+                    status="cancelled",
+                    elapsed_seconds=0.0,
+                    details={"reason": "KeyboardInterrupt", "scope": "规模级阶段外中断"},
+                    error="KeyboardInterrupt",
+                ).as_dict()
+            )
+        _mark_record_termination(
+            record,
+            "cancelled",
+            stage="规模执行",
+            reason="KeyboardInterrupt",
+        )
         return record
     finally:
         if conn is not None:
@@ -824,6 +928,15 @@ def run_benchmark(
             # 旧报告会短暂保留 ``running``，让恢复工具无法区分已取消现场。
             if result.get("status") != "completed":
                 report["status"] = result.get("status", "failed")
+                termination = result.get("termination")
+                if isinstance(termination, dict):
+                    report["termination"] = {
+                        **termination,
+                        "size": result.get("size"),
+                    }
+                    if report["status"] == "cancelled":
+                        report["cancelled_at"] = termination.get("at", _now())
+                        report["cancelled_size"] = result.get("size")
             # 每个规模完成即落盘，Ctrl-C 或进程异常时至少保留已完成规模。
             report["generated_at"] = _now()
             _write_reports(report, report_dir)
@@ -834,14 +947,74 @@ def run_benchmark(
             report["status"] = "completed"
     except KeyboardInterrupt:
         report["status"] = "cancelled"
-        report["cancelled_at"] = _now()
+        cancelled_at = _now()
+        report["cancelled_at"] = cancelled_at
         if active_size is not None:
             # 中断可能发生在 _run_size 尚未返回时（例如解析器逐格落库中）。
             # 记录规模和现场入口，避免报告只显示前一规模而掩盖半成品现场。
             report["cancelled_size"] = active_size
+            report["termination"] = _termination_payload(
+                "cancelled",
+                size=active_size,
+                stage="规模执行",
+                reason="KeyboardInterrupt",
+                at=cancelled_at,
+            )
+            if not any(item.get("size") == active_size for item in report["results"]):
+                report["results"].append(
+                    {
+                        "size": active_size,
+                        "status": "cancelled",
+                        "total_detail_rows": active_size,
+                        "rows_per_direction": _split_direction_rows(active_size),
+                        "stages": [
+                            StageResult(
+                                name="规模执行",
+                                status="cancelled",
+                                elapsed_seconds=0.0,
+                                details={"reason": "KeyboardInterrupt"},
+                                error="KeyboardInterrupt",
+                            ).as_dict()
+                        ],
+                        "workspace_retained": True,
+                        "termination": report["termination"],
+                        "cancelled_at": cancelled_at,
+                    }
+                )
     except Exception as exc:
         report["status"] = "failed"
         report["fatal_error"] = _safe_error(exc)
+        failed_at = _now()
+        report["termination"] = _termination_payload(
+            "failed",
+            size=active_size,
+            stage="基准运行",
+            reason=report["fatal_error"],
+            at=failed_at,
+        )
+        if active_size is not None and not any(
+            item.get("size") == active_size for item in report["results"]
+        ):
+            report["results"].append(
+                {
+                    "size": active_size,
+                    "status": "failed",
+                    "total_detail_rows": active_size,
+                    "rows_per_direction": _split_direction_rows(active_size),
+                    "stages": [
+                        StageResult(
+                            name="基准运行",
+                            status="failed",
+                            elapsed_seconds=0.0,
+                            details={"reason": report["fatal_error"]},
+                            error=report["fatal_error"],
+                        ).as_dict()
+                    ],
+                    "workspace_retained": True,
+                    "termination": report["termination"],
+                    "failed_at": failed_at,
+                }
+            )
     finally:
         if tracemalloc.is_tracing():
             # Ctrl-C 可能在阶段返回后才被解释；清理阶段不得再次把已捕获

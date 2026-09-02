@@ -113,6 +113,44 @@ def test_run_analysis_does_not_skip_anomaly_stage_when_crosscheck_fails(monkeypa
     assert result.failed_stage == "crosscheck"
 
 
+def test_run_analysis_materializes_period_totals_for_fresh_import(tmp_path):
+    """新导入项目首次正式分析前应先物化聚合行，不能卡在缺少回写行。"""
+    import openpyxl
+
+    from jiadun.core import analysis
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as project_model
+
+    info = project_model.create_project("首次正式分析", tmp_path / "ws")
+    info, conn = project_model.open_project(info.workspace_path)
+    source = tmp_path / "第1期.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "第1期"
+    sheet.append(["清单编码", "清单名称", "计量单位", "工程量", "综合单价", "合价"])
+    sheet.append(["A-001", "平整场地", "m2", 2, 3, 6])
+    sheet.append(["合计", "", "", "", "", 6])
+    book.save(source)
+    try:
+        report = settlement_io.import_settlement_file(
+            conn,
+            info.project_id,
+            info.workspace_path,
+            source,
+            direction="upward",
+        )
+        assert report.status in {"ok", "partial"}
+        assert conn.execute("SELECT COUNT(*) FROM period_totals").fetchone()[0] == 0
+
+        result = analysis.run_analysis(conn, info.project_id)
+
+        assert result.crosscheck_results, result.errors
+        assert not any("period_totals 缺少当前项目" in error for error in result.errors)
+        assert conn.execute("SELECT COUNT(*) FROM period_totals").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("status", ["same_row_set"])
 def test_same_row_set_has_non_green_semantic_warning(status):
     from jiadun.core import analysis

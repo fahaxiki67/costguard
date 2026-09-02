@@ -167,6 +167,75 @@ class TestSheetConfirmDialog:
         assert dlg.sheet_list.count() == 0, "抽取后该页不再待确认"
         conn.close()
 
+    def test_extract_failure_exposes_actionable_reason(self, qapp, quiet_boxes,
+                                                       gated_project, monkeypatch):
+        """核心抽取失败时，界面必须保留具体原因并允许用户重试。"""
+        from jiadun.core.engine import settlement_io
+
+        conn, pid = gated_project
+        dlg = self._dialog(conn, pid)
+        dlg._on_select(0)
+        for field, col in {
+            "name": 2, "unit": 3, "quantity": 4,
+            "unit_price": 5, "amount": 6,
+        }.items():
+            dlg._col_spins[field].setValue(col)
+        dlg.hdr_lo.setValue(2)
+        dlg.hdr_hi.setValue(2)
+        dlg.reason_edit.setPlainText("已核对列位，模拟抽取失败")
+
+        failure_reason = "示例：公式缓存未验证，金额暂不能作为确定性依据"
+
+        def fail_extract(*_args, **_kwargs):
+            raise ValueError(failure_reason)
+
+        monkeypatch.setattr(settlement_io, "confirm_sheet_role_and_extract", fail_extract)
+        dlg._do_extract()
+
+        assert quiet_boxes["warning"], "失败时必须给出可见提示"
+        message = quiet_boxes["warning"][-1][-1]
+        assert failure_reason in message
+        assert "重试" in message
+        conn.close()
+
+    def test_extract_pending_status_is_explicitly_reported(
+        self, qapp, quiet_boxes, gated_project, monkeypatch
+    ):
+        """抽取完成但仍有结构性缺口时，不能只提示“已抽取”造成误读。"""
+        from jiadun.core.engine import settlement_io
+
+        conn, pid = gated_project
+        dlg = self._dialog(conn, pid)
+        dlg._on_select(0)
+        for field, col in {
+            "name": 2, "unit": 3, "quantity": 4,
+            "unit_price": 5, "amount": 6,
+        }.items():
+            dlg._col_spins[field].setValue(col)
+        dlg.hdr_lo.setValue(2)
+        dlg.hdr_hi.setValue(2)
+        dlg.reason_edit.setPlainText("已核对列位，但结构证据仍需复核")
+        sheet_id = int(dlg._current()["sheet_id"])
+        pending_reason = "公式缓存未验证，金额暂不能作为确定性依据"
+
+        def extract_but_keep_pending(*_args, **_kwargs):
+            conn.execute(
+                "UPDATE raw_sheets SET sheet_status='pending', sheet_status_reason=? WHERE id=?",
+                (pending_reason, sheet_id),
+            )
+            return 6
+
+        monkeypatch.setattr(
+            settlement_io, "confirm_sheet_role_and_extract", extract_but_keep_pending
+        )
+        dlg._do_extract()
+
+        assert quiet_boxes["warning"], "结构性缺口必须以警告显示"
+        message = quiet_boxes["warning"][-1][-1]
+        assert "已保存" in message and "仍待复核" in message
+        assert pending_reason in message
+        conn.close()
+
     def test_evidence_only_records_role(self, qapp, quiet_boxes, gated_project):
         conn, pid = gated_project
         dlg = self._dialog(conn, pid)

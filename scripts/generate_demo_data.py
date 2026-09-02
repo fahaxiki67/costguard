@@ -69,15 +69,21 @@ def _normalize_zip(path: Path) -> None:
     entries = [(info.filename, src.read(info.filename)) for info in src.infolist()]
     src.close()
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
-        for name, data in entries:
-            if name == "docProps/core.xml":
-                data = core_ts.sub(rb"\g<1>" + fixed_ts + rb"\g<2>", data)
-            info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o600 << 16
-            info.create_system = 3  # 固定为 Unix，否则 Windows 生成字节与 macOS 不一致
-            dst.writestr(info, data)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
+            for name, data in entries:
+                if name == "docProps/core.xml":
+                    data = core_ts.sub(rb"\g<1>" + fixed_ts + rb"\g<2>", data)
+                info = zipfile.ZipInfo(name, date_time=FIXED_TIME)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.external_attr = 0o600 << 16
+                info.create_system = 3  # 固定为 Unix，否则 Windows 生成字节与 macOS 不一致
+                dst.writestr(info, data)
+    except Exception:
+        # 生成或压缩失败时删除可再生暂存文件，避免下一次运行误把半成品
+        # 当作有效演示数据；原始 path 从未被覆盖。
+        tmp.unlink(missing_ok=True)
+        raise
     # Windows：杀毒软件可能短暂锁定刚写完的文件，os.replace 会 WinError 5，退避重试
     import time
 
@@ -87,6 +93,9 @@ def _normalize_zip(path: Path) -> None:
             break
         except PermissionError:
             if attempt == 5:
+                # 持续锁定时也不留下 .tmp。若暂存文件本身被系统锁住，
+                # 保留原始 PermissionError 供调用方报告，避免掩盖根因。
+                tmp.unlink(missing_ok=True)
                 raise
             time.sleep(0.2 * (attempt + 1))
 

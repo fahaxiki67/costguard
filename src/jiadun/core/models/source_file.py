@@ -57,8 +57,19 @@ class SourceFile:
     size_bytes: int
 
 
-def import_file(conn: sqlite3.Connection, project_id: int, project_dir: Path, src: Path) -> SourceFile:
-    """复制 src 到项目 originals/ 并登记。返回登记信息。"""
+def import_file(
+    conn: sqlite3.Connection,
+    project_id: int,
+    project_dir: Path,
+    src: Path,
+    *,
+    commit: bool = True,
+) -> SourceFile:
+    """复制 src 到项目 originals/ 并登记。返回登记信息。
+
+    ``commit=False`` 供结算导入的外层事务使用；副本文件本身仍按只读资产
+    写入，数据库登记会随调用方事务一起提交或回滚。
+    """
     src = Path(src)
     if not src.is_file():
         raise SourceFileError(f"source file not found: {src}")
@@ -98,14 +109,32 @@ def import_file(conn: sqlite3.Connection, project_id: int, project_dir: Path, sr
     os.chmod(stored, 0o444) if os.name != "nt" else None
 
     now = datetime.now().isoformat(timespec="seconds")
-    with conn:
+    def _insert() -> int:
         cur = conn.execute(
             """INSERT INTO source_files
                (project_id, original_path, stored_path, original_name, sha256, size_bytes, file_type, imported_at)
                VALUES (?,?,?,?,?,?,?,?)""",
             (project_id, str(src), str(stored), src.name, digest, size, ftype, now),
         )
-        file_id = cur.lastrowid
+        return int(cur.lastrowid)
+    if not commit:
+        file_id = _insert()
+    elif conn.in_transaction:
+        # 不提交调用方已经打开的外层事务；导入编排会在同一事务中登记
+        # source_files，并在后续物化失败时整体回滚数据库记录。
+        savepoint = "source_file_insert"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            file_id = _insert()
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    else:
+        with conn:
+            file_id = _insert()
     return SourceFile(file_id, str(src), str(stored), src.name, digest, ftype, size)
 
 

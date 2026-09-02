@@ -127,6 +127,44 @@ def test_workbench_parse_failure_is_not_reported_as_success(
         page.deleteLater()
 
 
+def test_workbench_import_failure_keeps_reason_and_retry_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """导入异常必须向用户说明具体原因，而不是伪装成按钮无反应。"""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from jiadun.core.engine import settlement_io
+    from jiadun.core.models import project as project_model
+    from jiadun.ui.workbench import WorkbenchPage
+
+    QApplication.instance() or QApplication([])
+    info = project_model.create_project("导入失败提示", tmp_path / "ws")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    source = tmp_path / "不可读结算表.xlsx"
+    source.write_bytes(b"placeholder")
+    messages: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        lambda _parent, _title, text, *_args, **_kwargs: messages.append(text),
+    )
+
+    failure_reason = "测试失败：工作表范围无法确认"
+
+    def fail_import(*_args, **_kwargs):
+        raise ValueError(failure_reason)
+
+    monkeypatch.setattr(settlement_io, "import_settlement_file", fail_import)
+    page = WorkbenchPage(conn, info, info.workspace_path, on_back=lambda: None)
+    try:
+        page.import_paths([source])
+        assert messages
+        assert failure_reason in messages[-1]
+        assert "重试" in messages[-1]
+    finally:
+        conn.close()
+        page.deleteLater()
+
+
 def test_project_card_summary_failure_falls_back_to_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

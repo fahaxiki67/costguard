@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from jiadun.version import read_project_version  # noqa: E402
+
 BASE_DOC_FILES = (
     Path("README.md"),
     Path("README_zh-CN.md"),
@@ -26,12 +30,7 @@ BASE_DOC_FILES = (
 
 
 def _read_version(root: Path) -> str | None:
-    try:
-        text = (root / "pyproject.toml").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = re.search(r"(?ms)^\[project\].*?^version\s*=\s*[\"']([^\"']+)[\"']", text)
-    return match.group(1) if match else None
+    return read_project_version(root)
 
 
 def _check(
@@ -178,9 +177,61 @@ def check_release_consistency(
             else:
                 real_case_count = int(golden.get("real_case_count") or 0)
                 regression_passed = golden.get("status") == "passed"
-                if not regression_passed:
+                expected_total: object | None = golden.get("case_count")
+                if expected_total is None and (
+                    "available_case_count" in golden or "not_available_case_count" in golden
+                ):
+                    try:
+                        expected_total = (
+                            golden.get("available_case_count", 0)
+                            + golden.get("not_available_case_count", 0)
+                        )
+                    except TypeError:
+                        expected_total = "invalid"
+                comparison_counts, canonical_errors = (
+                    golden_regression.normalize_comparison_status_counts(
+                        golden.get("comparison_status_counts"),
+                        expected_total=expected_total,
+                    )
+                )
+                pending_count = comparison_counts.get("PENDING", 0)
+                incomparable_count = comparison_counts.get("INCOMPARABLE", 0)
+                fail_count = comparison_counts.get("FAIL", 0)
+                known_statuses = {"PASS", "FAIL", "PENDING", "INCOMPARABLE"}
+                unknown_count = sum(
+                    count
+                    for status, count in comparison_counts.items()
+                    if status not in known_statuses
+                )
+                canonical_detail = ", ".join(
+                    f"{status}={count}"
+                    for status, count in sorted(comparison_counts.items())
+                )
+                canonical_error_detail = (
+                    f"canonical_errors={'；'.join(canonical_errors)}, "
+                    if canonical_errors
+                    else ""
+                )
+                unavailable_count = int(golden.get("not_available_case_count") or 0)
+                pending_only_unavailable = (
+                    pending_count > 0
+                    and pending_count == unavailable_count
+                    and real_case_count == 0
+                )
+                if (
+                    not regression_passed
+                    or canonical_errors
+                    or fail_count
+                    or incomparable_count
+                    or unknown_count
+                ):
                     gate_status = "failed"
                     passed = False
+                    issues.append(
+                        "黄金回归 canonical comparison_status 存在不可放行项："
+                        f"{canonical_detail}"
+                        + (f"；校验错误：{'；'.join(canonical_errors)}" if canonical_errors else "")
+                    )
                 elif real_case_count == 0 and not allow_no_real:
                     gate_status = "blocked"
                     passed = False
@@ -188,15 +239,26 @@ def check_release_consistency(
                         "生产发布被阻断：真实黄金案例回归 real_case_count=0；"
                         "补齐脱敏真实案例，或仅在开发检查中显式使用 allow_no_real"
                     )
-                elif real_case_count == 0:
+                elif real_case_count == 0 and allow_no_real and (
+                    pending_count == 0 or pending_only_unavailable
+                ):
                     gate_status = "conditional"
                     passed = True
+                elif pending_count:
+                    gate_status = "blocked"
+                    passed = False
+                    issues.append(
+                        "黄金回归仍有 PENDING 案例，不能形成生产结论："
+                        f"{canonical_detail}"
+                    )
                 else:
                     gate_status = "passed"
                     passed = True
                 detail = (
                     f"status={golden.get('status')}, available={golden.get('available_case_count')}, "
                     f"real_case_count={real_case_count}, mismatches={golden.get('mismatch_case_count')}, "
+                    f"comparison_status_counts={canonical_detail}, "
+                    f"{canonical_error_detail}"
                     f"gate_status={gate_status}, allow_no_real={allow_no_real}"
                 )
                 _check(checks, "golden_regression", passed, detail, status=gate_status)

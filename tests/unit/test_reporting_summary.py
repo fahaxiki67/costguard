@@ -1509,6 +1509,114 @@ def test_project_state_requires_direction_snapshot():
     assert "direction_scope_incomplete" in result["reason_codes"]
 
 
+def test_project_state_requires_confirmed_amount_unit_for_unconditional_conclusion():
+    """金额单位未确认时，项目级状态只能是有条件结论。"""
+    upward = direction_state(
+        direction="upward",
+        periods_total=1,
+        periods_checked=1,
+        sufficient=1,
+        findings=0,
+        insufficient=0,
+        run_available=True,
+        coverage_complete=True,
+    )
+    result = project_state(
+        source_files=1,
+        period_count=1,
+        run_available=True,
+        current_periods_checked=1,
+        period_code="sufficient",
+        direction_states={"upward": upward},
+        detection_complete=True,
+        aggregate_complete=True,
+        pending_count=0,
+        manifest_blocked=False,
+        amount_unit_confirmed=False,
+    )
+    assert result["code"] == "conditional"
+    assert "amount_unit_unconfirmed" in result["reason_codes"]
+
+
+def test_project_state_default_amount_unit_gate_is_fail_closed():
+    """直接调用项目状态 API 省略金额单位时也不能形成无条件结论。"""
+    upward = direction_state(
+        direction="upward",
+        periods_total=1,
+        periods_checked=1,
+        sufficient=1,
+        findings=0,
+        insufficient=0,
+        run_available=True,
+        coverage_complete=True,
+    )
+    result = project_state(
+        source_files=1,
+        period_count=1,
+        run_available=True,
+        current_periods_checked=1,
+        period_code="sufficient",
+        direction_states={"upward": upward},
+        detection_complete=True,
+        aggregate_complete=True,
+        pending_count=0,
+        manifest_blocked=False,
+    )
+    assert result["code"] == "conditional"
+    assert "amount_unit_unconfirmed" in result["reason_codes"]
+
+
+def test_project_state_requires_direction_period_counts_to_reconcile():
+    """方向快照缺期或多报期时不得形成项目级 can_conclude。"""
+    upward = direction_state(
+        direction="upward",
+        periods_total=1,
+        periods_checked=1,
+        sufficient=1,
+        findings=0,
+        insufficient=0,
+        run_available=True,
+        coverage_complete=True,
+    )
+    result = project_state(
+        source_files=1,
+        period_count=2,
+        run_available=True,
+        current_periods_checked=2,
+        period_code="sufficient",
+        direction_states={"upward": upward},
+        detection_complete=True,
+        aggregate_complete=True,
+        pending_count=0,
+        manifest_blocked=False,
+    )
+    assert result["code"] == "conditional"
+    assert "direction_period_count_mismatch" in result["reason_codes"]
+
+
+def test_project_state_rejects_invalid_direction_period_counts():
+    result = project_state(
+        source_files=1,
+        period_count=1,
+        run_available=True,
+        current_periods_checked=1,
+        period_code="sufficient",
+        direction_states={
+            "upward": {
+                "code": "complete",
+                "periods_total": 1,
+                "periods_checked": 2,
+            }
+        },
+        detection_complete=True,
+        aggregate_complete=True,
+        pending_count=0,
+        manifest_blocked=False,
+    )
+    assert result["code"] == "conditional"
+    assert "direction_period_count_invalid" in result["reason_codes"]
+
+
 def test_unknown_direction_cannot_be_complete_project_scope():
     """未确认方向不能因局部数字完整而变成完整有效或可形成结论。"""
     direction = direction_state(

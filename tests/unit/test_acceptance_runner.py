@@ -187,6 +187,398 @@ def test_decimal_warning_forces_with_findings() -> None:
     assert status == "with_findings"
 
 
+def test_corpus_preflight_classifies_missing_and_hash_mismatch(runner_env):
+    """真实资料副本缺失/哈希不符必须可分类为 pending，而不是裸断言。"""
+    runner, base = runner_env
+    missing = base / "corpus" / "T12_sample.xlsx"
+    missing.unlink()
+    altered = base / "corpus" / "T13_sample.xlsx"
+    altered.write_bytes(altered.read_bytes() + b"altered")
+
+    with open(base / "manifest.csv", encoding="utf-8") as f:
+        import csv
+
+        records = list(csv.DictReader(f))
+    pre = runner.verify_corpus(records)
+
+    summary = runner.summarize_corpus_preflight(pre)
+
+    assert summary == {
+        "status": "pending",
+        "record_count": 13,
+        "ready_count": 11,
+        "pending_count": 2,
+        "missing_test_ids": ["T12"],
+        "hash_mismatch_test_ids": ["T13"],
+    }
+
+
+def test_corpus_preflight_records_hash_read_error_as_pending(runner_env, monkeypatch):
+    """文件存在但无法读取哈希时，也必须进入完整性待复核而非中断整批。"""
+    runner, base = runner_env
+
+    def unreadable(_path):
+        raise PermissionError("simulated file lock")
+
+    monkeypatch.setattr(runner, "sha256_of", unreadable)
+    with open(base / "manifest.csv", encoding="utf-8") as f:
+        import csv
+
+        records = list(csv.DictReader(f))
+    pre = runner.verify_corpus(records)
+
+    assert pre[0]["exists"] is True
+    assert pre[0]["hash_match"] is False
+    assert pre[0]["hash_error"].startswith("PermissionError:")
+    summary = runner.summarize_corpus_preflight(pre)
+    assert summary["status"] == "pending"
+    assert summary["pending_count"] == 13
+    pending = runner._pending_source_result(pre[0])
+    assert pending["preflight"]["reason"] == "hash_unreadable"
+    assert "无法读取 SHA-256" in pending["preflight"]["message"]
+
+
+def test_runner_records_partial_corpus_as_pending_without_processing_bad_files(
+    runner_env, monkeypatch
+):
+    """预检不完整时仍生成可恢复 run；坏副本不得进入解析/计算。"""
+    runner, base = runner_env
+    missing = base / "corpus" / "T12_sample.xlsx"
+    missing.unlink()
+    altered = base / "corpus" / "T13_sample.xlsx"
+    altered.write_bytes(altered.read_bytes() + b"altered")
+
+    seen: list[str] = []
+    original_inspect = runner.inspect_file
+
+    def track_inspect(test_id, *args, **kwargs):
+        seen.append(test_id)
+        return original_inspect(test_id, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "inspect_file", track_inspect)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    report = json.loads((run / "acceptance_results.json").read_text(encoding="utf-8"))
+    assert report["preflight"] == {
+        "status": "pending",
+        "record_count": 13,
+        "ready_count": 11,
+        "pending_count": 2,
+        "missing_test_ids": ["T12"],
+        "hash_mismatch_test_ids": ["T13"],
+    }
+    assert "T12" not in seen and "T13" not in seen
+    assert report["hash_check"]["before_all_match"] is False
+    assert report["hash_check"]["after_all_match"] is False
+    human_report = (run / "LOCAL_ACCEPTANCE_REPORT.md").read_text(encoding="utf-8")
+    assert "## 副本预检" in human_report
+    assert "待补资料：T12" in human_report
+    assert "哈希待复核：T13" in human_report
+    assert "完整性预检未全部通过" in human_report
+
+    for test_id, reason in (("T12", "missing"), ("T13", "hash_mismatch")):
+        result = json.loads((run / "done" / f"{test_id}.json").read_text(encoding="utf-8"))
+        assert result["preflight"]["status"] == "pending"
+        assert result["preflight"]["reason"] == reason
+        assert result["steps"]["technical_execution_complete"] is False
+        assert result["steps"]["technical_validation_status"] == "not_run_or_incomplete"
+        assert result["steps"]["overall_acceptance_status"] == "pending_source_data"
+        assert result["steps"]["verification_level"] == "insufficient"
+        assert result.get("decimal_recompute") in (None, {})
+        assert result.get("dual_path_check") in (None, {}, [])
+
+
+def test_pending_source_can_resume_in_same_run_after_copy_is_restored(runner_env):
+    """补齐并校正副本后，同一 run 的 pending marker 应重新进入流程。"""
+    runner, base = runner_env
+    source = base / "corpus" / "T13_sample.xlsx"
+    original = source.read_bytes()
+    source.unlink()
+
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    pending = json.loads((run / "done" / "T13.json").read_text(encoding="utf-8"))
+    assert pending["preflight"]["reason"] == "missing"
+
+    source.write_bytes(original)
+    runner.main(run_dir=run)
+    resumed = json.loads((run / "done" / "T13.json").read_text(encoding="utf-8"))
+    assert resumed.get("preflight") in (None, {})
+    assert resumed["steps"]["import"] is True
+    assert resumed["steps"]["overall_acceptance_status"] != "pending_source_data"
+
+
+def test_resume_downgrades_completed_marker_when_copy_changes(runner_env):
+    """已完成 marker 不能掩盖续跑时发现的副本篡改。"""
+    runner, base = runner_env
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    source = base / "corpus" / "T13_sample.xlsx"
+    source.write_bytes(source.read_bytes() + b"changed-after-run")
+
+    runner.main(run_dir=run)
+    result = json.loads((run / "done" / "T13.json").read_text(encoding="utf-8"))
+
+    assert result["preflight"]["reason"] == "hash_mismatch"
+    assert result["steps"]["overall_acceptance_status"] == "pending_source_data"
+    assert result.get("decimal_recompute") in (None, {})
+    assert result.get("dual_path_check") in (None, {}, [])
+
+
+def test_post_run_copy_mutation_invalidates_processed_result(runner_env, monkeypatch):
+    """处理期间源副本被修改时，已生成结果必须整体降级为待补资料。"""
+    runner, base = runner_env
+    original_inspect = runner.inspect_file
+
+    def inspect_then_mutate(test_id, purpose, copy, *args, **kwargs):
+        result = original_inspect(test_id, purpose, copy, *args, **kwargs)
+        if test_id == "T01":
+            copy.write_bytes(copy.read_bytes() + b"changed-during-run")
+        return result
+
+    monkeypatch.setattr(runner, "inspect_file", inspect_then_mutate)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    report = json.loads((run / "acceptance_results.json").read_text(encoding="utf-8"))
+    result = next(item for item in report["per_file"] if item["test_id"] == "T01")
+
+    assert report["hash_check"]["after_all_match"] is False
+    assert report["hash_check"]["modified_copies"] == ["T01"]
+    assert report["hash_check"]["invalidated_results"] == ["T01"]
+    assert result["preflight"]["reason"] == "modified_after_processing"
+    assert result["steps"]["overall_acceptance_status"] == "pending_source_data"
+    assert result["steps"]["technical_execution_complete"] is False
+    assert result.get("decimal_recompute") in (None, {})
+    assert result.get("dual_path_check") in (None, {}, [])
+
+
+def test_pipeline_stage_failure_is_recorded_and_run_remains_recoverable(
+    runner_env, monkeypatch
+):
+    """异常检测失败不能中断整批，必须留下 done marker 和汇总报告。"""
+    runner, base = runner_env
+    from jiadun.core.anomalies import engine as anomaly_engine
+
+    def fail_anomalies(*_args, **_kwargs):
+        raise RuntimeError("anomaly boom")
+
+    monkeypatch.setattr(anomaly_engine, "run_anomalies", fail_anomalies)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    assert (run / "acceptance_results.json").is_file()
+    assert (run / "LOCAL_ACCEPTANCE_REPORT.md").is_file()
+    result = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    assert result["pipeline_error"]["stage"] == "anomalies"
+    assert "anomaly boom" in result["pipeline_error"]["error"]
+    assert result["steps"]["anomalies"] is False
+    assert result["steps"]["matches"] is False
+    assert result["steps"]["technical_execution_complete"] is False
+    assert result["steps"]["overall_acceptance_status"] == "not_passed"
+
+
+def test_failed_marker_can_be_retried_after_input_or_stage_is_fixed(runner_env, monkeypatch):
+    """失败 marker 不得被续跑逻辑永久当成已完成结果。"""
+    runner, base = runner_env
+    from jiadun.core.anomalies import engine as anomaly_engine
+
+    original = anomaly_engine.run_anomalies
+    calls = {"count": 0}
+
+    def fail_once(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("retryable anomaly failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(anomaly_engine, "run_anomalies", fail_once)
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    failed = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    assert failed["pipeline_error"]["stage"] == "anomalies"
+
+    runner.main(run_dir=run)
+    retried = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    assert "pipeline_error" not in retried
+    assert retried["import"]["ok"] is True
+    assert (run / "验收-T02_r2").exists()
+
+
+def test_unexpected_file_exception_is_recorded_without_aborting_batch(runner_env, monkeypatch):
+    """文件级未预期异常也要转为 marker，后续 test_id 仍可继续。"""
+    runner, base = runner_env
+    original_inspect = runner.inspect_file
+
+    def fail_one(test_id, *args, **kwargs):
+        if test_id == "T02":
+            raise OSError("synthetic inspect failure")
+        return original_inspect(test_id, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "inspect_file", fail_one)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    failed = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    completed = json.loads((run / "done" / "T03.json").read_text(encoding="utf-8"))
+    assert failed["pipeline_error"]["stage"] == "inspect_file"
+    assert "synthetic inspect failure" in failed["pipeline_error"]["error"]
+    assert failed["steps"]["technical_execution_complete"] is False
+    assert completed["test_id"] == "T03"
+    assert (run / "acceptance_results.json").is_file()
+
+
+def test_word_export_failure_does_not_leave_partial_excel_result(runner_env, monkeypatch):
+    """成对导出任一格式失败时，本次 Excel 不得作为看似完整成果残留。"""
+    runner, base = runner_env
+    from jiadun.core.export import excel_export
+
+    original_docx = excel_export.export_management_summary_docx
+    failed_once = {"value": False}
+
+    def fail_first_docx(*args, **kwargs):
+        if not failed_once["value"]:
+            failed_once["value"] = True
+            raise RuntimeError("synthetic Word export failure")
+        return original_docx(*args, **kwargs)
+
+    monkeypatch.setattr(excel_export, "export_management_summary_docx", fail_first_docx)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    first = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    exports = list((run / "验收-T02" / "exports").glob("*"))
+    assert first["export"]["error"]
+    assert first["steps"]["technical_execution_complete"] is False
+    assert exports == []
+
+
+def test_partial_export_files_are_rolled_back_when_export_raises(runner_env, monkeypatch):
+    """导出函数已写出半文件后抛异常时，验收包装层仍必须清理现场。"""
+    runner, base = runner_env
+    from jiadun.core.export import excel_export
+
+    original_xlsx = excel_export.export_workbook
+    original_docx = excel_export.export_management_summary_docx
+    raised = {"xlsx": False, "docx": False}
+
+    def partial_xlsx(conn, project_id, export_dir):
+        if not raised["xlsx"]:
+            raised["xlsx"] = True
+            export_dir.mkdir(parents=True, exist_ok=True)
+            (export_dir / "partial.xlsx").write_bytes(b"partial")
+            raise RuntimeError("synthetic partial Excel failure")
+        return original_xlsx(conn, project_id, export_dir)
+
+    def partial_docx(conn, project_id, export_dir):
+        if not raised["docx"]:
+            raised["docx"] = True
+            export_dir.mkdir(parents=True, exist_ok=True)
+            (export_dir / "partial.docx").write_bytes(b"partial")
+            raise RuntimeError("synthetic partial Word failure")
+        return original_docx(conn, project_id, export_dir)
+
+    monkeypatch.setattr(excel_export, "export_workbook", partial_xlsx)
+    monkeypatch.setattr(excel_export, "export_management_summary_docx", partial_docx)
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    failed_xlsx = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    failed_docx = json.loads((run / "done" / "T03.json").read_text(encoding="utf-8"))
+    assert failed_xlsx["pipeline_error"]["stage"] == "export_excel"
+    assert failed_docx["pipeline_error"]["stage"] == "export_word"
+    assert list((run / "验收-T02" / "exports").glob("*")) == []
+    assert list((run / "验收-T03" / "exports").glob("*")) == []
+
+
+def test_nested_same_basename_partial_export_is_rolled_back(tmp_path):
+    """嵌套目录中已有同名文件时，新半文件仍必须被识别并清理。"""
+    import scripts.real_acceptance_run as runner
+
+    export_dir = tmp_path / "exports"
+    old = export_dir / "old" / "partial.xlsx"
+    old.parent.mkdir(parents=True)
+    old.write_bytes(b"old")
+    existing_paths = {old.relative_to(export_dir).as_posix()}
+    new = export_dir / "new" / "partial.xlsx"
+    new.parent.mkdir(parents=True)
+    new.write_bytes(b"new")
+
+    assert runner._new_export_files(export_dir, existing_paths) == [new]
+
+
+def test_corrupt_done_marker_is_recorded_and_does_not_abort_batch(runner_env):
+    """损坏的续跑 marker 应转为结构化失败，后续文件仍可继续处理。"""
+    runner, base = runner_env
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    marker = run / "done" / "T02.json"
+    marker.write_text("{broken", encoding="utf-8")
+
+    runner.main(run_dir=run)
+
+    failed = json.loads(marker.read_text(encoding="utf-8"))
+    continued = json.loads((run / "done" / "T03.json").read_text(encoding="utf-8"))
+    assert failed["pipeline_error"]["stage"] == "done_marker"
+    assert "JSONDecodeError" in failed["pipeline_error"]["error"]
+    assert failed["steps"]["technical_execution_complete"] is False
+    assert continued["test_id"] == "T03"
+
+
+def test_semantically_incomplete_done_marker_is_not_reused(runner_env):
+    """合法 JSON 但缺关键步骤/身份的 marker 必须重新处理。"""
+    runner, base = runner_env
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    marker = run / "done" / "T02.json"
+    marker.write_text(
+        json.dumps({"test_id": "T02", "steps": {}, "import": {"ok": False}}),
+        encoding="utf-8",
+    )
+
+    runner.main(run_dir=run)
+
+    repaired = json.loads(marker.read_text(encoding="utf-8"))
+    assert repaired["marker"]["test_id"] == "T02"
+    assert repaired["steps"]["import"] is True
+    assert "pipeline_error" not in repaired
+
+
+def test_done_marker_with_wrong_test_id_is_not_reused(runner_env):
+    """不同 test_id 的合法 marker 不能因文件名相同而错归属。"""
+    runner, base = runner_env
+    runner.main()
+    run = sorted((base / "work").glob("run_*"))[-1]
+    marker = run / "done" / "T02.json"
+    previous = json.loads(marker.read_text(encoding="utf-8"))
+    previous["marker"]["test_id"] = "T03"
+    previous["test_id"] = "T03"
+    marker.write_text(json.dumps(previous), encoding="utf-8")
+
+    runner.main(run_dir=run)
+
+    repaired = json.loads(marker.read_text(encoding="utf-8"))
+    assert repaired["marker"]["test_id"] == "T02"
+    assert repaired["test_id"] == "T02"
+
+
+def test_corrupt_manual_decisions_are_structured_and_recoverable(runner_env):
+    """损坏人工决定文件不能在批次入口裸抛异常或锁死界面。"""
+    runner, base = runner_env
+    (base / "manual_sheet_decisions.json").write_text("{broken", encoding="utf-8")
+
+    runner.main()
+
+    run = sorted((base / "work").glob("run_*"))[-1]
+    failed = json.loads((run / "done" / "T01.json").read_text(encoding="utf-8"))
+    continued = json.loads((run / "done" / "T02.json").read_text(encoding="utf-8"))
+    assert failed["pipeline_error"]["stage"] == "manual_decisions"
+    assert "JSONDecodeError" in failed["pipeline_error"]["error"]
+    assert failed["steps"]["technical_execution_complete"] is False
+    assert continued["test_id"] == "T02"
+
+
 @pytest.mark.parametrize(
     ("verification_level", "range_unproven_sheets"),
     [("insufficient", 0), ("findings", 0), ("sufficient", 1)],
@@ -228,6 +620,21 @@ class TestRunnerNonDestructive:
         # 每轮都包含全部 13 个 test_id 项目
         projects = [d.name for d in runs[1].iterdir() if d.is_dir() and d.name.startswith("验收-")]
         assert len(projects) == 13
+
+    def test_timestamped_runs_preserve_human_reports(self, runner_env):
+        """每轮 Markdown 报告随 run 保存，不能覆盖上一轮验收记录。"""
+        runner, base = runner_env
+        runner.main()
+        first = sorted((base / "work").glob("run_*"))[0]
+        first_report = first / "LOCAL_ACCEPTANCE_REPORT.md"
+        assert first_report.is_file()
+        first_bytes = first_report.read_bytes()
+
+        runner.main()
+        runs = sorted((base / "work").glob("run_*"))
+        assert len(runs) == 2
+        assert runs[0].joinpath("LOCAL_ACCEPTANCE_REPORT.md").read_bytes() == first_bytes
+        assert runs[1].joinpath("LOCAL_ACCEPTANCE_REPORT.md").is_file()
 
     def test_resume_skips_completed(self, runner_env):
         """可恢复重跑：同 run 目录续跑时跳过已完成 test_id。"""

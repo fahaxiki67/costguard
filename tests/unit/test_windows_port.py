@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import zipfile
@@ -56,6 +57,100 @@ class TestDemoZipDeterminism:
             _normalize_zip(p)
             with zipfile.ZipFile(p) as zf:
                 assert all(i.create_system == 3 for i in zf.infolist())
+
+    def test_generator_retries_transient_windows_file_lock(self, tmp_path, monkeypatch):
+        """文件被杀毒软件短暂占用时，归一化应退避重试而非留下半成品。"""
+        import time
+
+        import openpyxl
+
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        try:
+            from generate_demo_data import _normalize_zip
+        finally:
+            sys.path.pop(0)
+
+        path = tmp_path / "locked.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active["A1"] = "x"
+        wb.save(path)
+        real_replace = Path.replace
+        attempts = {"count": 0}
+        sleeps: list[float] = []
+
+        def flaky_replace(self, target):
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                raise PermissionError("simulated Windows file lock")
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", flaky_replace)
+        monkeypatch.setattr(time, "sleep", lambda delay: sleeps.append(delay))
+        _normalize_zip(path)
+
+        assert attempts["count"] == 3
+        assert sleeps == [0.2, 0.4]
+        assert path.is_file()
+        with zipfile.ZipFile(path) as zf:
+            assert all(info.create_system == 3 for info in zf.infolist())
+
+    def test_generator_removes_staging_file_after_persistent_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """持续占用导致失败时不得遗留看似可用的 .tmp 半成品。"""
+        import time
+
+        import openpyxl
+
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        try:
+            from generate_demo_data import _normalize_zip
+        finally:
+            sys.path.pop(0)
+
+        path = tmp_path / "locked-permanently.xlsx"
+        wb = openpyxl.Workbook()
+        wb.active["A1"] = "x"
+        wb.save(path)
+        monkeypatch.setattr(Path, "replace", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("simulated persistent Windows file lock")
+        ))
+        monkeypatch.setattr(time, "sleep", lambda _delay: None)
+
+        with pytest.raises(PermissionError, match="persistent Windows file lock"):
+            _normalize_zip(path)
+        assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_privacy_audit_console_is_utf8_safe_on_windows_codepage(tmp_path, monkeypatch):
+    """Windows cp1252 控制台也不能因中文审计信息崩溃。"""
+    from scripts import audit_bundle_privacy as audit
+
+    app = tmp_path / "Jiadun"
+    app.mkdir()
+    (app / "Jiadun.exe").write_bytes(b"placeholder")
+    monkeypatch.setattr(sys, "argv", ["audit_bundle_privacy.py", str(app)])
+    monkeypatch.setattr(
+        audit,
+        "_identity_patterns",
+        lambda: {
+            "binary": {"仓库": b"repo", "私有": b"local_private_data"},
+            "pyz": {"仓库": b"repo", "私有": b"local_private_data"},
+        },
+    )
+    monkeypatch.setattr(audit, "_scan_uncompressed", lambda *_args: [])
+    monkeypatch.setattr(audit, "_scan_pyz", lambda *_args: ([], ""))
+
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stdout)
+    try:
+        assert audit.main() == 0
+        stdout.flush()
+        output = stdout.buffer.getvalue().decode("utf-8")
+    finally:
+        stdout.detach()
+    assert "审计对象" in output
+    assert "PASS" in output
 
 
 class TestSubtotalPageWords:

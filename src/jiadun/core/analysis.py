@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -93,6 +94,29 @@ def _anomaly_stage_has_technical_failure(findings: list[Any]) -> bool:
     )
 
 
+def _materialize_period_totals(conn: Any, project_id: int) -> None:
+    """在正式校核前物化当前导入的聚合行。
+
+    导入阶段先保留原始网格和清洗明细；``period_totals`` 是校核结果回写
+    所需的逐清单投影，只有在用户真正启动正式分析时才建立/刷新。把这一步
+    放在编排入口，既让新项目可以直接走到 A/B/C，又保留
+    ``crosscheck.run_crosscheck`` 对手工/损坏数据库缺行的严格检测。非
+    SQLite 的编排测试连接不执行数据库副作用。
+    """
+    if not isinstance(conn, sqlite3.Connection):
+        return
+    from jiadun.core.engine import aggregate
+
+    aggs = aggregate.aggregate_project(
+        conn,
+        project_id,
+        include_all_directions=True,
+        persist_derived_flags=False,
+    )
+    if aggs:
+        aggregate.persist_period_totals(conn, project_id, aggs)
+
+
 def run_analysis(conn, project_id: int) -> AnalysisResult:
     """按固定顺序执行一次项目分析并返回 fail-closed 结果。
 
@@ -104,6 +128,7 @@ def run_analysis(conn, project_id: int) -> AnalysisResult:
     result = AnalysisResult(stage_order=ANALYSIS_STAGE_ORDER)
 
     try:
+        _materialize_period_totals(conn, project_id)
         result.crosscheck_results = list(
             crosscheck.run_crosscheck_project(conn, project_id)
         )

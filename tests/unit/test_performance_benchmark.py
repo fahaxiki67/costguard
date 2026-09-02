@@ -37,6 +37,10 @@ def test_benchmark_cancel_preserves_exact_worksite(tmp_path: Path):
     )
     assert report["status"] == "cancelled"
     assert report["results"][0]["status"] == "cancelled"
+    assert report["termination"]["status"] == "cancelled"
+    assert report["termination"]["size"] == 100
+    assert report["termination"]["stage"] == "合成数据生成"
+    assert report["termination"]["reason"]
     assert Path(report["workspace"]).is_dir()
     assert report["acceptance_bundle"]["truth"]["status"] == "not_available"
     persisted = json.loads(Path(report["output_paths"]["json"]).read_text(encoding="utf-8"))
@@ -53,6 +57,48 @@ def test_keyboard_interrupt_records_active_size_and_writes_final_report(tmp_path
 
     assert report["status"] == "cancelled"
     assert report["cancelled_size"] == 200000
+    assert report["termination"]["status"] == "cancelled"
+    assert report["termination"]["size"] == 200000
+    assert report["termination"]["stage"] == "规模执行"
+    assert report["results"][-1]["termination"]["reason"] == "KeyboardInterrupt"
     persisted = json.loads(Path(report["output_paths"]["json"]).read_text(encoding="utf-8"))
     assert persisted["status"] == "cancelled"
     assert persisted["cancelled_size"] == 200000
+    assert persisted["termination"]["size"] == 200000
+
+
+def test_keyboard_interrupt_inside_size_records_terminal_stage(tmp_path, monkeypatch):
+    """规模内部的硬中断也必须有与 termination 对应的阶段记录。"""
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(benchmark, "_measure_stage", interrupt)
+
+    record = benchmark._run_size(
+        100,
+        tmp_path / "work",
+        skip_export=True,
+        progress=None,
+        cancel_check=None,
+    )
+
+    assert record["status"] == "cancelled"
+    assert record["termination"]["stage"] == "规模执行"
+    assert any(stage["name"] == "规模执行" for stage in record["stages"])
+    assert record["stages"][-1]["elapsed_seconds"] == 0.0
+
+
+def test_generated_cancelled_report_meets_terminal_evidence_schema(tmp_path: Path):
+    """真实生成的取消现场应能被发布清单结构校验器完整读取。"""
+    from scripts import release_checklist
+
+    report = benchmark.run_benchmark(
+        list(release_checklist.PERFORMANCE_SIZES),
+        output=tmp_path / "cancelled-schema",
+        skip_export=True,
+        cancel_check=lambda: True,
+    )
+
+    assert report["status"] == "cancelled"
+    assert release_checklist._validate_performance_report(report) == []

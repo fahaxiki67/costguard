@@ -32,6 +32,25 @@ class TestClean:
         # 异常检测只对数量/单价/金额列应用文本数字规则）
         assert r.stats["n_text_numbers"] == 6
 
+    def test_source_census_falls_back_when_write_only_omits_dimension(self, tmp_path):
+        """write-only Excel 没有 dimension 时，源目录扫描仍应独立推导范围。"""
+        import openpyxl
+
+        path = tmp_path / "write-only.xlsx"
+        workbook = openpyxl.Workbook(write_only=True)
+        sheet = workbook.create_sheet("第1期")
+        sheet.append(["项目编码", "项目名称", "工程量", "综合单价", "合价"])
+        sheet.append(["A1", "项目", 1, 2, 2])
+        workbook.save(path)
+
+        result = excel_parser.parse_file(path, "xlsx")
+
+        assert result.stats["source_census_status"] == "complete"
+        source_sheet = result.stats["source_census"]["sheets"][0]
+        assert source_sheet["range_method"] == "row_cell_scan"
+        assert source_sheet["n_rows"] == 2
+        assert source_sheet["n_cols"] == 5
+
 
 class TestMessy:
     @pytest.fixture(scope="class")

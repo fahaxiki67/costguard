@@ -12,7 +12,7 @@ from pathlib import Path
 
 from jiadun.core.contracts import run_contract
 from jiadun.core.evidence import evidence as evidence_api
-from jiadun.core.models.source_file import import_file
+from jiadun.core.models.source_file import SourceFile, import_file
 from jiadun.core.parsing import coverage_proof, excel_parser, extract_items
 from jiadun.core.parsing.header_detect import HeaderDetection, detect_header
 
@@ -765,7 +765,8 @@ def ensure_period(
 def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
                        sheet_id: int, sheet_name: str,
                        confidence: float | None, oversized: bool,
-                       reason: str | None = None) -> None:
+                       reason: str | None = None,
+                       *, commit: bool = True) -> None:
     """需角色审阅 sheet：留 evidence 候选与审计，不写 canonical tables。"""
     from jiadun.core.evidence import audit as audit_log
     from jiadun.core.evidence import evidence as evidence_api
@@ -779,11 +780,14 @@ def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
         steps=[{"step": "角色门控", "confidence": confidence, "reason": reason}],
         sources=[{"file_id": file_id, "sheet_id": sheet_id, "location": "整表",
                   "confidence": confidence}],
+        commit=commit,
     )
     audit_log.record_audit(
         conn, project_id, "system", "route_role_review", f"sheet:{sheet_id}",
         None, {"sheet": sheet_name, "confidence": confidence, "oversized": oversized},
-        f"角色审阅路由：{reason}；保留 raw 网格，未进入结算模型")
+        f"角色审阅路由：{reason}；保留 raw 网格，未进入结算模型",
+        commit=commit,
+    )
 
 
 def _validate_confirmed_col_map(col_map: dict, max_col: int) -> None:
@@ -1297,13 +1301,100 @@ def import_settlement_file(
     direction: str = "unknown",
     contract_party: str = "",
 ) -> ImportReport:
+    """以单个外层事务执行文件物化，失败时只保留 failed 批次和 Evidence。"""
+    src = Path(src)
+    # 原始文件副本是可恢复的输入资产，先登记并提交；后续数据库物化失败
+    # 时，副本仍可被同一 SHA 的下一次重试复用，不会留下无法解释的来源。
+    sf = import_file(conn, project_id, project_dir, src, commit=True)
+    try:
+        with run_contract._transaction(conn, "import_settlement_file"):
+            return _import_settlement_file(
+                conn,
+                project_id,
+                project_dir,
+                src,
+                period_no=period_no,
+                direction=direction,
+                contract_party=contract_party,
+                _source_file=sf,
+            )
+    except Exception as exc:
+        # 任一物化阶段失败均不得把已写入的 raw/period/line_items 当作成功
+        # 结果。外层事务已回滚；这里重新登记一个无 Sheet 的 failed 批次，
+        # 保留可追溯错误并允许用户重新选择/重试。
+        error = f"{type(exc).__name__}: {exc}"
+        failed_result = excel_parser.ParseResult(
+            parser="pipeline",
+            status="failed",
+            stats={"pipeline_error": error},
+            error=error,
+        )
+        with run_contract._transaction(conn, "persist_import_failure"):
+            failed_batch_id = excel_parser.persist_parse_result(
+                conn, sf.file_id, failed_result, commit=False
+            )
+            evidence_api.add_evidence(
+                conn,
+                project_id,
+                "parse_failure",
+                f"文件「{sf.original_name}」导入物化失败：{error}",
+                steps=[
+                    {
+                        "step": "导入物化",
+                        "status": "failed",
+                        "error": error,
+                        "rollback": "raw/period/line_items 已回滚",
+                    }
+                ],
+                sources=[
+                    {
+                        "file_id": sf.file_id,
+                        "batch_id": failed_batch_id,
+                        "location": "文件级导入管线",
+                        "original_name": sf.original_name,
+                    }
+                ],
+                commit=False,
+                scope="source",
+            )
+        run_contract.ensure_if_materialized(conn, project_id)
+        fallback = period_no or next_period_no(conn, project_id, direction)
+        return ImportReport(
+            sf.file_id,
+            failed_batch_id,
+            fallback,
+            -1,
+            "failed",
+            sheets=[
+                SheetReport(
+                    sf.original_name,
+                    "parse_failed",
+                    state_code="parse_failed",
+                    notes=[error],
+                )
+            ],
+            message=error,
+        )
+
+
+def _import_settlement_file(
+    conn: sqlite3.Connection,
+    project_id: int,
+    project_dir: Path,
+    src: Path,
+    period_no: int | None = None,
+    direction: str = "unknown",
+    contract_party: str = "",
+    *,
+    _source_file: SourceFile | None = None,
+) -> ImportReport:
     """导入并解析一个结算文件。
 
     期次归属（v2 模型）：一个工作簿可含多期。逐 Sheet 判定期号——
     Sheet 名或表前标题含"第N期"则用之；否则用文件名期号；再否则按递增编号。
     """
     src = Path(src)
-    sf = import_file(conn, project_id, project_dir, src)
+    sf = _source_file or import_file(conn, project_id, project_dir, src, commit=False)
     existing_report = _existing_import_report(
         conn,
         project_id,
@@ -1317,6 +1408,23 @@ def import_settlement_file(
     used_increment = file_period is None
 
     result = excel_parser.parse_file(Path(sf.stored_path), sf.file_type)
+    # 入口必须先独立盘点源工作簿的 Sheet 目录，再接受解析器的结果。
+    # 对 xlsx/xlsm，缺失或不一致的源清单都意味着解析范围无法证明完整；
+    # 即使剩余 Sheet 的 A/B/C 数值碰巧相等，也只能进入待人工复核。
+    source_census_status = str(result.stats.get("source_census_status") or "")
+    source_census_differences = result.stats.get("source_census_differences", [])
+    if not isinstance(source_census_differences, list):
+        source_census_differences = [str(source_census_differences)]
+    source_scope_unproven = sf.file_type == "xlsx" and source_census_status != "complete"
+    source_scope_reason = (
+        "；".join(str(item) for item in source_census_differences if str(item).strip())
+        if source_census_differences
+        else "源文件 Sheet 清单缺失或无法与解析结果对照"
+    )
+    if source_scope_unproven:
+        result.stats["source_scope_gate_reason"] = source_scope_reason
+        if result.status == "ok":
+            result.status = "partial"
     # ``partial`` 仍然保留原始网格供预览/人工映射，但所有结构性能力缺口
     # 必须沿导入链路落库并让工作表进入 pending；只有真正的 unsupported/
     # failed 才走“无可解析 Sheet”的失败分支。
@@ -1375,7 +1483,92 @@ def import_settlement_file(
 
     from jiadun.core.parsing.excel_parser import persist_parse_result
 
-    batch_id = persist_parse_result(conn, sf.file_id, result)
+    try:
+        batch_id = persist_parse_result(conn, sf.file_id, result, commit=False)
+    except excel_parser.ParseResultValidationError as exc:
+        # 解析器元数据（尤其是 Sheet 索引/网格坐标）不满足落库合同。
+        # 这类错误必须在首个 INSERT 前转换为一个无 Sheet 的 failed 批次，
+        # 保留失败 Evidence，同时绝不能把部分 raw_sheets/期次/明细留在库中。
+        error = f"{type(exc).__name__}: {exc}"
+        failed_result = excel_parser.ParseResult(
+            parser=result.parser,
+            status="failed",
+            stats={**result.stats, "validation_error": error},
+            error=error,
+        )
+        with run_contract._transaction(conn, "persist_parse_validation_failure"):
+            failed_batch_id = persist_parse_result(
+                conn, sf.file_id, failed_result, commit=False
+            )
+            evidence_api.add_evidence(
+                conn,
+                project_id,
+                "parse_failure",
+                f"文件「{sf.original_name}」解析结果元数据无效：{exc}",
+                steps=[
+                    {
+                        "step": "解析结果结构校验",
+                        "parser": result.parser,
+                        "status": "failed",
+                        "error": error,
+                    }
+                ],
+                sources=[
+                    {
+                        "file_id": sf.file_id,
+                        "batch_id": failed_batch_id,
+                        "location": "文件级 Sheet 索引/网格元数据",
+                        "original_name": sf.original_name,
+                    }
+                ],
+                commit=False,
+                scope="source",
+            )
+        run_contract.ensure_if_materialized(conn, project_id)
+        fallback = file_period or next_period_no(conn, project_id, direction)
+        return ImportReport(
+            sf.file_id,
+            failed_batch_id,
+            fallback,
+            -1,
+            "failed",
+            sheets=[
+                SheetReport(
+                    sf.original_name,
+                    "parse_failed",
+                    state_code="parse_failed",
+                    notes=[error],
+                )
+            ],
+            message=error,
+        )
+
+    if source_scope_unproven:
+        evidence_api.add_evidence(
+            conn,
+            project_id,
+            "source_sheet_scope_mismatch",
+            f"文件「{sf.original_name}」源文件 Sheet 范围无法证明完整：{source_scope_reason}",
+            steps=[
+                {
+                    "step": "源工作簿 Sheet 目录盘点",
+                    "status": source_census_status or "unavailable",
+                    "census": result.stats.get("source_census"),
+                    "parsed_sheet_count": len(result.sheets),
+                    "differences": source_census_differences,
+                }
+            ],
+            sources=[
+                {
+                    "file_id": sf.file_id,
+                    "batch_id": batch_id,
+                    "location": "文件级 Sheet 范围",
+                    "original_name": sf.original_name,
+                }
+            ],
+            commit=False,
+            scope="source",
+        )
 
     parse_partial = result.status == "partial"
     report = ImportReport(sf.file_id, batch_id, file_period or 0, -1, "partial")
@@ -1385,7 +1578,7 @@ def import_settlement_file(
     parsed_any = False
     form_routed = False
     role_gated = False
-    structural_gate = False
+    structural_gate = source_scope_unproven
     period_ids: set[int] = set()
     # 覆盖证明要绑定“整次导入完成后”的 Run Contract。导入过程中期次、
     # Sheet 和明细仍在逐步落库，若逐 Sheet 立即 ensure 契约，会把前半个
@@ -1433,7 +1626,8 @@ def import_settlement_file(
                       "表头存在歧义或识别不可靠（needs_review）" if needs_review_gate else
                       "未识别到数量（计量）列，结算清单结构不完整")
             _route_role_review(conn, project_id, sf.file_id, sheet_id, sheet.sheet_name,
-                               det.confidence if det else None, False, reason)
+                               det.confidence if det else None, False, reason,
+                               commit=False)
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "needs_role_review",
                 notes=[f"{reason}：未经人工确认角色前不写入结算模型；"
@@ -1472,6 +1666,12 @@ def import_settlement_file(
         data_merged_ranges = _data_merged_ranges(merged, detected_data_range)
         extraction_merged_ranges = _header_only_merged_ranges(merged, det.header_row_hi)
         structural_reasons = _structural_gate_reasons(sheet_meta, data_merged_ranges)
+        if source_scope_unproven:
+            structural_reasons.insert(
+                0,
+                "源文件 Sheet 清单与解析结果不一致，当前工作表取数范围需人工确认："
+                + source_scope_reason,
+            )
         range_evidence = {
             "method": range_method,
             "header_range": [det.header_row_lo, det.header_row_hi],
@@ -1590,34 +1790,44 @@ def import_settlement_file(
         else:
             pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id, direction)
         title = f"{src.stem}/{sheet.sheet_name}"
-        period_id = ensure_period(conn, project_id, pno, title, sf.file_id, direction, contract_party)
+        period_id = ensure_period(
+            conn,
+            project_id,
+            pno,
+            title,
+            sf.file_id,
+            direction,
+            contract_party,
+            commit=False,
+        )
         if structural_reasons:
             structural_gate = True
-        with conn:
-            conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
-            set_sheet_status(
-                conn, sheet_id, "pending" if structural_reasons else "confirmed",
-                reason=(
-                    "自动表头与数据范围已识别，但存在结构性证据缺口："
-                    + "；".join(structural_reasons)
-                    if structural_reasons
-                    else "自动表头与数据范围通过确定性规则识别并写入结算模型"
-                ),
-                actor="system",
-            )
-            conn.execute(
-                """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
-                   confidence, needs_review, data_row_start, data_row_end,
-                   data_range_status, data_range_method, data_range_evidence_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (sheet_id, det.header_row_lo, det.header_row_hi,
-                 json.dumps(det.col_map), det.confidence, int(det.needs_review),
-                 stored_start, stored_end, range_status, range_method,
-                 json.dumps(range_evidence, ensure_ascii=False)),
-            )
+        conn.execute("UPDATE raw_sheets SET period_id=? WHERE id=?", (period_id, sheet_id))
+        set_sheet_status(
+            conn, sheet_id, "pending" if structural_reasons else "confirmed",
+            reason=(
+                "自动表头与数据范围已识别，但存在结构性证据缺口："
+                + "；".join(structural_reasons)
+                if structural_reasons
+                else "自动表头与数据范围通过确定性规则识别并写入结算模型"
+            ),
+            actor="system",
+        )
+        conn.execute(
+            """INSERT INTO table_headers(sheet_id, header_row_lo, header_row_hi, col_map_json,
+               confidence, needs_review, data_row_start, data_row_end,
+               data_range_status, data_range_method, data_range_evidence_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (sheet_id, det.header_row_lo, det.header_row_hi,
+             json.dumps(det.col_map), det.confidence, int(det.needs_review),
+             stored_start, stored_end, range_status, range_method,
+             json.dumps(range_evidence, ensure_ascii=False)),
+        )
         period_ids.add(period_id)
 
-        extract_items.persist_line_items(conn, period_id, sheet_id, items)
+        extract_items.persist_line_items(
+            conn, period_id, sheet_id, items, commit=False
+        )
         pending_coverage_proofs.append({
             "file_id": sf.file_id,
             "batch_id": batch_id,
@@ -1660,15 +1870,18 @@ def import_settlement_file(
         report.status = "partial"
         report.needs_manual_review = True
         report.message = "non_settlement_form_needs_manual_review"
-    elif role_gated or form_routed:
+    elif role_gated or form_routed or source_scope_unproven:
         report.status = "partial"
         report.needs_manual_review = True
-        report.message = ("non_settlement_spreadsheet_needs_role_review" if role_gated
-                          else "non_settlement_form_needs_manual_review")
+        report.message = (
+            "non_settlement_spreadsheet_needs_role_review" if role_gated
+            else "non_settlement_form_needs_manual_review" if form_routed
+            else "source_sheet_scope_unproven"
+        )
     else:
         report.status = "failed"
         report.message = "no sheets parsed"
-    if parsed_any or role_gated or form_routed:
+    if parsed_any or role_gated or form_routed or source_scope_unproven:
         # 新导入既可能新增明细，也可能只新增待确认工作表；两者都会改变
         # 项目级校核前提，因此旧的最新结果必须重新计算。
         invalidate_crosscheck_results(conn, project_id)

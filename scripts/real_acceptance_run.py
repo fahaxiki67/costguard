@@ -16,9 +16,15 @@ import hashlib
 import json
 import platform
 import shutil
+import sys
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from jiadun.version import app_version  # noqa: E402
 
 BASE = Path(__file__).resolve().parents[1] / "local_private_data" / "real_acceptance"
 CORPUS = BASE / "corpus"
@@ -60,6 +66,7 @@ OVERALL_STATUS_ZH = {
     "pending_wps_with_findings": "有发现，待 WPS/Excel 复核",
     "needs_manual_review": "待人工复核",
     "parsed_needs_manual_review": "已解析，待人工来源复核",
+    "pending_source_data": "待补资料/源副本完整性待复核",
     "not_passed": "未通过",
 }
 EXECUTION_STATUS_ZH = {
@@ -75,6 +82,7 @@ SHEET_STATUS_ZH = {
     "duplicate_header": "表头重复，待人工复核",
 }
 WPS_STATUS_ZH = {"pending_manual": "待三环境人工复核", "not_applicable": "不适用"}
+ACCEPTANCE_MARKER_SCHEMA_VERSION = 1
 
 
 def _safe_report_note(value: object, *, max_chars: int = 60) -> str:
@@ -115,14 +123,7 @@ def _safe_support_limit(value: object) -> str:
 
 
 def jiadun_version() -> str:
-    # 旧版验收现场可能只带有 costguard dist-info。读取回退不改变当前
-    # 报告身份，只保证改名后的报告仍能记录可追溯的软件版本。
-    for distribution in ("jiadun", "costguard"):
-        try:
-            return version(distribution)
-        except PackageNotFoundError:
-            continue
-    return "source-checkout"
+    return app_version()
 
 
 def sha256_of(path: Path) -> str:
@@ -140,10 +141,165 @@ def verify_corpus(records: list[dict]) -> list[dict]:
     out = []
     for rec in records:
         p = BASE / rec["copy_path"]
-        actual = sha256_of(p) if p.exists() else None
-        out.append({**rec, "exists": p.exists(), "hash_before": actual,
-                    "hash_match": actual == rec["sha256"]})
+        exists = p.exists()
+        actual = None
+        hash_error = None
+        if exists:
+            try:
+                actual = sha256_of(p)
+            except OSError as exc:
+                hash_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        out.append({
+            **rec,
+            "exists": exists,
+            "hash_before": actual,
+            "hash_match": actual == rec["sha256"],
+            "hash_error": hash_error,
+        })
     return out
+
+
+def summarize_corpus_preflight(records: list[dict]) -> dict[str, object]:
+    """汇总验收副本预检状态，不抛出断言、不修改任何资料。
+
+    ``verify_corpus`` 已经把“文件不存在”和“哈希不符”分开记录；这里保留
+    两类 test_id，供执行器和报告统一判定。缺失/不一致是 ``pending``，不是
+    可继续计算的失败回退，也不应被解释为金额为零。
+    """
+    missing = [str(rec["test_id"]) for rec in records if not rec.get("exists")]
+    hash_mismatch = [
+        str(rec["test_id"])
+        for rec in records
+        if rec.get("exists") and not rec.get("hash_match")
+    ]
+    pending_ids = set(missing) | set(hash_mismatch)
+    return {
+        "status": "pending" if pending_ids else "ready",
+        "record_count": len(records),
+        "ready_count": len(records) - len(pending_ids),
+        "pending_count": len(pending_ids),
+        "missing_test_ids": missing,
+        "hash_mismatch_test_ids": hash_mismatch,
+    }
+
+
+def _pending_source_result(
+    rec: dict,
+    *,
+    reason: str | None = None,
+    message: str | None = None,
+) -> dict:
+    """为未通过副本完整性预检的文件建立 fail-closed 结果。
+
+    该结果刻意不包含任何解析、计算、匹配、异常或导出数据，避免把缺失
+    资料当作空文件继续运行。结构与 ``main`` 的 steps 口径保持一致，便于
+    UI、JSON 和 Markdown 报告统一展示，并支持后续补资料后续跑。
+    """
+    reason = reason or (
+        "missing" if not rec.get("exists")
+        else "hash_unreadable" if rec.get("hash_error")
+        else "hash_mismatch"
+    )
+    reason_zh = (
+        "验收副本缺失，待补资料"
+        if reason == "missing"
+        else "验收副本无法读取 SHA-256，待文件权限或占用复核"
+        if reason == "hash_unreadable"
+        else "验收副本在处理后发生变化，已使本次结果失效，待完整性复核"
+        if reason == "modified_after_processing"
+        else "验收副本在处理后缺失，已使本次结果失效，待补资料"
+        if reason == "missing_after_processing"
+        else "验收副本在处理后无法读取 SHA-256，已使本次结果失效，待权限或占用复核"
+        if reason == "hash_unreadable_after_processing"
+        else "验收副本 SHA-256 与 manifest 不一致，待完整性复核"
+    )
+    reason_zh = message or reason_zh
+    return {
+        "marker": _marker_metadata(rec),
+        "test_id": rec.get("test_id"),
+        "copy": Path(str(rec.get("copy_path", ""))).name,
+        "purpose": rec.get("purpose", ""),
+        "preflight": {
+            "status": "pending",
+            "reason": reason,
+            "copy_path": rec.get("copy_path"),
+            "exists": bool(rec.get("exists")),
+            "hash_match": bool(rec.get("hash_match")),
+            "expected_sha256": rec.get("sha256"),
+            "actual_sha256": rec.get("hash_before"),
+            "hash_error": rec.get("hash_error"),
+            "message": reason_zh,
+            "detected_after_processing": reason.endswith("_after_processing"),
+        },
+        "import": {
+            "ok": False,
+            "status": "pending_source_data",
+            "error": reason_zh,
+        },
+        "steps": {
+            "import": False,
+            "parse": False,
+            "compute": False,
+            "anomalies": False,
+            "matches": False,
+            "excel": False,
+            "word": False,
+            "wps": "not_applicable",
+            "technical_execution_complete": False,
+            "technical_execution_status": "not_run_or_incomplete",
+            "technical_validation_status": "not_run_or_incomplete",
+            "verification_level": "insufficient",
+            "range_unproven_sheets": 0,
+            "crosscheck_results_count": 0,
+            "ab_check_status": "not_applicable_or_not_run",
+            "control_status": "not_available",
+            "anomaly_status": "not_run",
+            "evidence_trace_status": "not_applicable_or_not_run",
+            "overall_acceptance_status": "pending_source_data",
+            "non_settlement_form_needs_manual_review": False,
+            "non_settlement_spreadsheet_needs_role_review": False,
+        },
+    }
+
+
+def _inspection_failure_result(
+    rec: dict, exc: Exception, *, stage: str = "inspect_file"
+) -> dict:
+    """把文件级未预期异常转换为可写入 marker 的 fail-closed 结果。"""
+    error = f"{type(exc).__name__}: {exc}"
+    return {
+        "marker": _marker_metadata(rec),
+        "test_id": rec.get("test_id"),
+        "copy": Path(str(rec.get("copy_path", ""))).name,
+        "category": rec.get("category", ""),
+        "purpose": rec.get("purpose", ""),
+        "source_evidence_status": rec.get("evidence_status", ""),
+        "import": {"ok": False, "status": "execution_failed", "error": error},
+        "pipeline_error": {"stage": stage, "error": error},
+        "steps": {
+            "import": False,
+            "parse": False,
+            "compute": False,
+            "anomalies": False,
+            "matches": False,
+            "excel": False,
+            "word": False,
+            "wps": "not_applicable",
+            "technical_execution_complete": False,
+            "technical_execution_status": "not_run_or_incomplete",
+            "technical_validation_status": "not_run_or_incomplete",
+            "verification_level": "insufficient",
+            "range_unproven_sheets": 0,
+            "crosscheck_results_count": 0,
+            "ab_check_status": "not_applicable_or_not_run",
+            "control_status": "not_available",
+            "anomaly_status": "not_run",
+            "evidence_trace_status": "not_applicable_or_not_run",
+            "overall_acceptance_status": "not_passed",
+            "non_settlement_form_needs_manual_review": False,
+            "non_settlement_spreadsheet_needs_role_review": False,
+        },
+    }
 
 
 def load_manual_decisions() -> dict[str, list[dict]]:
@@ -151,7 +307,7 @@ def load_manual_decisions() -> dict[str, list[dict]]:
     if not DECISIONS.exists():
         return {}
     data = json.loads(DECISIONS.read_text(encoding="utf-8"))
-    if data.get("version") != 1 or not isinstance(data.get("files"), dict):
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("files"), dict):
         raise ValueError("manual_sheet_decisions.json 格式无效：需要 version=1 与 files 对象")
     return data["files"]
 
@@ -161,6 +317,8 @@ def load_acceptance_controls() -> dict[str, dict]:
     if not DECISIONS.exists():
         return {}
     data = json.loads(DECISIONS.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("manual_sheet_decisions.json 格式无效：根节点必须为对象")
     controls = data.get("acceptance_controls", {})
     if not isinstance(controls, dict):
         raise ValueError("manual_sheet_decisions.json acceptance_controls 必须为对象")
@@ -219,9 +377,27 @@ def record_acceptance_controls(
     return recorded
 
 
-def write_acceptance_report(report: dict) -> Path:
-    """生成仅含验收状态与证据位置的本地报告，不复制私有原文。"""
+def write_acceptance_report(report: dict, output_path: Path | None = None) -> Path:
+    """生成仅含验收状态与证据位置的本地报告，不复制私有原文。
+
+    未指定路径时保留旧版脚本调用的 BASE 位置；正式运行由 ``main`` 传入
+    当前 run 目录，使每轮人读报告与 JSON 一起留存，避免覆盖历史记录。
+    """
     results = report["per_file"]
+    hash_check = report.get("hash_check") or {}
+    if hash_check.get("before_all_match") and hash_check.get("after_all_match"):
+        hash_note = "安全结论：原始副本前后哈希一致；未上传云端或 GitHub。"
+    elif hash_check.get("invalidated_results"):
+        invalidated = ", ".join(hash_check["invalidated_results"])
+        hash_note = (
+            "安全结论：处理后发现副本完整性变化；受影响结果（"
+            f"{invalidated}）已失效并降级为待补资料/复核，不得据此形成业务结论。"
+        )
+    else:
+        hash_note = (
+            "安全结论：副本完整性预检未全部通过；缺失或哈希不符项未进入计算，"
+            "不得据此形成业务结论。"
+        )
     lines = [
         "# 价盾（Jiadun）本地真实资料验收报告",
         "",
@@ -231,9 +407,33 @@ def write_acceptance_report(report: dict) -> Path:
         f"{report['environment']['machine']}，Python {report['environment']['python']}",
         f"- 测试副本数量：{len(results)}",
         "- 资料范围：仅 `local_private_data/real_acceptance/corpus/` 副本",
-        "- 安全结论：原始副本前后哈希一致；未上传云端或 GitHub。",
+        hash_note,
         "- 业务边界：自动计算结果仅为测试结果，不构成批准的结算、付款、责任或管理结论。",
         "",
+    ]
+    preflight = report.get("preflight") or {}
+    if preflight.get("status") == "pending":
+        missing = ", ".join(preflight.get("missing_test_ids") or []) or "无"
+        mismatch = ", ".join(preflight.get("hash_mismatch_test_ids") or []) or "无"
+        lines.extend([
+            "## 副本预检",
+            "",
+            "本轮资料集不完整或完整性未通过。缺失副本和哈希不符副本均未解析、"
+            "未计算、未匹配、未导出；补齐或校正后应重新运行。",
+            f"- 待补资料：{missing}",
+            f"- 哈希待复核：{mismatch}",
+            "",
+        ])
+    invalidated = hash_check.get("invalidated_results") or []
+    if invalidated:
+        lines.extend([
+            "## 处理后完整性复核",
+            "",
+            "以下副本在处理期间或处理后发生变化，原本生成的结果已经失效；需恢复经核验的只读副本后重新运行。",
+            f"- 已失效结果：{', '.join(str(test_id) for test_id in invalidated)}",
+            "",
+        ])
+    lines.extend([
         "## 总体状态",
         "",
         "技术流程与 WPS 人工门槛分列记录。对适用的表格导出，只要 WPS 尚未完成实际打开、"
@@ -241,7 +441,7 @@ def write_acceptance_report(report: dict) -> Path:
         "",
         "| 测试编号 | 导入 | 技术执行 | 技术校验 | 校核级别 | 取数范围未证明 | A/B独立复算 | C/源表控制 | 异常 | 证据链 | WPS | 整体状态 |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
-    ]
+    ])
     for rec in results:
         steps = rec.get("steps") or {}
         level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
@@ -332,6 +532,11 @@ def write_acceptance_report(report: dict) -> Path:
     for rec in results:
         steps = rec.get("steps") or {}
         limitations = []
+        if steps.get("overall_acceptance_status") == "pending_source_data":
+            preflight_rec = rec.get("preflight") or {}
+            limitations.append(
+                preflight_rec.get("message") or "源副本完整性未通过，待补资料/复核"
+            )
         if steps.get("overall_acceptance_status") in {
             "pending_wps", "pending_wps_with_findings"
         }:
@@ -373,9 +578,70 @@ def write_acceptance_report(report: dict) -> Path:
                   "以下仅列测试编号和 SHA-256，不复制原始路径或私有内容。", ""])
     for test_id, digest in sorted((report.get("corpus_sha256") or {}).items()):
         lines.append(f"- `{test_id}`：`{digest}`")
-    path = BASE / "LOCAL_ACCEPTANCE_REPORT.md"
+    path = Path(output_path) if output_path is not None else BASE / "LOCAL_ACCEPTANCE_REPORT.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
+
+
+def _rollback_acceptance_exports(
+    conn,
+    project_id: int,
+    generated_paths: list[Path],
+) -> list[str]:
+    """撤销成对导出失败时已经登记的临时成果。
+
+    Excel/Word 验收是一个整体：任一必需格式失败，不能让用户在 exports
+    目录中看到只完成一半的成果。物理文件只删除本次调用明确生成的路径，
+    数据库登记保留为 ``stale`` 以便审计，不删除历史记录。
+    """
+    cleanup_errors: list[str] = []
+    for path in generated_paths:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_errors.append(f"删除 {Path(path).name} 失败：{type(exc).__name__}: {exc}")
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE export_runs SET status='stale' "
+                    "WHERE project_id=? AND path=? AND status='current'",
+                    (int(project_id), str(path)),
+                )
+        except Exception as exc:  # noqa: BLE001 - 清理失败必须继续记录其余路径
+            cleanup_errors.append(
+                f"标记 {Path(path).name} 失效失败：{type(exc).__name__}: {exc}"
+            )
+    return cleanup_errors
+
+
+def _export_snapshot(export_dir: Path) -> set[str]:
+    """返回导出目录内文件的相对 POSIX 路径快照。
+
+    不能只保存 ``Path.name``：不同嵌套目录可以合法地包含同名导出文件，
+    仅按 basename 比较会把本次新文件误判为历史文件，进而留下半成品。
+    """
+    if not export_dir.is_dir():
+        return set()
+    return {
+        path.relative_to(export_dir).as_posix()
+        for path in export_dir.rglob("*")
+        if path.is_file()
+    }
+
+
+def _new_export_files(export_dir: Path, existing_paths: set[str]) -> list[Path]:
+    """列出本次导出调用新出现的文件（含写半文件后抛异常的现场）。"""
+    if not export_dir.is_dir():
+        return []
+    return sorted(
+        (
+            path for path in export_dir.rglob("*")
+            if path.is_file()
+            and path.relative_to(export_dir).as_posix() not in existing_paths
+        ),
+        key=lambda path: str(path),
+    )
 
 
 def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
@@ -641,50 +907,120 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                 rec["dual_path_check"] = {"error": f"{type(exc).__name__}: {exc}"}
 
             # ---- 异常 + 匹配 ----
-            from jiadun.core.anomalies import engine as anomaly_engine
-            from jiadun.core.matching import matching
-            anomaly_engine.run_anomalies(conn, info.project_id)
-            controls_recorded = record_acceptance_controls(
-                conn, info.project_id, acceptance_controls
-            )
-            if controls_recorded:
-                rec["acceptance_controls"] = controls_recorded
-            sev: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "info": 0}
-            by_rule: dict[str, int] = {}
-            anomaly_rows = conn.execute(
-                "SELECT severity, rule_id FROM anomalies WHERE project_id=?",
-                (info.project_id,),
-            ).fetchall()
-            for finding in anomaly_rows:
-                sev[finding["severity"]] = sev.get(finding["severity"], 0) + 1
-                by_rule[finding["rule_id"]] = by_rule.get(finding["rule_id"], 0) + 1
-            rec["anomalies"] = {"total": len(anomaly_rows), **sev,
-                                "top_rules": dict(sorted(by_rule.items(), key=lambda kv: -kv[1])[:8])}
-            groups = matching.match_items(conn, info.project_id)
-            matching.save_matches(conn, info.project_id, groups)
-            levels: dict[str, int] = {}
-            for g in groups:
-                levels[g.level] = levels.get(g.level, 0) + 1
-            rec["matches"] = {
-                "total": len(groups),
-                "automated_level_counts": levels,
-                "human_review_status": "pending",
-            }
+            try:
+                from jiadun.core.anomalies import engine as anomaly_engine
+
+                anomaly_engine.run_anomalies(conn, info.project_id)
+                sev: dict[str, int] = {"high": 0, "medium": 0, "low": 0, "info": 0}
+                by_rule: dict[str, int] = {}
+                anomaly_rows = conn.execute(
+                    "SELECT severity, rule_id FROM anomalies WHERE project_id=?",
+                    (info.project_id,),
+                ).fetchall()
+                for finding in anomaly_rows:
+                    sev[finding["severity"]] = sev.get(finding["severity"], 0) + 1
+                    by_rule[finding["rule_id"]] = by_rule.get(finding["rule_id"], 0) + 1
+                rec["anomalies"] = {
+                    "total": len(anomaly_rows),
+                    **sev,
+                    "top_rules": dict(sorted(by_rule.items(), key=lambda kv: -kv[1])[:8]),
+                }
+            except Exception as exc:  # noqa: BLE001 - 验收需记录阶段失败并可恢复
+                rec["anomalies"] = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                rec["pipeline_error"] = {
+                    "stage": "anomalies",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return rec
+
+            try:
+                controls_recorded = record_acceptance_controls(
+                    conn, info.project_id, acceptance_controls
+                )
+                if controls_recorded:
+                    rec["acceptance_controls"] = controls_recorded
+            except Exception as exc:  # noqa: BLE001 - 保留人工控制值失败原因
+                rec["pipeline_error"] = {
+                    "stage": "acceptance_controls",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return rec
+
+            try:
+                from jiadun.core.matching import matching
+
+                groups = matching.match_items(conn, info.project_id)
+                matching.save_matches(conn, info.project_id, groups)
+                levels: dict[str, int] = {}
+                for g in groups:
+                    levels[g.level] = levels.get(g.level, 0) + 1
+                rec["matches"] = {
+                    "total": len(groups),
+                    "automated_level_counts": levels,
+                    "human_review_status": "pending",
+                }
+            except Exception as exc:  # noqa: BLE001 - 单文件失败不应中断整批
+                rec["matches"] = {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                rec["pipeline_error"] = {
+                    "stage": "matching",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return rec
 
             # ---- 导出（Excel 审核底稿 + Word 管理层摘要）----
             from jiadun.core.export import excel_export
+            export_dir = pdir / "exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            generated_exports: list[Path] = []
+            before_excel_exports = _export_snapshot(export_dir)
             try:
-                xlsx = excel_export.export_workbook(conn, info.project_id, pdir / "exports")
-                rec["export"] = {"xlsx": xlsx.name}
+                xlsx = excel_export.export_workbook(conn, info.project_id, export_dir)
+                generated_exports.append(Path(xlsx))
             except Exception as exc:  # noqa: BLE001
+                generated_exports.extend(_new_export_files(export_dir, before_excel_exports))
+                cleanup_errors = _rollback_acceptance_exports(
+                    conn, info.project_id, generated_exports
+                )
                 rec["export"] = {"error": f"{type(exc).__name__}: {exc}"}
+                rec["export"]["cleanup"] = "completed" if not cleanup_errors else "failed"
+                if cleanup_errors:
+                    rec["export"]["cleanup_errors"] = cleanup_errors
+                rec["pipeline_error"] = {
+                    "stage": "export_excel",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
                 return rec
+            before_word_exports = _export_snapshot(export_dir)
             try:
                 docx = excel_export.export_management_summary_docx(
-                    conn, info.project_id, pdir / "exports")
-                rec["export"]["docx"] = docx.name
+                    conn, info.project_id, export_dir)
+                generated_exports.append(Path(docx))
             except Exception as exc:  # noqa: BLE001
-                rec["export"]["docx_error"] = f"{type(exc).__name__}: {exc}"
+                generated_exports.extend(_new_export_files(export_dir, before_word_exports))
+                cleanup_errors = _rollback_acceptance_exports(
+                    conn, info.project_id, generated_exports
+                )
+                rec["export"] = {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "cleanup": "completed" if not cleanup_errors else "failed",
+                }
+                if cleanup_errors:
+                    rec["export"]["cleanup_errors"] = cleanup_errors
+                rec["pipeline_error"] = {
+                    "stage": "export_word",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                return rec
+            rec["export"] = {
+                "xlsx": generated_exports[0].name,
+                "docx": generated_exports[1].name,
+            }
             evidence_count = conn.execute(
                 "SELECT COUNT(*) c FROM evidence WHERE project_id=?", (info.project_id,)
             ).fetchone()["c"]
@@ -765,6 +1101,89 @@ def classify_technical_validation(
     return "passed"
 
 
+def _marker_metadata(rec: dict) -> dict[str, object]:
+    """返回与 manifest 记录绑定的 marker 身份。
+
+    marker 文件位于可恢复的本地 run 目录，不能只依赖文件名判断归属；把
+    test_id、相对副本路径和 manifest SHA 一并写入，避免合法 JSON 的错位或
+    半写入结果被另一个 test 复用。
+    """
+    return {
+        "schema_version": ACCEPTANCE_MARKER_SCHEMA_VERSION,
+        "test_id": str(rec.get("test_id") or ""),
+        "copy_path": str(rec.get("copy_path") or ""),
+        "source_sha256": str(rec.get("sha256") or "").lower(),
+        "manifest_version": 1,
+    }
+
+
+def _done_marker_is_reusable(previous: object, rec: dict | None = None) -> bool:
+    """判断续跑时是否可以安全复用既有 marker。
+
+    ``done`` 目录既保存成功结果，也保存文件级失败/待人工记录。失败记录
+    不能被当成“已完成”永久跳过，否则用户修复输入或人工决定后重新运行同一
+    ``run_dir`` 仍会看见旧错误，形成操作锁死。只有没有 pipeline_error、且
+    已达到一个可复用的终态时才跳过；源副本 pending 由主循环单独处理。
+    """
+    if not isinstance(previous, dict) or not isinstance(rec, dict):
+        return False
+    marker = previous.get("marker")
+    expected_marker = _marker_metadata(rec)
+    if not isinstance(marker, dict) or any(
+        marker.get(key) != value for key, value in expected_marker.items()
+    ):
+        return False
+    if previous.get("pipeline_error"):
+        return False
+    steps = previous.get("steps")
+    if not isinstance(steps, dict):
+        return False
+    required_step_keys = {
+        "import", "parse", "compute", "anomalies", "matches", "excel", "word",
+        "technical_execution_complete", "technical_execution_status",
+        "technical_validation_status", "verification_level", "overall_acceptance_status",
+    }
+    if not required_step_keys.issubset(steps):
+        return False
+    import_result = previous.get("import")
+    if not isinstance(import_result, dict) or import_result.get("ok") is not True:
+        return False
+    allowed_overall = {
+        "pending_wps", "pending_wps_with_findings", "needs_manual_review",
+        "parsed_needs_manual_review",
+    }
+    overall = steps.get("overall_acceptance_status")
+    if overall not in allowed_overall:
+        return False
+    if steps.get("technical_execution_complete") is True:
+        return all(steps.get(key) is True for key in (
+            "import", "parse", "compute", "anomalies", "matches", "excel", "word",
+        )) and steps.get("technical_execution_status") == "settlement_pipeline_complete"
+    # 文本文件没有结算技术执行链，但解析结果可作为当前 run 的可复用现场；
+    # 仍要求导入成功，避免把损坏/半写入 marker 当成完成。
+    if (
+        isinstance(previous.get("text_parse"), dict)
+        and previous["text_parse"].get("ok") is True
+        and steps.get("parse") is True
+        and steps.get("overall_acceptance_status") == "parsed_needs_manual_review"
+    ):
+        return True
+    # 保留既有“结构化待人工结果可复用”的续跑语义（例如非结算表单）；
+    # 这类结果不是执行失败，人工决定更新后可通过新 run 或删除其 marker
+    # 重新进入。真正的阶段/输入失败均带 pipeline_error，已在上面强制重试。
+    settlement_parse = previous.get("settlement_parse")
+    if not isinstance(settlement_parse, dict):
+        return False
+    # 仅复用明确的“已导入但待人工角色/范围确认”结构；未知字段组合一律
+    # 重新执行，避免合法但截断的 marker 永久锁住旧结果。
+    return (
+        settlement_parse.get("status") == "partial"
+        and settlement_parse.get("needs_manual_review") is True
+        and overall == "needs_manual_review"
+        and steps.get("technical_execution_complete") is False
+    )
+
+
 def main(run_dir: Path | None = None) -> None:
     """非破坏性验收执行：时间戳 run 目录 + 可恢复重跑。
 
@@ -774,8 +1193,17 @@ def main(run_dir: Path | None = None) -> None:
     """
 
     now = datetime.now()
-    manual_by_test = load_manual_decisions()
-    controls_by_test = load_acceptance_controls()
+    decisions_error: Exception | None = None
+    try:
+        manual_by_test = load_manual_decisions()
+        controls_by_test = load_acceptance_controls()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError) as exc:
+        # 人工决定文件属于可修复的运行输入；损坏时不能在批次入口裸抛异常，
+        # 也不能把旧决定当成有效确认。后续每个可处理文件都会留下统一的
+        # execution_failed marker，用户修复文件后可用同一入口重新开始。
+        manual_by_test = {}
+        controls_by_test = {}
+        decisions_error = exc
     with open(MANIFEST, encoding="utf-8") as f:
         records_raw = list(csv.DictReader(f))
     # 语料集允许增长（如 T 系列真实新增副本），但必须不少于最初 13 行且 id 唯一，
@@ -785,8 +1213,7 @@ def main(run_dir: Path | None = None) -> None:
     assert len(_ids) == len(set(_ids)), f"manifest test_id 存在重复：{_ids}"
 
     pre = verify_corpus(records_raw)
-    bad = [r for r in pre if not r["hash_match"] or not r["exists"]]
-    assert not bad, f"哈希不符或缺失: {[r['test_id'] for r in bad]}"
+    preflight = summarize_corpus_preflight(pre)
 
     WORK.mkdir(parents=True, exist_ok=True)
     # 旧版平铺结构一次性归档（mv 保留，不删除）
@@ -807,16 +1234,63 @@ def main(run_dir: Path | None = None) -> None:
     for rec in pre:
         done_marker = run_dir / "done" / f"{rec['test_id']}.json"
         if done_marker.exists():  # 可恢复重跑：跳过已完成
-            results.append(json.loads(done_marker.read_text(encoding="utf-8")))
+            try:
+                previous = json.loads(done_marker.read_text(encoding="utf-8"))
+                if not isinstance(previous, dict):
+                    raise ValueError("done marker 根节点必须为对象")
+            except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError) as exc:
+                result = _inspection_failure_result(rec, exc, stage="done_marker")
+                done_marker.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                results.append(result)
+                continue
+            # 每次续跑先重新执行副本预检。即使旧 marker 看似已完成，当前
+            # 副本一旦缺失、不可读或哈希不符，也必须降级为 pending，不能
+            # 把旧的解析/计算结果继续暴露为本轮结果。
+            if not rec.get("exists") or not rec.get("hash_match"):
+                result = _pending_source_result(rec)
+                done_marker.write_text(
+                    json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                results.append(result)
+                continue
+            # 来源预检 pending 不是永久完成：用户补齐或校正副本后，
+            # 同一 run 续跑应允许重新进入完整流程。失败/待人工 marker
+            # 也不能永久跳过，修复输入或决定后应能重新开始；仅复用明确
+            # 达到可复用终态的结果，且不重复计算或覆盖现场。
+            if (previous.get("preflight") or {}).get("status") != "pending":
+                if _done_marker_is_reusable(previous, rec):
+                    results.append(previous)
+                    continue
+        if not rec.get("exists") or not rec.get("hash_match"):
+            result = _pending_source_result(rec)
+            done_marker.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            results.append(result)
             continue
         copy = BASE / rec["copy_path"]
-        result = inspect_file(
-            rec["test_id"], rec["purpose"], copy, run_dir,
-            category=rec.get("category", ""),
-            evidence_status=rec.get("evidence_status", ""),
-            manual_decisions=manual_by_test.get(rec["test_id"]),
-            acceptance_controls=controls_by_test.get(rec["test_id"]),
-        )
+        if decisions_error is not None:
+            result = _inspection_failure_result(rec, decisions_error, stage="manual_decisions")
+        else:
+            try:
+                result = inspect_file(
+                    rec["test_id"], rec["purpose"], copy, run_dir,
+                    category=rec.get("category", ""),
+                    evidence_status=rec.get("evidence_status", ""),
+                    manual_decisions=manual_by_test.get(rec["test_id"]),
+                    acceptance_controls=controls_by_test.get(rec["test_id"]),
+                )
+            except Exception as exc:  # noqa: BLE001 - 单文件异常必须可记录、可续跑
+                result = _inspection_failure_result(rec, exc)
+        if isinstance(result, dict):
+            # 统一由 manifest 记录补齐 marker 身份；inspect_file 也可被测试
+            # 或外部脚本直接调用，因此不能依赖其内部猜测 SHA/相对路径。
+            result["marker"] = _marker_metadata(rec)
         # 分步状态（监督要求分列，文本只解析不算完整流程成功）
         imp = result.get("import", {})
         file_type = imp.get("file_type")
@@ -958,12 +1432,46 @@ def main(run_dir: Path | None = None) -> None:
         results.append(result)
 
     post = verify_corpus(records_raw)
-    modified = [r["test_id"] for r in post if r["hash_before"] != r["sha256"]]
+    modified = [
+        r["test_id"]
+        for r in post
+        if r.get("exists")
+        and r.get("hash_before") is not None
+        and r["hash_before"] != r["sha256"]
+    ]
+    post_by_id = {str(record["test_id"]): record for record in post}
+    invalidated_results: list[str] = []
+    for index, result in enumerate(results):
+        test_id = str(result.get("test_id"))
+        post_record = post_by_id.get(test_id)
+        if post_record is None or (
+            post_record.get("exists") and post_record.get("hash_match")
+        ):
+            continue
+        # 预检阶段已经 pending 的副本没有进入处理，不需要重复标记；只有
+        # 真正生成过解析/计算结果的文件才在处理后完整性变化时失效。
+        if (result.get("preflight") or {}).get("status") == "pending":
+            continue
+        if not post_record.get("exists"):
+            reason = "missing_after_processing"
+        elif post_record.get("hash_error"):
+            reason = "hash_unreadable_after_processing"
+        else:
+            reason = "modified_after_processing"
+        invalidated = _pending_source_result(post_record, reason=reason)
+        invalidated["preflight"]["previous_result_invalidated"] = True
+        results[index] = invalidated
+        (run_dir / "done" / f"{test_id}.json").write_text(
+            json.dumps(invalidated, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        invalidated_results.append(test_id)
 
     version_value = jiadun_version()
     report = {
         "generated_at": now.isoformat(timespec="seconds"),
         "run_dir": str(run_dir),
+        "preflight": preflight,
         "environment": {
             "jiadun_version": version_value,
             # 旧验收结果读取器仍查找 costguard_version；保留为只读兼容别名，
@@ -976,13 +1484,16 @@ def main(run_dir: Path | None = None) -> None:
         },
         "hash_check": {"before_all_match": all(r["hash_match"] for r in pre),
                        "after_all_match": all(r["hash_match"] for r in post),
-                       "modified_copies": modified},
+                       "modified_copies": modified,
+                       "invalidated_results": invalidated_results},
         "corpus_sha256": {r["test_id"]: r["hash_before"] for r in post},
         "per_file": results,
     }
     (run_dir / "acceptance_results.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    acceptance_report = write_acceptance_report(report)
+    acceptance_report = write_acceptance_report(
+        report, run_dir / "LOCAL_ACCEPTANCE_REPORT.md"
+    )
     technical = sum(
         1 for r in results if (r.get("steps") or {}).get("technical_execution_complete")
     )

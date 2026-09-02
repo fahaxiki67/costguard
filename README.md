@@ -11,8 +11,8 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.16 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.16
+> **Status: v0.1.17 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.17
 > candidate tightens A/B/C independence, raw-range coverage, formula/filter/merge/hidden
 > structure and the `.xls` capability boundary, while retaining blank-by-default startup,
 > direct file/folder import, drag-and-drop intake, immutable run identities, per-sheet coverage
@@ -20,7 +20,7 @@ Excel import → field standardization → quantity/unit-price/amount checks
 > versions, BOQ differences and historical price hints. It also includes the v0.1.13
 > Windows symlink-test guards and cross-platform demo determinism. Real WPS/Excel environment verification,
 > sanitized real-case regression and production signing remain open release gates.
-> See the [release notes](docs/RELEASE_NOTES_v0.1.16.md) and the
+> See the [release notes](docs/RELEASE_NOTES_v0.1.17.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -111,9 +111,14 @@ uv run python scripts/performance_benchmark.py --sizes 10000 50000 200000
 uv run python scripts/release_consistency_check.py
 ```
 
+The synthetic benchmark removes its reproducible workspace after a successful run
+by default. When the report is used as release evidence or needs external review,
+add `--keep-workspace` so the generated inputs, database and XLSX exports remain
+available for hash and ZIP validation.
+
 The target-machine performance measurements, WPS/Excel checks, signing and
 notarization, recovery tests and real-case regression remain open release
-gates for v0.1.16.
+gates for v0.1.17.
 
 ## Rename and compatibility
 

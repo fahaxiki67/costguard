@@ -438,6 +438,25 @@ def _sheet_structural_risks(
     reasons: list[str] = []
     if det is None or confirmed is None or data_range is None:
         return ["表头或数据范围无法确认"]
+    # 解析入口保存的源工作簿 Sheet 目录是本路径的独立范围证据。若目录
+    # 与落库的 raw_sheets 不一致或不可用，不能因当前剩余 Sheet 的金额相等
+    # 就把取数范围当作完整；把差异直接提升为结构性风险。
+    row_keys = set(sheet_row.keys()) if hasattr(sheet_row, "keys") else set()
+    batch_stats = _json_value(
+        sheet_row["batch_stats_json"] if "batch_stats_json" in row_keys else None,
+        {},
+    )
+    if isinstance(batch_stats, dict):
+        source_scope_status = str(batch_stats.get("source_census_status") or "")
+        if source_scope_status and source_scope_status != "complete":
+            differences = batch_stats.get("source_census_differences", [])
+            if not isinstance(differences, list):
+                differences = [str(differences)]
+            detail = "；".join(str(item) for item in differences if str(item).strip())
+            reasons.append(
+                "源文件 Sheet 范围与解析落库不一致或不可用"
+                + (f"（{detail}）" if detail else "，不能证明取数范围完整")
+            )
     evidence = _json_value(confirmed["data_range_evidence_json"], {})
     if not isinstance(evidence, dict):
         evidence = {}
@@ -1433,7 +1452,7 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
                   rs.filter_state, rs.filter_conditions_json,
                   rs.formula_metadata_json, rs.merged_ranges_json,
                   pb.id AS batch_id, sf.id AS file_id, sf.original_name,
-                  sf.sha256 AS file_sha256
+                  sf.sha256 AS file_sha256, pb.stats_json AS batch_stats_json
              FROM raw_sheets rs
              LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
              LEFT JOIN source_files sf ON sf.id=pb.file_id

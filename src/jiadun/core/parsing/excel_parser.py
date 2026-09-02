@@ -11,10 +11,15 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import posixpath
+import re
 import sqlite3
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from xml.etree import ElementTree
 
 from jiadun.core.engine.money import NotANumberError, to_decimal
 
@@ -67,6 +72,60 @@ class ParseResult:
     sheets: list[SheetRecord] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     error: str = ""
+
+
+class ParseResultValidationError(ValueError):
+    """解析结果元数据不满足可安全落库的结构合同。"""
+
+
+def _validate_parse_result_for_persistence(result: ParseResult) -> None:
+    """在任何 INSERT 之前校验 Sheet 身份、网格范围和逐格坐标。"""
+    errors: list[str] = []
+    indices: list[int] = []
+    for position, sheet in enumerate(result.sheets):
+        index = sheet.sheet_index
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            errors.append(f"第{position + 1}个 Sheet 的 sheet_index 无效：{index!r}")
+            continue
+        indices.append(index)
+        valid_grid = (
+            isinstance(sheet.n_rows, int)
+            and not isinstance(sheet.n_rows, bool)
+            and sheet.n_rows >= 0
+            and isinstance(sheet.n_cols, int)
+            and not isinstance(sheet.n_cols, bool)
+            and sheet.n_cols >= 0
+        )
+        if not valid_grid:
+            errors.append(
+                f"Sheet「{sheet.sheet_name}」声明网格无效："
+                f"{sheet.n_rows!r}×{sheet.n_cols!r}"
+            )
+            continue
+        for cell in sheet.cells:
+            if (
+                isinstance(cell.row, bool)
+                or not isinstance(cell.row, int)
+                or cell.row < 1
+                or cell.row > int(sheet.n_rows)
+                or isinstance(cell.col, bool)
+                or not isinstance(cell.col, int)
+                or cell.col < 1
+                or cell.col > int(sheet.n_cols)
+            ):
+                errors.append(
+                    f"Sheet「{sheet.sheet_name}」存在超出声明网格的原始单元格："
+                    f"行{cell.row}列{cell.col}（网格 {sheet.n_rows}×{sheet.n_cols}）"
+                )
+                # 记录每个 Sheet 的第一处越界即可，避免异常文本膨胀。
+                break
+    expected = list(range(len(result.sheets)))
+    if indices != expected or len(indices) != len(set(indices)):
+        errors.append(
+            f"解析结果 Sheet 索引必须从 0 开始连续且唯一：实际={indices}，期望={expected}"
+        )
+    if errors:
+        raise ParseResultValidationError("；".join(dict.fromkeys(errors)))
 
 
 def _num_stored_as_text(value) -> bool:
@@ -440,6 +499,364 @@ def parse_csv(path: Path) -> ParseResult:
 UNSUPPORTED = {"pdf", "doc", "docx", "image"}
 
 
+_OOXML_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_OOXML_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_OOXML_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_CELL_REF_RE = re.compile(r"^\$?([A-Za-z]+)\$?([0-9]+)$")
+
+
+def _column_number(label: str) -> int:
+    value = 0
+    for char in label.upper():
+        value = value * 26 + ord(char) - ord("A") + 1
+    return value
+
+
+def _dimension_shape(ref: str | None) -> tuple[int, int] | None:
+    """将 OOXML dimension 的末端单元格转换为最大行/列。"""
+    if not ref:
+        return None
+    endpoint = str(ref).split(":")[-1].strip()
+    match = _CELL_REF_RE.fullmatch(endpoint)
+    if match is None:
+        return None
+    return int(match.group(2)), _column_number(match.group(1))
+
+
+def _column_label(number: int) -> str:
+    """把 1-based 列号转回 OOXML 使用范围可读的列名。"""
+    if number <= 0:
+        return "A"
+    chars: list[str] = []
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        chars.append(chr(ord("A") + remainder))
+    return "".join(reversed(chars))
+
+
+def _worksheet_shape(worksheet_root: ElementTree.Element) -> tuple[str | None, tuple[int, int] | None, str]:
+    """读取 worksheet 的使用范围；没有 dimension 时独立扫描 row/c。"""
+    dimension = worksheet_root.find(f"{{{_OOXML_MAIN_NS}}}dimension")
+    dimension_ref = str(dimension.attrib.get("ref")) if dimension is not None else None
+    shape = _dimension_shape(dimension_ref)
+    if shape is not None:
+        return dimension_ref, shape, "dimension"
+
+    min_row: int | None = None
+    max_row: int | None = None
+    min_col: int | None = None
+    max_col: int | None = None
+    sheet_data = worksheet_root.find(f"{{{_OOXML_MAIN_NS}}}sheetData")
+    for row in list(sheet_data) if sheet_data is not None else []:
+        try:
+            row_number = int(row.attrib.get("r", ""))
+        except (TypeError, ValueError):
+            continue
+        for cell in row.findall(f"{{{_OOXML_MAIN_NS}}}c"):
+            ref = cell.attrib.get("r")
+            match = _CELL_REF_RE.fullmatch(str(ref or ""))
+            if match is None:
+                continue
+            col_number = _column_number(match.group(1))
+            cell_row = int(match.group(2))
+            min_row = cell_row if min_row is None else min(min_row, cell_row)
+            max_row = cell_row if max_row is None else max(max_row, cell_row)
+            min_col = col_number if min_col is None else min(min_col, col_number)
+            max_col = col_number if max_col is None else max(max_col, col_number)
+        # A row without cells still proves that this row exists, but not a
+        # business column. Keep it only when at least one cell is found in the
+        # worksheet; an entirely empty sheet remains range-unproven.
+        if min_row is not None:
+            min_row = min(min_row, row_number)
+            max_row = max(max_row or row_number, row_number)
+    if min_row is None or max_row is None or min_col is None or max_col is None:
+        return None, None, "unavailable"
+    fallback_ref = (
+        f"{_column_label(min_col)}{min_row}:{_column_label(max_col)}{max_row}"
+    )
+    return fallback_ref, (max_row, max_col), "row_cell_scan"
+
+
+def _worksheet_content_fingerprint(
+    worksheet_root: ElementTree.Element,
+) -> tuple[int, int, str]:
+    """独立统计源 Sheet 的有值单元格与物理行坐标。
+
+    ``dimension`` 只描述最大范围，无法发现“尺寸不变但中间漏掉一行”的
+    解析错误。这里只依据 OOXML 中带值/公式的 ``c`` 节点生成坐标指纹，
+    不解析业务字段、公式结果或 shared string 内容，避免与主解析器共享
+    行分类逻辑；解析结果落库前再用同一坐标口径对照。
+    """
+    sheet_data = worksheet_root.find(f"{{{_OOXML_MAIN_NS}}}sheetData")
+    coordinates: list[str] = []
+    row_numbers: set[int] = set()
+    for row in list(sheet_data) if sheet_data is not None else []:
+        for cell in row.findall(f"{{{_OOXML_MAIN_NS}}}c"):
+            ref = cell.attrib.get("r")
+            match = _CELL_REF_RE.fullmatch(str(ref or ""))
+            if match is None:
+                continue
+            formula = cell.find(f"{{{_OOXML_MAIN_NS}}}f")
+            value_nodes = (
+                cell.find(f"{{{_OOXML_MAIN_NS}}}v"),
+                cell.find(f"{{{_OOXML_MAIN_NS}}}is"),
+            )
+            has_value = any(
+                node is not None
+                and any(str(text or "").strip() for text in node.itertext())
+                for node in value_nodes
+            )
+            if formula is None and not has_value:
+                continue
+            row_number = int(match.group(2))
+            coordinate = f"{row_number}:{_column_number(match.group(1))}"
+            coordinates.append(coordinate)
+            row_numbers.add(row_number)
+    coordinates.sort()
+    digest = hashlib.sha256("\n".join(coordinates).encode("utf-8")).hexdigest()
+    return len(coordinates), len(row_numbers), digest
+
+
+def _ooxml_part_target(target: str) -> str:
+    """将 workbook 关系目标规范化为 ZIP 内部的绝对部件路径。"""
+    target = str(target or "").replace("\\", "/")
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join("xl", target))
+
+
+def _source_xlsx_census(path: Path) -> dict[str, object]:
+    """从 OOXML 包目录独立盘点源工作簿的 Sheet 顺序与使用范围。
+
+    该过程不调用 ``parse_xlsx``、不读取解析后的 ``SheetRecord``，只读取
+    源文件中的 workbook.xml、关系文件和各 worksheet 的 dimension；若某些
+    生成器省略 dimension，则由 worksheet 的 row/c 坐标独立推导使用范围。
+    这样即使解析器共同漏掉整张 Sheet，入口仍能以源文件清单发现范围不一致。
+    """
+    workbook_part = "xl/workbook.xml"
+    rels_part = "xl/_rels/workbook.xml.rels"
+    with zipfile.ZipFile(path) as package:
+        workbook_root = ElementTree.fromstring(package.read(workbook_part))
+        rels_root = ElementTree.fromstring(package.read(rels_part))
+        relationships = {
+            rel.attrib.get("Id", ""): _ooxml_part_target(rel.attrib.get("Target", ""))
+            for rel in rels_root.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
+        }
+        sheets: list[dict[str, object]] = []
+        sheets_root = workbook_root.find(f"{{{_OOXML_MAIN_NS}}}sheets")
+        for index, sheet in enumerate(
+            list(sheets_root) if sheets_root is not None else [], start=0
+        ):
+            rel_id = sheet.attrib.get(f"{{{_OOXML_REL_NS}}}id", "")
+            target = relationships.get(rel_id)
+            if not target or target not in package.namelist():
+                raise ValueError(f"Sheet 关系缺失：{sheet.attrib.get('name', '')}")
+            worksheet_root = ElementTree.fromstring(package.read(target))
+            dimension_ref, shape, range_method = _worksheet_shape(worksheet_root)
+            populated_cell_count, populated_row_count, content_digest = (
+                _worksheet_content_fingerprint(worksheet_root)
+            )
+            sheets.append({
+                "sheet_index": index,
+                "sheet_name": str(sheet.attrib.get("name", "")),
+                "relationship_id": rel_id,
+                "part": target,
+                "dimension": dimension_ref,
+                "range_status": "available" if shape is not None else "unavailable",
+                "range_method": range_method,
+                "n_rows": shape[0] if shape is not None else None,
+                "n_cols": shape[1] if shape is not None else None,
+                "populated_cell_count": populated_cell_count,
+                "populated_row_count": populated_row_count,
+                "populated_coordinate_sha256": content_digest,
+            })
+    return {
+        "method": "ooxml_zip_directory",
+        "status": "available",
+        "file_type": "xlsx",
+        "sheet_count": len(sheets),
+        "sheets": sheets,
+    }
+
+
+def _source_csv_census(path: Path) -> dict[str, object]:
+    rows = 0
+    cols = 0
+    with open(path, encoding="utf-8-sig", newline="") as handle:
+        for row in csv.reader(handle):
+            rows += 1
+            cols = max(cols, len(row))
+    return {
+        "method": "csv_source_scan",
+        "status": "available",
+        "file_type": "csv",
+        "sheet_count": 1,
+        "sheets": [{
+            "sheet_index": 0,
+            "sheet_name": path.stem,
+            "n_rows": rows,
+            "n_cols": cols,
+            "range_status": "available",
+        }],
+    }
+
+
+def _source_xls_census(path: Path) -> dict[str, object]:
+    """盘点旧式 XLS 的工作表目录；结构能力仍由主解析器降级处理。"""
+    import xlrd
+
+    book = xlrd.open_workbook(str(path), on_demand=True)
+    try:
+        sheets = [
+            {
+                "sheet_index": index,
+                "sheet_name": str(book.sheet_by_index(index).name),
+                "n_rows": int(book.sheet_by_index(index).nrows),
+                "n_cols": int(book.sheet_by_index(index).ncols),
+                "range_status": "available",
+            }
+            for index in range(book.nsheets)
+        ]
+    finally:
+        book.release_resources()
+    return {
+        "method": "xls_source_directory",
+        "status": "available",
+        "file_type": "xls",
+        "sheet_count": len(sheets),
+        "sheets": sheets,
+    }
+
+
+def _source_workbook_census(path: Path, file_type: str) -> dict[str, object]:
+    """从源文件建立独立 Sheet 清单；失败时返回可序列化的不可用状态。"""
+    try:
+        if file_type == "xlsx":
+            return _source_xlsx_census(path)
+        if file_type == "xls":
+            return _source_xls_census(path)
+        if file_type == "csv":
+            return _source_csv_census(path)
+    except Exception as exc:  # noqa: BLE001 - 入口必须保留失败证据并继续主解析
+        return {
+            "method": "source_scan",
+            "status": "unavailable",
+            "file_type": file_type,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "sheet_count": None,
+            "sheets": [],
+        }
+    return {
+        "method": "source_scan",
+        "status": "unavailable",
+        "file_type": file_type,
+        "reason": "当前文件类型没有可用的源工作簿 Sheet 盘点器",
+        "sheet_count": None,
+        "sheets": [],
+    }
+
+
+def _compare_source_census(census: dict[str, object], sheets: list[SheetRecord]) -> tuple[str, list[str]]:
+    """比较源 Sheet 目录与解析落库前的结果，返回状态和差异说明。"""
+    if census.get("status") != "available":
+        return "unavailable", [str(census.get("reason") or "源文件 Sheet 范围无法盘点")]
+    source_sheets = census.get("sheets")
+    if not isinstance(source_sheets, list):
+        return "unavailable", ["源文件 Sheet 清单不是数组"]
+    differences: list[str] = []
+    if len(source_sheets) != len(sheets):
+        differences.append(
+            f"源文件 Sheet 数量={len(source_sheets)}，解析结果数量={len(sheets)}"
+        )
+    parsed_indices: list[object] = [sheet.sheet_index for sheet in sheets]
+    expected_indices = list(range(len(sheets)))
+    if (
+        any(isinstance(index, bool) or not isinstance(index, int) for index in parsed_indices)
+        or parsed_indices != expected_indices
+        or len(parsed_indices) != len(set(parsed_indices))
+    ):
+        differences.append(
+            f"解析结果 Sheet 索引必须从 0 开始连续且唯一："
+            f"实际={parsed_indices}，期望={expected_indices}"
+        )
+    for index, (source, parsed) in enumerate(zip(source_sheets, sheets, strict=False)):
+        if not isinstance(source, dict):
+            differences.append(f"源文件第{index + 1}个 Sheet 目录项无效")
+            continue
+        source_name = str(source.get("sheet_name") or "")
+        if source.get("sheet_index") != parsed.sheet_index:
+            differences.append(
+                f"第{index + 1}个 Sheet 索引不一致："
+                f"源文件={source.get('sheet_index')!r}/解析={parsed.sheet_index!r}"
+            )
+        if source_name != parsed.sheet_name:
+            differences.append(
+                f"第{index + 1}个 Sheet 名称不一致：源文件「{source_name}」/解析「{parsed.sheet_name}」"
+            )
+        if source.get("range_status") != "available":
+            differences.append(f"Sheet「{source_name}」源文件使用范围无法独立盘点")
+        source_rows = source.get("n_rows")
+        source_cols = source.get("n_cols")
+        if source_rows is not None and int(source_rows) != int(parsed.n_rows):
+            differences.append(
+                f"Sheet「{source_name}」行数不一致：源文件={source_rows}/解析={parsed.n_rows}"
+            )
+        if source_cols is not None and int(source_cols) != int(parsed.n_cols):
+            differences.append(
+                f"Sheet「{source_name}」列数不一致：源文件={source_cols}/解析={parsed.n_cols}"
+            )
+        source_cell_count = source.get("populated_cell_count")
+        if source_cell_count is not None:
+            parsed_cell_count = sum(
+                1
+                for cell in parsed.cells
+                if cell.is_formula or cell.raw_value not in (None, "")
+            )
+            if int(source_cell_count) != parsed_cell_count:
+                differences.append(
+                    f"Sheet「{source_name}」有值单元格数不一致："
+                    f"源文件={source_cell_count}/解析={parsed_cell_count}"
+                )
+        source_row_count = source.get("populated_row_count")
+        if source_row_count is not None:
+            parsed_rows = {
+                int(cell.row)
+                for cell in parsed.cells
+                if cell.is_formula or cell.raw_value not in (None, "")
+            }
+            if int(source_row_count) != len(parsed_rows):
+                differences.append(
+                    f"Sheet「{source_name}」有值物理行数不一致："
+                    f"源文件={source_row_count}/解析={len(parsed_rows)}"
+                )
+        source_digest = source.get("populated_coordinate_sha256")
+        if source_digest:
+            parsed_coordinates = sorted({
+                f"{int(cell.row)}:{int(cell.col)}"
+                for cell in parsed.cells
+                if cell.is_formula or cell.raw_value not in (None, "")
+            })
+            parsed_digest = hashlib.sha256(
+                "\n".join(parsed_coordinates).encode("utf-8")
+            ).hexdigest()
+            if str(source_digest) != parsed_digest:
+                differences.append(
+                    f"Sheet「{source_name}」有值单元格坐标指纹不一致"
+                )
+    return ("complete" if not differences else "mismatch"), differences
+
+
+def _attach_source_census(result: ParseResult, census: dict[str, object]) -> ParseResult:
+    stats = dict(result.stats)
+    status, differences = _compare_source_census(census, result.sheets)
+    stats["source_census"] = census
+    stats["source_census_status"] = status
+    if differences:
+        stats["source_census_differences"] = differences
+    result.stats = stats
+    return result
+
+
 def parse_file(path: Path, file_type: str) -> ParseResult:
     """按文件类型分发。未知类型/未实现类型返回明确状态。"""
     path = Path(path)
@@ -448,19 +865,26 @@ def parse_file(path: Path, file_type: str) -> ParseResult:
                            error=f"parser for '{file_type}' not implemented yet (planned Phase 6+)")
     if not path.exists():
         return ParseResult(parser="none", status="failed", error=f"file not found: {path}")
+    census = _source_workbook_census(path, file_type)
     try:
         if file_type == "xlsx":
-            return parse_xlsx(path)
+            return _attach_source_census(parse_xlsx(path), census)
         if file_type == "xls":
-            return parse_xls(path)
+            return _attach_source_census(parse_xls(path), census)
         if file_type == "csv":
-            return parse_csv(path)
+            return _attach_source_census(parse_csv(path), census)
         if file_type in UNSUPPORTED:
             return ParseResult(parser="none", status="unsupported",
                                error=f"parser for '{file_type}' not implemented yet (planned Phase 6+)")
-        return ParseResult(parser="none", status="failed", error=f"unknown file_type: {file_type}")
+        return _attach_source_census(
+            ParseResult(parser="none", status="failed", error=f"unknown file_type: {file_type}"),
+            census,
+        )
     except Exception as exc:  # 解析器级失败必须显式报告，不静默
-        return ParseResult(parser="unknown", status="failed", error=f"{type(exc).__name__}: {exc}")
+        return _attach_source_census(
+            ParseResult(parser="unknown", status="failed", error=f"{type(exc).__name__}: {exc}"),
+            census,
+        )
 
 
 def persist_parse_result(
@@ -475,6 +899,7 @@ def persist_parse_result(
     ``failed``/``unsupported`` 解析批次也必须落库；调用方可以传
     ``commit=False``，把批次和对应的 Evidence 放在同一个外层事务内。
     """
+    _validate_parse_result_for_persistence(result)
     now = datetime.now().isoformat(timespec="seconds")
     stats = dict(result.stats)
     if result.error:

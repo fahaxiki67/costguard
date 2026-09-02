@@ -2232,6 +2232,9 @@ def _statuses(
     run_availability: dict[str, Any] | None = None,
     direction_states: dict[str, dict[str, Any]] | None = None,
     sheet_states: list[dict[str, Any]] | None = None,
+    # 与底层 project_state 保持 fail-closed：新调用方必须显式确认金额单位，
+    # 否则只能返回有条件结论。
+    amount_unit_confirmed: bool = False,
 ) -> dict[str, Any]:
     unavailable = bool(
         run_availability is not None and not run_availability.get("available", True)
@@ -2301,6 +2304,7 @@ def _statuses(
         manifest_blocked=manifest_blocked,
         sheet_parse_failed_count=parse_failed_sheet_count,
         evidence_complete=bool(verification.get("evidence_complete", True)),
+        amount_unit_confirmed=amount_unit_confirmed,
     )
     return {
         "automatic_analysis": automatic,
@@ -2418,6 +2422,12 @@ def build_project_summary(
         pending=pending,
         evidence_complete=bool(verification.get("evidence_complete", True)),
     )
+    current_contract = run_contract.get_current_contract(conn, project_id)
+    contract_components = (
+        current_contract.components if current_contract is not None else {}
+    )
+    amount_unit = contract_components.get("amount_unit")
+    amount_unit_confirmed = bool(amount_unit and amount_unit != "unknown")
     return ProjectSummary(
         project_id=int(project_id),
         project_name=project_name,
@@ -2446,6 +2456,7 @@ def build_project_summary(
             run_availability,
             direction_states,
             sheet_states,
+            amount_unit_confirmed=amount_unit_confirmed,
         ),
         version_chain=version_chain,
         historical_price_assets=historical_price_assets,

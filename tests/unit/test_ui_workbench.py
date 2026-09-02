@@ -352,6 +352,35 @@ class TestWorkbench:
 
 
 class TestMainWindow:
+    def test_startup_keeps_project_list_blank_until_explicit_refresh(
+        self, app, tmp_path, monkeypatch
+    ):
+        """启动页不应扫描旧项目；查看已有项目必须是用户明确动作。"""
+        from jiadun.core.models import project as pm
+        from jiadun.ui.main_window import MainWindow
+
+        monkeypatch.setattr(pm, "_SETTINGS_FILE", tmp_path / "settings.json")
+        monkeypatch.setattr(
+            pm.platform_paths, "default_workspace_root", lambda: tmp_path / "ws"
+        )
+        pm.create_project("启动前已存在", tmp_path / "ws")
+
+        win = MainWindow()
+        try:
+            win.show()
+            app.processEvents()
+            assert win.project_list.count() == 0
+            assert not win.project_list.isVisible()
+            assert win.empty_box.isVisible()
+            assert win.empty_drop_zone.isVisible()
+
+            # “刷新”仍可显式查看已有项目，不能把用户的资料入口一并删掉。
+            win.refresh_projects(include_known=False, include_legacy=False)
+            assert win.project_list.count() == 1
+            assert win.project_list.item(0).text() == "启动前已存在"
+        finally:
+            win.close()
+
     def test_project_snapshot_does_not_show_historical_risk_or_matches(
         self, app, tmp_path, monkeypatch
     ):

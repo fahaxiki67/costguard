@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 
 from PySide6.QtWidgets import (
@@ -43,6 +44,8 @@ from jiadun.core.mapping import templates as mapping_templates
 from jiadun.ui import theme
 from jiadun.ui.labels import DIRECTION_ZH
 from jiadun.ui.widgets import section_header
+
+_LOG = logging.getLogger(__name__)
 
 SHEET_FIELD_ZH = [
     ("code", "编码"), ("name", "名称"), ("feature", "特征"), ("unit", "单位"),
@@ -515,11 +518,31 @@ class SheetConfirmDialog(QDialog):
                 reason=reason, direction=direction, period_no=self.period_spin.value(),
                 confirmed_col_map=col_map, confirmed_header_range=hdr,
                 confirmed_data_range=data_range)
-            QMessageBox.information(self, "人工确认", f"已抽取 {n} 行明细。")
-        except Exception:  # noqa: BLE001 — UI 层兜底提示
+            state = self.conn.execute(
+                "SELECT sheet_status, sheet_status_reason FROM raw_sheets WHERE id=?",
+                (int(s["sheet_id"]),),
+            ).fetchone()
+            if state and str(state["sheet_status"] or "") == "pending":
+                pending_reason = str(state["sheet_status_reason"] or "结构性证据仍待复核")
+                QMessageBox.warning(
+                    self,
+                    "人工确认已保存，仍待复核",
+                    f"已保存并抽取 {n} 行明细，但该工作表仍待复核。\n"
+                    f"{pending_reason}\n可继续调整范围或字段映射后重试。",
+                )
+            else:
+                QMessageBox.information(self, "人工确认", f"已抽取 {n} 行明细。")
+        except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
+            _LOG.exception(
+                "工作表确认抽取失败 project_id=%s sheet_id=%s",
+                self.project_id,
+                s["sheet_id"],
+            )
+            detail = str(exc).strip() or "程序未返回具体原因"
             QMessageBox.warning(
                 self, "人工确认失败",
-                "工作表确认未完成，请检查字段映射、表头范围和确认依据后重试。",
+                "工作表确认未完成："
+                f"{detail}\n请检查字段映射、表头/数据行范围和确认依据后重试。",
             )
             return
         self.reason_edit.clear()

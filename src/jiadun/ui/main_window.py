@@ -173,6 +173,9 @@ class MainWindow(QMainWindow):
 
         self.project_list = QListWidget()
         self.project_list.itemDoubleClicked.connect(self._on_open)
+        # 在用户明确刷新/打开前，项目列表本身也隐藏，避免空白首页出现
+        # 一个无内容的边框区域；refresh_projects() 会按结果重新切换可见性。
+        self.project_list.setVisible(False)
         layout.addWidget(self.project_list, 1)
 
         self.empty_drop_zone = FileDropZone(
@@ -183,7 +186,7 @@ class MainWindow(QMainWindow):
 
         self.empty_box = empty_state(
             "还没有工程项目",
-            "选择资料后会先创建一个新项目，再把资料只读复制到项目中",
+            "选择资料会先创建一个新项目；已有项目请点击“打开已有项目…”或“刷新”",
             # 页面底部保留唯一主按钮；空状态中的快捷入口使用默认次级样式，
             # 避免同一页出现两个同等权重的“新建项目”主操作。
             [("导入资料文件…", ""), ("导入资料文件夹…", ""), ("新建项目", "")])
@@ -229,10 +232,10 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 启动页只显示当前默认工作空间中明确存在的项目；历史/临时工作空间
-        # 不在启动时隐式汇总，避免测试目录或旧记忆目录把首页灌满。用户仍
-        # 可用“打开已有项目…”明确选择任意项目目录。
-        self.refresh_projects(include_known=False, include_legacy=False)
+        # 启动页保持空白，避免旧项目、演示项目或测试目录在用户尚未明确
+        # 选择前灌入首页。用户可通过“刷新”查看当前默认工作空间，或通过
+        # “打开已有项目…”直接打开一个明确的项目目录；创建/导入后返回页
+        # 也会显式刷新。这样首次启动不会把历史结果误当成当前工作。
 
     def closeEvent(self, event):
         settings = _settings()

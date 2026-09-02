@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.metadata
 import json
 import os
 import re
@@ -30,6 +29,7 @@ from typing import Any
 from jiadun import branding
 from jiadun.core.db import migrations
 from jiadun.core.evidence.finding import canonical_json, stable_fingerprint
+from jiadun.version import app_version
 
 LEGACY_STALE_SIGNATURE = "legacy:stale"
 # 运行条件不变但本次重跑未形成可用结果时使用的非当前标记。它与旧库迁移
@@ -846,25 +846,8 @@ def _strict_json_mapping(value: Any) -> dict[str, Any] | None:
 
 
 def _app_version() -> str:
-    """读取发布版本；开发树未安装时从仓库 pyproject.toml 读取。"""
-    root = Path(__file__).resolve().parents[4]
-    pyproject = root / "pyproject.toml"
-    try:
-        text = pyproject.read_text(encoding="utf-8")
-    except OSError:
-        text = ""
-    match = re.search(r"(?m)^version\s*=\s*[\"']([^\"']+)[\"']", text)
-    if match:
-        return match.group(1)
-    # 源码工作树优先使用当前发行名。旧的 v0.x 环境可能仍只有
-    # ``costguard`` 的 dist-info；仅在找不到新发行名时回退读取它，避免
-    # 改名后 Run Contract 因无法取版本而把可追溯信息降级为 unknown。
-    for distribution in (branding.PRODUCT_SLUG, branding.LEGACY_PRODUCT_SLUG):
-        try:
-            return importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-    return "unknown"
+    """读取统一的运行时版本入口，避免 Run Contract 自行解析版本。"""
+    return app_version()
 
 
 def _source_files(

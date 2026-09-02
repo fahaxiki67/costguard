@@ -142,6 +142,22 @@ _UPSTREAM_TOOLCHAIN_DIRS = (
 )
 
 
+def _configure_console_encoding() -> None:
+    """让 Windows 非 UTF-8 控制台也能输出中文审计结果。
+
+    GitHub Windows runner 默认可能使用 cp1252；审计信息包含中文，直接
+    ``print`` 会在扫描完成后因 ``UnicodeEncodeError`` 退出，掩盖真正的
+    隐私审计结果。仅重配置当前进程的输出流，不修改系统代码页或用户文件；
+    不支持 ``reconfigure`` 的测试/管道流保持原样。
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            continue
+
+
 def _upstream_allowlisted(hit: dict, repo_name: str) -> bool:
     """上游第三方自带内容的精确豁免。
 
@@ -168,6 +184,7 @@ def _upstream_allowlisted(hit: dict, repo_name: str) -> bool:
 
 
 def main() -> int:
+    _configure_console_encoding()
     parser = argparse.ArgumentParser(description="安装包隐私审计")
     parser.add_argument("app", type=Path, help="Jiadun.app 路径")
     args = parser.parse_args()

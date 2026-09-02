@@ -9,6 +9,7 @@ Tab 结构：期次概览 | 清单明细 | 审核问题中心 | 匹配复核 | �
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import sys
 from datetime import datetime
@@ -81,6 +82,8 @@ from jiadun.ui.widgets import badge_item, fill_cell, make_data_table
 # 本表只做 UI 显示转换；未知值使用安全中文兜底，原始枚举仅保留在 Tooltip。
 SEVERITY_ZH = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
 SEVERITY_KIND = {"high": "danger", "medium": "warning", "low": "neutral", "info": "info"}
+
+_LOG = logging.getLogger(__name__)
 
 
 def _export_files(export_dir: Path, kind: str) -> list[Path]:
@@ -662,8 +665,22 @@ class WorkbenchPage(QWidget):
                 else:
                     # scan_import_paths 已过滤；保留显式分支防止未来扩展时静默成功。
                     raise ValueError("unsupported file type")
-            except Exception:  # noqa: BLE001 — UI 层兜底提示
-                fail.append(f"{path.name}：导入失败，请检查文件格式、权限或数据完整性")
+            except Exception as exc:  # noqa: BLE001 — UI 层兜底提示
+                _LOG.exception(
+                    "资料导入失败 project_id=%s path=%s",
+                    self.project.project_id,
+                    path,
+                )
+                detail = str(exc).strip()
+                if detail:
+                    # 保留核心层已经给出的可执行原因；截断长度避免异常文本
+                    # 把导入结果对话框撑满。完整堆栈只写入日志，不阻塞重试。
+                    detail = detail[:240]
+                    fail.append(f"{path.name}：{detail}；请检查后重试")
+                else:
+                    fail.append(
+                        f"{path.name}：导入失败，请检查文件格式、权限或数据完整性后重试"
+                    )
         self._notify_import(
             ok,
             fail,

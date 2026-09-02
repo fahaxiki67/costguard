@@ -5,6 +5,7 @@
   "cases": [
     {
       "case_id": "sanitized_real_case_template",
+      "case_version": "1",
       "case_kind": "sanitized_real",
       "availability": "not_available",
       "reason": "待用户提供脱敏真实项目资料、控制金额、异常项、匹配结果和不可比项；此占位案例不参与金额回归。"
