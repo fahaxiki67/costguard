@@ -65,12 +65,12 @@ def test_open_in_spreadsheet_fallbacks(tmp_path: Path, monkeypatch: pytest.Monke
         opened.append(p)
 
     # 无 COM（空 progids）→ 仅打开文件
-    out = sj.open_in_spreadsheet(target, progids=(), opener=fake_opener)
+    out = sj.open_in_spreadsheet(target, progids=(), opener=fake_opener, platform="nt")
     assert out == "opened_only" and opened == [f]
 
     # 哈希不符 → 只开文件夹
     target2 = sj.JumpTarget(file_path=f, sheet_name="S", row=1, col=1, sha256="deadbeef")
-    out = sj.open_in_spreadsheet(target2, opener=fake_opener)
+    out = sj.open_in_spreadsheet(target2, opener=fake_opener, platform="nt")
     assert out == "hash_mismatch" and opened[-1] == f.parent
 
     # 文件缺失 → FileNotFoundError
@@ -79,8 +79,7 @@ def test_open_in_spreadsheet_fallbacks(tmp_path: Path, monkeypatch: pytest.Monke
         sj.open_in_spreadsheet(missing, opener=fake_opener)
 
     # 非 Windows 平台 → opened_only
-    monkeypatch.setattr(sj.os, "name", "linux")
-    out = sj.open_in_spreadsheet(target, opener=fake_opener)
+    out = sj.open_in_spreadsheet(target, opener=fake_opener, platform="darwin")
     assert out == "opened_only"
 
 
@@ -140,7 +139,7 @@ def test_located_with_fake_com(tmp_path: Path):
     monkey.setitem(sys.modules, "pythoncom", pythoncom)
     try:
         out = sj.open_in_spreadsheet(
-            target, progids=("Excel.Application",), opener=lambda p: None
+            target, progids=("Excel.Application",), opener=lambda p: None, platform="nt"
         )
     finally:
         monkey.undo()

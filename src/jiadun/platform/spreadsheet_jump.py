@@ -113,6 +113,7 @@ def open_in_spreadsheet(
     *,
     progids: tuple[str, ...] | None = None,
     opener=os.startfile if os.name == "nt" else None,
+    platform: str | None = None,
 ) -> str:
     """打开并定位；返回 located/opened_only/hash_mismatch/jump_failed/unsupported_platform。
 
@@ -120,17 +121,18 @@ def open_in_spreadsheet(
     """
     if opener is None:
         opener = _os_open
-    if os.name != "nt":
+    if not target.file_path.exists():
+        raise FileNotFoundError(str(target.file_path))
+    # 哈希校验全平台一致：内容已变更就不做任何自动定位
+    if target.sha256 and _file_sha256(target.file_path) != target.sha256:
+        opener(target.file_path.parent)
+        return "hash_mismatch"
+    if (platform or os.name) != "nt":
         try:
             opener(target.file_path)
         except Exception:  # noqa: BLE001
             return "unsupported_platform"
         return "opened_only"
-    if not target.file_path.exists():
-        raise FileNotFoundError(str(target.file_path))
-    if target.sha256 and _file_sha256(target.file_path) != target.sha256:
-        opener(target.file_path.parent)
-        return "hash_mismatch"
     try:
         import pythoncom
         import win32com.client
