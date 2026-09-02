@@ -108,6 +108,41 @@ if ($LASTEXITCODE -ne 0) { Fail "Inno Setup 编译失败" }
 $Setup = "dist/installer/Jiadun-$Version-windows-x64-setup.exe"
 if (-not (Test-Path $Setup)) { Fail "未找到安装器 $Setup" }
 
+# ---- 11.5 代码签名（正式发布门槛；提供 JIADUN_SIGN_PFX 时启用）----
+$SignPfx = $env:JIADUN_SIGN_PFX
+if ($SignPfx) {
+    Step "代码签名（SHA256 + 时间戳）"
+    $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if (-not $signtool) {
+        $kitRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
+        if (Test-Path $kitRoot) {
+            $cand = Get-ChildItem $kitRoot -Directory | Sort-Object Name -Descending |
+                ForEach-Object { Join-Path $_.FullName "x64\signtool.exe" } |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($cand) { $signtool = Get-Item $cand }
+        }
+    }
+    if (-not $signtool) { Fail "未找到 signtool.exe（请安装 Windows SDK 或加入 PATH）" }
+    if (-not $env:JIADUN_SIGN_PFX_PASSWORD) { Fail "设置了 JIADUN_SIGN_PFX 但缺少 JIADUN_SIGN_PFX_PASSWORD" }
+    Write-Host "  signtool: $($signtool.FullName)"
+    & $signtool.FullName sign /f $SignPfx /p $env:JIADUN_SIGN_PFX_PASSWORD /fd SHA256 `
+        /tr http://timestamp.digicert.com /td SHA256 "$App\Jiadun.exe" $Setup
+    if ($LASTEXITCODE -ne 0) { Fail "签名失败" }
+    & $signtool.FullName verify /pa "$App\Jiadun.exe" $Setup
+    if ($LASTEXITCODE -ne 0) { Fail "签名验证失败" }
+    Write-Host "  签名验证通过（含便携版主程序与安装器）"
+} else {
+    Step "代码签名：未设置 JIADUN_SIGN_PFX，跳过（正式发布必须签名，清单中将记为 PENDING）"
+}
+
+# ---- 11.6 EXE 版本资源校验 ----
+Step "EXE VERSIONINFO 校验"
+$vi = (Get-Item "$App\Jiadun.exe").VersionInfo
+if ($vi.ProductVersion -notlike "*$Version*") { Fail "ProductVersion=$($vi.ProductVersion) 与 $Version 不符" }
+if (-not $vi.ProductName) { Fail "ProductName 缺失" }
+if (-not $vi.CompanyName) { Fail "CompanyName(Publisher) 缺失" }
+Write-Host ("  Product={0} | Version={1} | Company={2}" -f $vi.ProductName, $vi.ProductVersion, $vi.CompanyName)
+
 # ---- 12. SHA256 ----
 Step "SHA256 汇总"
 $artifacts = @("dist/Jiadun-$Version-windows-x64-portable.zip", $Setup)

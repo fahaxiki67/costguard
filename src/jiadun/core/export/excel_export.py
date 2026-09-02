@@ -1013,6 +1013,7 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
     anomaly_rows = conn.execute(
         f"""SELECT a.id, a.rule_id, a.severity, a.subject_type, a.subject_id,
                   a.evidence_id, a.message, a.status, a.lifecycle_status,
+                  a.fingerprint,
                   COALESCE(sp_item.direction, sp_period.direction, sp_sheet.direction, '')
                     AS direction
            FROM anomalies a
@@ -1028,18 +1029,37 @@ def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook
            WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, a.id""",
         (project_id, *scope_params),
     ).fetchall()
+    # 台账字段（v46）：人工评估与异常发现分离展示，未建台账时显示占位。
+    # 台账列追加在既有 9 列之后，规则代码列保持隐藏不变。
+    try:
+        from jiadun.core import ledger as _ledger
+
+        ledger_by_fp = {
+            e.fingerprint: e for e in _ledger.list_finding_ledger(conn, project_id)
+        }
+    except Exception:  # noqa: BLE001  旧库无 finding_ledger 表时不阻塞导出
+        ledger_by_fp = {}
+    ledger_status_zh = {"pending_confirmation": "待确认", "confirmed": "已确认",
+                        "resolved": "已解决", "not_applicable": "不适用"}
     sev_zh = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
     ws = wb.create_sheet("异常清单")
-    ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态", "规则代码"])
-    _style_header(ws, 1, 9)
+    ws.append(["编号", "方向", "规则", "级别", "对象", "说明", "证据ID", "状态", "规则代码",
+               "台账状态", "金额影响", "责任单位", "责任事项", "处理意见"])
+    _style_header(ws, 1, 14)
     for r in anomaly_rows:
         sev = sev_zh.get(r["severity"], "其他")
         direction = _business_direction(r["direction"], project_level=not r["direction"])
         subject = _business_subject(r["subject_type"])
         status = _business_status(finding_lifecycle.lifecycle_status(r))
+        entry = ledger_by_fp.get(r["fingerprint"])
         ws.append([r["id"], direction, _business_rule(r["rule_id"]), sev,
                    f"{subject}#{r['subject_id']}",
-                   _normalize_business_text(r["message"]), r["evidence_id"], status, r["rule_id"]])
+                   _normalize_business_text(r["message"]), r["evidence_id"], status, r["rule_id"],
+                   ledger_status_zh.get(getattr(entry, "ledger_status", None), "—"),
+                   getattr(entry, "amount_impact", None) or "—",
+                   getattr(entry, "responsible_unit", None) or "—",
+                   getattr(entry, "responsible_matter", None) or "—",
+                   getattr(entry, "handling_opinion", None) or "—"])
     _autowidth(ws)
     # 原始规则编码仅供高级排查，默认隐藏，避免普通业务界面直接暴露开发字段；
     # 列仍保留以便技术人员在需要时取消隐藏并追溯。

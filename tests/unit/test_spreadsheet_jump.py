@@ -90,6 +90,7 @@ def test_located_with_fake_com(tmp_path: Path):
     target = sj.JumpTarget(file_path=f, sheet_name="S", row=2, col=5)
 
     calls: list[str] = []
+    quits: list[int] = []
 
     class FakeCells:
         def __init__(self, row, col):
@@ -109,6 +110,9 @@ def test_located_with_fake_com(tmp_path: Path):
         def Worksheets(self, name):  # noqa: N802
             return FakeSheet(name)
 
+        def Close(self, save):  # noqa: N802
+            calls.append(f"Close:{save}")
+
     class FakeApp:
         def __init__(self, progid):
             calls.append(progid)
@@ -124,6 +128,9 @@ def test_located_with_fake_com(tmp_path: Path):
         def Goto(self, cell, scroll):  # noqa: N802
             calls.append(f"Goto:{cell.row},{cell.col}")
 
+        def Quit(self):  # noqa: N802
+            quits.append(1)
+
     import sys
     import types
 
@@ -133,16 +140,152 @@ def test_located_with_fake_com(tmp_path: Path):
     fake.client = client
     pythoncom = types.ModuleType("pythoncom")
     pythoncom.CoInitialize = lambda: None
+    pythoncom.CoUninitialize = lambda: None
+    monkey = pytest.MonkeyPatch()
+    monkey.setitem(sys.modules, "win32com", fake)
+    monkey.setitem(sys.modules, "win32com.client", client)
+    monkey.setitem(sys.modules, "pythoncom", pythoncom)
+    # 进程快照：调用前就有表格进程（用户已开）→ 绝不允许 Quit
+    snapshot = lambda: {"excel.exe": {111}, "et.exe": set(), "wps.exe": set()}  # noqa: E731
+    try:
+        out = sj.open_in_spreadsheet(
+            target, progids=("Excel.Application",), opener=lambda p: None,
+            platform="nt", pid_snapshot=snapshot)
+    finally:
+        monkey.undo()
+    assert out == "located"
+    assert calls[0] == "Excel.Application"
+    assert "Goto:2,5" in calls
+    assert "Close:False" in calls  # 自己开的工作簿要关
+    assert quits == []             # 用户会话在 → 绝不 Quit
+
+
+def test_quit_only_when_started_from_nothing(tmp_path: Path):
+    """调用前无任何表格进程 + Dispatch 出现新进程 → 允许 Quit。"""
+    f = tmp_path / "c.xlsx"
+    f.write_bytes(b"PK\x03\x04fake")
+    target = sj.JumpTarget(file_path=f, sheet_name="S", row=1, col=1)
+    quits: list[int] = []
+    closes: list[int] = []
+
+    class FakeSheet:
+        def Cells(self, row, col):  # noqa: N802
+            return (row, col)
+
+    class FakeBook:
+        def Worksheets(self, name):  # noqa: N802
+            return FakeSheet()
+
+        def Close(self, save):  # noqa: N802
+            closes.append(save)
+
+    class FakeApp:
+        @property
+        def Workbooks(self):  # noqa: N802
+            return self
+
+        def Open(self, path, u, ro):  # noqa: N802
+            return FakeBook()
+
+        def Goto(self, cell, scroll):  # noqa: N802
+            pass
+
+        def Quit(self):  # noqa: N802
+            quits.append(1)
+
+    import sys
+    import types
+
+    fake = types.ModuleType("win32com")
+    client = types.ModuleType("win32com.client")
+    client.Dispatch = lambda progid: FakeApp()
+    fake.client = client
+    pythoncom = types.ModuleType("pythoncom")
+    monkey = pytest.MonkeyPatch()
+    monkey.setitem(sys.modules, "win32com", fake)
+    monkey.setitem(sys.modules, "win32com.client", client)
+    monkey.setitem(sys.modules, "pythoncom", pythoncom)
+    state = {"n": 0}
+
+    def snapshot():
+        state["n"] += 1
+        return {"excel.exe": set(), "et.exe": {100} if state["n"] >= 2 else set(),
+                "wps.exe": set()}
+
+    try:
+        out = sj.open_in_spreadsheet(
+            target, progids=("Excel.Application",), opener=lambda p: None,
+            platform="nt", pid_snapshot=snapshot)
+    finally:
+        monkey.undo()
+    assert out == "located"
+    assert closes == [False]
+    assert quits == [1]
+
+
+def test_no_snapshot_never_quits(tmp_path: Path):
+    """进程快照不可用（None）→ 保守：即使新启动也绝不 Quit。"""
+    f = tmp_path / "d.xlsx"
+    f.write_bytes(b"PK\x03\x04fake")
+    target = sj.JumpTarget(file_path=f, sheet_name="S", row=1, col=1)
+    quits: list[int] = []
+
+    class FakeSheet:
+        def Cells(self, row, col):  # noqa: N802
+            return (row, col)
+
+    class FakeBook:
+        def Worksheets(self, name):  # noqa: N802
+            return FakeSheet()
+
+        def Close(self, save):  # noqa: N802
+            pass
+
+    class FakeApp:
+        @property
+        def Workbooks(self):  # noqa: N802
+            return self
+
+        def Open(self, path, u, ro):  # noqa: N802
+            return FakeBook()
+
+        def Goto(self, cell, scroll):  # noqa: N802
+            pass
+
+        def Quit(self):  # noqa: N802
+            quits.append(1)
+
+    import sys
+    import types
+
+    fake = types.ModuleType("win32com")
+    client = types.ModuleType("win32com.client")
+    client.Dispatch = lambda progid: FakeApp()
+    fake.client = client
+    pythoncom = types.ModuleType("pythoncom")
     monkey = pytest.MonkeyPatch()
     monkey.setitem(sys.modules, "win32com", fake)
     monkey.setitem(sys.modules, "win32com.client", client)
     monkey.setitem(sys.modules, "pythoncom", pythoncom)
     try:
         out = sj.open_in_spreadsheet(
-            target, progids=("Excel.Application",), opener=lambda p: None, platform="nt"
-        )
+            target, progids=("Excel.Application",), opener=lambda p: None,
+            platform="nt", pid_snapshot=lambda: None)
     finally:
         monkey.undo()
     assert out == "located"
-    assert calls[0] == "Excel.Application"
-    assert calls[-1] == "Goto:2,5"
+    assert quits == []
+
+
+def test_decide_started_here_table():
+    empty = {"excel.exe": set(), "et.exe": set(), "wps.exe": set()}
+    occupied = {"excel.exe": {1}, "et.exe": set(), "wps.exe": set()}
+    started = {"excel.exe": {2}, "et.exe": set(), "wps.exe": set()}
+    # 无人使用 + 出现新进程 → 是我们启动的
+    assert sj._decide_started_here(empty, started, attached_ok=False) is True
+    # 无人使用但附着成功 → 不 Quit（附着失败才会 Dispatch）
+    assert sj._decide_started_here(empty, started, attached_ok=True) is False
+    # 已有用户进程 → 永不 Quit
+    assert sj._decide_started_here(occupied, occupied, attached_ok=False) is False
+    # 快照不可用 → 永不 Quit
+    assert sj._decide_started_here(None, None, attached_ok=False) is False

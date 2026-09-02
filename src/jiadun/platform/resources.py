@@ -6,6 +6,7 @@ core/ 与 ui/ 不得自行探测打包路径，一律经由本模块。
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -39,18 +40,24 @@ def bundled_demo_dir() -> Path:
 
 
 def app_icon_path() -> Path | None:
-    """应用图标（.icns/.png）；不存在时返回 None（UI 使用系统默认图标）。"""
+    """应用图标（按平台优先 .icns/.ico）；不存在时返回 None（UI 使用系统默认图标）。"""
+    exts = (".ico",) if os.name == "nt" else (".icns",)
     candidates: list[Path] = []
     if is_frozen():
         for resource_name in (branding.RESOURCE_DIR_NAME, branding.LEGACY_RESOURCE_DIR_NAME):
-            candidates.append(_bundle_base() / resource_name / "icon.icns")
+            for ext in exts:
+                candidates.append(_bundle_base() / resource_name / f"icon{ext}")
     here = Path(__file__).resolve()
     for parent in here.parents:
-        candidates.append(parent / "src" / branding.PRODUCT_SLUG / "resources" / "icon.icns")
-        candidates.append(parent / branding.PRODUCT_SLUG / "resources" / "icon.icns")
+        for ext in exts:
+            candidates.append(parent / "src" / branding.PRODUCT_SLUG / "resources" / f"icon{ext}")
+            candidates.append(parent / branding.PRODUCT_SLUG / "resources" / f"icon{ext}")
         # legacy: 仅在旧源码目录仍被外部保留时发现资源，不写入或搬迁它。
-        candidates.append(parent / "src" / branding.LEGACY_PRODUCT_SLUG / "resources" / "icon.icns")
-        candidates.append(parent / branding.LEGACY_PRODUCT_SLUG / "resources" / "icon.icns")
+        for ext in exts:
+            candidates.append(
+                parent / "src" / branding.LEGACY_PRODUCT_SLUG / "resources" / f"icon{ext}")
+            candidates.append(
+                parent / branding.LEGACY_PRODUCT_SLUG / "resources" / f"icon{ext}")
     for cand in candidates:
         if cand.is_file():
             return cand

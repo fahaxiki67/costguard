@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from jiadun import branding
@@ -14,6 +15,11 @@ from jiadun.ui.theme import apply_theme
 
 
 def main() -> int:
+    # Qt6 默认启用高 DPI 缩放；这里显式钉死取整策略，保证 100%–200% 缩放下
+    # 布局按物理像素精确渲染，不因四舍五入产生模糊或错位。
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication.instance() or QApplication(sys.argv)
     apply_theme(app)
     app.setApplicationName(branding.PRODUCT_SLUG)

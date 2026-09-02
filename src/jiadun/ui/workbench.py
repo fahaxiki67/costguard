@@ -361,6 +361,87 @@ class WorkbenchPage(QWidget):
         self.tabs.addTab(self._export_tab(), "成果导出")
         self.tabs.addTab(self._version_history_tab(), "版本与历史资产")
         self.refresh_all()
+        self._install_windows_shortcuts()
+
+    # ---- Windows 键盘习惯 -------------------------------------------------
+    def _install_windows_shortcuts(self) -> None:
+        """Ctrl+F 搜索、Ctrl+A 全选、Ctrl+C 复制选中、Esc 清空/取消选择。
+
+        表格是只读审计数据：不绑定 Delete 等删除类快捷键（防误删证据）；
+        粘贴仅在搜索框等可编辑控件内使用 Qt 内置行为。焦点在可编辑控件上时
+        复制/全选显式委托给该控件，保持编辑器默认习惯。
+        """
+        from PySide6.QtGui import QKeySequence, QShortcut
+        from PySide6.QtWidgets import QApplication, QPlainTextEdit
+
+        tab_tables: dict[int, QTableWidget | None] = {
+            0: self.period_table,
+            1: self.items_table,
+            2: self.anomaly_table,
+            3: self.match_table,
+            4: None,
+            5: self.version_chain_table,
+        }
+
+        def _focused_table() -> QTableWidget | None:
+            w = QApplication.focusWidget()
+            if isinstance(w, QTableWidget):
+                return w
+            return tab_tables.get(self.tabs.currentIndex())
+
+        def _copy_selection() -> None:
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, QPlainTextEdit)):
+                w.copy()
+                return
+            table = _focused_table()
+            if table is None or not table.selectionModel().hasSelection():
+                return
+            rows = sorted({i.row() for i in table.selectedIndexes()})
+            cols = sorted({i.column() for i in table.selectedIndexes()})
+            lines = ["\t".join(
+                table.item(r, c).text() if table.item(r, c) else ""
+                for c in cols) for r in rows]
+            QGuiApplication.clipboard().setText("\n".join(lines))
+
+        def _select_all() -> None:
+            w = QApplication.focusWidget()
+            if isinstance(w, (QLineEdit, QPlainTextEdit)):
+                w.selectAll()
+                return
+            table = _focused_table()
+            if table is not None:
+                table.selectAll()
+
+        def _focus_search() -> None:
+            w = QApplication.focusWidget()
+            if isinstance(w, QLineEdit):
+                w.setFocus()
+                w.selectAll()
+                return
+            search = {1: self.items_search, 3: self.match_search}.get(
+                self.tabs.currentIndex())
+            if search is not None:
+                search.setFocus()
+                search.selectAll()
+
+        def _escape() -> None:
+            w = QApplication.focusWidget()
+            if isinstance(w, QLineEdit) and w.text():
+                w.clear()
+                return
+            table = _focused_table()
+            if table is not None:
+                table.clearSelection()
+
+        def _bind(seq, slot) -> None:
+            sc = QShortcut(seq, self)
+            sc.activated.connect(slot)
+
+        _bind(QKeySequence.Copy, _copy_selection)
+        _bind(QKeySequence.SelectAll, _select_all)
+        _bind(QKeySequence.Find, _focus_search)
+        _bind(QKeySequence(Qt.Key_Escape), _escape)
 
     def _ensure_current_results_for_ui(
         self, operation: str, *, allow_unbound_read_only: bool = False
@@ -898,6 +979,8 @@ class WorkbenchPage(QWidget):
             ["方向", "期次", "编码", "名称", "单位", "数量", "单价", "合价", "税率", "出处(数量)"],
             stretch_cols=(3,), right_cols=(5, 6, 7, 8),
             fixed_widths={0: 60, 1: 52, 2: 118, 4: 56, 9: 96})
+        # 只读明细允许多选（Ctrl/Shift 点选、Ctrl+A 全选），便于整段复制核查
+        self.items_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         # 分页查询必须在完整结果集上排序，不能只对当前页做 QTableWidget
         # 的本地排序；表头点击因此转为安全的 SQL 字段排序。
         self.items_sort_column = 1

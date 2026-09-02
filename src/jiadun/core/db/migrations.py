@@ -2724,6 +2724,37 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                END""",
         ],
     ),
+    # v46（v0.1.18）：经营合规问题台账字段。技术异常（anomalies）与人工台账
+    # 评估严格分离：台账值只能由人工经 ledger API 写入并留审计事件，
+    # 规则引擎永远不写这些列。金额影响保存为 TEXT 由上层 Decimal 解析，
+    # 避免引入浮点。台账按 (project_id, fingerprint) 定位——anomalies.id
+    # 每次分析运行都会重建，fingerprint 才是跨运行稳定的问题身份。
+    (
+        46,
+        [
+            """CREATE TABLE IF NOT EXISTS finding_ledger (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                fingerprint TEXT NOT NULL,
+                amount_impact TEXT,
+                responsible_unit TEXT,
+                responsible_matter TEXT,
+                handling_opinion TEXT,
+                ledger_status TEXT NOT NULL DEFAULT 'pending_confirmation',
+                updated_by TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, fingerprint)
+            )""",
+            """CREATE TRIGGER IF NOT EXISTS finding_ledger_status_guard
+               BEFORE UPDATE ON finding_ledger
+               FOR EACH ROW
+               WHEN NEW.ledger_status NOT IN (
+                   'pending_confirmation','confirmed','resolved','not_applicable')
+               BEGIN
+                   SELECT RAISE(ABORT, 'invalid finding_ledger status');
+               END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

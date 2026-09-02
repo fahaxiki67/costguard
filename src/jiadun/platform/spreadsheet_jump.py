@@ -4,8 +4,9 @@
 parse_batches → source_files（original_path 优先，缺失时回退只读副本
 stored_path）。打开前校验 SHA-256，内容已变更则只开所在文件夹。
 
-纪律：只读打开（ReadOnly=True, UpdateLinks=0）；不 Quit 用户已开的
-表格程序；无 Office/WPS 时退化为 os.startfile 仅开文件并如实提示。
+纪律：只读打开（ReadOnly=True, UpdateLinks=0）；先尝试附着用户已开实例，
+附着失败才自行启动，且只 Quit 自己启动的实例；打开的工作簿一律
+Close(SaveChanges=False)；无 Office/WPS 时退化为 os.startfile 仅开文件并如实提示。
 """
 from __future__ import annotations
 
@@ -108,19 +109,73 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+_SPREADSHEET_PROC_NAMES = ("excel.exe", "et.exe", "wps.exe", "ket.exe")
+
+
+def _spreadsheet_process_pids() -> dict[str, set[int]] | None:
+    """按进程名枚举表格程序 PID；无法枚举时返回 None（保守判定，绝不 Quit）。"""
+    if os.name != "nt":
+        return None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+            text=True, check=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    pids: dict[str, set[int]] = {n: set() for n in _SPREADSHEET_PROC_NAMES}
+    for line in out.stdout.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower() in pids:
+            try:
+                pids[parts[0].lower()].add(int(parts[1]))
+            except ValueError:
+                continue
+    return pids
+
+
+def _decide_started_here(
+    pids_before: dict[str, set[int]] | None,
+    pids_after: dict[str, set[int]] | None,
+    attached_ok: bool,
+) -> bool:
+    """只 Quit 自己从头启动的实例（fail-safe：证据不足一律不 Quit）。
+
+    WPS(et.exe/wps.exe) 是单进程多会话：Dispatch 可能附着既有服务器，
+    而 Quit 会终止整个进程、连带关掉用户会话。因此只有当
+    “调用前无任何表格进程，调用后出现新进程”时才认定实例由本进程
+    启动并允许 Quit；进程快照不可用时保守返回 False。
+    """
+    if pids_before is None or pids_after is None:
+        return False
+    if attached_ok:
+        # ROT 附着成功说明实例早已存在（哪怕快照没看到），绝不 Quit
+        return False
+    if any(pids_before.values()):
+        return False
+    return any(pids_after.values())
+
+
 def open_in_spreadsheet(
     target: JumpTarget,
     *,
     progids: tuple[str, ...] | None = None,
     opener=os.startfile if os.name == "nt" else None,
     platform: str | None = None,
+    pid_snapshot=None,
 ) -> str:
     """打开并定位；返回 located/opened_only/hash_mismatch/jump_failed/unsupported_platform。
 
-    opener 可注入（测试用）；progids 可注入（测试用空元组模拟无 COM）。
+    opener 可注入（测试用）；progids 可注入（测试用空元组模拟无 COM）；
+    pid_snapshot 可注入（测试用），默认按进程名枚举表格程序 PID。
     """
     if opener is None:
         opener = _os_open
+    if pid_snapshot is None:
+        pid_snapshot = _spreadsheet_process_pids
     if not target.file_path.exists():
         raise FileNotFoundError(str(target.file_path))
     # 哈希校验全平台一致：内容已变更就不做任何自动定位
@@ -139,27 +194,66 @@ def open_in_spreadsheet(
     except ImportError:
         opener(target.file_path)
         return "opened_only"
+    pids_before = pid_snapshot()
     app = None
+    attached_ok = False
     for progid in (
         progids if progids is not None else _DEFAULT_PROGIDS
     ):
         try:
             pythoncom.CoInitialize()
-            app = win32com.client.Dispatch(progid)
+        except Exception:  # noqa: BLE001
+            pass
+        client = win32com.client
+        # 先附着已开实例，绝不接管/关闭用户自己的会话
+        attach = getattr(client, "GetActiveObject", None)
+        if attach is not None:
+            try:
+                app = attach(progid)
+                attached_ok = True
+                break
+            except Exception:  # noqa: BLE001
+                app = None
+        try:
+            app = client.Dispatch(progid)
             break
         except Exception:  # noqa: BLE001
             app = None
     if app is None:
         opener(target.file_path)
         return "opened_only"
+    started_here = _decide_started_here(
+        pids_before, pid_snapshot(), attached_ok)
+    result = "located"
+    workbook = None
+    worksheet = None
     try:
         workbook = app.Workbooks.Open(str(target.file_path), 0, True)
         worksheet = workbook.Worksheets(target.sheet_name)
         app.Goto(worksheet.Cells(target.row, target.col), True)
-        return "located"
     except Exception:  # noqa: BLE001
+        result = "jump_failed"
         try:
             opener(target.file_path)
         except Exception:  # noqa: BLE001
             pass
-        return "jump_failed"
+    finally:
+        # 只关自己开的工作簿；只 Quit 自己启动的实例；COM 逐层释放。
+        # 注意：绝不在此调用 pythoncom.CoUninitialize()——GUI 线程 STA 上
+        # 还有应用/用户会话的其他存活 COM 代理，中途 CoUninitialize 会把
+        # 整个公寓拆掉导致它们全部断连（WPS/Excel 实测复现）。保留一个
+        # apartment 引用到进程退出是无害的。
+        if workbook is not None:
+            try:
+                workbook.Close(False)
+            except Exception:  # noqa: BLE001
+                pass
+        if started_here:
+            try:
+                app.Quit()
+            except Exception:  # noqa: BLE001
+                pass
+        worksheet = None
+        workbook = None
+        app = None
+    return result
