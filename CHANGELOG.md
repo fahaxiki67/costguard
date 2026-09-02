@@ -9,9 +9,25 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-First Windows x64 deliverables (installer + portable zip) on top of the
-v0.1.14 trust-gate release; no parsing or calculation behavior changes.
+Staged preview on top of v0.1.15: real-data findings (F14/F15) and
+anomaly-to-source cell jump (F16).
 
+## [0.1.16] - 2026-09-02
+
+Staged preview on top of the v0.1.15 Windows deliverables; no parsing or
+calculation behavior changes.
+
+### Added
+- Anomaly context menu can open the source workbook (Excel/WPS via COM, read-only)
+  and jump to the offending cell; falls back to opening the file or its folder
+  with honest messaging when COM, file, or hash checks fail.
+- Magic-byte pre-checks for PDF/DOCX contract parsing reject corrupted or
+  misnamed files with explicit messages instead of raw parser exceptions.
+
+### Changed
+- formula_no_cache / formula_untrusted_cache findings are demoted from high to
+  low severity: WPS-saved workbooks commonly lack formula caches, which is not
+  an amount error.
 ## [0.1.15] - 2026-09-02
 
 First Windows deliverables on top of the v0.1.14 trust-gate release; no parsing

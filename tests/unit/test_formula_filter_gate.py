@@ -156,7 +156,7 @@ def test_import_persists_filter_and_formula_risk_and_keeps_sheet_pending(importe
     assert "筛选" in sheet["sheet_status_reason"]
 
 
-def test_formula_without_cache_is_structural_high_risk_with_source_location(imported_project, tmp_path):
+def test_formula_without_cache_is_structural_low_risk_hint_with_source_location(imported_project, tmp_path):
     info, conn, project_dir = imported_project
     src = tmp_path / "无缓存公式.xlsx"
     _make_workbook(src)
@@ -166,7 +166,8 @@ def test_formula_without_cache_is_structural_high_risk_with_source_location(impo
     formula_findings = [finding for finding in findings if finding.rule_id == "formula_no_cache"]
     assert formula_findings
     finding = formula_findings[0]
-    assert finding.severity == "high"
+    # v0.1.16：WPS 保存不缓存公式值是常见行为而非金额错误，降级为 low 提示
+    assert finding.severity == "low"
     assert finding.details["blocks_verification"] is True
     assert finding.details["row"] == 2
     assert finding.details["col"] == 5

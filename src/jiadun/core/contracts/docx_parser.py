@@ -8,6 +8,16 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def _ensure_magic(path: Path, magics: tuple[bytes, ...], label: str) -> None:
+    """魔数前置校验：同步残留/损坏/误命名文件显式拒绝，不给解析器抛裸异常。"""
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if not any(head.startswith(m) for m in magics):
+        raise ValueError(
+            f"不是有效的 {label} 文件（文件头不符，可能是同步残留、损坏或误命名文件）：{path.name}"
+        )
+
+
 def parse_docx(path: Path) -> list[dict]:
     import docx  # python-docx
 
@@ -57,8 +67,10 @@ def parse_contract(path: Path, file_type: str) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(str(path))
     if file_type == "docx":
+        _ensure_magic(path, (b"PK",), "DOCX")
         return parse_docx(path)
     if file_type == "pdf":
+        _ensure_magic(path, (b"%PDF-",), "PDF")
         return parse_pdf(path)
     if file_type == "txt":
         return parse_txt(path)

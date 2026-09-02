@@ -584,8 +584,9 @@ def rule_formula_issues(conn, project_id) -> list[Finding]:
                     f"({e['row']},{e['col']}) 公式 {e['raw_value']} 无缓存计算值，"
                     "请用 WPS/Excel 打开重算后重新导入"
                 )
+            # WPS 保存不缓存公式值是常见行为而非金额错误：降级为 low，避免淹没真实高危项
             out.append(Finding(
-                rule_id, "high", "sheet", s["id"], message,
+                rule_id, "low", "sheet", s["id"], message,
                 {
                     "row": e["row"], "col": e["col"],
                     "cache_status": cache_status, "blocks_verification": True,

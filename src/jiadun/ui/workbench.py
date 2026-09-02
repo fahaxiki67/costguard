@@ -15,9 +15,11 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -1193,6 +1196,12 @@ class WorkbenchPage(QWidget):
             stretch_cols=(4,), center_cols=(2,),
             fixed_widths={0: 56, 1: 56, 3: 150, 5: 90, 6: 64})
         self.anomaly_table.cellDoubleClicked.connect(self._show_anomaly_detail)
+        self.anomaly_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.anomaly_table.customContextMenuRequested.connect(
+            self._show_anomaly_context_menu
+        )
         self.anomaly_detail_panel = QTextEdit()
         self.anomaly_detail_panel.setReadOnly(True)
         self.anomaly_detail_panel.setPlaceholderText("双击问题查看计算过程、来源证据和处理历史")
@@ -1273,6 +1282,56 @@ class WorkbenchPage(QWidget):
             fill_cell(t, i, 6, item_status_zh(finding_lifecycle.lifecycle_status(r)))
         t.setSortingEnabled(True)
         self._apply_match_filters()
+
+    def _show_anomaly_context_menu(self, pos):
+        item = self.anomaly_table.itemAt(pos)
+        if item is None:
+            return
+        id_item = self.anomaly_table.item(item.row(), 0)
+        anomaly_id = id_item.data(Qt.UserRole) if id_item else None
+        if anomaly_id is None:
+            return
+        from jiadun.platform.spreadsheet_jump import (
+            cell_ref,
+            jump_target_for_anomaly,
+            open_in_spreadsheet,
+        )
+
+        target = jump_target_for_anomaly(self.conn, int(anomaly_id))
+        menu = QMenu(self)
+        act_jump = menu.addAction("打开源文件并定位单元格")
+        act_folder = menu.addAction("打开所在文件夹")
+        act_copy = menu.addAction("复制单元格引用")
+        if target is None:
+            for action in (act_jump, act_folder, act_copy):
+                action.setEnabled(False)
+        chosen = menu.exec(self.anomaly_table.viewport().mapToGlobal(pos))
+        if chosen is None or target is None:
+            return
+        if chosen is act_copy:
+            QGuiApplication.clipboard().setText(cell_ref(target))
+            return
+        if chosen is act_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.file_path.parent)))
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            # TODO 异步化：COM 打开约 1-3 秒，暂同步执行
+            outcome = open_in_spreadsheet(target)
+        except FileNotFoundError:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "异常定位", "原始文件已移动或删除")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        text = {
+            "located": f"已在表格程序中定位：{cell_ref(target)}",
+            "opened_only": "已打开文件（未检测到可编程表格接口，无法自动定位单元格）",
+            "hash_mismatch": "原始文件内容已变更，仅打开所在文件夹，请人工核对",
+            "jump_failed": "自动定位失败，已尝试打开文件，请手动查找",
+            "unsupported_platform": "当前平台不支持自动定位",
+        }.get(outcome, "定位失败")
+        QMessageBox.information(self, "异常定位", text)
 
     def _show_anomaly_detail(self, row: int, _column: int):
         item = self.anomaly_table.item(row, 0)
