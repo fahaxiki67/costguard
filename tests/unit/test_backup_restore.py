@@ -135,7 +135,7 @@ def test_backup_restore_handles_chinese_and_space_paths(tmp_path: Path):
 def test_restore_refuses_overwrite_and_tamper(demo_project: Path, tmp_path: Path):
     out = br.backup_project(demo_project, tmp_path)
     (tmp_path / "restore" / demo_project.name).mkdir(parents=True)
-    (tmp_path / "restore" / demo_project.name / "keep.txt").write_text("用户已有内容")
+    (tmp_path / "restore" / demo_project.name / "keep.txt").write_text("用户已有内容", encoding="utf-8")
     with pytest.raises(FileExistsError):
         br.restore_project(out, tmp_path / "restore")
 

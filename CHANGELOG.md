@@ -23,6 +23,9 @@ ROADMAP v0.1.23 生产门槛章节）；以 P0 修复后的全量 pytest 最终�
 现于创建处解析到真实路径（`backup_restore.py`、`golden_regression.py`），不放松任何
 检查强度，并新增 symlink 临时目录回归测试。Windows 构建脚本对过长仓库路径改用
 subst 短盘符调用 Inno Setup，规避 Windows 260 字符路径上限。
+另修复 main CI（Windows 作业）暴露的英文 locale 编码缺陷：测试 write_text 补
+`encoding="utf-8"`；`generate_demo_data.py` / `release_consistency_check.py` 入口
+强制 UTF-8 输出，cp1252 控制台不再 UnicodeEncodeError。
 真实工程 OCR 质量、人工确认界面、Office 真机、50k/200k 性能基准、签名与公证
 仍为 `PENDING / NOT VERIFIED`。
 

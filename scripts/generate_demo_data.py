@@ -523,6 +523,13 @@ def generate(out_dir: Path) -> dict:
 
 
 def main() -> int:
+    # CI/英文 Windows 控制台默认 cp1252，输出中文会 UnicodeEncodeError；统一 UTF-8。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and getattr(_stream, "encoding", "").lower() not in ("utf-8", "utf8"):
+                _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = argparse.ArgumentParser(description="生成匿名演示数据（examples/demo）")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="输出目录")
     parser.add_argument("--check", action="store_true",

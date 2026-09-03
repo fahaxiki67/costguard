@@ -250,3 +250,13 @@
   "系统找不到指定的路径"。构建脚本 Inno 步骤改为在仓库路径过长时用 subst 短盘符
   调用 ISCC（用后即删），产物路径与校验流程不变。
 - 本修复随 v0.1.23 tag 交付；Windows 安装包/便携包从含本修复的最终提交重建。
+
+## 2026-09-04 v0.1.23 增补 2：main CI Windows 作业英文 locale 编码修复
+
+- main 推进后 CI 首次覆盖 v0.1.19–v0.1.22 代码，`test-windows-x64` 作业暴露 4 项失败
+  （本地中文 locale 全量回归为绿，未暴露）：cp1252 控制台下中文输出/写入
+  UnicodeEncodeError。`test_macos` 与安全扫描作业通过，页级 OCR 修复在 macOS CI 实测有效。
+- 修复：`test_acceptance_runner.py` / `test_backup_restore.py` 两处 `write_text` 补
+  `encoding="utf-8"`；`generate_demo_data.py` / `release_consistency_check.py` 的
+  `main()` 入口对 stdout/stderr 做 UTF-8 reconfigure（对英文 Windows 真实用户同样是
+  产品级修复）。本地以 `PYTHONIOENCODING=cp1252` 复现验证通过，ruff 通过。
