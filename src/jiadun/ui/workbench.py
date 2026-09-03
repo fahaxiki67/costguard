@@ -1083,6 +1083,25 @@ class WorkbenchPage(QWidget):
         dlg.exec()
         self.refresh_all()
 
+    def _open_page_review(self) -> None:
+        from jiadun.ui.dialogs.page_review import PageReviewDialog
+
+        record = self._selected_source_file()
+        if record is None:
+            return
+        if str(record["parse_status"]) != "needs_review":
+            QMessageBox.information(
+                self, "逐页对照复核",
+                "只有状态为“解析不完整，待人工确认”的资料需要逐页对照复核。"
+            )
+            return
+        dlg = PageReviewDialog(
+            self.conn, self.project.project_id, int(record["file_id"]),
+            str(record["original_name"]), self,
+        )
+        dlg.exec()
+        self.refresh_all()
+
     def _import_contract(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择合同/补充协议/纪要", "", "文档 (*.docx *.pdf *.txt)")
@@ -1259,11 +1278,13 @@ class WorkbenchPage(QWidget):
         process = QPushButton("按类别重新处理")
         process.setObjectName("btnPrimary")
         process.clicked.connect(self._process_selected_source_file)
+        page_review_btn = QPushButton("逐页对照复核…")
+        page_review_btn.clicked.connect(self._open_page_review)
         original_folder = QPushButton("查看原件位置")
         original_folder.clicked.connect(lambda: self._reveal_selected_source_file("original_path"))
         copy_folder = QPushButton("查看只读副本")
         copy_folder.clicked.connect(lambda: self._reveal_selected_source_file("stored_path"))
-        for button in (reclassify, process, original_folder, copy_folder):
+        for button in (reclassify, process, page_review_btn, original_folder, copy_folder):
             row.addWidget(button)
         row.addStretch(1)
         layout.addLayout(row)

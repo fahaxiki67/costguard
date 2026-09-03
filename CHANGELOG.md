@@ -11,6 +11,14 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.24` 为预发行/预览候选，不代表正式生产能力。
 
+### PDF 逐页人工对照复核（阶段 C-2，schema v49）
+
+- 迁移 v49：新增 pdf_page_reviews（每页当前复核决定，历史流转留审计 Evidence）。
+- 含 OCR 页的合同停在 needs_review；用户对照只读原件逐页核实（核实必填对照依据），
+  全部应复核页 verified 后才允许文档转 parsed；pending_ocr/failed 不适用。
+- 资料中心新增"逐页对照复核…"对话框：页级状态/复核状态/该页候选条款与原文引用。
+- 文档转 parsed 后条款仍为候选，需按条款逐条确认（阶段 C-1 语义不变）。
+
 ## [0.1.24] - 2026-09-04
 
 合同事实确认生命周期（阶段 C-1，schema v48）：contract_facts 增加确认状态字段，

@@ -281,3 +281,17 @@
   改变既有风险判定（候选仍算覆盖），不存在存量项目风险突增。
 - 验证边界：本阶段为纯增量；尚未实现 OCR 扫描页逐条对照复核入口与 confirmed 接入
   控制基准候选算法。全量回归结果见本轮记录。
+
+## 阶段 C-2 进行中：PDF 逐页人工对照复核（schema v49）
+
+- 依据宪章"含 OCR 页的合同停在 needs_review、候选不进入运行契约"与 ROADMAP 阶段 C，
+  本轮补上把文档救回来的合法路径：逐页人工对照复核。
+- 迁移 v49 新增 pdf_page_reviews（project_id/file_id/page_number 唯一，保存当前决定，
+  历史流转留 Evidence）。list_pdf_pages/set_page_review/mark_document_pages_reviewed：
+  页清单与复核状态、单页核实（必填对照依据）/退回、全部应复核页 verified 后文档
+  needs_review → parsed（写 Evidence，产生新 Run Contract 签名）。
+- fail-closed 边界：无 PDF 批次/覆盖不完整拒绝复核；原生文本页无需也不可复核；
+  pending_ocr/failed 文档不适用（需先重新解析）；未核实全部应复核页不得完成。
+- UI：资料中心"逐页对照复核…"对话框（页表/该页候选条款与原文引用/核实/退回/完成）。
+- 语义边界：页级复核只解除文档门控；条款仍为候选，需按条款逐条确认（C-1 不变）。
+  原件保持只读；OCR 全文不落库（沿用既有设计）。

@@ -2800,6 +2800,26 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE contract_facts ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
         ],
     ),
+    # v49：PDF 逐页人工对照复核。含 OCR 页的合同停在 needs_review；用户对照
+    # 只读原件逐页核实后，全部应复核页 verified 的文档才允许转 parsed。
+    # 表保存每页当前决定，历史流转留在 contract_fact_review 同级审计 Evidence。
+    (
+        49,
+        [
+            """CREATE TABLE IF NOT EXISTS pdf_page_reviews (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                file_id INTEGER NOT NULL REFERENCES source_files(id),
+                page_number INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                reviewed_by TEXT NOT NULL DEFAULT 'user',
+                reviewed_at TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER,
+                UNIQUE(project_id, file_id, page_number)
+            )""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
