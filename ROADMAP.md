@@ -48,6 +48,27 @@ GitHub 仓库地址、已有 v0.x tag、Release、远端资产和历史项目目
 提示新版本 → 用户点击查看 GitHub Release → 用户主动决定升级。
 不实现后台静默更新。
 
+## v0.1.23 生产门槛（未全部满足）
+
+v0.1.23 聚焦页级 OCR 与混合 PDF 不漏页能力的回归收口和发行卫生修复：补齐 v0.1.22
+跳过的发行文档与一致性门槛，把版本断言从测试硬编码改为跟随 `pyproject.toml` 单一
+版本源，并以 P0 修复后的全量回归结果作为版本记录依据。不改变 macOS Apple Silicon
+主平台定位，Windows 特有行为继续隔离在 `platform/` 层。以下门槛未全部关闭前，
+只能标记为预览候选，不能标记为正式生产版。
+
+- [x] P0 修复后全量 pytest 回归以最终退出码收口；失败项逐一定位并修复
+  （发行文档缺失、测试版本断言过期），修复后重跑相关集合通过。
+- [x] README / README_zh-CN / ARCHITECTURE / ROADMAP 与当前版本一致；
+  `docs/RELEASE_NOTES_v0.1.23.md` 按门槛清单格式建立，发行一致性检查可通过。
+- [x] 黄金回归：合成案例 PASS、脱敏真实案例保持 PENDING 登记（不冒充）。
+- [ ] 真实工程扫描 PDF 的中文、表格、印章、旋转页、低质量复印件 OCR 质量回归；
+  脱敏黄金样本登记仍未完成。
+- [ ] OCR 合同候选的人工确认界面与 confirmed 才生效的事实生命周期闭环。
+- [ ] 对上终审/审计清单作为控制候选的上限关系与冲突分层算法
+  （reference / control_candidate / settlement_result 角色分层）。
+- [ ] 真实 Microsoft Excel/WPS（Windows 与 macOS）、最终包启动与取消/异常恢复专项、
+  50k/200k 完整导出基准、Windows 代码签名与 macOS 公证。
+
 ## v0.1.20 生产门槛（未全部满足）
 
 v0.1.20 聚焦资料中心、明确分类和导入过程可观察性；不改变 macOS Apple Silicon

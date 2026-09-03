@@ -9,13 +9,17 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.22` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.23` 为预发行/预览候选，不代表正式生产能力。
 
-当前 `v0.1.22` 预发行增量：建立逐页混合 PDF 提取管线和本地 RapidOCR 平台适配，
-把完整性、页状态和模型元数据写入解析批次与 Evidence；真实工程 OCR、人工确认界面、
-Windows onedir 的 OCR 模型资源收集烟测已通过；最终包启动、真实工程 OCR、人工确认界面
-和 Office 真机验证仍保持开放，不将本版本描述为正式生产版。另已关闭未分类合同
-同步入口、非 canonical OCR 批次复用和资料重新分类审计/刷新缺口。
+## [0.1.23] - 2026-09-04
+
+页级 OCR 回归收口与发行卫生修复预发行：补齐 v0.1.22 跳过的发行文档与一致性门槛
+（README / ROADMAP / ARCHITECTURE 状态更新、`docs/RELEASE_NOTES_v0.1.23.md`、
+ROADMAP v0.1.23 生产门槛章节）；以 P0 修复后的全量 pytest 最终退出码重新收口，
+定位出的 5 个失败均为发行文档缺失与测试版本断言硬编码（`0.1.20`）过期，已改为
+从 `pyproject.toml` 单一版本源读取；黄金回归合成案例 PASS、真实案例保持 PENDING。
+真实工程 OCR 质量、人工确认界面、Office 真机、50k/200k 性能基准、签名与公证
+仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.22] - 2026-09-04
 

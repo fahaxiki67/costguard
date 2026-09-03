@@ -206,3 +206,28 @@
 - 原始业务资料：本次页级管线测试未读取用户真实项目文件；所有测试文件均在临时目录，
   不进入 Git。若后续使用真实样本，必须先复制到独立临时目录并在前后比较 SHA-256、大小和
   修改时间，任何原件哈希变化立即停止。
+
+## 2026-09-04 v0.1.23 收口记录（ZCode 接力）
+
+- 接力背景：v0.1.21/v0.1.22 在交付窗口压力下发行，P0 修复后的全量 pytest 中止于约 8%
+  记为 PENDING；四个发行（v0.1.19–v0.1.22）均无附件、CI 未运行、main 未推进。
+- 全量回归收口：Windows x64 / Python 3.12 项目环境 `python -m pytest -q` 完整运行，
+  最终退出码 1，818 项收集，5 个失败全部集中发布门槛测试：
+  - `test_release_consistency.py` 2 项：测试硬编码 `expected_version="0.1.20"`，
+    与 pyproject `0.1.22` 不符（测试断言过期，非业务回归）。
+  - `test_release_checklist.py` / `test_release_consistency.py` 3 项：v0.1.22 升版时
+    未建 RELEASE_NOTES、未更新 README/ROADMAP/ARCHITECTURE，发布一致性检查按设计
+    判 failed（门槛生效的证明，不是误报）。
+- 修复：版本号升至 0.1.23；README / README_zh-CN / ARCHITECTURE / ROADMAP 当前版本
+  状态更新；新建 `docs/RELEASE_NOTES_v0.1.23.md`（含预览候选定位、门槛清单与
+  PENDING 边界）；门槛测试期望版本改为读 `pyproject.toml`（`tomllib` /
+  `release_checklist._version`），消除每次发版手改测试的隐患。
+- 黄金回归：`scripts/golden_regression.py --json` 实跑 `status=passed`，
+  合成案例 `PASS 1`；真实案例 `not_available/PENDING`（无脱敏登记，不冒充）。
+- 业务计算边界：本轮零业务代码改动（仅版本号、发行文档、测试断言来源）；Decimal /
+  Run Contract / Evidence / OCR 页级管线均未触碰。
+- 仍然 PENDING / NOT VERIFIED：真实工程扫描 PDF OCR 质量、OCR 合同候选人工确认
+  界面、对上控制候选上限/冲突算法、真实 Microsoft Excel/WPS（Windows 与 macOS）
+  真机、最终包启动与取消/异常恢复、50k/200k 完整导出基准、Windows 签名与 macOS 公证、
+  脱敏黄金案例登记（当前为 0）。
+- 原始业务资料：本轮未读取用户真实项目文件；全部测试使用仓库合成/临时数据。
