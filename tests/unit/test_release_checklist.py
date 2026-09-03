@@ -657,3 +657,78 @@ def test_performance_validator_returns_structured_error_for_non_object(report):
     errors = release_checklist._validate_performance_report(report)
     assert errors
     assert any("对象" in error for error in errors)
+
+
+def _write_signature_artifact(path: Path, content: bytes) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return hashlib.sha256(content).hexdigest()
+
+
+def test_signature_item_rehashes_entries_across_dist_layouts(tmp_path):
+    """签名门禁必须逐项重新哈希核对，兼容 dist/ 与 dist/installer/ 布局。"""
+    zip_digest = _write_signature_artifact(
+        tmp_path / "dist" / "Jiadun-0.1.99-windows-x64-portable.zip", b"zip-bytes"
+    )
+    exe_digest = _write_signature_artifact(
+        tmp_path / "dist" / "installer" / "Jiadun-0.1.99-windows-x64-setup.exe", b"exe-bytes"
+    )
+    (tmp_path / "dist" / "SHA256SUMS.txt").write_text(
+        f"{zip_digest}  Jiadun-0.1.99-windows-x64-portable.zip\n"
+        f"{exe_digest}  Jiadun-0.1.99-windows-x64-setup.exe\n",
+        encoding="ascii",
+    )
+
+    item = release_checklist._signature_item(tmp_path, "0.1.99")
+
+    assert item["status"] == "conditional"
+    assert "哈希核对一致" in item["detail"]
+    assert "portable.zip" in item["detail"]
+    assert "setup.exe" in item["detail"]
+    assert "本地未找到" not in item["detail"]
+
+
+def test_signature_item_fails_closed_on_hash_mismatch(tmp_path):
+    """登记哈希与实际产物不一致时必须 failed，不能只看版本号字样。"""
+    _write_signature_artifact(
+        tmp_path / "dist" / "Jiadun-0.1.99-windows-x64-portable.zip", b"real-bytes"
+    )
+    (tmp_path / "dist" / "SHA256SUMS.txt").write_text(
+        f"{'0' * 64}  Jiadun-0.1.99-windows-x64-portable.zip\n",
+        encoding="ascii",
+    )
+
+    item = release_checklist._signature_item(tmp_path, "0.1.99")
+
+    assert item["status"] == "failed"
+    assert "哈希与实际产物不一致" in item["detail"]
+
+
+def test_signature_item_marks_unresolvable_entries_not_available(tmp_path):
+    """条目在本地均不可解析（如仅存在于其他平台的构建现场）时不得记为已核验。"""
+    (tmp_path / "dist").mkdir(parents=True)
+    (tmp_path / "dist" / "SHA256SUMS.txt").write_text(
+        f"{'0' * 64}  Jiadun-0.1.99-macos-arm64.dmg\n",
+        encoding="ascii",
+    )
+
+    item = release_checklist._signature_item(tmp_path, "0.1.99")
+
+    assert item["status"] == "not_available"
+    assert "本地未找到" in item["detail"]
+
+
+def test_signature_item_rejects_stale_version_even_if_hashes_match(tmp_path):
+    """哈希一致但登记的不是当前版本时，仍不能当作当前安装包签名证据。"""
+    dmg_digest = _write_signature_artifact(
+        tmp_path / "dist" / "Jiadun-0.1.98-macos-arm64.dmg", b"dmg-bytes"
+    )
+    (tmp_path / "dist" / "SHA256SUMS.txt").write_text(
+        f"{dmg_digest}  Jiadun-0.1.98-macos-arm64.dmg\n",
+        encoding="ascii",
+    )
+
+    item = release_checklist._signature_item(tmp_path, "0.1.99")
+
+    assert item["status"] == "not_available"
+    assert "不包含当前版本" in item["detail"]

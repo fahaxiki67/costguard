@@ -1201,6 +1201,14 @@ def _office_item(root: Path) -> dict[str, Any]:
     )
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _signature_item(root: Path, version: str | None) -> dict[str, Any]:
     sums = root / "dist" / "SHA256SUMS.txt"
     if not sums.is_file():
@@ -1213,15 +1221,74 @@ def _signature_item(root: Path, version: str | None) -> dict[str, Any]:
     text = sums.read_text(encoding="utf-8", errors="replace")
     version_token = f"{version}-" if version else ""
     has_current = version_token in text or (version is not None and f"{version}." in text)
+
+    # SHA256SUMS 沿用 GitHub Release 资产的扁平命名；本地构建布局中安装器位于
+    # dist/installer/，因此按 dist/ 与 dist/installer/ 两处解析。解析不到或
+    # 哈希不符都不得记为已核验（fail-closed）。
+    entries: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest = parts[0].strip().lower()
+        name = parts[1].strip().lstrip("*")
+        if digest and name:
+            entries.append((digest, name))
+
+    verified: list[str] = []
+    mismatched: list[str] = []
+    missing: list[str] = []
+    for digest, name in entries:
+        candidates = (root / "dist" / name, root / "dist" / "installer" / name)
+        path = next((c for c in candidates if c.is_file()), None)
+        if path is None:
+            missing.append(name)
+        elif _sha256_file(path) == digest:
+            verified.append(name)
+        else:
+            mismatched.append(name)
+
+    detail_parts: list[str] = []
+    if verified:
+        detail_parts.append("哈希核对一致：" + ", ".join(verified))
+    if missing:
+        detail_parts.append("本地未找到、无法核验：" + ", ".join(missing))
+    if mismatched:
+        detail_parts.append("哈希与实际产物不一致：" + ", ".join(mismatched))
+    detail_suffix = "；".join(detail_parts)
+
+    if mismatched:
+        return _item(
+            "package_signature",
+            "安装包签名状态",
+            "failed",
+            evidence=str(sums.relative_to(root)),
+            detail=f"dist/SHA256SUMS.txt 存在不可信条目；{detail_suffix}。",
+        )
+    if not has_current:
+        return _item(
+            "package_signature",
+            "安装包签名状态",
+            "not_available",
+            evidence=str(sums.relative_to(root)),
+            detail=f"校验和文件不包含当前版本，不能当作当前安装包签名证据。{detail_suffix}",
+        )
+    if not verified:
+        return _item(
+            "package_signature",
+            "安装包签名状态",
+            "not_available",
+            evidence=str(sums.relative_to(root)),
+            detail=f"校验和条目在本地均不可解析，无法核验。{detail_suffix}",
+        )
     return _item(
         "package_signature",
         "安装包签名状态",
-        "conditional" if has_current else "not_available",
+        "conditional",
         evidence=str(sums.relative_to(root)),
         detail=(
-            "当前版本的校验和文件已登记；签名、公证和证书链仍须以对应构建现场证据为准。"
-            if has_current
-            else "校验和文件不包含当前版本，不能当作当前安装包签名证据。"
+            f"当前版本的校验和文件已登记并逐项重新哈希核对；{detail_suffix}；"
+            "签名、公证和证书链仍须以对应构建现场证据为准。"
         ),
     )
 
