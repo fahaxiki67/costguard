@@ -48,6 +48,26 @@ GitHub 仓库地址、已有 v0.x tag、Release、远端资产和历史项目目
 提示新版本 → 用户点击查看 GitHub Release → 用户主动决定升级。
 不实现后台静默更新。
 
+## v0.1.19 生产门槛（未全部满足）
+
+v0.1.19 聚焦备份恢复安全、Windows Excel/WPS 工作簿所有权和 Excel 大规模导出
+性能；不改变 macOS Apple Silicon 主平台定位，Windows 特有行为继续隔离在 platform
+层。以下门槛未全部关闭前，只能标记为预览候选，不能标记为正式生产版。
+
+- [x] 备份恢复拒绝路径穿越、绝对/盘符/UNC、非法项目名、重复 ZIP/manifest、
+  manifest 内容不一致和 symlink/junction/reparse point；失败不覆盖已有目录，
+  只按本次创建身份清理。
+- [x] Windows Excel/WPS 记录 Workbook 与 Application 所有权；用户已有文档不关，
+  已有实例不 Quit，所有权未知时保守不关闭。
+- [x] Excel 导出完成 10k 同环境 before/after 计时与内存记录；50k 基准保留完整
+  现场并如实记录旧版与优化版的 `TIMEOUT / INCOMPLETE`。
+- [x] Windows CI 加入普通回归测试；中文/空格路径和文件占用测试保留；真实
+  Microsoft Excel COM 明确标记 `PENDING / NOT VERIFIED`。
+- [ ] 50k/更大规模完整 Excel 导出基准成功完成，并补齐阶段级峰值内存对比。
+- [ ] 真实 Microsoft Excel、macOS Excel/WPS 真机专项和并发路径竞态复核。
+- [ ] Windows 代码签名、macOS Developer ID 签名与公证，以及授权脱敏黄金案例。
+- [ ] 问题台账 UI 录入、云同步/协作等仍按既定边界暂缓。
+
 ## v0.1.18 生产门槛（未全部满足）
 
 v0.1.18 以 Windows x64 生产化与真实工程案例验证为主线：真机完成安装/启动/

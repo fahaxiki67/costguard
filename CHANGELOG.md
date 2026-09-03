@@ -9,7 +9,38 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；当前 `v0.1.18` 仍是预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；当前 `v0.1.19` 仍是预发行/预览候选，不代表正式生产能力。
+
+## [0.1.19] - 2026-09-03
+
+备份恢复安全、Windows Excel/WPS 所有权与大规模 Excel 导出性能的预发行加固；
+不改变 macOS Apple Silicon 主平台定位，不改变 Decimal、Evidence、Run Contract、
+原始文件只读和 fail-closed 原则。
+
+### Fixed
+
+- 备份恢复严格拒绝路径穿越、绝对/盘符/UNC 路径、非法项目目录名、ZIP 或
+  manifest 重复/碰撞路径、manifest 与 ZIP 内容不一致，以及 symlink/junction/
+  reparse point 越界；恢复不覆盖已有项目目录，目标写入使用 platform 层目录句柄
+  相对独占创建，失败清理按创建时身份和内容校验，不递归删除调用前存在的用户目录。
+- Windows 表格跳转显式区分 `workbook_owned_by_jiadun` 与用户工作簿：已有目标
+  直接复用且不关闭；无法证明所有权时不关闭；已有 Excel/WPS 实例不 Quit，只有
+  本次明确创建且退出前确认无工作簿的实例才允许 Quit。
+- Excel 导出将自动列宽、Evidence 链接和统一样式的重复扫描降为受控扫描，保留
+  Decimal、公式、Evidence、待补资料、不可比和审计回溯语义。
+
+### Validation boundary
+
+- Windows x64 CI 已加入 Ruff、完整 pytest 和 golden regression；真实 Microsoft
+  Excel COM、macOS Excel/WPS 真机仍为 `PENDING / NOT VERIFIED`，本机 WPS 仅作为
+  代码路径参考，不能等同 Excel PASS。
+- 同一 Windows 环境 10k 正式基准：Excel 导出 1013.171s → 662.354s（1.530x，
+  -34.626%），总流程 1309.928s → 970.937s（1.349x，-25.879%）；Python 导出
+  峰值约 304.4MB → 304.4MB。50k 旧版 3:00:37、优化版 1:02:30 均在完整导出
+  JSON 前停止，均为 `TIMEOUT / INCOMPLETE`，因此不宣称 50k 已完成或给出伪造倍数。
+- 5 个本机真实项目副本（`.xlsx`/`.xls`）均在中文/空格隔离目录中测试；均因解析能力
+  或人工确认门槛记为 `PENDING`，未强行分析或导出；原文件 SHA-256、大小、修改时间
+  全部保持不变。真实 Excel/WPS 打开关闭和复杂业务结果仍待授权真机/人工验证。
 
 ## [0.1.18] - 2026-09-03
 

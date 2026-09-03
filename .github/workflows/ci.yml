@@ -25,6 +25,35 @@ jobs:
       - name: Golden regression
         run: .venv/bin/python scripts/golden_regression.py
 
+  test-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv pip install -e ".[dev]"
+      - name: Lint
+        run: uv run ruff check src scripts tests
+      - name: Tests
+        run: uv run python -m pytest tests/ -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Golden regression
+        run: uv run python scripts/golden_regression.py
+      - name: Real Microsoft Excel verification status
+        shell: pwsh
+        run: |
+          # Mock COM tests validate ownership branches only; they never certify
+          # a real Excel process. A separate Office-enabled machine is required.
+          $excel = Get-Command excel.exe -ErrorAction SilentlyContinue
+          if ($null -eq $excel) {
+            Write-Host "Microsoft Excel COM: PENDING / NOT VERIFIED"
+          } else {
+            Write-Host "Microsoft Excel COM: PENDING / NOT VERIFIED (runner presence is not a test)"
+          }
+
   security-scan:
     runs-on: ubuntu-latest
     steps:

@@ -20,6 +20,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles.cell_style import StyleArray
 from openpyxl.utils import get_column_letter
 
 from jiadun import branding
@@ -173,19 +174,37 @@ def _style_header(ws, row: int, cols: int):
 
 
 def _autowidth(ws):
-    for col in ws.columns:
-        width = max((len(str(c.value or "")) for c in col), default=8)
-        ws.column_dimensions[get_column_letter(col[0].column)].width = min(max(width + 2, 8), 60)
+    """单次行扫描统计列宽，避免逐列重复创建/遍历 Cell 对象。"""
+    max_column = ws.max_column
+    if not max_column:
+        return
+    widths = [8] * max_column
+    for row in ws.iter_rows(
+        min_row=1, max_row=ws.max_row, min_col=1, max_col=max_column,
+        values_only=True,
+    ):
+        for index, value in enumerate(row):
+            if value is not None:
+                widths[index] = max(widths[index], len(str(value)) + 2)
+    for index, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(index)].width = min(width, 60)
 
 
 def _style_used_range(ws) -> None:
     """给导出工作表的有效矩形范围统一添加边框、居中和自动换行。"""
+    # 先把两个不可变样式注册一次，再直接更新每个 Cell 的 style ID。
+    # 这样保留原有字体/填充/数字格式，同时避免 descriptor 每次重新查找
+    # 完整 Border/Alignment 对象；输出语义与原实现一致。
+    border_id = ws.parent._borders.add(TABLE_BORDER)
+    alignment_id = ws.parent._alignments.add(CENTER_WRAP)
     for row in ws.iter_rows(
         min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column
     ):
         for cell in row:
-            cell.border = TABLE_BORDER
-            cell.alignment = CENTER_WRAP
+            if cell._style is None:
+                cell._style = StyleArray()
+            cell._style.borderId = border_id
+            cell._style.alignmentId = alignment_id
 
 
 def _prepare_data_sheet(ws, *, header_row: int = 1) -> None:
@@ -205,32 +224,72 @@ def _link_evidence_references(wb: Workbook) -> None:
     if evidence_ws is None:
         return
     row_by_id = {
-        evidence_ws.cell(row=row, column=1).value: row
-        for row in range(2, evidence_ws.max_row + 1)
-        if evidence_ws.cell(row=row, column=1).value is not None
+        value: row
+        for row, (value,) in enumerate(
+            evidence_ws.iter_rows(
+                min_row=2, max_row=evidence_ws.max_row,
+                min_col=1, max_col=1, values_only=True,
+            ),
+            start=2,
+        )
+        if value is not None
     }
+
+    def link_cell(cell) -> None:
+        value = cell.value
+        target_id = value if isinstance(value, int) else None
+        if target_id is None and isinstance(value, str):
+            match = re.search(r"Evidence ID\s+(\d+)", value)
+            target_id = int(match.group(1)) if match else None
+        target_row = row_by_id.get(target_id)
+        if target_row is not None:
+            cell.hyperlink = f"#'证据索引'!A{target_row}"
+
+    def iter_non_evidence_cells(ws, evidence_columns: set[int]):
+        """遍历非 Evidence 列中的已创建 Cell，保留旧的文本回溯语义。"""
+        cells = getattr(ws, "_cells", None)
+        if isinstance(cells, dict):
+            for cell in cells.values():
+                if cell.row >= 2 and cell.column not in evidence_columns:
+                    yield cell
+            return
+        # 兼容不暴露 _cells 的工作表替身；真实 openpyxl 路径使用上面的
+        # 稀疏 Cell 容器，避免为每个单元格重复读取表头。
+        for row in ws.iter_rows(
+            min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column,
+            values_only=False,
+        ):
+            for cell in row:
+                if cell.column not in evidence_columns:
+                    yield cell
+
     for ws in wb.worksheets:
         if ws.title == "证据索引":
             continue
-        for row in range(2, ws.max_row + 1):
-            for col in range(1, ws.max_column + 1):
-                cell = ws.cell(row=row, column=col)
-                value = cell.value
-                header = str(ws.cell(row=1, column=col).value or "")
-                evidence_column = (
-                    "证据" in header or "出处" in header or "Evidence ID" in header
-                )
-                if not evidence_column and not (
-                    isinstance(value, str) and "Evidence ID" in value
+        evidence_columns = [
+            col for col in range(1, ws.max_column + 1)
+            if (
+                "证据" in str(ws.cell(row=1, column=col).value or "")
+                or "出处" in str(ws.cell(row=1, column=col).value or "")
+                or "Evidence ID" in str(ws.cell(row=1, column=col).value or "")
+            )
+        ]
+        evidence_column_set = set(evidence_columns)
+        if evidence_columns:
+            # 绝大多数大表（尤其审核底稿）只需遍历预先确定的 Evidence
+            # 列；表头只读取一次，避免对每个 Cell 重复查表头。
+            for col in evidence_columns:
+                for (cell,) in ws.iter_rows(
+                    min_row=2, max_row=ws.max_row,
+                    min_col=col, max_col=col, values_only=False,
                 ):
-                    continue
-                target_id = value if isinstance(value, int) else None
-                if target_id is None and isinstance(value, str):
-                    match = re.search(r"Evidence ID\s+(\d+)", value)
-                    target_id = int(match.group(1)) if match else None
-                target_row = row_by_id.get(target_id)
-                if target_row is not None:
-                    cell.hyperlink = f"#'证据索引'!A{target_row}"
+                    link_cell(cell)
+        # 无论是否存在 Evidence 表头，都保留旧实现对非 Evidence 列中
+        # ``Evidence ID N`` 文本的回溯能力；使用已创建 Cell 的单次扫描，
+        # 不再在每个单元格上重复读取对应表头。
+        for cell in iter_non_evidence_cells(ws, evidence_column_set):
+            if isinstance(cell.value, str) and "Evidence ID" in cell.value:
+                link_cell(cell)
 
 
 # openpyxl 原生支持 Decimal（XML 层写精确十进制字符串），当前序列化无需 float。

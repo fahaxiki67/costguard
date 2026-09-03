@@ -151,6 +151,26 @@ class TestExcelExport:
                     "证据索引", "审核底稿"}
         assert expected <= set(wb.sheetnames), wb.sheetnames
 
+    def test_evidence_text_in_non_evidence_column_keeps_hyperlink(self):
+        """优化后仍保留旧行为：普通说明列嵌入 Evidence ID 也可追溯。"""
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        evidence = wb.active
+        evidence.title = "证据索引"
+        evidence.append(["Evidence ID", "来源"])
+        evidence.append([7, "synthetic source"])
+        ws = wb.create_sheet("结果")
+        ws.append(["备注", "证据ID"])
+        ws.append(["说明：Evidence ID 7", 7])
+
+        excel_export._link_evidence_references(wb)
+
+        assert ws["A2"].hyperlink is not None
+        assert ws["A2"].hyperlink.target == "#'证据索引'!A2"
+        assert ws["B2"].hyperlink is not None
+        assert ws["B2"].hyperlink.target == "#'证据索引'!A2"
+
     def test_version_and_history_assets_are_exported_with_traceable_fields(
         self, full_project, monkeypatch
     ):
