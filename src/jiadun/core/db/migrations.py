@@ -2820,6 +2820,31 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )""",
         ],
     ),
+    # v50：对上控制基准候选（终审/审计报告等作为对比上限候选）。候选只能来自
+    # 已确认合同事实或人工显式登记；只有人工确认的基准才参与上限比较；
+    # supersedes 必须显式声明，两个并存有效基准比较时返回 CONTROL_CONFLICT。
+    (
+        50,
+        [
+            """CREATE TABLE IF NOT EXISTS control_baselines (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                doc_id INTEGER REFERENCES contract_docs(id),
+                fact_id INTEGER REFERENCES contract_facts(id),
+                amount TEXT NOT NULL,
+                tax_basis TEXT NOT NULL DEFAULT 'unknown',
+                scope_note TEXT NOT NULL DEFAULT '',
+                source_note TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'candidate',
+                supersedes_id INTEGER REFERENCES control_baselines(id),
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                confirmed_by TEXT,
+                confirmed_reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER
+            )""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

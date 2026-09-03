@@ -295,3 +295,21 @@
 - UI：资料中心"逐页对照复核…"对话框（页表/该页候选条款与原文引用/核实/退回/完成）。
 - 语义边界：页级复核只解除文档门控；条款仍为候选，需按条款逐条确认（C-1 不变）。
   原件保持只读；OCR 全文不落库（沿用既有设计）。
+
+## 对上控制基准候选与上限比较进行中（schema v50）
+
+- 依据宪章 §六（reference/control_candidate/settlement_result 三角色、五态输出、
+  禁止自动挑选基准）与用户业务需求（终审/审计报告作为对上对比上限），实现：
+  - 迁移 v50 新增 control_baselines 表（amount 为 Decimal 字符串，tax_basis/
+    scope_note/supersedes_id/确认状态与依据）。
+  - 候选来源两条路：已确认合同事实（非 confirmed 拒绝；非金额值拒绝）与人工显式
+    登记（出处必填）；候选确认必须给出核对依据；supersedes 必须显式声明。
+  - compare_upward_result 五态：CONTROL_CONFLICT（有效基准并存且无替代关系）、
+    INCOMPARABLE（税口径/范围明确不同）、PENDING（税口径未确认等）、
+    FAIL（超出金额，附差额，不认定违规责任）、PASS。全部写审计 Evidence。
+  - list_upward_periods：对上期次明细合计 = line_items.amount 的 Decimal 求和
+    （导入管线已排除小计行），税口径取期次 tax_mode。
+- UI：工作台"对上控制基准…"对话框（候选登记/确认拒绝/选期次比较/结论与差额展示）。
+- 边界（如实）：控制基准尚未写入 Run Contract 载荷（比较为独立分析层，结果留
+  Evidence）；范围比较目前是文本说明比对（双方都填写且不同才 INCOMPARABLE），
+  结构化 scope 字段留待后续；框架/管理性协议独立算法仍为实现。

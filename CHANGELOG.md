@@ -11,6 +11,18 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.24` 为预发行/预览候选，不代表正式生产能力。
 
+### 对上控制基准候选与上限比较（schema v50）
+
+- 迁移 v50：新增 control_baselines（金额/税口径/范围/supersedes/确认状态/审计）。
+- 控制基准候选只能来自已确认合同事实或人工显式登记（出处必填）；候选本身仍需
+  人工确认（必须给出范围/税口径/版本核对依据）后才参与比较。
+- 上限比较输出固定五态：PASS / FAIL（给出超出金额，不认定违规或责任）/
+  PENDING（未确认）/ INCOMPARABLE（税口径或范围明确不同）/
+  CONTROL_CONFLICT（多个有效基准并存且无 supersedes 替代关系）。
+- 对上结算结果 = 对上期次明细合计（Decimal；小计行在导入时已被排除）。
+- 工作台新增"对上控制基准…"对话框（候选登记/确认/拒绝/选对上期次比较）。
+- 全部操作写入 control_baseline* 审计 Evidence。
+
 ### PDF 逐页人工对照复核（阶段 C-2，schema v49）
 
 - 迁移 v49：新增 pdf_page_reviews（每页当前复核决定，历史流转留审计 Evidence）。
