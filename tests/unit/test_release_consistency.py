@@ -136,6 +136,7 @@ def test_release_consistency_cli_can_import_golden_runner_from_scripts_directory
         cwd=root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
@@ -154,6 +155,7 @@ def test_release_consistency_cli_can_import_golden_runner_from_scripts_directory
         cwd=root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert allowed.returncode == 0, allowed.stdout + allowed.stderr
