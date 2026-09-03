@@ -103,7 +103,7 @@ def _load_local_ocr_provider():
 def _contract_document_status(conn, project_id: int, doc_id: int) -> str:
     """读取合同资料的最终状态，避免把 OCR 候选显示成普通成功。"""
     row = conn.execute(
-        """SELECT COALESCE(di.parse_status, 'parsed') AS parse_status
+        """SELECT COALESCE(di.parse_status, 'needs_review') AS parse_status
            FROM contract_docs cd
            LEFT JOIN document_intake di
              ON di.file_id=cd.file_id AND di.project_id=cd.project_id

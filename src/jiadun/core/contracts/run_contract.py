@@ -1517,14 +1517,13 @@ def _contract_facts(conn: sqlite3.Connection, project_id: int) -> list[dict[str,
     rows = conn.execute(
         """SELECT cd.id AS doc_id, cd.doc_type, cd.title, cd.file_id,
                   cf.fact_key, cf.fact_value, cf.quote_text, cf.location, cf.confidence,
-                  COALESCE(di.parse_status, 'parsed') AS document_parse_status
+                  di.parse_status AS document_parse_status
            FROM contract_docs cd LEFT JOIN contract_facts cf ON cf.doc_id=cd.id
            LEFT JOIN document_intake di ON di.file_id=cd.file_id AND di.project_id=cd.project_id
            WHERE cd.project_id=?
-             AND (
-                 di.file_id IS NULL
-                 OR (di.category='upward_contract' AND di.parse_status='parsed')
-             )
+             AND di.file_id IS NOT NULL
+             AND di.category='upward_contract'
+             AND di.parse_status='parsed'
            ORDER BY cd.id, cf.id""",
         (project_id,),
     ).fetchall()

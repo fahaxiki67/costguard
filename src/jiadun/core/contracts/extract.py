@@ -670,10 +670,10 @@ def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
            FROM contract_docs cd
            LEFT JOIN document_intake di
              ON di.file_id=cd.file_id AND di.project_id=cd.project_id
-           WHERE cd.project_id=? AND (
-             di.file_id IS NULL
-             OR (di.category='upward_contract' AND di.parse_status='parsed')
-           )""",
+           WHERE cd.project_id=?
+             AND di.file_id IS NOT NULL
+             AND di.category='upward_contract'
+             AND di.parse_status='parsed'""",
         (project_id,),
     ).fetchall()
     risks = []

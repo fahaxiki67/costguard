@@ -452,6 +452,12 @@ def test_old_pdf_projection_is_retired_before_retry(project_db):
                ) VALUES (?,?,?,?,?,?,?)""",
             (doc_id, "payment_clause", "80%", "旧版片段", "p1", 0.9, evidence_id),
         )
+        from jiadun.core.document_intake import record_document
+
+        record_document(
+            conn, project_id, source_file.file_id, category="upward_contract",
+            parse_status="parsed", parser="legacy", commit=False,
+        )
     risks = extract.contract_risks(conn, project_id)
     assert risks
     extract.persist_risks(conn, project_id, risks)
@@ -497,6 +503,27 @@ def test_old_pdf_projection_is_retired_before_retry(project_db):
         "SELECT COUNT(*) AS n FROM finding_status_events WHERE anomaly_id=?",
         (old_risk["id"],),
     ).fetchone()["n"] == 1
+
+
+def test_legacy_contract_without_intake_is_excluded_fail_closed(project_db):
+    conn, project_id, project_dir = project_db
+    source = _pdf_copy(project_dir)
+    source_file = import_file(conn, project_id, project_dir, source)
+    with conn:
+        doc_id = conn.execute(
+            """INSERT INTO contract_docs(project_id, file_id, doc_type, title, parsed_at)
+               VALUES (?,?,?,?,?)""",
+            (project_id, source_file.file_id, "legacy", "无 intake 合同", "2026"),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO contract_facts(
+                   doc_id, fact_key, fact_value, quote_text, location, confidence
+               ) VALUES (?,?,?,?,?,?)""",
+            (doc_id, "payment_clause", "80%", "旧版片段", "p1", 0.9),
+        )
+
+    assert run_contract._contract_facts(conn, project_id) == []
+    assert extract.contract_risks(conn, project_id) == []
 
 
 def test_failed_pdf_retry_invalidates_an_existing_run_contract(project_db):
