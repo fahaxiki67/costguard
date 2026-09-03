@@ -16,7 +16,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -44,16 +44,18 @@ from PySide6.QtWidgets import (
 )
 
 from jiadun import branding
-from jiadun.core import analysis
+from jiadun.core import analysis, document_intake
 from jiadun.core.anomalies import catalog as rule_catalog
 from jiadun.core.anomalies import coverage as detection_coverage
 from jiadun.core.anomalies import engine as anomaly_engine
 from jiadun.core.contracts import run_contract
+from jiadun.core.db import migrations
 from jiadun.core.engine import settlement_io
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.export import excel_export
 from jiadun.core.matching import matching
 from jiadun.core.matching import mirror as matching_mirror
+from jiadun.core.models.source_file import import_file
 from jiadun.core.pricing import history as pricing_history
 from jiadun.core.reporting import build_report_model
 from jiadun.core.versions import project as project_versions
@@ -202,6 +204,156 @@ class ReasonDialog(QDialog):
 
     def reason(self) -> str:
         return self.reason_edit.toPlainText().strip()
+
+
+class ImportCategoryDialog(QDialog):
+    """资料导入前的人工分类，不根据文件名猜测对上/对下。"""
+
+    def __init__(self, selection_count: int, parent=None, *, category: str = "unclassified"):
+        super().__init__(parent)
+        self.setWindowTitle("选择资料类别")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        prompt = QLabel(
+            f"已选择 {selection_count} 项资料（文件夹会在后台扫描）。请先确认资料类别；"
+            "未能确认时请选择“待人工分类”。\n"
+            "资料只会复制到项目的只读原件库；未分类、台账和报告不会自动进入金额计算。"
+        )
+        prompt.setWordWrap(True)
+        layout.addWidget(prompt)
+        form = QFormLayout()
+        self.category_combo = QComboBox()
+        for item in document_intake.DOCUMENT_CATEGORIES:
+            self.category_combo.addItem(item.label, item.code)
+        index = self.category_combo.findData(category)
+        self.category_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.detail = QLabel()
+        self.detail.setWordWrap(True)
+        form.addRow("资料类别：", self.category_combo)
+        form.addRow("处理方式：", self.detail)
+        layout.addLayout(form)
+        self.category_combo.currentIndexChanged.connect(self._refresh_detail)
+        self._refresh_detail()
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        confirm = buttons.addButton("开始后台导入", QDialogButtonBox.AcceptRole)
+        confirm.setObjectName("btnPrimary")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refresh_detail(self) -> None:
+        item = document_intake.category_for(self.category_combo.currentData())
+        strategy = {
+            "contract": "提取合同文本；扫描 PDF 会标为 OCR 待处理，不能据此作业务结论。",
+            "settlement": f"按{DIRECTION_ZH.get(item.direction, '未标记')}结算资料解析；异常结构进入人工确认。",
+            "control_candidate": "登记为对上控制基准候选；不混入当前结算期次，须先人工确认范围、版本、税口径及变更关系。",
+            "evidence_only": "仅登记、只读保存并保留 SHA-256，不自动解析为结算金额。",
+        }[item.parse_strategy]
+        self.detail.setText(f"{item.description or '待补充说明'}\n{strategy}")
+
+    def category(self) -> str:
+        return str(self.category_combo.currentData() or "unclassified")
+
+
+class ImportWorker(QObject):
+    """在独立 SQLite 连接中导入，避免 PDF/OCR 能力异常阻塞 Qt 主事件循环。"""
+
+    progress = Signal(str)
+    finished = Signal(object)
+
+    def __init__(self, project_dir: str, project_id: int, files, category: str):
+        super().__init__()
+        self.project_dir = Path(project_dir)
+        self.project_id = int(project_id)
+        self.paths = tuple(Path(path) for path in files)
+        self.category = document_intake.category_for(category).code
+
+    def run(self) -> None:
+        result = {
+            "ok": 0, "partial": [], "fail": [], "pending": 0, "category": self.category,
+            "skipped": (), "skipped_details": (),
+        }
+        conn = None
+        try:
+            conn = migrations.connect(self.project_dir / "project.db")
+            spec = document_intake.category_for(self.category)
+            self.progress.emit("正在后台扫描资料目录（不跟随符号链接）…")
+            selection = scan_import_paths(self.paths)
+            result["skipped"] = selection.skipped
+            result["skipped_details"] = selection.skipped_reasons
+            if not selection.files:
+                self.progress.emit("未发现可导入资料；已结束后台任务。")
+                self.finished.emit(result)
+                return
+            total = len(selection.files)
+            for ordinal, path in enumerate(selection.files, start=1):
+                self.progress.emit(f"正在后台导入 {ordinal}/{total}：{path.name}")
+                try:
+                    if spec.parse_strategy == "settlement":
+                        report = settlement_io.import_settlement_file(
+                            conn, self.project_id, self.project_dir, path,
+                            direction=spec.direction, document_category=spec.code,
+                        )
+                        result["pending"] += sum(
+                            1 for sheet in report.sheets
+                            if sheet.status in ("needs_role_review", "no_header", "non_settlement_form")
+                            or sheet.state_code == "pending"
+                        )
+                        if report.status == "ok":
+                            result["ok"] += 1
+                        elif report.status == "partial":
+                            result["partial"].append(
+                                f"{path.name}：部分工作表已导入，其余待人工确认"
+                                + (f"（{report.message}）" if report.message else "")
+                            )
+                        else:
+                            result["fail"].append(
+                                f"{path.name}：结算文件导入失败"
+                                + (f"（{report.message}）" if report.message else "")
+                            )
+                    elif spec.parse_strategy == "contract":
+                        from jiadun.core.contracts import extract as contract_extract
+
+                        contract_extract.import_contract(
+                            conn, self.project_id, self.project_dir, path,
+                            document_category=spec.code,
+                        )
+                        risks = contract_extract.contract_risks(conn, self.project_id)
+                        contract_extract.persist_risks(conn, self.project_id, risks)
+                        result["ok"] += 1
+                    else:
+                        source = import_file(conn, self.project_id, self.project_dir, path)
+                        intake_status = (
+                            "registered" if spec.code == "unclassified" else
+                            "control_candidate" if spec.parse_strategy == "control_candidate" else
+                            "evidence_only"
+                        )
+                        document_intake.record_document(
+                            conn, self.project_id, source.file_id, category=spec.code,
+                            parse_status=intake_status,
+                            detail=(
+                                "等待人工选择资料类别；尚未进入结算或合同计算"
+                                if spec.code == "unclassified" else
+                                "已登记为对上控制基准候选；须人工确认范围、版本、税口径和变更关系后才能用于上限预警"
+                                if intake_status == "control_candidate" else
+                                "资料已登记，等待人工核阅"
+                            ),
+                            parser="",
+                        )
+                        result["ok"] += 1
+                except NotImplementedError as exc:
+                    # OCR/未实现能力不是解析成功，也不是“资料缺失”；资料中心会保留
+                    # 可重试的明确状态，且主窗口继续响应。
+                    result["partial"].append(f"{path.name}：OCR/解析待处理（{str(exc)[:180]}）")
+                except Exception as exc:  # noqa: BLE001 - 返回可行动的文件级结果
+                    _LOG.exception("后台资料导入失败 project_id=%s file=%s", self.project_id, path.name)
+                    result["fail"].append(f"{path.name}：{str(exc).strip()[:240] or type(exc).__name__}；请检查后重试")
+        except Exception as exc:  # noqa: BLE001 - 连接/项目级失败同样不能令 UI 无响应
+            result["fail"].append(f"后台导入任务未启动：{type(exc).__name__}: {exc}")
+        finally:
+            if conn is not None:
+                conn.close()
+        self.finished.emit(result)
 
 
 def _make_table(headers: list[str], **spec) -> QTableWidget:
@@ -360,6 +512,7 @@ class WorkbenchPage(QWidget):
         self.tabs.addTab(self._match_tab(), "匹配复核")
         self.tabs.addTab(self._export_tab(), "成果导出")
         self.tabs.addTab(self._version_history_tab(), "版本与历史资产")
+        self.source_files_tab_index = self.tabs.addTab(self._source_files_tab(), "资料中心")
         self.refresh_all()
         self._install_windows_shortcuts()
 
@@ -484,7 +637,7 @@ class WorkbenchPage(QWidget):
         outer.addLayout(head)
         cards = QHBoxLayout()
         cards.setSpacing(theme.SP_S)
-        self.overview_values: dict[str, QLabel] = {}
+        self.overview_values: dict[str, QWidget] = {}
         for key, label in (
             ("files", "已导入文件"),
             ("pending_sheets", "待确认工作表"),
@@ -502,7 +655,14 @@ class WorkbenchPage(QWidget):
             cv.setSpacing(0)
             caption = QLabel(label)
             caption.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
-            value = QLabel("—")
+            if key == "files":
+                value = QPushButton("—")
+                value.setFlat(True)
+                value.setCursor(Qt.PointingHandCursor)
+                value.setToolTip("查看已登记资料、类别、处理状态和只读副本")
+                value.clicked.connect(self._show_source_files_tab)
+            else:
+                value = QLabel("—")
             value.setStyleSheet("font-size: 15px; font-weight: 600; background: transparent;")
             cv.addWidget(caption)
             cv.addWidget(value)
@@ -514,6 +674,10 @@ class WorkbenchPage(QWidget):
         self.overview_hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
         outer.addWidget(self.overview_hint)
         return box
+
+    def _show_source_files_tab(self) -> None:
+        self.tabs.setCurrentIndex(self.source_files_tab_index)
+        self.refresh_documents()
 
     def refresh_overview(self):
         pid = self.project.project_id
@@ -540,6 +704,8 @@ class WorkbenchPage(QWidget):
             "historical_prices": str(summary.historical_price_assets.get("active", 0)),
         }
         for key, value in values.items():
+            # 统计卡的“已导入文件”是可点击的按钮，其他卡为 QLabel；二者都
+            # 使用 Qt 的 setText 接口，避免只显示不可操作的数字。
             self.overview_values[key].setText(value)
         if not summary.run_availability["available"]:
             self._next_action = "crosscheck"
@@ -605,6 +771,8 @@ class WorkbenchPage(QWidget):
         folder_btn.clicked.connect(self._import_folder)
         contract_btn = QPushButton("导入合同/纪要…")
         contract_btn.clicked.connect(self._import_contract)
+        files_btn = QPushButton("查看已导入资料…")
+        files_btn.clicked.connect(self._show_source_files_tab)
         detect_btn = QPushButton("运行异常检测")
         detect_btn.clicked.connect(self._run_anomalies)
         check_btn = QPushButton("双向校核")
@@ -612,16 +780,24 @@ class WorkbenchPage(QWidget):
         confirm_btn = QPushButton("人工确认清单页…")
         confirm_btn.clicked.connect(self._open_sheet_confirm)
         for b, name in ((import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
-                        (confirm_btn, None), (detect_btn, None), (check_btn, None)):
+                        (files_btn, None), (confirm_btn, None), (detect_btn, None), (check_btn, None)):
             if name:
                 b.setObjectName(name)
             btn_row.addWidget(b)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
+        self.import_progress_label = QLabel("")
+        self.import_progress_label.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        self.import_progress_label.setWordWrap(True)
+        v.addWidget(self.import_progress_label)
+        self._import_action_buttons = (import_btn, folder_btn, contract_btn)
+        self._import_thread: QThread | None = None
+        self._import_worker: ImportWorker | None = None
         self.import_drop_zone = FileDropZone(
-            "将结算表、合同/纪要文件或资料文件夹拖到这里（支持递归导入）"
+            "将资料文件、资料文件夹或打包资料拖到这里（支持递归导入与人工分类）"
         )
-        self.import_drop_zone.paths_dropped.connect(self.import_paths)
+        self.import_drop_zone.paths_dropped.connect(self._choose_category_and_import)
         v.addWidget(self.import_drop_zone)
         self.period_table = _make_table(
             ["期次", "标题", "方向", "明细行数", "小计行", "合同单位"],
@@ -667,17 +843,76 @@ class WorkbenchPage(QWidget):
 
     def _import_files(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "选择结算文件", "", "结算文件 (*.xlsx *.xlsm *.xls *.csv)")
+            self, "选择资料文件", "",
+            "价盾可导入资料 (*.xlsx *.xlsm *.xls *.csv *.docx *.pdf *.txt)")
         if not files:
             return
-        self.import_paths(files)
+        self._choose_category_and_import(files)
 
     def _import_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self, "选择要导入的资料文件夹", str(self.project_dir)
         )
         if folder:
-            self.import_paths([folder])
+            self._choose_category_and_import([folder])
+
+    def _choose_category_and_import(self, paths, *, default_category: str = "unclassified") -> None:
+        """扫描后由用户确认类别，再交给后台线程；不以文件名替用户定性。"""
+        if self._import_thread is not None:
+            QMessageBox.information(self, "资料导入", "已有资料正在后台导入，请等待当前任务完成。")
+            return
+        raw_paths = tuple(Path(path) for path in paths)
+        if not raw_paths:
+            return
+        dialog = ImportCategoryDialog(len(raw_paths), self, category=default_category)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._start_background_import(raw_paths, dialog.category())
+
+    def _start_background_import(self, files, category: str) -> None:
+        """启动独立连接的导入线程。主线程只负责进度和完成后的只读刷新。"""
+        self._import_thread = QThread(self)
+        self._import_worker = ImportWorker(
+            self.project_dir, self.project.project_id, files, category
+        )
+        self._import_worker.moveToThread(self._import_thread)
+        self._import_thread.started.connect(self._import_worker.run)
+        self._import_worker.progress.connect(self._on_import_progress)
+        self._import_worker.finished.connect(self._on_background_import_finished)
+        self._import_worker.finished.connect(self._import_thread.quit)
+        self._import_thread.finished.connect(self._import_worker.deleteLater)
+        self._import_thread.finished.connect(self._clear_import_worker)
+        for button in self._import_action_buttons:
+            button.setEnabled(False)
+        self.import_progress_label.setText("正在后台扫描并导入资料；窗口仍可查看已有资料。")
+        self._import_thread.start()
+
+    def _on_import_progress(self, text: str) -> None:
+        self.import_progress_label.setText(text)
+
+    def _clear_import_worker(self) -> None:
+        for button in self._import_action_buttons:
+            button.setEnabled(True)
+        self._import_worker = None
+        self._import_thread = None
+
+    def _on_background_import_finished(self, result: dict) -> None:
+        self.import_progress_label.setText("后台导入已完成；已刷新资料中心。")
+        self._notify_import(
+            int(result["ok"]), list(result["fail"]), int(result["pending"]),
+            skipped=len(result["skipped"]), partial=list(result["partial"]),
+            skipped_details=result["skipped_details"],
+        )
+        self.refresh_all()
+        if result["pending"]:
+            ret = QMessageBox.question(
+                self, "待人工确认",
+                f"有 {result['pending']} 个工作表需要人工确认；相关结论不会自动显示为校核充分。\n"
+                "现在打开「人工确认清单页」处理吗？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret == QMessageBox.Yes:
+                self._open_sheet_confirm()
 
     def import_paths(self, paths, *, skipped=(), skipped_reasons=()):
         """导入一组文件或文件夹中的资料，并按扩展名路由到对应解析器。"""
@@ -711,7 +946,8 @@ class WorkbenchPage(QWidget):
             try:
                 if kind == "settlement":
                     report = settlement_io.import_settlement_file(
-                        self.conn, self.project.project_id, self.project_dir, path
+                        self.conn, self.project.project_id, self.project_dir, path,
+                        document_category="unclassified",
                     )
                     pending += sum(
                         1
@@ -734,7 +970,8 @@ class WorkbenchPage(QWidget):
                         )
                 elif kind == "contract":
                     contract_extract.import_contract(
-                        self.conn, self.project.project_id, self.project_dir, path
+                        self.conn, self.project.project_id, self.project_dir, path,
+                        document_category="unclassified",
                     )
                     risks = contract_extract.contract_risks(
                         self.conn, self.project.project_id
@@ -793,7 +1030,7 @@ class WorkbenchPage(QWidget):
             self, "选择合同/补充协议/纪要", "", "文档 (*.docx *.pdf *.txt)")
         if not files:
             return
-        self.import_paths(files)
+        self._choose_category_and_import(files, default_category="upward_contract")
 
     def _run_anomalies(self):
         # 异常检测按钮也经过正式分析入口，避免从 UI 直接调用异常引擎而
@@ -936,6 +1173,166 @@ class WorkbenchPage(QWidget):
             QMessageBox.warning(self, "标记方向", str(exc))
             return
         self.refresh_all()
+
+    # ---------- 资料中心 ----------
+    def _source_files_tab(self) -> QWidget:
+        """显示所有登记资料，而不是把“已导入文件 N 个”做成不可点击计数。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        notice = QLabel(
+            "资料中心只显示已登记的原件身份与处理边界。类别由人工选择；系统不会仅凭"
+            "文件名把资料断定为对上、对下或某一期结算。双击一行查看 SHA-256、路径和处理原因。"
+        )
+        notice.setWordWrap(True)
+        notice.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
+        layout.addWidget(notice)
+        self.document_table = _make_table(
+            ["文件名", "资料类别", "处理状态", "方向", "类型", "大小", "SHA-256", "导入时间"],
+            stretch_cols=(0, 1), fixed_widths={2: 100, 3: 64, 4: 56, 5: 82, 6: 142, 7: 142},
+        )
+        self.document_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.document_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.document_table.cellClicked.connect(self._show_source_file_detail)
+        self.document_table.cellDoubleClicked.connect(self._show_source_file_detail)
+        layout.addWidget(self.document_table, 1)
+        row = QHBoxLayout()
+        reclassify = QPushButton("重新分类…")
+        reclassify.clicked.connect(self._reclassify_source_file)
+        process = QPushButton("按类别重新处理")
+        process.setObjectName("btnPrimary")
+        process.clicked.connect(self._process_selected_source_file)
+        original_folder = QPushButton("查看原件位置")
+        original_folder.clicked.connect(lambda: self._reveal_selected_source_file("original_path"))
+        copy_folder = QPushButton("查看只读副本")
+        copy_folder.clicked.connect(lambda: self._reveal_selected_source_file("stored_path"))
+        for button in (reclassify, process, original_folder, copy_folder):
+            row.addWidget(button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.document_detail = QTextEdit()
+        self.document_detail.setReadOnly(True)
+        self.document_detail.setPlaceholderText("选择资料后显示来源、SHA-256、类别、处理状态和可行动原因")
+        self.document_detail.setMinimumHeight(155)
+        layout.addWidget(self.document_detail)
+        self._document_rows: dict[int, sqlite3.Row] = {}
+        return widget
+
+    @staticmethod
+    def _document_status_text(status: str) -> str:
+        return {
+            "registered": "已登记，待分类/处理",
+            "processing": "正在处理",
+            "parsed": "已解析（仍需人工复核）",
+            "needs_review": "解析不完整，待人工确认",
+            "pending_ocr": "OCR 待处理（不能作结论）",
+            "control_candidate": "控制基准候选，待确认",
+            "evidence_only": "仅归档，待人工核阅",
+            "failed": "处理失败，可查看原因",
+        }.get(status, "状态待确认")
+
+    def refresh_documents(self) -> None:
+        if not hasattr(self, "document_table"):
+            return
+        rows = document_intake.list_documents(self.conn, self.project.project_id)
+        self._document_rows = {int(row["file_id"]): row for row in rows}
+        table = self.document_table
+        table.setRowCount(len(rows))
+        for index, record in enumerate(rows):
+            category = document_intake.category_for(record["category"])
+            status = str(record["parse_status"])
+            table.setItem(index, 0, QTableWidgetItem(str(record["original_name"])))
+            table.setItem(index, 1, QTableWidgetItem(category.label))
+            status_kind = "danger" if status == "failed" else (
+                "warning" if status in {"registered", "needs_review", "pending_ocr", "control_candidate"} else "info"
+            )
+            table.setItem(index, 2, badge_item(self._document_status_text(status), status_kind))
+            table.setItem(index, 3, QTableWidgetItem(DIRECTION_ZH.get(record["direction"], "未标记")))
+            table.setItem(index, 4, QTableWidgetItem(str(record["file_type"]).upper()))
+            fill_cell(table, index, 5, f"{int(record['size_bytes']):,}", right=True)
+            table.setItem(index, 6, QTableWidgetItem(str(record["sha256"])[:16] + "…"))
+            table.setItem(index, 7, QTableWidgetItem(str(record["imported_at"])))
+            table.item(index, 0).setData(Qt.UserRole, int(record["file_id"]))
+        if not rows:
+            self.document_detail.setPlainText("尚未登记资料。导入时请先选择资料类别；无法确认时选择“待人工分类”。")
+
+    def _selected_source_file(self) -> sqlite3.Row | None:
+        row = self.document_table.currentRow()
+        if row < 0 or not self.document_table.item(row, 0):
+            QMessageBox.information(self, "资料中心", "请先选择一份资料。")
+            return None
+        file_id = self.document_table.item(row, 0).data(Qt.UserRole)
+        record = self._document_rows.get(int(file_id)) if file_id is not None else None
+        if record is None:
+            QMessageBox.warning(self, "资料中心", "资料记录已变化，请刷新后重试。")
+        return record
+
+    def _show_source_file_detail(self, *_args) -> None:
+        record = self._selected_source_file()
+        if record is None:
+            return
+        category = document_intake.category_for(record["category"])
+        detail = str(record["detail"] or "无额外处理说明")
+        self.document_detail.setPlainText(
+            f"文件：{record['original_name']}\n"
+            f"资料类别：{category.label}（{record['classification_status']}）\n"
+            f"处理状态：{self._document_status_text(str(record['parse_status']))}\n"
+            f"方向：{DIRECTION_ZH.get(record['direction'], '未标记')}\n"
+            f"原文件：{record['original_path']}\n"
+            f"项目只读副本：{record['stored_path']}\n"
+            f"SHA-256：{record['sha256']}\n"
+            f"大小：{record['size_bytes']} bytes\n"
+            f"处理器：{record['parser'] or '未使用'}\n"
+            f"原因/边界：{detail}"
+        )
+
+    def _reveal_selected_source_file(self, field: str) -> None:
+        record = self._selected_source_file()
+        if record is None:
+            return
+        path = Path(str(record[field]))
+        if not path.exists():
+            QMessageBox.warning(self, "资料中心", "该文件路径当前不可访问；不会创建替代文件。")
+            return
+        platform_paths.reveal_in_file_manager(path)
+
+    def _reclassify_source_file(self) -> None:
+        record = self._selected_source_file()
+        if record is None:
+            return
+        dialog = ImportCategoryDialog(1, self, category=str(record["category"]))
+        dialog.setWindowTitle("重新分类资料")
+        if dialog.exec() != QDialog.Accepted:
+            return
+        spec = document_intake.category_for(dialog.category())
+        status = {
+            "evidence_only": "evidence_only",
+            "control_candidate": "control_candidate",
+        }.get(spec.parse_strategy, "registered")
+        document_intake.record_document(
+            self.conn, self.project.project_id, int(record["file_id"]), category=spec.code,
+            parse_status=status,
+            detail=("分类已更新；请点击“按类别重新处理”后再进入对应解析。"
+                    if status == "registered" else
+                    "已重新分类为对上控制基准候选，尚未进入金额计算。" if status == "control_candidate" else
+                    "资料已重新分类为仅归档资料，未进入金额计算。"),
+            parser="",
+        )
+        self.refresh_documents()
+        QMessageBox.information(self, "资料中心", "资料类别已更新；原文件和只读副本未被修改。")
+
+    def _process_selected_source_file(self) -> None:
+        record = self._selected_source_file()
+        if record is None:
+            return
+        spec = document_intake.category_for(record["category"])
+        if spec.code == "unclassified":
+            QMessageBox.information(self, "资料中心", "请先重新分类；待人工分类资料不会被自动解析或进入计算。")
+            return
+        copy_path = Path(str(record["stored_path"]))
+        if not copy_path.is_file():
+            QMessageBox.warning(self, "资料中心", "项目只读副本不可访问，已拒绝处理，原文件不会被替代。")
+            return
+        self._start_background_import([copy_path], spec.code)
 
     # ---------- 清单明细 ----------
     def _items_tab(self) -> QWidget:
@@ -2578,6 +2975,7 @@ class WorkbenchPage(QWidget):
     def refresh_all(self):
         self.status_label.setText(project_status_summary(self.conn, self.project.project_id))
         self.refresh_overview()
+        self.refresh_documents()
         self.refresh_periods()
         self.refresh_items()
         self.refresh_anomalies()

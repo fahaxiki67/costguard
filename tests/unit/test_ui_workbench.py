@@ -43,7 +43,10 @@ def wb_page(tmp_path, app):
 class TestWorkbench:
     def test_tabs_present(self, wb_page):
         names = [wb_page.tabs.tabText(i) for i in range(wb_page.tabs.count())]
-        assert names == ["期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出", "版本与历史资产"]
+        assert names == [
+            "期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出",
+            "版本与历史资产", "资料中心",
+        ]
 
     def test_version_history_tab_is_readable_before_assets_exist(self, wb_page):
         wb_page.refresh_version_assets()

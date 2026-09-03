@@ -2755,6 +2755,39 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                END""",
         ],
     ),
+    # v47（开发中）：资料接收台账与可复核分类。类别只表达用户确认的资料用途，
+    # 绝不从文件名推断对上/对下或业务金额；未分类文件保留原件且不进入计算模型。
+    (
+        47,
+        [
+            """CREATE TABLE IF NOT EXISTS document_intake (
+                file_id INTEGER PRIMARY KEY REFERENCES source_files(id),
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                category TEXT NOT NULL DEFAULT 'unclassified',
+                classification_status TEXT NOT NULL DEFAULT 'unclassified',
+                direction TEXT NOT NULL DEFAULT 'unknown',
+                parse_status TEXT NOT NULL DEFAULT 'registered',
+                detail TEXT NOT NULL DEFAULT '',
+                parser TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_document_intake_project_status ON document_intake(project_id, parse_status, category)",
+            """CREATE TRIGGER IF NOT EXISTS trg_document_intake_project_guard_insert
+               BEFORE INSERT ON document_intake
+               WHEN NOT EXISTS (
+                   SELECT 1 FROM source_files sf
+                    WHERE sf.id=NEW.file_id AND sf.project_id=NEW.project_id
+               )
+               BEGIN SELECT RAISE(ABORT, 'document intake source project mismatch'); END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_document_intake_project_guard_update
+               BEFORE UPDATE OF file_id, project_id ON document_intake
+               WHEN NOT EXISTS (
+                   SELECT 1 FROM source_files sf
+                    WHERE sf.id=NEW.file_id AND sf.project_id=NEW.project_id
+               )
+               BEGIN SELECT RAISE(ABORT, 'document intake source project mismatch'); END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -146,7 +146,7 @@ def _complete_performance_payload(tmp_path: Path, *, create_artifacts: bool = Tr
     payload = {
         "schema_version": 1,
         "benchmark": "Jiadun synthetic performance benchmark",
-        "benchmark_version": "0.1.19",
+        "benchmark_version": "0.1.20",
         "generated_at": "2026-09-02T00:00:00+00:00",
         "status": "completed",
         "config": {"sizes": list(release_checklist.PERFORMANCE_SIZES), "skip_export": False},

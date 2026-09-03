@@ -1300,15 +1300,22 @@ def import_settlement_file(
     period_no: int | None = None,
     direction: str = "unknown",
     contract_party: str = "",
+    document_category: str = "unclassified",
 ) -> ImportReport:
     """以单个外层事务执行文件物化，失败时只保留 failed 批次和 Evidence。"""
     src = Path(src)
     # 原始文件副本是可恢复的输入资产，先登记并提交；后续数据库物化失败
     # 时，副本仍可被同一 SHA 的下一次重试复用，不会留下无法解释的来源。
     sf = import_file(conn, project_id, project_dir, src, commit=True)
+    from jiadun.core import document_intake
+
+    document_intake.record_document(
+        conn, project_id, sf.file_id, category=document_category,
+        parse_status="processing", parser="settlement",
+    )
     try:
         with run_contract._transaction(conn, "import_settlement_file"):
-            return _import_settlement_file(
+            report = _import_settlement_file(
                 conn,
                 project_id,
                 project_dir,
@@ -1359,7 +1366,7 @@ def import_settlement_file(
             )
         run_contract.ensure_if_materialized(conn, project_id)
         fallback = period_no or next_period_no(conn, project_id, direction)
-        return ImportReport(
+        report = ImportReport(
             sf.file_id,
             failed_batch_id,
             fallback,
@@ -1375,6 +1382,17 @@ def import_settlement_file(
             ],
             message=error,
         )
+        document_intake.mark_document_status(
+            conn, project_id, sf.file_id, parse_status="failed",
+            detail=error, parser="settlement",
+        )
+        return report
+    status = "parsed" if report.status == "ok" else "needs_review"
+    document_intake.mark_document_status(
+        conn, project_id, sf.file_id, parse_status=status,
+        detail=report.message or "", parser="settlement",
+    )
+    return report
 
 
 def _import_settlement_file(

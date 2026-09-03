@@ -288,6 +288,7 @@ def test_main_window_source_file_flow_creates_project_and_imports_file(
 
     from jiadun.core.models import project as project_model
     from jiadun.ui import main_window
+    from jiadun.ui.workbench import WorkbenchPage
 
     QApplication.instance() or QApplication([])
     monkeypatch.setattr(project_model, "_SETTINGS_FILE", tmp_path / "settings.json")
@@ -319,6 +320,12 @@ def test_main_window_source_file_flow_creates_project_and_imports_file(
 
     monkeypatch.setattr(main_window, "NewProjectDialog", FakeDialog)
     monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    # 此用例只验证首页创建项目后的委派和旧同步核心入口；后台线程/类别
+    # 对话框由 test_document_intake 单独覆盖，避免 offscreen 测试等待人工 UI。
+    monkeypatch.setattr(
+        WorkbenchPage, "_choose_category_and_import",
+        lambda page, paths: page.import_paths(paths),
+    )
 
     win = main_window.MainWindow()
     try:

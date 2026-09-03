@@ -11,7 +11,7 @@ from scripts import release_consistency_check
 
 def test_release_documents_without_real_golden_case_are_blocked_by_default():
     result = release_consistency_check.check_release_consistency(
-        Path(__file__).parents[2], expected_version="0.1.19"
+        Path(__file__).parents[2], expected_version="0.1.20"
     )
     assert not result["ok"], result
     golden = next(item for item in result["checks"] if item["name"] == "golden_regression")
@@ -24,7 +24,7 @@ def test_release_documents_without_real_golden_case_are_blocked_by_default():
 def test_release_consistency_allows_no_real_only_with_explicit_development_flag():
     result = release_consistency_check.check_release_consistency(
         Path(__file__).parents[2],
-        expected_version="0.1.19",
+        expected_version="0.1.20",
         allow_no_real=True,
     )
     assert result["ok"], result
@@ -57,7 +57,7 @@ def test_runtime_and_release_entrypoints_share_the_same_version_source():
         run_contract._app_version(),
         real_acceptance_run.jiadun_version(),
     }
-    assert readers == {"0.1.19"}
+    assert readers == {"0.1.20"}
 
 
 def test_release_consistency_blocks_non_pass_canonical_golden_statuses(monkeypatch):
@@ -79,7 +79,7 @@ def test_release_consistency_blocks_non_pass_canonical_golden_statuses(monkeypat
     )
 
     result = release_consistency_check.check_release_consistency(
-        Path(__file__).parents[2], expected_version="0.1.19"
+        Path(__file__).parents[2], expected_version="0.1.20"
     )
 
     assert result["ok"] is False
@@ -110,7 +110,7 @@ def test_release_consistency_rejects_malformed_canonical_counts(monkeypatch, cou
     monkeypatch.setattr(golden_regression, "run_golden_regression_suite", lambda **_kwargs: fake)
 
     result = release_consistency_check.check_release_consistency(
-        Path(__file__).parents[2], expected_version="0.1.19"
+        Path(__file__).parents[2], expected_version="0.1.20"
     )
 
     assert result["ok"] is False

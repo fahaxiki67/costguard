@@ -425,6 +425,15 @@ class MainWindow(QMainWindow):
     def _handle_source_paths(self, paths):
         """把用户选中的文件/文件夹导入当前项目或新建项目。"""
         original_paths = [Path(path) for path in paths]
+
+        # 已有工作台的资料导入不在 GUI 线程预先递归扫描；目录扫描和解析统一
+        # 交给 WorkbenchPage 的后台 worker，避免拖入大型资料目录时主窗口先卡住。
+        if self.stack.currentIndex() == PAGE_WORKBENCH:
+            page = self.stack.widget(PAGE_WORKBENCH)
+            if isinstance(page, WorkbenchPage):
+                page._choose_category_and_import(original_paths)
+            return
+
         selection = scan_import_paths(original_paths)
         if not selection.files:
             extra = ""
@@ -447,17 +456,6 @@ class MainWindow(QMainWindow):
                 "所选内容中没有价盾支持的结算表或合同/纪要文件。"
                 "\n支持：XLSX、XLSM、XLS、CSV、DOCX、PDF、TXT。" + extra,
             )
-            return
-
-        # 在工作台内拖入/选择资料，直接追加到当前项目；首页才需要创建项目。
-        if self.stack.currentIndex() == PAGE_WORKBENCH:
-            page = self.stack.widget(PAGE_WORKBENCH)
-            if isinstance(page, WorkbenchPage):
-                page.import_paths(
-                    selection.files,
-                    skipped=selection.skipped,
-                    skipped_reasons=selection.skipped_reasons,
-                )
             return
 
         dlg = NewProjectDialog(self)
@@ -492,11 +490,7 @@ class MainWindow(QMainWindow):
         self._open(info)
         page = self.stack.widget(PAGE_WORKBENCH)
         if isinstance(page, WorkbenchPage):
-            page.import_paths(
-                selection.files,
-                skipped=selection.skipped,
-                skipped_reasons=selection.skipped_reasons,
-            )
+            page._choose_category_and_import(original_paths)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt override
         if FileDropZone.paths_from_mime(event.mimeData()):

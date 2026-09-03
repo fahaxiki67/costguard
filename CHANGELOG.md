@@ -9,7 +9,38 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；当前 `v0.1.19` 仍是预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；当前 `v0.1.20` 仍是预发行/预览候选，不代表正式生产能力。
+
+## [0.1.20] - 2026-09-03
+
+资料中心与异步导入的预发行增量；不改变 macOS Apple Silicon 主平台定位，
+不改变 Decimal、Evidence、Run Contract、原始文件只读和 fail-closed 原则。
+
+### Added
+
+- 增加资料中心和明确的资料分类入口：对上投标/中标、对上合同及补充协议、
+  对上框架/管理性协议、会议纪要、其他协议、对上结算、对上竣工结算/终审
+  报告、对上收款、对下支付、对下物资结算和对下分包结算等分类；未知分类
+  保持“待人工分类”，不按文件名猜业务含义。
+- 文件/文件夹/拖拽导入改由后台工作线程处理，并为每个文件保留分类、方向、
+  解析状态、短 SHA-256 和原始文件只读副本入口；已导入文件统计可点击进入资料中心。
+
+### Fixed
+
+- 扫描型 PDF 或解析能力不足的资料显式进入 `OCR 待处理`/`PENDING`，不继续生成
+  自动结算、匹配或报告；导入异常按文件记录，不因一个文件阻塞界面或制造错误结论。
+- 对上终审/审计/审核报告当前只登记为“控制基准候选”，框架/管理性协议和会议纪要
+  当前只作为 Evidence 资料，均需人工确认；本版不擅自把它们当作合同额、上限或金额结论。
+
+### Validation boundary
+
+- Windows x64 CI 已加入 Ruff、完整 pytest 和 golden regression；真实 Microsoft
+  Excel COM、macOS Excel/WPS 真机仍为 `PENDING / NOT VERIFIED`，本机 WPS 不能等同 Excel PASS。
+- 同一 Windows 环境 10k 正式基准仍沿用 v0.1.19 已记录的 before/after；50k 完整
+  导出仍为 `TIMEOUT / INCOMPLETE`，不宣称已完成或给出伪造倍数。
+- 本版新增的 5 个本机真实项目副本（`.xlsx`/`.xls`）均在中文/空格隔离目录中测试；
+  最大副本 64,858,270 bytes、32 个 Sheet（含隐藏 Sheet、公式、合并单元格、外部链接），
+  均因解析能力或人工确认门槛记为 `PENDING`；原文件 SHA-256、大小、修改时间全部保持不变。
 
 ## [0.1.19] - 2026-09-03
 

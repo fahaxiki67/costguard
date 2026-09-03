@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from jiadun.core import document_intake
 from jiadun.core.contracts import docx_parser, run_contract
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.evidence import finding_lifecycle
@@ -103,16 +104,56 @@ def import_contract(
     project_dir: Path,
     src: Path,
     doc_type: str = "unknown",
+    document_category: str = "upward_contract",
 ) -> int:
     """导入并解析一份合同/补充协议/纪要等。返回 contract_docs.id。"""
     from jiadun.core.models.source_file import import_file
 
     previous_contract = run_contract.get_current_contract(conn, project_id)
     sf = import_file(conn, project_id, project_dir, src)
+    existing = conn.execute(
+        "SELECT id FROM contract_docs WHERE project_id=? AND file_id=? ORDER BY id DESC LIMIT 1",
+        (project_id, sf.file_id),
+    ).fetchone()
+    if existing is not None:
+        # 同一 SHA 的合同不得重复写入 facts/Evidence。允许资料中心对其重新分类，
+        # 但不会借“重新处理”制造第二份合同事实。
+        document_intake.record_document(
+            conn, project_id, sf.file_id, category=document_category,
+            parse_status="parsed", detail="同一只读原件已解析，未重复写入合同事实",
+            parser="contract_text",
+        )
+        return int(existing["id"])
+    document_intake.record_document(
+        conn, project_id, sf.file_id, category=document_category,
+        parse_status="processing", parser="contract_text",
+    )
     ftype = sf.file_type
     if ftype == "xlsx":  # 文本类导入兜底：txt 归入合同文本
+        document_intake.mark_document_status(
+            conn, project_id, sf.file_id, parse_status="failed",
+            detail="合同资料不支持以 XLSX 文本解析；已保留只读原件，等待人工选择资料类别",
+            parser="contract_text",
+        )
         raise ValueError("xlsx is not a contract text file")
-    paras = docx_parser.parse_contract(Path(sf.stored_path), ftype if ftype != "csv" else "txt")
+    try:
+        paras = docx_parser.parse_contract(
+            Path(sf.stored_path), ftype if ftype != "csv" else "txt"
+        )
+    except NotImplementedError as exc:
+        # 扫描 PDF 不是“没有条款”。文件已安全登记，因此把能力边界持久化为
+        # OCR 待处理；UI 重启后仍可看到原因，而不是只留下一个数字。
+        document_intake.mark_document_status(
+            conn, project_id, sf.file_id, parse_status="pending_ocr",
+            detail=str(exc), parser="contract_text",
+        )
+        raise
+    except Exception as exc:
+        document_intake.mark_document_status(
+            conn, project_id, sf.file_id, parse_status="failed",
+            detail=f"{type(exc).__name__}: {exc}", parser="contract_text",
+        )
+        raise
     now = datetime.now().isoformat(timespec="seconds")
     with conn:
         cur = conn.execute(
@@ -152,6 +193,9 @@ def import_contract(
             current_contract,
             reason="合同资料进入运行契约；结算 Sheet 原始网格和逐行覆盖分类未改变",
         )
+    document_intake.mark_document_status(
+        conn, project_id, sf.file_id, parse_status="parsed", parser="contract_text",
+    )
     return doc_id
 
 
