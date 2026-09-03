@@ -964,6 +964,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # CI/英文 Windows 控制台默认 cp1252，输出中文会 UnicodeEncodeError；统一 UTF-8。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None and getattr(_stream, "encoding", "").lower() not in ("utf-8", "utf8"):
+                _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
     args = build_parser().parse_args(argv)
     try:
         report = run_golden_regression(
