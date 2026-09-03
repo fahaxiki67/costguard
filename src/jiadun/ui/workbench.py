@@ -823,8 +823,11 @@ class WorkbenchPage(QWidget):
         check_btn.clicked.connect(self._run_crosscheck)
         confirm_btn = QPushButton("人工确认清单页…")
         confirm_btn.clicked.connect(self._open_sheet_confirm)
+        review_btn = QPushButton("合同条款确认…")
+        review_btn.clicked.connect(self._open_contract_review)
         for b, name in ((import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
-                        (files_btn, None), (confirm_btn, None), (detect_btn, None), (check_btn, None)):
+                        (files_btn, None), (confirm_btn, None), (review_btn, None),
+                        (detect_btn, None), (check_btn, None)):
             if name:
                 b.setObjectName(name)
             btn_row.addWidget(b)
@@ -1070,6 +1073,13 @@ class WorkbenchPage(QWidget):
 
     def _open_sheet_confirm(self):
         dlg = SheetConfirmDialog(self.conn, self.project.project_id, self)
+        dlg.exec()
+        self.refresh_all()
+
+    def _open_contract_review(self):
+        from jiadun.ui.dialogs.contract_review import ContractReviewDialog
+
+        dlg = ContractReviewDialog(self.conn, self.project.project_id, self)
         dlg.exec()
         self.refresh_all()
 

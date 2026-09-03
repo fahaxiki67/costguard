@@ -260,3 +260,24 @@
   `encoding="utf-8"`；`generate_demo_data.py` / `release_consistency_check.py` 的
   `main()` 入口对 stdout/stderr 做 UTF-8 reconfigure（对英文 Windows 真实用户同样是
   产品级修复）。本地以 `PYTHONIOENCODING=cp1252` 复现验证通过，ruff 通过。
+
+## 阶段 C-1 进行中：合同事实确认生命周期（schema v48）
+
+- 依据宪章"只有 confirmed 才能用于金额和控制规则"与 ROADMAP 阶段 C，本轮实现确认
+  生命周期基础设施：迁移 v48 为 contract_facts 增加 review_status/reviewed_at/
+  reviewed_by/review_reason；历史事实一律回填 candidate（无法证明人工确认不得视为
+  已确认，宪章原则）。
+- 新增 set_fact_review/list_contract_facts：确认/拒绝/待复核三向流转，推翻已确认或
+  已拒绝结论必须填写理由；每次流转写入 contract_fact_review Evidence（前后值、操作者、
+  理由），随后按既有机制产生新的 Run Contract 签名（旧运行保留为历史）。
+- Run Contract：事实载荷带确认状态标记；被人工拒绝的事实不再进入运行契约；
+  新增 contract_fact_review_summary 汇总。风险语义：拒绝条款视为缺失；候选条款
+  保持覆盖不误报缺失，但给出"候选条款待人工确认"低级提示（fail-closed 可见，
+  不静默当作已确认）。
+- UI：工作台新增"合同条款确认…"对话框（状态筛选、确认/拒绝/待复核、推翻理由必填），
+  offscreen UI 测试覆盖列表/确认/阻断提示。
+- 行为影响（如实声明）：v48 迁移后所有存量合同的 Run Contract 签名将变化（载荷新增
+  状态字段），已存在的计算结果保留但退出当前结论，用户重跑后恢复当前；候选语义不
+  改变既有风险判定（候选仍算覆盖），不存在存量项目风险突增。
+- 验证边界：本阶段为纯增量；尚未实现 OCR 扫描页逐条对照复核入口与 confirmed 接入
+  控制基准候选算法。全量回归结果见本轮记录。

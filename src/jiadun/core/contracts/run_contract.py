@@ -1514,9 +1514,15 @@ def _aliases(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
 
 
 def _contract_facts(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+    """读取合同事实投影；被人工拒绝的事实不再进入运行契约。
+
+    candidate/needs_review 事实仍随载荷输出并带状态标记——它们是候选，
+    不是已确认合同事实；只有 confirmed 才能视为已确认。
+    """
     rows = conn.execute(
         """SELECT cd.id AS doc_id, cd.doc_type, cd.title, cd.file_id,
                   cf.fact_key, cf.fact_value, cf.quote_text, cf.location, cf.confidence,
+                  cf.review_status, cf.reviewed_at, cf.reviewed_by, cf.review_reason,
                   di.parse_status AS document_parse_status
            FROM contract_docs cd LEFT JOIN contract_facts cf ON cf.doc_id=cd.id
            LEFT JOIN document_intake di ON di.file_id=cd.file_id AND di.project_id=cd.project_id
@@ -1527,7 +1533,27 @@ def _contract_facts(conn: sqlite3.Connection, project_id: int) -> list[dict[str,
            ORDER BY cd.id, cf.id""",
         (project_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    facts: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if item.get("fact_key") is None:
+            continue
+        status = item.get("review_status")
+        if status == "rejected":
+            continue
+        item["review_status"] = status or "candidate"
+        facts.append(item)
+    return facts
+
+
+def _fact_review_summary(facts: list[dict[str, Any]]) -> dict[str, int]:
+    """确认情况汇总：候选不是已确认事实，汇总让界面和报告无需重算即可见。"""
+    summary = {"confirmed": 0, "candidate": 0, "needs_review": 0, "rejected": 0}
+    for fact in facts:
+        summary[fact.get("review_status") or "candidate"] = (
+            summary.get(fact.get("review_status") or "candidate", 0) + 1
+        )
+    return summary
 
 
 def _manifest_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
@@ -1699,6 +1725,7 @@ def build_run_contract_components(
     schema_version = migrations.current_version(conn)
     aliases = _aliases(conn, project_id)
     manifest_scope = _manifest_scope(conn, project_id)
+    facts_for_payload = _contract_facts(conn, project_id)
     return {
         "format_version": CONTRACT_FORMAT_VERSION,
         # 产品身份属于运行契约的一部分。品牌/发行包从 CostGuard 迁移为
@@ -1737,7 +1764,8 @@ def build_run_contract_components(
         # 当前项目模型没有可靠的金额单位字段；unknown 必须触发后续人工
         # 口径确认，不能从项目名、税率或文件名推断人民币/元。
         "amount_unit": "unknown",
-        "contract_facts": _contract_facts(conn, project_id),
+        "contract_facts": facts_for_payload,
+        "contract_fact_review_summary": _fact_review_summary(facts_for_payload),
         "import_manifest": manifest_scope,
         # P0-03 要求合同明确绑定权威清单的状态快照；保留旧键供兼容读取，
         # 新键让审阅者无需从组件名称猜测其语义。

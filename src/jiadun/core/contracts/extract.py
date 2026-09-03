@@ -623,9 +623,9 @@ def import_contract(
             )
             conn.execute(
                 """INSERT INTO contract_facts(doc_id, fact_key, fact_value, quote_text, location,
-                   confidence, evidence_id) VALUES (?,?,?,?,?,?,?)""",
+                   confidence, evidence_id, review_status) VALUES (?,?,?,?,?,?,?,?)""",
                 (doc_id, f["fact_key"], f["fact_value"], f["quote_text"], f["location"],
-                 f["confidence"], ev_id),
+                 f["confidence"], ev_id, FACT_REVIEW_CANDIDATE),
             )
         document_intake.mark_document_status(
             conn, project_id, sf.file_id, parse_status=final_status,
@@ -664,7 +664,11 @@ RISK_CHECKS = [
 
 
 def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
-    """按已导入合同检查关键条款覆盖：缺失即风险（不编造结论）。"""
+    """按已导入合同检查关键条款覆盖：缺失即风险（不编造结论）。
+
+    已被人工拒绝（rejected）的条款视为缺失；候选（candidate/needs_review）
+    条款仍算覆盖但必须给出"待人工确认"提示——确认前不能当作已确认事实。
+    """
     docs = conn.execute(
         """SELECT cd.id, cd.title
            FROM contract_docs cd
@@ -678,9 +682,14 @@ def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
     ).fetchall()
     risks = []
     for doc in docs:
+        facts = conn.execute(
+            """SELECT fact_key, review_status FROM contract_facts WHERE doc_id=?""",
+            (doc["id"],),
+        ).fetchall()
         keys = {
             r["fact_key"]
-            for r in conn.execute("SELECT DISTINCT fact_key FROM contract_facts WHERE doc_id=?", (doc["id"],))
+            for r in facts
+            if (r["review_status"] or FACT_REVIEW_CANDIDATE) != FACT_REVIEW_REJECTED
         }
         for key, severity, msg in RISK_CHECKS:
             if key not in keys:
@@ -688,6 +697,19 @@ def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
                     {"doc_id": doc["id"], "doc_title": doc["title"], "fact_key": key,
                      "severity": severity, "message": f"《{doc['title']}》：{msg}"}
                 )
+        pending = {
+            r["fact_key"]
+            for r in facts
+            if (r["review_status"] or FACT_REVIEW_CANDIDATE) in
+            (FACT_REVIEW_CANDIDATE, FACT_REVIEW_NEEDS_REVIEW)
+        }
+        if pending:
+            risks.append(
+                {"doc_id": doc["id"], "doc_title": doc["title"], "fact_key": "fact_review_pending",
+                 "severity": "low",
+                 "message": f"《{doc['title']}》：{len(pending)} 项条款仍为候选，"
+                            "未经人工确认不得作为已确认合同事实"}
+            )
     return risks
 
 
@@ -812,12 +834,116 @@ def persist_risks(conn: sqlite3.Connection, project_id: int, risks: list[dict]) 
                  json.dumps(finding.normalized_values, ensure_ascii=False, default=str),
                  finding.impact,
                  json.dumps(finding.limitations, ensure_ascii=False, default=str),
-                 finding.recommendation, "new",
-                 json.dumps(
-                     repeated_history.get(finding.fingerprint, []),
-                     ensure_ascii=False,
-                     default=str,
-                 )),
+                   finding.recommendation, "new",
+                   json.dumps(
+                       repeated_history.get(finding.fingerprint, []),
+                       ensure_ascii=False,
+                       default=str,
+                   )),
             )
             n += 1
     return n
+
+
+# ---- 合同事实确认生命周期（阶段 C）----
+# 抽取产出只是候选；只有人工确认（confirmed）的事实才能视为已确认合同事实。
+# 历史事实无法证明经过人工确认，迁移回填为 candidate，不自动升 confirmed。
+
+FACT_REVIEW_CANDIDATE = "candidate"
+FACT_REVIEW_CONFIRMED = "confirmed"
+FACT_REVIEW_REJECTED = "rejected"
+FACT_REVIEW_NEEDS_REVIEW = "needs_review"
+_FACT_REVIEW_DECISIONS = (
+    FACT_REVIEW_CONFIRMED,
+    FACT_REVIEW_REJECTED,
+    FACT_REVIEW_NEEDS_REVIEW,
+    FACT_REVIEW_CANDIDATE,
+)
+
+
+def list_contract_facts(
+    conn: sqlite3.Connection,
+    project_id: int,
+    review_status: str | None = None,
+) -> list[dict]:
+    """列出合同事实（含确认状态）；rejected 默认仍返回，由调用方决定是否展示。"""
+    sql = """SELECT cf.id, cf.doc_id, cd.title AS doc_title, cf.fact_key, cf.fact_value,
+                    cf.quote_text, cf.location, cf.confidence, cf.evidence_id,
+                    cf.review_status, cf.reviewed_at, cf.reviewed_by, cf.review_reason
+             FROM contract_facts cf
+             JOIN contract_docs cd ON cd.id = cf.doc_id
+             WHERE cd.project_id=?"""
+    params: list[object] = [project_id]
+    if review_status is not None:
+        sql += " AND cf.review_status=?"
+        params.append(review_status)
+    sql += " ORDER BY cf.doc_id, cf.id"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def set_fact_review(
+    conn: sqlite3.Connection,
+    project_id: int,
+    fact_id: int,
+    decision: str,
+    *,
+    reviewed_by: str = "user",
+    reason: str = "",
+) -> dict:
+    """人工确认/拒绝/标记待复核一条合同事实，并写入审计 Evidence。
+
+    推翻已确认/已拒绝结论必须给出理由；所有流转都留下前后值与操作者。
+    合同事实是运行输入，状态变化后按既有机制产生新的 Run Contract 签名。
+    """
+    if decision not in _FACT_REVIEW_DECISIONS:
+        raise ValueError(f"未知的确认决定：{decision}")
+    row = conn.execute(
+        """SELECT cf.id, cf.review_status, cf.fact_key, cf.fact_value, cd.title AS doc_title,
+                  cd.id AS doc_id
+           FROM contract_facts cf JOIN contract_docs cd ON cd.id=cf.doc_id
+           WHERE cf.id=? AND cd.project_id=?""",
+        (fact_id, project_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"合同事实不存在或不属于当前项目：fact_id={fact_id}")
+    before = row["review_status"] or FACT_REVIEW_CANDIDATE
+    if before in (FACT_REVIEW_CONFIRMED, FACT_REVIEW_REJECTED) and not (reason or "").strip():
+        raise ValueError(f"推翻既有结论（{before}）必须填写理由")
+    now = datetime.now().isoformat(timespec="seconds")
+    with conn:
+        conn.execute(
+            """UPDATE contract_facts
+               SET review_status=?, reviewed_at=?, reviewed_by=?, review_reason=?
+               WHERE id=?""",
+            (decision, now, reviewed_by, (reason or "").strip(), fact_id),
+        )
+        evidence_api.add_evidence(
+            conn,
+            project_id,
+            "contract_fact_review",
+            f"《{row['doc_title']}》{row['fact_key']}：{before} → {decision}"
+            + (f"（{reason.strip()}）" if (reason or "").strip() else ""),
+            steps=[{
+                "step": "人工确认合同事实",
+                "fact_id": fact_id,
+                "before": before,
+                "after": decision,
+                "reviewed_by": reviewed_by,
+                "reason": (reason or "").strip(),
+            }],
+            sources=[{
+                "doc": row["doc_title"],
+                "doc_id": row["doc_id"],
+                "fact_key": row["fact_key"],
+                "fact_value": row["fact_value"],
+            }],
+            commit=False,
+        )
+    run_contract.ensure_run_contract(conn, project_id)
+    return {
+        "fact_id": fact_id,
+        "before": before,
+        "after": decision,
+        "reviewed_at": now,
+        "reviewed_by": reviewed_by,
+    }

@@ -2788,6 +2788,18 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                BEGIN SELECT RAISE(ABORT, 'document intake source project mismatch'); END""",
         ],
     ),
+    # v48：合同事实确认生命周期。抽取产出一律是 candidate；只有人工确认
+    # （review_status='confirmed'）的事实才可视为已确认合同事实；历史事实
+    # 无法证明经过人工确认，回填为 candidate 而不是 confirmed。
+    (
+        48,
+        [
+            "ALTER TABLE contract_facts ADD COLUMN review_status TEXT NOT NULL DEFAULT 'candidate'",
+            "ALTER TABLE contract_facts ADD COLUMN reviewed_at TEXT",
+            "ALTER TABLE contract_facts ADD COLUMN reviewed_by TEXT",
+            "ALTER TABLE contract_facts ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -15,6 +15,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
   发布一致性 CLI 测试 subprocess 指定 UTF-8 解码；`golden_regression.py` 入口
   统一 UTF-8 输出，修复 cp1252 控制台中文输出崩溃（CI Golden regression 步骤实测暴露）。
 
+### 合同事实确认生命周期（阶段 C-1，schema v48）
+
+- 迁移 v48：`contract_facts` 新增 `review_status/reviewed_at/reviewed_by/review_reason`；
+  历史事实无法证明经过人工确认，一律回填 `candidate`，不自动升 confirmed。
+- 抽取产出一律是候选；新增 `set_fact_review`（确认/拒绝/待复核，推翻已确认或已拒绝
+  结论必须填写理由）与 `list_contract_facts`；每次流转写入 `contract_fact_review`
+  Evidence（前后值+操作者+理由），并按既有机制产生新的 Run Contract 签名。
+- Run Contract：事实载荷带确认状态标记；被人工拒绝的事实不再进入运行契约；
+  新增 `contract_fact_review_summary` 确认情况汇总。
+- 风险语义：被拒绝的条款视为缺失（缺失类风险照常触发）；候选条款保持覆盖不误报
+  缺失，但按文档给出"候选条款待人工确认"低级提示。
+- 工作台新增"合同条款确认…"对话框（状态筛选/确认/拒绝/待复核，理由必填于推翻时）。
+
 ## [0.1.23] - 2026-09-04
 
 页级 OCR 回归收口与发行卫生修复预发行：补齐 v0.1.22 跳过的发行文档与一致性门槛
