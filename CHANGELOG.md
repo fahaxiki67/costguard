@@ -11,6 +11,10 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.23` 为预发行/预览候选，不代表正式生产能力。
 
+- 发布后 CI 收尾修复（不改变 v0.1.23 tag 内容，测试/CI 专用）：
+  发布一致性 CLI 测试 subprocess 指定 UTF-8 解码；`golden_regression.py` 入口
+  统一 UTF-8 输出，修复 cp1252 控制台中文输出崩溃（CI Golden regression 步骤实测暴露）。
+
 ## [0.1.23] - 2026-09-04
 
 页级 OCR 回归收口与发行卫生修复预发行：补齐 v0.1.22 跳过的发行文档与一致性门槛
