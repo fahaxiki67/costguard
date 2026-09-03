@@ -50,3 +50,4 @@ build/
 # 本机私有笔记
 *.local.md
 TODO.private.md
+.v2c/

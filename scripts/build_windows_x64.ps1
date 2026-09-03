@@ -103,8 +103,26 @@ if (-not $isccPath) {
 }
 if (-not $isccPath) { Fail "未找到 Inno Setup 6（ISCC.exe）" }
 Write-Host "  ISCC: $isccPath"
-& $isccPath "src/jiadun/platform/packaging/windows_x64.iss"
-if ($LASTEXITCODE -ne 0) { Fail "Inno Setup 编译失败" }
+# 仓库根路径过长时，Inno 以未折叠的 "..\..\..\.." 相对前缀拼接内部路径，
+# 会超出 Windows 260 字符上限（实测报"系统找不到指定的路径"）。
+# 此时用 subst 短盘符调用 ISCC，产物仍落在仓库 dist/ 下，用后即删。
+$issRel = "src/jiadun/platform/packaging/windows_x64.iss"
+$substDrive = $null
+if ($RepoRoot.Length -gt 100) {
+    foreach ($d in @('Y:', 'X:', 'W:', 'V:')) {
+        if (-not (Test-Path ($d + '\'))) { $substDrive = $d; break }
+    }
+    if (-not $substDrive) { Fail "仓库路径过长且无可用的 subst 盘符（Y/X/W/V）" }
+    subst $substDrive $RepoRoot
+    if ($LASTEXITCODE -ne 0) { Fail "subst $substDrive 失败" }
+    $issArg = "$substDrive\$issRel"
+} else {
+    $issArg = $issRel
+}
+& $isccPath $issArg
+$isccExit = $LASTEXITCODE
+if ($substDrive) { subst $substDrive /D | Out-Null }
+if ($isccExit -ne 0) { Fail "Inno Setup 编译失败" }
 $Setup = "dist/installer/Jiadun-$Version-windows-x64-setup.exe"
 if (-not (Test-Path $Setup)) { Fail "未找到安装器 $Setup" }
 

@@ -231,3 +231,22 @@
   真机、最终包启动与取消/异常恢复、50k/200k 完整导出基准、Windows 签名与 macOS 公证、
   脱敏黄金案例登记（当前为 0）。
 - 原始业务资料：本轮未读取用户真实项目文件；全部测试使用仓库合成/临时数据。
+
+## 2026-09-04 v0.1.23 增补：macOS 临时目录 symlink 缺陷与 Windows 长路径构建修复
+
+- macOS CI（Package macOS arm64 @ v0.1.23 tag）实测暴露：系统临时目录位于 symlink
+  之后（`/var→/private/var`）时，`backup_project`/`verify_backup` 的暂存目录
+  （`tempfile.TemporaryDirectory(prefix="jiadun_backup_*"/"jiadun_bverify_*")`）与
+  `golden_regression` 的工作区会被 v0.1.19 引入的 fail-closed 链检查按
+  "路径包含 symlink" 拒绝。Windows 开发/测试环境 temp 前缀无 symlink，因此本地
+  全量回归未能暴露此平台差异。
+- 修复：在创建处 `Path(...).resolve()` 解析到真实路径（`backup_restore.py` 两处、
+  `golden_regression.py` 一处）；不放松任何检查强度，用户提供的路径若含 symlink
+  仍按原样 fail-closed。新增回归测试
+  `test_backup_survives_system_temp_behind_symlink`（monkeypatch tempdir 指向
+  symlink 目录，Windows 无 symlink 权限时按仓库既有守卫跳过，macOS CI 真实执行）。
+- Windows 本机构建实测暴露独立问题：仓库根路径过长时，Inno Setup 以未折叠的
+  `..\..\..\..` 相对前缀拼接内部路径，超出 Windows 260 字符上限，压缩中段报
+  "系统找不到指定的路径"。构建脚本 Inno 步骤改为在仓库路径过长时用 subst 短盘符
+  调用 ISCC（用后即删），产物路径与校验流程不变。
+- 本修复随 v0.1.23 tag 交付；Windows 安装包/便携包从含本修复的最终提交重建。

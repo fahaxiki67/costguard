@@ -500,3 +500,25 @@ def test_backup_snapshot_with_open_wal_connection(demo_project: Path, tmp_path: 
     snap.close()
     assert n_snap == n_before
     assert br.verify_backup(out)["ok"]
+
+
+def test_backup_survives_system_temp_behind_symlink(
+    demo_project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """系统临时目录位于 symlink 之后（macOS /var→/private/var 的真实形态）时，
+    备份暂存目录解析到真实路径后必须仍能完成备份，
+    而不是被自身的 fail-closed 链检查拒绝操作系统前缀。"""
+    import tempfile
+
+    real_temp = tmp_path / "temp_real"
+    real_temp.mkdir()
+    link_temp = tmp_path / "temp_link"
+    try:
+        link_temp.symlink_to(real_temp, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前环境不允许创建目录 symlink")
+    monkeypatch.setattr(tempfile, "tempdir", str(link_temp))
+
+    out = br.backup_project(demo_project, tmp_path / "out")
+    assert out.exists()
+    assert br.verify_backup(out)["ok"]

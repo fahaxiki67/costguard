@@ -715,7 +715,9 @@ def _backup_project_impl(
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     with tempfile.TemporaryDirectory(prefix="jiadun_backup_") as td:
-        tdir = Path(td)
+        # 系统临时目录可能位于 symlink 之后（macOS /var→/private/var）；
+        # 先解析到真实路径，避免自身的 fail-closed 链检查误拒操作系统前缀。
+        tdir = Path(td).resolve()
         staged: list[tuple[Path, str]] = []  # (文件, 归档内相对路径)
         # DB 一致性快照
         snap = tdir / _DB_NAME
@@ -1005,7 +1007,7 @@ def verify_backup(zip_path: Path) -> dict:
                         digest.update(chunk)
                 if digest.hexdigest() != entry["sha256"]:
                     bad.append(f"{relative_path}: sha256 不符")
-        db_extract = Path(td) / _DB_NAME
+        db_extract = Path(td).resolve() / _DB_NAME
         with zipfile.ZipFile(zip_path) as zf:
             _manifest, _entry_map, zip_entries = _validate_zipfile(zf, zip_path)
             db_info = zip_entries[_DB_NAME]

@@ -18,6 +18,11 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 ROADMAP v0.1.23 生产门槛章节）；以 P0 修复后的全量 pytest 最终退出码重新收口，
 定位出的 5 个失败均为发行文档缺失与测试版本断言硬编码（`0.1.20`）过期，已改为
 从 `pyproject.toml` 单一版本源读取；黄金回归合成案例 PASS、真实案例保持 PENDING。
+另修复 macOS CI 实测暴露的平台缺陷：系统临时目录位于 symlink 之后（`/var→/private/var`）
+时，备份/校验暂存目录与黄金回归工作区会被自身的 fail-closed 链检查误拒，
+现于创建处解析到真实路径（`backup_restore.py`、`golden_regression.py`），不放松任何
+检查强度，并新增 symlink 临时目录回归测试。Windows 构建脚本对过长仓库路径改用
+subst 短盘符调用 Inno Setup，规避 Windows 260 字符路径上限。
 真实工程 OCR 质量、人工确认界面、Office 真机、50k/200k 性能基准、签名与公证
 仍为 `PENDING / NOT VERIFIED`。
 

@@ -756,7 +756,8 @@ def run_golden_regression(
     work_parent: tempfile.TemporaryDirectory[str] | None = None
     if output is None:
         work_parent = tempfile.TemporaryDirectory(prefix="jiadun-golden-")
-        work_root = Path(work_parent.name)
+        # macOS 系统 temp 前缀位于 symlink 之后，解析到真实路径避免 fail-closed 误拒。
+        work_root = Path(work_parent.name).resolve()
     else:
         work_root = Path(output).resolve()
         work_root.mkdir(parents=True, exist_ok=True)
