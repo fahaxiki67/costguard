@@ -11,19 +11,23 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.23 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.23
-> candidate adds a page-level hybrid PDF extraction boundary with offline RapidOCR (per-page
-> 1..N coverage, fail-closed on missing/reordered/failed pages, OCR metadata into Evidence),
-> traceable document intake with category/direction/status, background import, and the
-> fail-closed legacy-contract gate, while retaining fail-closed backup/restore and Windows
-> workbook ownership, A/B/C independence, raw-range coverage, formula/filter/merge/hidden
-> structure and the `.xls` capability boundary, blank-by-default startup, immutable run
-> identities, per-sheet coverage proofs, a shared fail-closed status model, controlled
-> mapping/rule/alias knowledge, project versions, BOQ differences and historical price hints.
-> Real WPS/Excel environment verification, sanitized real-case regression, real scan-PDF OCR
-> quality, human confirmation of OCR contract candidates and production signing remain open
-> release gates. See the [release notes](docs/RELEASE_NOTES_v0.1.23.md) and the
+> **Status: v0.1.24 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.24
+> candidate adds the contract-fact confirmation lifecycle: extracted clauses are candidates
+> by default, human confirmation (with mandatory reason when overturning) produces confirmed
+> facts with full audit evidence, rejected facts leave the run contract, and a workbench
+> dialog reviews candidates by status. It retains the page-level hybrid PDF extraction
+> boundary with offline RapidOCR (per-page 1..N coverage, fail-closed on missing/reordered/
+> failed pages, OCR metadata into Evidence), traceable document intake with category/
+> direction/status, background import, the fail-closed legacy-contract gate, fail-closed
+> backup/restore, Windows workbook ownership, A/B/C independence, raw-range coverage,
+> formula/filter/merge/hidden structure, the `.xls` capability boundary, blank-by-default
+> startup, immutable run identities, per-sheet coverage proofs, a shared fail-closed status
+> model, controlled mapping/rule/alias knowledge, project versions, BOQ differences and
+> historical price hints. Real WPS/Excel environment verification, sanitized real-case
+> regression, real scan-PDF OCR quality, per-page OCR candidate review and production
+> signing remain open release gates. See the
+> [release notes](docs/RELEASE_NOTES_v0.1.24.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![期次概览](examples/screenshots/03-期次概览.png)
@@ -121,7 +125,7 @@ available for hash and ZIP validation.
 
 The target-machine performance measurements, real Microsoft Excel checks, signing and
 notarization, recovery race checks and real-case regression remain open release
-gates for v0.1.23.
+gates for v0.1.24.
 
 ## Rename and compatibility
 

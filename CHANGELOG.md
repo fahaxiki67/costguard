@@ -9,7 +9,16 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.23` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.24` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.24] - 2026-09-04
+
+合同事实确认生命周期（阶段 C-1，schema v48）：contract_facts 增加确认状态字段，
+历史事实回填 candidate 不自动升 confirmed；抽取条款一律候选，人工确认（推翻须留
+理由）才是已确认事实并写审计 Evidence；被拒绝事实退出运行契约；候选带状态标记与
+确认汇总；工作台新增条款确认对话框。黄金基线按先例升 schema_version 48。
+真实 OCR 质量、扫描页逐条对照复核、控制基准候选算法、Office 真机、50k/200k 性能、
+签名与公证仍为 `PENDING / NOT VERIFIED`。
 
 - 发布后 CI 收尾修复（不改变 v0.1.23 tag 内容，测试/CI 专用）：
   发布一致性 CLI 测试 subprocess 指定 UTF-8 解码；`golden_regression.py` 入口
