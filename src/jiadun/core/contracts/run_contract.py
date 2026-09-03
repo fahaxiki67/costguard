@@ -1556,6 +1556,51 @@ def _fact_review_summary(facts: list[dict[str, Any]]) -> dict[str, int]:
     return summary
 
 
+def _control_baselines(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+    """读取控制基准投影；被人工拒绝的基准不再进入运行契约。
+
+    金额、角色、口径与替代关系原样进入载荷并带确认状态标记——比较是
+    派生行为，不进入运行契约的输入快照；只有 confirmed 才是已确认基准。
+    """
+    rows = conn.execute(
+        """SELECT id, role, title, file_id, amount, currency, tax_basis,
+                  scope_descriptor, effective_period, version, supersedes_id,
+                  priority, review_status, reviewed_at, reviewed_by, review_reason,
+                  evidence_id, created_at
+           FROM control_baselines WHERE project_id=? ORDER BY id""",
+        (project_id,),
+    ).fetchall()
+    baselines: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        status = item.get("review_status")
+        if status == "rejected":
+            continue
+        item["review_status"] = status or "candidate"
+        baselines.append(item)
+    return baselines
+
+
+def _control_baseline_summary(baselines: list[dict[str, Any]]) -> dict[str, Any]:
+    """控制基准汇总：角色分层与确认情况一眼可见，被拒基准不进入载荷。"""
+    summary: dict[str, Any] = {
+        "roles": {"control_candidate": 0, "reference": 0, "settlement_result": 0},
+        "review_status": {"confirmed": 0, "candidate": 0, "needs_review": 0, "rejected": 0},
+        # 载荷内被其他基准显式替代（supersedes）的条数；替代者尚未确认时
+        # 被替代基准在比较中仍参与，这里只做可见性统计。
+        "superseded": 0,
+    }
+    superseded_ids = {
+        int(item["supersedes_id"]) for item in baselines if item.get("supersedes_id")
+    }
+    for item in baselines:
+        summary["roles"][item.get("role") or "control_candidate"] += 1
+        summary["review_status"][item.get("review_status") or "candidate"] += 1
+        if int(item["id"]) in superseded_ids:
+            summary["superseded"] += 1
+    return summary
+
+
 def _manifest_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
     """把当前权威应到清单纳入运行契约；没有清单时明确记录不可用。"""
     manifest = conn.execute(
@@ -1726,6 +1771,7 @@ def build_run_contract_components(
     aliases = _aliases(conn, project_id)
     manifest_scope = _manifest_scope(conn, project_id)
     facts_for_payload = _contract_facts(conn, project_id)
+    control_for_payload = _control_baselines(conn, project_id)
     return {
         "format_version": CONTRACT_FORMAT_VERSION,
         # 产品身份属于运行契约的一部分。品牌/发行包从 CostGuard 迁移为
@@ -1766,6 +1812,10 @@ def build_run_contract_components(
         "amount_unit": "unknown",
         "contract_facts": facts_for_payload,
         "contract_fact_review_summary": _fact_review_summary(facts_for_payload),
+        # 对上控制基准输入快照（阶段 C-2）：被拒基准不进入载荷；比较结果是
+        # 派生行为，不进入运行契约输入。
+        "control_baselines": control_for_payload,
+        "control_baseline_summary": _control_baseline_summary(control_for_payload),
         "import_manifest": manifest_scope,
         # P0-03 要求合同明确绑定权威清单的状态快照；保留旧键供兼容读取，
         # 新键让审阅者无需从组件名称猜测其语义。

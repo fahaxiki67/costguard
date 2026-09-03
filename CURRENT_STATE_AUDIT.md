@@ -281,3 +281,33 @@
   改变既有风险判定（候选仍算覆盖），不存在存量项目风险突增。
 - 验证边界：本阶段为纯增量；尚未实现 OCR 扫描页逐条对照复核入口与 confirmed 接入
   控制基准候选算法。全量回归结果见本轮记录。
+
+## 阶段 C-2 进行中：对上控制基准候选（schema v50，分支 feat/control-baseline-candidates）
+
+- 依据宪章第六节与 ROADMAP v0.1.24 门槛，本轮在独立分支实现控制基准候选基础设施：
+  迁移 v50 新表 control_baselines（角色 control_candidate / reference /
+  settlement_result、金额 Decimal 字符串、币种/税口径/范围/生效期间/版本、
+  supersedes 替代链、确认生命周期字段、项目归属守卫触发器、supersedes 唯一索引）。
+  v49 为并行开发中的 PDF 逐页复核阶段预留，本分支不占用；不回填、不改变任何
+  既有金额与结论。
+- 新增 core/control_baselines.py：register_baseline（登记即 candidate，金额必须
+  为正有限 Decimal，范围必填，替代必须同角色且一基准至多被替代一次）、
+  set_baseline_review（推翻 confirmed/rejected 须留理由；币种/税口径/范围/
+  生效期间/版本可在复核时人工补正并留痕；金额与 supersedes 不可改，修正金额
+  必须登记新基准声明替代）、每次登记与流转写审计 Evidence 并刷新 Run Contract。
+- 确定性比较引擎 evaluate_baselines：纯函数、不查库不读时钟；只有
+  control_candidate 角色产生判定；rejected 或被 confirmed 基准替代者退出比较
+  （excluded 留痕）；未确认 → PENDING；币种/税口径/范围任一未声明或不同 →
+  INCOMPARABLE（自由文本范围逐字匹配，文本不同即不可比，不做语义猜测）；
+  可比 confirmed 基准金额不一致且无替代关系 → CONTROL_CONFLICT；结算侧金额
+  缺失 → PENDING；超出 → FAIL（仅提示"结算结果较已确认控制基准高 X 元"，
+  不作违规/责任认定）。汇总优先级 control_conflict > fail > incomparable >
+  pending > pass，确定发现不被不可比掩盖，逐条明细全量保留。
+- Run Contract：新增 control_baselines 输入快照（被拒基准不进入载荷）与
+  control_baseline_summary 汇总（角色/确认状态/被替代计数）；比较结果属派生
+  行为，不进入运行契约输入。
+- 验证边界（如实声明）：结算侧金额与口径由调用方显式提供——"结算结果"取
+  哪个合计（原始 vs 计算、对上方向口径）属业务口径决策，按宪章第十六节不
+  自行猜测；UI 登记入口与报告层接线、confirmed 合同事实到控制候选的联动
+  留待下一阶段。44 项新增单测（含 hypothesis 边界/确定性/全序性）全过；
+  黄金基线按先例升 schema_version 50 并附 GOLDEN_BASELINE_CHANGELOG_v0.1.25。

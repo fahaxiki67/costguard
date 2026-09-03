@@ -2790,7 +2790,7 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
     ),
     # v48：合同事实确认生命周期。抽取产出一律是 candidate；只有人工确认
     # （review_status='confirmed'）的事实才可视为已确认合同事实；历史事实
-    # 无法证明经过人工确认，回填为 candidate 而不是 confirmed。
+    # 无法证明经过人工确认，回填为 candidate 而不自动升 confirmed。
     (
         48,
         [
@@ -2798,6 +2798,60 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE contract_facts ADD COLUMN reviewed_at TEXT",
             "ALTER TABLE contract_facts ADD COLUMN reviewed_by TEXT",
             "ALTER TABLE contract_facts ADD COLUMN review_reason TEXT NOT NULL DEFAULT ''",
+        ],
+    ),
+    # v49：预留给并行开发中的 PDF 逐页人工对照复核阶段（pdf_page_reviews）。
+    # 本分支不创建 v49；合并时按该阶段的迁移定义填入，保持版本号单调。
+    #
+    # v50：对上控制基准候选（宪章第六节 / ROADMAP v0.1.24 门槛）。终审/
+    # 审计报告金额登记为 control_candidate / reference / settlement_result
+    # 三种角色之一；登记与复核沿用阶段 C-1 的 candidate→confirmed 生命周期，
+    # 只有 confirmed 且未被 confirmed 替代（supersedes）的基准参与比较。
+    # 比较维度（币种/税口径/范围）不同 → INCOMPARABLE，绝不强行比较；
+    # 两个有效基准金额冲突且无替代关系 → CONTROL_CONFLICT。金额以 Decimal
+    # 字符串存储，本迁移不回填、不改变任何既有金额与结论。
+    (
+        50,
+        [
+            """CREATE TABLE IF NOT EXISTS control_baselines (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                role TEXT NOT NULL DEFAULT 'control_candidate',
+                title TEXT NOT NULL,
+                file_id INTEGER REFERENCES source_files(id),
+                amount TEXT NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'unknown',
+                tax_basis TEXT NOT NULL DEFAULT 'unknown',
+                scope_descriptor TEXT NOT NULL DEFAULT '',
+                effective_period TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
+                supersedes_id INTEGER REFERENCES control_baselines(id),
+                priority INTEGER NOT NULL DEFAULT 0,
+                review_status TEXT NOT NULL DEFAULT 'candidate',
+                reviewed_at TEXT,
+                reviewed_by TEXT,
+                review_reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_control_baselines_project_status
+               ON control_baselines(project_id, role, review_status)""",
+            # 一个基准至多被一条新版本替代，防止出现两条并行的“修正版”。
+            # SQLite 唯一索引对 NULL 不去重，允许多条无替代关系的基准共存。
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_control_baselines_supersedes
+               ON control_baselines(supersedes_id)""",
+            """CREATE TRIGGER IF NOT EXISTS trg_control_baselines_project_guard_insert
+               BEFORE INSERT ON control_baselines
+               WHEN NOT EXISTS (
+                   SELECT 1 FROM projects p WHERE p.id=NEW.project_id
+               )
+               BEGIN SELECT RAISE(ABORT, 'control baseline project mismatch'); END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_control_baselines_project_guard_update
+               BEFORE UPDATE OF project_id ON control_baselines
+               WHEN NOT EXISTS (
+                   SELECT 1 FROM projects p WHERE p.id=NEW.project_id
+               )
+               BEGIN SELECT RAISE(ABORT, 'control baseline project mismatch'); END""",
         ],
     ),
 ]

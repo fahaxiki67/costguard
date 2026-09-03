@@ -11,6 +11,38 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.24` 为预发行/预览候选，不代表正式生产能力。
 
+### 对上控制基准候选（阶段 C-2，schema v50，分支 feat/control-baseline-candidates）
+
+宪章第六节落地：正式区分 reference / control_candidate / settlement_result 三种
+角色，替代关系必须显式 supersedes（一个基准至多被一条新版本替代），不用
+"最新日期/最大金额/最新文件覆盖"之类粗暴规则。
+
+- 迁移 v50 新表 `control_baselines`：金额以 Decimal 字符串存储，币种/税口径/
+  范围/生效期间/版本/supersedes 替代链/确认生命周期字段齐备；项目归属守卫
+  触发器与 supersedes 唯一索引。v49 为并行开发中的 PDF 逐页复核阶段预留；
+  本迁移不回填、不改变任何既有金额与结论。
+- `register_baseline` 登记即 candidate：金额必须为正有限 Decimal（不接受
+  float），范围说明必填，替代必须同角色；登记写 `control_baseline_registered`
+  Evidence（scope=human）并刷新 Run Contract。
+- `set_baseline_review`：确认/拒绝/待复核三向流转，推翻 confirmed/rejected
+  必须留理由；币种/税口径/范围/生效期间/版本可随复核人工补正并全程留痕；
+  金额与 supersedes 不可改——修正金额必须登记新基准声明替代（历史不可篡改）。
+- 确定性比较引擎 `evaluate_baselines`（纯函数，同输入必得同输出）：五态
+  PASS/FAIL/PENDING/INCOMPARABLE/CONTROL_CONFLICT；被拒或被确认版本替代的
+  基准退出比较并留痕；币种/税口径/范围任一未声明或不同 → INCOMPARABLE
+  （自由文本范围逐字匹配，不做语义猜测）；可比 confirmed 基准金额冲突且无
+  替代关系 → CONTROL_CONFLICT；结算侧金额缺失 → PENDING；超出仅提示
+  "结算结果较已确认控制基准高 X 元"，不认定违规、责任人或违规金额。
+- Run Contract 新增 `control_baselines` 输入快照（被拒基准不进入载荷）与
+  `control_baseline_summary` 汇总（角色/确认状态/被替代计数）；比较结果属
+  派生行为，不进入运行契约输入。
+- 已知边界：结算侧金额与口径由调用方显式提供（"结算结果"取哪个合计属业务
+  口径决策，未定前不自动比较）；工作台登记/复核 UI 与报告层接线、confirmed
+  合同事实到控制候选的联动留待后续阶段。真实 OCR 质量、Office 真机、
+  50k/200k 性能、签名与公证仍为 `PENDING / NOT VERIFIED`。
+- 新增 44 项单测（生命周期/门控/五态/supersedes 链/hypothesis 边界与确定性）；
+  黄金基线按先例升 schema_version 50，附 `GOLDEN_BASELINE_CHANGELOG_v0.1.25`。
+
 ## [0.1.24] - 2026-09-04
 
 合同事实确认生命周期（阶段 C-1，schema v48）：contract_facts 增加确认状态字段，

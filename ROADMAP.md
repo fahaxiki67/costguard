@@ -80,6 +80,37 @@ v0.1.24 交付合同事实确认生命周期（阶段 C-1，schema v48）：抽�
 - [ ] OCR 页候选条款按页状态细分复核入口（扫描页逐条对照原文确认）。
 - [ ] confirmed 事实接入对上控制基准候选算法（终审报告作为上限候选）。
 
+## 阶段 C-2：对上控制基准候选（进行中，分支 feat/control-baseline-candidates）
+
+宪章第六节：正式区分 reference / control_candidate / settlement_result 三角色；
+不用"最新日期/最大金额/最新文件覆盖"等粗暴规则；替代必须显式 supersedes；
+维度不可比不强行比较；冲突必须显式分层。已交付核心引擎与生命周期：
+
+- [x] 迁移 v50：新表 control_baselines（角色/金额 Decimal 字符串/币种/税口径/
+  范围/生效期间/版本/supersedes 替代链/确认生命周期字段/项目守卫触发器/
+  supersedes 唯一索引）；v49 预留给并行的 PDF 逐页复核阶段；不回填不调平。
+- [x] 登记即候选：register_baseline 金额必须为正有限 Decimal、范围必填、
+  替代必须同角色且一基准至多被替代一次；登记写 control_baseline_registered
+  Evidence（scope=human）并刷新 Run Contract。
+- [x] 复核生命周期：set_baseline_review 推翻 confirmed/rejected 须留理由；
+  币种/税口径/范围/生效期间/版本可随复核人工补正并全程留痕；金额与替代
+  关系不可改（修正金额=登记新基准声明替代，历史不可篡改）。
+- [x] 确定性比较引擎 evaluate_baselines（纯函数）：五态 PASS/FAIL/PENDING/
+  INCOMPARABLE/CONTROL_CONFLICT；被拒/被确认版本替代者退出比较留痕；
+  币种/税口径/范围未声明或不同 → INCOMPARABLE（范围逐字匹配不做语义猜测）；
+  可比 confirmed 基准金额冲突且无替代关系 → CONTROL_CONFLICT；超出仅提示
+  "高 X 元"，不作违规/责任认定；汇总优先级冲突>超出>不可比>待确认>通过。
+- [x] Run Contract：control_baselines 输入快照（被拒不进载荷）+ 角色/确认/
+  替代汇总；比较结果为派生行为不进入契约输入。
+- [x] 44 项单测（生命周期/门控/五态/supersedes 链/hypothesis 边界与确定性）；
+  黄金基线升 schema_version 50（附 GOLDEN_BASELINE_CHANGELOG_v0.1.25）。
+- [ ] 工作台登记/复核入口与控制比较结果展示（含按页状态的终审报告登记向导）。
+- [ ] 结算侧口径接线：确定"结算结果"取哪个合计（原始/计算、方向与期次范围）
+  并经人工确认后接入 evaluate_project_control；口径未定前不自动比较。
+- [ ] confirmed 合同事实与控制候选的联动（终审/审计报告作为上限候选的
+  自动登记建议仍须人工确认）。
+
+
 ## v0.1.23 生产门槛（未全部满足）
 
 v0.1.23 聚焦页级 OCR 与混合 PDF 不漏页能力的回归收口和发行卫生修复：补齐 v0.1.22
