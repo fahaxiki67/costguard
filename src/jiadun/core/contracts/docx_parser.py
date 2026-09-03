@@ -5,7 +5,17 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from jiadun.core.parsing.pdf_pipeline import (
+    OcrProvider,
+    PdfExtractionReport,
+    PdfRenderer,
+    extract_pdf_document,
+    paragraphs_from_report,
+)
 
 
 def _ensure_magic(path: Path, magics: tuple[bytes, ...], label: str) -> None:
@@ -36,25 +46,25 @@ def parse_docx(path: Path) -> list[dict]:
     return paras
 
 
-def parse_pdf(path: Path) -> list[dict]:
-    import pdfplumber
+@dataclass(frozen=True, slots=True)
+class ContractParseResult:
+    """兼容段落结果之外，向导入层提供 PDF 页级提取快照。"""
 
-    paras = []
-    with pdfplumber.open(str(path)) as pdf:
-        for pi, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            for j, line in enumerate(text.splitlines(), start=1):
-                line = line.strip()
-                if line:
-                    paras.append({"index": f"p{pi}:{j}", "text": line})
-    if not paras:
-        # 扫描件无文本层时必须显式失败（验收执行器/Gui 均有 NotImplementedError
-        # 通道），绝不静默返回空结果让用户误以为"合同里没有该条款"。
-        raise NotImplementedError(
-            f"PDF 未提取到任何文本层（疑似扫描件，OCR 尚未支持）：{path.name}；"
-            "扫描资料不得直接形成业务结论，需人工复核原件"
-        )
-    return paras
+    paragraphs: list[dict[str, Any]]
+    pdf_report: PdfExtractionReport | None = None
+
+
+def parse_pdf(
+    path: Path,
+    *,
+    renderer: PdfRenderer | None = None,
+    ocr_provider: OcrProvider | None = None,
+) -> list[dict[str, Any]]:
+    """逐页解析 PDF；页面未完整解释时抛出兼容的专用待处理异常。"""
+    report = extract_pdf_document(
+        Path(path), renderer=renderer, ocr_provider=ocr_provider
+    )
+    return paragraphs_from_report(report)
 
 
 def parse_txt(path: Path) -> list[dict]:
@@ -62,18 +72,41 @@ def parse_txt(path: Path) -> list[dict]:
     return [{"index": i, "text": t.strip()} for i, t in enumerate(text.splitlines(), start=1) if t.strip()]
 
 
-def parse_contract(path: Path, file_type: str) -> list[dict]:
+def parse_contract_result(
+    path: Path,
+    file_type: str,
+    *,
+    renderer: PdfRenderer | None = None,
+    ocr_provider: OcrProvider | None = None,
+) -> ContractParseResult:
+    """解析合同文本，并在 PDF 时返回页级提取报告。"""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(str(path))
     if file_type == "docx":
         _ensure_magic(path, (b"PK",), "DOCX")
-        return parse_docx(path)
+        return ContractParseResult(parse_docx(path))
     if file_type == "pdf":
         _ensure_magic(path, (b"%PDF-",), "PDF")
-        return parse_pdf(path)
+        report = extract_pdf_document(
+            path, renderer=renderer, ocr_provider=ocr_provider
+        )
+        return ContractParseResult(paragraphs_from_report(report), report)
     if file_type == "txt":
-        return parse_txt(path)
+        return ContractParseResult(parse_txt(path))
     if file_type in ("doc", "image"):
         raise NotImplementedError(f"parser for '{file_type}' not implemented yet")
     raise ValueError(f"unsupported contract file type: {file_type}")
+
+
+def parse_contract(
+    path: Path,
+    file_type: str,
+    *,
+    renderer: PdfRenderer | None = None,
+    ocr_provider: OcrProvider | None = None,
+) -> list[dict[str, Any]]:
+    """保留旧返回类型的合同解析兼容入口。"""
+    return parse_contract_result(
+        path, file_type, renderer=renderer, ocr_provider=ocr_provider
+    ).paragraphs

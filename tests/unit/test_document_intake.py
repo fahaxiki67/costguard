@@ -78,6 +78,48 @@ def test_import_worker_returns_for_scanned_pdf_and_keeps_document_visible(tmp_pa
         conn.close()
 
 
+def test_import_worker_does_not_count_needs_review_contract_as_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    pytest.importorskip("PySide6")
+    from jiadun.core import document_intake
+    from jiadun.core.contracts import extract as contract_extract
+    from jiadun.core.models import project as project_model
+    from jiadun.core.models.source_file import import_file
+    from jiadun.ui import workbench
+    from jiadun.ui.workbench import ImportWorker
+
+    info = project_model.create_project("OCR待复核计数", tmp_path / "workspace")
+    info, conn = project_model.open_project(Path(info.workspace_path))
+    source = tmp_path / "候选合同.pdf"
+    source.write_bytes(b"%PDF-1.7\nunit-test-placeholder\n")
+    source_file = import_file(conn, info.project_id, Path(info.workspace_path), source)
+    with conn:
+        doc_id = conn.execute(
+            """INSERT INTO contract_docs(project_id, file_id, doc_type, title, parsed_at)
+               VALUES (?,?,?,?,?)""",
+            (info.project_id, source_file.file_id, "unknown", "候选合同", "2026"),
+        ).lastrowid
+        document_intake.record_document(
+            conn, info.project_id, source_file.file_id,
+            category="upward_contract", parse_status="needs_review",
+            parser="pdf_hybrid", commit=False,
+        )
+    conn.close()
+    monkeypatch.setattr(workbench, "_load_local_ocr_provider", lambda: None)
+    monkeypatch.setattr(contract_extract, "import_contract", lambda *_args, **_kwargs: doc_id)
+    monkeypatch.setattr(contract_extract, "contract_risks", lambda *_args: [])
+    monkeypatch.setattr(contract_extract, "persist_risks", lambda *_args: 0)
+
+    completed: list[dict] = []
+    worker = ImportWorker(info.workspace_path, info.project_id, [source], "upward_contract")
+    worker.finished.connect(completed.append)
+    worker.run()
+
+    assert completed and completed[0]["ok"] == 0
+    assert any("需人工复核" in detail for detail in completed[0]["partial"])
+
+
 def test_import_worker_emits_completion_when_selection_has_no_supported_files(tmp_path: Path):
     pytest.importorskip("PySide6")
     from jiadun.core.models import project as project_model

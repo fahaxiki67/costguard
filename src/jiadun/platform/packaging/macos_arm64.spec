@@ -13,6 +13,8 @@ import os
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_all
+
 
 def _find_repo_root(start: Path) -> Path:
     for cand in (start, *start.parents):
@@ -41,16 +43,18 @@ MIN_MACOS = _compat_env("JIADUN_MIN_MACOS", "COSTGUARD_MIN_MACOS", "15.0")
 
 DEMO_SRC = REPO / "examples" / "demo"
 ICON_SRC = REPO / "src" / branding.PRODUCT_SLUG / "resources" / "icon.icns"
+OCR_DATAS, OCR_BINARIES, OCR_HIDDENIMPORTS = collect_all("rapidocr_onnxruntime")
 
 a = Analysis(
     [str(REPO / "src" / branding.PRODUCT_SLUG / "app.py")],
     pathex=[str(REPO / "src")],
-    binaries=[],
+    binaries=OCR_BINARIES,
     datas=[
         (str(DEMO_SRC), f"{branding.RESOURCE_DIR_NAME}/demo"),
         (str(ICON_SRC), branding.RESOURCE_DIR_NAME),
+        *OCR_DATAS,
     ],
-    hiddenimports=[],
+    hiddenimports=OCR_HIDDENIMPORTS,
     excludes=[
         "tkinter",
         "PyQt5",

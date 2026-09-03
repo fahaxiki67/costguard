@@ -70,6 +70,75 @@ class TestWorkbench:
         assert "下一步：" in wb_page.overview_hint.text()
         assert wb_page.next_action_btn.text().startswith("下一步：")
 
+    def test_reclassifying_contract_refreshes_materialized_run_contract(
+        self, wb_page, tmp_path, monkeypatch
+    ):
+        from PySide6.QtWidgets import QDialog, QMessageBox
+
+        from jiadun.core.contracts import extract, run_contract
+        from jiadun.ui import workbench
+
+        source = tmp_path / "合同资料.txt"
+        source.write_text("合同金额：1000元\n付款：30天", encoding="utf-8")
+        extract.import_contract(
+            wb_page.conn,
+            wb_page.project.project_id,
+            Path(wb_page.project_dir),
+            source,
+        )
+        old_contract = run_contract.ensure_run_contract(
+            wb_page.conn, wb_page.project.project_id
+        )
+        assert old_contract.components["contract_facts"]
+        wb_page.refresh_documents()
+        row_index = next(
+            index
+            for index in range(wb_page.document_table.rowCount())
+            if wb_page.document_table.item(index, 0).text() == source.name
+        )
+        wb_page.document_table.selectRow(row_index)
+
+        class FakeCategoryDialog:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def setWindowTitle(self, _title):
+                pass
+
+            def exec(self):
+                return QDialog.Accepted
+
+            def category(self):
+                return "other_agreement"
+
+        monkeypatch.setattr(workbench, "ImportCategoryDialog", FakeCategoryDialog)
+        monkeypatch.setattr(QMessageBox, "information", lambda *_args, **_kwargs: None)
+
+        wb_page._reclassify_source_file()
+
+        current = run_contract.get_current_contract(
+            wb_page.conn, wb_page.project.project_id
+        )
+        assert current is not None
+        assert current.run_id != old_contract.run_id
+        assert current.components["contract_facts"] == []
+        assert wb_page.conn.execute(
+            "SELECT invalidated_at FROM run_contracts WHERE run_id=?",
+            (old_contract.run_id,),
+        ).fetchone()["invalidated_at"] is not None
+        audit = wb_page.conn.execute(
+            """SELECT action, target, before_json, after_json, run_id, run_signature
+               FROM audit_log WHERE project_id=? AND action='reclassify_source_file'
+               ORDER BY id DESC LIMIT 1""",
+            (wb_page.project.project_id,),
+        ).fetchone()
+        assert audit is not None
+        assert audit["target"].startswith("source_file:")
+        assert '"category": "upward_contract"' in audit["before_json"]
+        assert '"category": "other_agreement"' in audit["after_json"]
+        assert audit["run_id"] == current.run_id
+        assert audit["run_signature"] == current.signature
+
     def test_items_populated_with_provenance(self, wb_page):
         wb_page.refresh_items()
         t = wb_page.items_table

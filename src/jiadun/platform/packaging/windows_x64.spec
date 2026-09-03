@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_all
+
 
 def _find_repo_root(start: Path) -> Path:
     for cand in (start, *start.parents):
@@ -28,6 +30,7 @@ VERSION = os.environ.get("JIADUN_VERSION", "0.0.0")
 
 DEMO_SRC = REPO / "examples" / "demo"
 ICON_SRC = REPO / "src" / "jiadun" / "resources" / "icon.ico"
+OCR_DATAS, OCR_BINARIES, OCR_HIDDENIMPORTS = collect_all("rapidocr_onnxruntime")
 
 _META_DIR = REPO / "build" / "jiadun_pe_meta"
 _META_DIR.mkdir(parents=True, exist_ok=True)
@@ -96,12 +99,13 @@ MANIFEST_FILE.write_text(f"""<?xml version="1.0" encoding="UTF-8" standalone="ye
 a = Analysis(
     [str(REPO / "src" / "jiadun" / "app.py")],
     pathex=[str(REPO / "src")],
-    binaries=[],
+    binaries=OCR_BINARIES,
     datas=[
         (str(DEMO_SRC), "jiadun_resources/demo"),
         (str(ICON_SRC), "jiadun_resources"),
+        *OCR_DATAS,
     ],
-    hiddenimports=[],
+    hiddenimports=OCR_HIDDENIMPORTS,
     excludes=[
         "tkinter",
         "PyQt5",

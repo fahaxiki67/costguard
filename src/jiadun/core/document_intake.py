@@ -147,7 +147,9 @@ def list_documents(conn: sqlite3.Connection, project_id: int) -> list[sqlite3.Ro
                   COALESCE(di.updated_at, sf.imported_at) AS updated_at,
                   EXISTS(SELECT 1 FROM contract_docs cd WHERE cd.file_id=sf.id) AS has_contract_doc,
                   (SELECT pb.status FROM parse_batches pb WHERE pb.file_id=sf.id
-                   ORDER BY pb.parsed_at DESC, pb.id DESC LIMIT 1) AS parser_batch_status
+                   ORDER BY pb.parsed_at DESC, pb.id DESC LIMIT 1) AS parser_batch_status,
+                  (SELECT pb.stats_json FROM parse_batches pb WHERE pb.file_id=sf.id
+                    ORDER BY pb.parsed_at DESC, pb.id DESC LIMIT 1) AS parser_batch_stats_json
            FROM source_files sf
            LEFT JOIN document_intake di ON di.file_id=sf.id AND di.project_id=sf.project_id
            WHERE sf.project_id=? ORDER BY sf.imported_at DESC, sf.id DESC""",

@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -19,6 +20,19 @@ from jiadun.core.contracts import docx_parser, run_contract
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.evidence.finding import Finding
+from jiadun.core.parsing.pdf_pipeline import (
+    PAGE_STATUSES,
+    PARSEABLE_PAGE_STATUSES,
+    PDF_PIPELINE_VERSION,
+    TRUSTED_RAPIDOCR_MODEL_FILES,
+    TRUSTED_RAPIDOCR_MODEL_SHA256,
+    TRUSTED_RAPIDOCR_MODEL_SIZE_BYTES,
+    OcrProvider,
+    PdfExtractionPending,
+    PdfExtractionReport,
+    PdfPipelineError,
+    PdfRenderer,
+)
 
 _MONEY = r"([¥￥]\s*[\d,，]+(?:\s*\.\s*\d+)?\s*(?:万元|亿元|元)?|\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?\s*(?:万元|亿元|元)?|\d{4,}(?:\.\d+)?\s*(?:万元|亿元|元)?)"
 _DAYS = r"(\d+)\s*(?:个)?\s*(日历天|工作日|天|日内)"
@@ -93,9 +107,331 @@ def extract_facts(paras: list[dict]) -> list[dict]:
                     "quote_text": text[:MAX_QUOTE_LEN] + ("…" if len(text) > MAX_QUOTE_LEN else ""),
                     "location": str(p["index"]),
                     "confidence": conf,
+                    "page_number": p.get("page_number"),
+                    "page_status": p.get("page_status"),
+                    "extraction_method": p.get("extraction_method"),
+                    "ocr_confidence": p.get("ocr_confidence"),
+                    "ocr_provider": p.get("ocr_provider"),
+                    "ocr_model": p.get("ocr_model"),
+                    "ocr_model_version": p.get("ocr_model_version"),
                 }
             )
     return facts
+
+
+def _pdf_processing_status(report: PdfExtractionReport) -> str:
+    """将页级状态聚合为文件级可重试状态。"""
+    statuses = {page.status for page in report.pages}
+    if not report.coverage_complete:
+        return "failed"
+    if statuses & {"pending_ocr", "ocr_failed"}:
+        return "pending_ocr"
+    if statuses & {"needs_review", "ocr"}:
+        # OCR 页即使置信度达到阈值，也不能跳过合同人工复核。
+        return "needs_review"
+    return "parsed"
+
+
+def _persist_pdf_batch(
+    conn: sqlite3.Connection,
+    file_id: int,
+    report: PdfExtractionReport,
+    *,
+    status: str,
+    source_sha256: str,
+) -> None:
+    """把页级摘要写入现有解析批次表；不重复存储整页 OCR 原文。"""
+    conn.execute(
+        """INSERT INTO parse_batches(file_id, parser, parsed_at, status, stats_json)
+           VALUES (?,?,?,?,?)""",
+        (
+            int(file_id),
+            "pdf_hybrid",
+            datetime.now().isoformat(timespec="seconds"),
+            status,
+            json.dumps(
+                report.as_stats(source_sha256=source_sha256),
+                ensure_ascii=False,
+                default=str,
+            ),
+        ),
+    )
+
+
+def _reusable_pdf_batch(
+    conn: sqlite3.Connection,
+    file_id: int,
+    source_sha256: str,
+) -> sqlite3.Row | None:
+    """只复用已证明全页覆盖的当前 PDF 批次，避免旧版部分解析快捷返回。"""
+    row = conn.execute(
+        """SELECT id, status, stats_json FROM parse_batches
+           WHERE file_id=? AND parser='pdf_hybrid'
+           ORDER BY parsed_at DESC, id DESC LIMIT 1""",
+        (int(file_id),),
+    ).fetchone()
+    if row is None or row["status"] not in {"parsed", "needs_review"}:
+        return None
+    try:
+        stats = json.loads(row["stats_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(stats, dict):
+        return None
+    if not _valid_pdf_batch_stats(stats, source_sha256=source_sha256, status=row["status"]):
+        return None
+    return row
+
+
+def _valid_pdf_batch_stats(
+    stats: object, *, source_sha256: str, status: str
+) -> bool:
+    """复用前重新验证持久化快照，数据库中任何不一致都拒绝复用。"""
+    if not isinstance(stats, dict):
+        return False
+    if (
+        stats.get("parser_version") != PDF_PIPELINE_VERSION
+        or stats.get("source_sha256") != source_sha256
+        or stats.get("coverage_complete") is not True
+        or stats.get("parse_ready") is not True
+        or stats.get("error") not in (None, "")
+    ):
+        return False
+    page_count = stats.get("page_count")
+    pages = stats.get("pages")
+    if (
+        isinstance(page_count, bool)
+        or not isinstance(page_count, int)
+        or page_count <= 0
+        or not isinstance(pages, list)
+        or len(pages) != page_count
+    ):
+        return False
+    expected_counts = {page_status: 0 for page_status in sorted(PAGE_STATUSES)}
+    provider_metadata = stats.get("ocr_provider")
+    page_numbers: list[int] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            return False
+        page_number = page.get("page_no")
+        page_status = page.get("status")
+        method = page.get("extraction_method")
+        text_hash = page.get("text_sha256")
+        text_chars = page.get("text_char_count")
+        line_count = page.get("line_count")
+        if (
+            isinstance(page_number, bool)
+            or not isinstance(page_number, int)
+            or page_status not in PARSEABLE_PAGE_STATUSES
+            or not isinstance(text_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", text_hash)
+            or isinstance(text_chars, bool)
+            or not isinstance(text_chars, int)
+            or text_chars <= 0
+            or isinstance(line_count, bool)
+            or not isinstance(line_count, int)
+            or line_count <= 0
+            or page.get("error") not in (None, "")
+        ):
+            return False
+        expected_method = "native_text" if page_status == "native_text" else "ocr"
+        if method != expected_method:
+            return False
+        if page_status == "native_text":
+            if page.get("confidence") is not None:
+                return False
+        else:
+            confidence = page.get("confidence")
+            if (
+                isinstance(confidence, bool)
+                or not isinstance(confidence, (int, float))
+                or not 0.0 <= float(confidence) <= 1.0
+                or not str(page.get("provider_id") or "").strip()
+                or not str(page.get("model_id") or "").strip()
+                or not str(page.get("model_version") or "").strip()
+                or not isinstance(provider_metadata, dict)
+                or page.get("provider_id") != provider_metadata.get("id")
+                or page.get("model_id") != provider_metadata.get("model_id")
+                or page.get("model_version") != provider_metadata.get("model_version")
+            ):
+                return False
+        page_numbers.append(page_number)
+        expected_counts[page_status] += 1
+    coverage_complete = page_numbers == list(range(1, page_count + 1))
+    parse_ready = coverage_complete and all(
+        page.get("status") in PARSEABLE_PAGE_STATUSES for page in pages
+    )
+    if (
+        not coverage_complete
+        or not parse_ready
+        or stats.get("page_status_counts") != expected_counts
+    ):
+        return False
+    if status == "parsed" and expected_counts["ocr"]:
+        return False
+    if status == "needs_review" and not expected_counts["ocr"]:
+        return False
+    if expected_counts["ocr"]:
+        provider = provider_metadata
+        required_text = (
+            "id", "engine", "engine_version", "model_id", "model_version",
+            "source", "license",
+        )
+        if not isinstance(provider, dict) or not all(
+            isinstance(provider.get(key), str) and provider[key].strip()
+            for key in required_text
+        ):
+            return False
+        if (
+            provider.get("model_downloaded") is not False
+            or not isinstance(provider.get("language"), list)
+            or not provider["language"]
+            or not all(isinstance(language, str) and language.strip() for language in provider["language"])
+            or isinstance(provider.get("model_size_bytes"), bool)
+            or not isinstance(provider.get("model_size_bytes"), int)
+            or provider["model_size_bytes"] <= 0
+            or not isinstance(provider.get("model_files"), list)
+            or not provider["model_files"]
+            or not isinstance(provider.get("model_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", provider["model_sha256"])
+        ):
+            return False
+        if (
+            provider.get("id") != "rapidocr_onnxruntime"
+            or provider.get("engine") != "RapidOCR"
+            or provider.get("engine_version") != "1.4.4"
+            or provider.get("model_id") != "ch_PP-OCRv4_det-rec_cls"
+            or provider.get("model_version") != "PP-OCRv4"
+            or provider.get("model_size_bytes") != TRUSTED_RAPIDOCR_MODEL_SIZE_BYTES
+            or provider.get("model_sha256") != TRUSTED_RAPIDOCR_MODEL_SHA256
+        ):
+            return False
+        expected_model_files = [
+            {
+                "name": name,
+                "filename": filename,
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            }
+            for name, filename, size_bytes, sha256 in TRUSTED_RAPIDOCR_MODEL_FILES
+        ]
+        if provider["model_files"] != expected_model_files:
+            return False
+        manifest_digest = hashlib.sha256()
+        model_size = 0
+        for model in provider["model_files"]:
+            if not isinstance(model, dict):
+                return False
+            filename = model.get("filename")
+            model_sha256 = model.get("sha256")
+            size_bytes = model.get("size_bytes")
+            if (
+                not isinstance(model.get("name"), str)
+                or not model["name"].strip()
+                or not isinstance(filename, str)
+                or not filename.strip()
+                or isinstance(size_bytes, bool)
+                or not isinstance(size_bytes, int)
+                or size_bytes <= 0
+                or not isinstance(model_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", model_sha256)
+            ):
+                return False
+            model_size += size_bytes
+            manifest_digest.update(f"{filename}:{model_sha256}\n".encode())
+        if (
+            model_size != provider["model_size_bytes"]
+            or manifest_digest.hexdigest() != provider["model_sha256"]
+        ):
+            return False
+    return True
+
+
+def _retire_existing_pdf_contracts(
+    conn: sqlite3.Connection,
+    project_id: int,
+    file_id: int,
+    *,
+    reason: str,
+) -> None:
+    """保留旧 Evidence 历史后移除旧 PDF 投影，允许新页级解析重新建立事实。"""
+    docs = conn.execute(
+        "SELECT id FROM contract_docs WHERE project_id=? AND file_id=?",
+        (int(project_id), int(file_id)),
+    ).fetchall()
+    if not docs:
+        return
+    doc_ids = [int(row["id"]) for row in docs]
+    placeholders = ",".join("?" for _ in doc_ids)
+    evidence_rows = conn.execute(
+        f"SELECT evidence_id FROM contract_facts WHERE doc_id IN ({placeholders})",
+        doc_ids,
+    ).fetchall()
+    risk_rows = conn.execute(
+        f"""SELECT id, finding_id, fingerprint, lifecycle_status, status,
+                    evidence_id, run_signature, run_id
+            FROM anomalies
+            WHERE project_id=? AND rule_id='contract_risk'
+              AND subject_type='contract_doc' AND subject_id IN ({placeholders})
+              AND COALESCE(lifecycle_status, 'new') <> 'historical'""",
+        (int(project_id), *doc_ids),
+    ).fetchall()
+    evidence_ids = {
+        int(row["evidence_id"])
+        for row in evidence_rows
+        if row["evidence_id"] is not None
+    }
+    evidence_ids.update(
+        int(row["evidence_id"])
+        for row in risk_rows
+        if row["evidence_id"] is not None
+    )
+    historical_reason = reason.strip()
+    evidence_api.mark_historical(
+        conn,
+        project_id,
+        evidence_ids,
+        historical_reason,
+        actor="system",
+        commit=False,
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+    for row in risk_rows:
+        conn.execute(
+            """UPDATE anomalies
+               SET status='stale', lifecycle_status='historical',
+                   resolved_note=COALESCE(resolved_note, ?),
+                   lifecycle_updated_at=?, lifecycle_updated_by='system'
+               WHERE id=? AND project_id=?""",
+            (historical_reason, now, int(row["id"]), int(project_id)),
+        )
+        conn.execute(
+            """INSERT INTO finding_status_events(
+                   project_id, anomaly_id, finding_id, fingerprint,
+                   before_status, after_status, reason, actor, occurred_at,
+                   run_signature, run_id, evidence_id, audit_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                int(project_id), int(row["id"]), row["finding_id"], row["fingerprint"],
+                finding_lifecycle.lifecycle_status(row), "historical",
+                historical_reason, "system", now, row["run_signature"], row["run_id"],
+                row["evidence_id"], None,
+            ),
+        )
+    conn.execute(
+        f"DELETE FROM contract_facts WHERE doc_id IN ({placeholders})", doc_ids
+    )
+    conn.execute(
+        f"DELETE FROM contract_docs WHERE id IN ({placeholders})", doc_ids
+    )
+
+
+def _refresh_contract_after_pdf_failure(
+    conn: sqlite3.Connection, project_id: int
+) -> None:
+    """PDF 失败后让已物化的旧运行退出 current，不能继续引用旧事实。"""
+    if run_contract.has_materialized_contract(conn, project_id):
+        run_contract.ensure_if_materialized(conn, project_id)
 
 
 def import_contract(
@@ -105,30 +441,60 @@ def import_contract(
     src: Path,
     doc_type: str = "unknown",
     document_category: str = "upward_contract",
+    *,
+    ocr_provider: OcrProvider | None = None,
+    pdf_renderer: PdfRenderer | None = None,
 ) -> int:
     """导入并解析一份合同/补充协议/纪要等。返回 contract_docs.id。"""
     from jiadun.core.models.source_file import import_file
 
     previous_contract = run_contract.get_current_contract(conn, project_id)
     sf = import_file(conn, project_id, project_dir, src)
+    ftype = sf.file_type
+    parser_name = "pdf_hybrid" if ftype == "pdf" else "contract_text"
     existing = conn.execute(
         "SELECT id FROM contract_docs WHERE project_id=? AND file_id=? ORDER BY id DESC LIMIT 1",
         (project_id, sf.file_id),
     ).fetchone()
     if existing is not None:
-        # 同一 SHA 的合同不得重复写入 facts/Evidence。允许资料中心对其重新分类，
-        # 但不会借“重新处理”制造第二份合同事实。
-        document_intake.record_document(
-            conn, project_id, sf.file_id, category=document_category,
-            parse_status="parsed", detail="同一只读原件已解析，未重复写入合同事实",
-            parser="contract_text",
-        )
-        return int(existing["id"])
+        if ftype == "pdf":
+            reusable = _reusable_pdf_batch(conn, sf.file_id, sf.sha256)
+            if reusable is not None:
+                batch_status = str(reusable["status"])
+                detail = (
+                    "同一只读原件已完成逐页 PDF 提取，未重复写入合同事实"
+                    if batch_status == "parsed"
+                    else "同一只读原件已完成逐页 PDF 提取；OCR 页面仍需人工复核，未重复写入合同事实"
+                )
+                document_intake.record_document(
+                    conn, project_id, sf.file_id, category=document_category,
+                    parse_status=batch_status, detail=detail, parser=parser_name,
+                )
+                return int(existing["id"])
+
+            # 旧版本可能已经为混合 PDF 建立了不完整的合同投影。没有当前、
+            # 全页覆盖的 pdf_hybrid 批次时，旧投影不能继续成为运行输入。
+            # 只删除可重建的 contract_docs/facts，保留原件、parse_batches 和
+            # 已写入的 Evidence（并将其历史化）。
+            with conn:
+                _retire_existing_pdf_contracts(
+                    conn, project_id, sf.file_id,
+                    reason="PDF 改用逐页混合提取；旧合同投影未证明覆盖全部页面",
+                )
+        else:
+            # 同一 SHA 的非 PDF 合同不得重复写入 facts/Evidence。允许资料中心
+            # 对其重新分类，但不会借“重新处理”制造第二份合同事实。
+            document_intake.record_document(
+                conn, project_id, sf.file_id, category=document_category,
+                parse_status="parsed", detail="同一只读原件已解析，未重复写入合同事实",
+                parser=parser_name,
+            )
+            return int(existing["id"])
+
     document_intake.record_document(
         conn, project_id, sf.file_id, category=document_category,
-        parse_status="processing", parser="contract_text",
+        parse_status="processing", parser=parser_name,
     )
-    ftype = sf.file_type
     if ftype == "xlsx":  # 文本类导入兜底：txt 归入合同文本
         document_intake.mark_document_status(
             conn, project_id, sf.file_id, parse_status="failed",
@@ -137,25 +503,88 @@ def import_contract(
         )
         raise ValueError("xlsx is not a contract text file")
     try:
-        paras = docx_parser.parse_contract(
-            Path(sf.stored_path), ftype if ftype != "csv" else "txt"
+        parsed = docx_parser.parse_contract_result(
+            Path(sf.stored_path), ftype if ftype != "csv" else "txt",
+            renderer=pdf_renderer, ocr_provider=ocr_provider,
         )
+    except PdfExtractionPending as exc:
+        report = exc.report
+        status = _pdf_processing_status(report)
+        with conn:
+            _persist_pdf_batch(
+                conn, sf.file_id, report, status=status, source_sha256=sf.sha256
+            )
+            document_intake.mark_document_status(
+                conn, project_id, sf.file_id, parse_status=status,
+                detail=str(exc), parser=parser_name, commit=False,
+            )
+        _refresh_contract_after_pdf_failure(conn, project_id)
+        raise
+    except PdfPipelineError as exc:
+        report = exc.report
+        if report is not None:
+            with conn:
+                _persist_pdf_batch(
+                    conn, sf.file_id, report, status="failed", source_sha256=sf.sha256
+                )
+                document_intake.mark_document_status(
+                    conn, project_id, sf.file_id, parse_status="failed",
+                    detail=str(exc), parser=parser_name, commit=False,
+                )
+        else:
+            document_intake.mark_document_status(
+                conn, project_id, sf.file_id, parse_status="failed",
+                detail=str(exc), parser=parser_name,
+            )
+        if ftype == "pdf":
+            _refresh_contract_after_pdf_failure(conn, project_id)
+        raise
     except NotImplementedError as exc:
         # 扫描 PDF 不是“没有条款”。文件已安全登记，因此把能力边界持久化为
         # OCR 待处理；UI 重启后仍可看到原因，而不是只留下一个数字。
         document_intake.mark_document_status(
             conn, project_id, sf.file_id, parse_status="pending_ocr",
-            detail=str(exc), parser="contract_text",
+            detail=str(exc), parser=parser_name,
         )
+        if ftype == "pdf":
+            _refresh_contract_after_pdf_failure(conn, project_id)
         raise
     except Exception as exc:
         document_intake.mark_document_status(
             conn, project_id, sf.file_id, parse_status="failed",
-            detail=f"{type(exc).__name__}: {exc}", parser="contract_text",
+            detail=f"{type(exc).__name__}: {exc}", parser=parser_name,
         )
+        if ftype == "pdf":
+            _refresh_contract_after_pdf_failure(conn, project_id)
         raise
+
+    paras = parsed.paragraphs
+    pdf_report = parsed.pdf_report
+    final_status = _pdf_processing_status(pdf_report) if pdf_report else "parsed"
+    if pdf_report:
+        ocr_pages = [
+            page.page_number
+            for page in pdf_report.pages
+            if page.extraction_method == "ocr"
+        ]
+        if ocr_pages:
+            final_detail = (
+                f"PDF 已逐页提取 {pdf_report.page_count} 页；OCR 页面 "
+                f"{','.join(str(page) for page in ocr_pages)} 需人工复核，"
+                "候选条款未进入运行契约"
+            )
+        else:
+            final_detail = f"PDF 已逐页提取 {pdf_report.page_count} 页原生文本"
+    else:
+        final_detail = "合同文本已解析"
+
     now = datetime.now().isoformat(timespec="seconds")
     with conn:
+        if pdf_report is not None:
+            _persist_pdf_batch(
+                conn, sf.file_id, pdf_report,
+                status=final_status, source_sha256=sf.sha256,
+            )
         cur = conn.execute(
             "INSERT INTO contract_docs(project_id, file_id, doc_type, title, parsed_at) VALUES (?,?,?,?,?)",
             (project_id, sf.file_id, doc_type, Path(src).stem, now),
@@ -163,12 +592,34 @@ def import_contract(
         doc_id = cur.lastrowid
         facts = extract_facts(paras)
         for f in facts:
+            source = {
+                "file": sf.original_name,
+                "file_id": sf.file_id,
+                "source_sha256": sf.sha256,
+                "location": f"段落/页 {f['location']}",
+                "quote": f["quote_text"],
+            }
+            step = {
+                "step": "条款抽取",
+                "pattern": f["fact_key"],
+                "confidence": f["confidence"],
+            }
+            if f.get("page_number") is not None:
+                page_metadata = {
+                    "page_no": f["page_number"],
+                    "page_status": f.get("page_status"),
+                    "extraction_method": f.get("extraction_method"),
+                }
+                source.update(page_metadata)
+                step.update(page_metadata)
+                for key in ("ocr_confidence", "ocr_provider", "ocr_model", "ocr_model_version"):
+                    if f.get(key) is not None:
+                        source[key] = f[key]
+                        step[key] = f[key]
             ev_id = evidence_api.add_evidence(
                 conn, project_id, "contract_fact",
                 f"{f['fact_key']} = {f['fact_value'] or '(关键词命中)'}",
-                steps=[{"step": "条款抽取", "pattern": f["fact_key"], "confidence": f["confidence"]}],
-                sources=[{"file": sf.original_name, "location": f"段落/页 {f['location']}",
-                          "quote": f["quote_text"]}],
+                steps=[step], sources=[source], commit=False,
             )
             conn.execute(
                 """INSERT INTO contract_facts(doc_id, fact_key, fact_value, quote_text, location,
@@ -176,6 +627,10 @@ def import_contract(
                 (doc_id, f["fact_key"], f["fact_value"], f["quote_text"], f["location"],
                  f["confidence"], ev_id),
             )
+        document_intake.mark_document_status(
+            conn, project_id, sf.file_id, parse_status=final_status,
+            detail=final_detail, parser=parser_name, commit=False,
+        )
     # 合同事实是运行输入的一部分；已有计算结果的项目在合同资料变化后
     # 立即切换到新签名，旧成果保留但不再作为当前结论使用。
     current_contract = run_contract.ensure_if_materialized(conn, project_id)
@@ -193,9 +648,6 @@ def import_contract(
             current_contract,
             reason="合同资料进入运行契约；结算 Sheet 原始网格和逐行覆盖分类未改变",
         )
-    document_intake.mark_document_status(
-        conn, project_id, sf.file_id, parse_status="parsed", parser="contract_text",
-    )
     return doc_id
 
 
@@ -214,7 +666,15 @@ RISK_CHECKS = [
 def contract_risks(conn: sqlite3.Connection, project_id: int) -> list[dict]:
     """按已导入合同检查关键条款覆盖：缺失即风险（不编造结论）。"""
     docs = conn.execute(
-        "SELECT id, title FROM contract_docs WHERE project_id=?", (project_id,)
+        """SELECT cd.id, cd.title
+           FROM contract_docs cd
+           LEFT JOIN document_intake di
+             ON di.file_id=cd.file_id AND di.project_id=cd.project_id
+           WHERE cd.project_id=? AND (
+             di.file_id IS NULL
+             OR (di.category='upward_contract' AND di.parse_status='parsed')
+           )""",
+        (project_id,),
     ).fetchall()
     risks = []
     for doc in docs:

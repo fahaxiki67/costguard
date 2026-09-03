@@ -274,7 +274,18 @@ def test_workbench_import_paths_accepts_folder_and_routes_settlement_and_contrac
         ).fetchone()["n"] == 2
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM contract_docs WHERE project_id=?", (info.project_id,)
-        ).fetchone()["n"] == 1
+        ).fetchone()["n"] == 0
+        intake = conn.execute(
+            """SELECT category, classification_status, parse_status, detail
+               FROM document_intake di
+               JOIN source_files sf ON sf.id=di.file_id
+               WHERE di.project_id=? AND sf.original_name='合同.txt'""",
+            (info.project_id,),
+        ).fetchone()
+        assert intake is not None
+        assert intake["classification_status"] == "unclassified"
+        assert intake["parse_status"] == "registered"
+        assert "未进入合同事实或运行契约" in intake["detail"]
     finally:
         conn.close()
         page.deleteLater()

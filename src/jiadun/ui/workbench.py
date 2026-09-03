@@ -51,6 +51,7 @@ from jiadun.core.anomalies import engine as anomaly_engine
 from jiadun.core.contracts import run_contract
 from jiadun.core.db import migrations
 from jiadun.core.engine import settlement_io
+from jiadun.core.evidence import audit as audit_log
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.export import excel_export
 from jiadun.core.matching import matching
@@ -86,6 +87,30 @@ SEVERITY_ZH = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
 SEVERITY_KIND = {"high": "danger", "medium": "warning", "low": "neutral", "info": "info"}
 
 _LOG = logging.getLogger(__name__)
+
+
+def _load_local_ocr_provider():
+    """在工作线程中加载本机 OCR；不可用时保守返回 None。"""
+    try:
+        from jiadun.platform.ocr import get_default_ocr_provider
+
+        return get_default_ocr_provider()
+    except Exception as exc:  # noqa: BLE001 - OCR 不可用必须回到待处理
+        _LOG.warning("本地 OCR 不可用，扫描 PDF 将保持待处理：%s", type(exc).__name__)
+        return None
+
+
+def _contract_document_status(conn, project_id: int, doc_id: int) -> str:
+    """读取合同资料的最终状态，避免把 OCR 候选显示成普通成功。"""
+    row = conn.execute(
+        """SELECT COALESCE(di.parse_status, 'parsed') AS parse_status
+           FROM contract_docs cd
+           LEFT JOIN document_intake di
+             ON di.file_id=cd.file_id AND di.project_id=cd.project_id
+           WHERE cd.id=? AND cd.project_id=?""",
+        (int(doc_id), int(project_id)),
+    ).fetchone()
+    return str(row["parse_status"]) if row else "failed"
 
 
 def _export_files(export_dir: Path, kind: str) -> list[Path]:
@@ -285,6 +310,10 @@ class ImportWorker(QObject):
                 self.progress.emit("未发现可导入资料；已结束后台任务。")
                 self.finished.emit(result)
                 return
+            ocr_provider = None
+            if spec.parse_strategy == "contract":
+                self.progress.emit("正在准备本机 OCR；文件不会上传网络…")
+                ocr_provider = _load_local_ocr_provider()
             total = len(selection.files)
             for ordinal, path in enumerate(selection.files, start=1):
                 self.progress.emit(f"正在后台导入 {ordinal}/{total}：{path.name}")
@@ -314,13 +343,28 @@ class ImportWorker(QObject):
                     elif spec.parse_strategy == "contract":
                         from jiadun.core.contracts import extract as contract_extract
 
-                        contract_extract.import_contract(
+                        doc_id = contract_extract.import_contract(
                             conn, self.project_id, self.project_dir, path,
                             document_category=spec.code,
+                            ocr_provider=ocr_provider,
                         )
                         risks = contract_extract.contract_risks(conn, self.project_id)
                         contract_extract.persist_risks(conn, self.project_id, risks)
-                        result["ok"] += 1
+                        status = _contract_document_status(conn, self.project_id, doc_id)
+                        if status == "parsed":
+                            result["ok"] += 1
+                        elif status == "needs_review":
+                            result["partial"].append(
+                                f"{path.name}：OCR 已提取，需人工复核；候选条款未进入运行契约"
+                            )
+                        elif status == "pending_ocr":
+                            result["partial"].append(
+                                f"{path.name}：扫描页面待 OCR，尚未进入运行契约"
+                            )
+                        else:
+                            result["fail"].append(
+                                f"{path.name}：合同资料状态为 {status}，未作为成功导入"
+                            )
                     else:
                         source = import_file(conn, self.project_id, self.project_dir, path)
                         intake_status = (
@@ -938,8 +982,6 @@ class WorkbenchPage(QWidget):
             )
             return
 
-        from jiadun.core.contracts import extract as contract_extract
-
         ok, partial, fail, pending = 0, [], [], 0
         for path in selection.files:
             kind = classify_import_file(path)
@@ -969,17 +1011,23 @@ class WorkbenchPage(QWidget):
                             + (f"（{report.message}）" if report.message else "")
                         )
                 elif kind == "contract":
-                    contract_extract.import_contract(
-                        self.conn, self.project.project_id, self.project_dir, path,
-                        document_category="unclassified",
+                    # 旧同步兼容入口没有资料类别上下文；合同/纪要只能先登记，
+                    # 禁止把“未分类”误当成对上合同进入 Run Contract。
+                    source = import_file(
+                        self.conn, self.project.project_id, self.project_dir, path
                     )
-                    risks = contract_extract.contract_risks(
-                        self.conn, self.project.project_id
+                    document_intake.record_document(
+                        self.conn,
+                        self.project.project_id,
+                        source.file_id,
+                        category="unclassified",
+                        parse_status="registered",
+                        detail="合同/纪要资料已登记，待人工分类；未进入合同事实或运行契约。",
+                        parser="",
                     )
-                    contract_extract.persist_risks(
-                        self.conn, self.project.project_id, risks
+                    partial.append(
+                        f"{path.name}：合同/纪要已登记，待人工分类；未进入合同解析或运行契约"
                     )
-                    ok += 1
                 else:
                     # scan_import_paths 已过滤；保留显式分支防止未来扩展时静默成功。
                     raise ValueError("unsupported file type")
@@ -1272,6 +1320,44 @@ class WorkbenchPage(QWidget):
             return
         category = document_intake.category_for(record["category"])
         detail = str(record["detail"] or "无额外处理说明")
+        page_detail: list[str] = []
+        try:
+            batch_stats = json.loads(record["parser_batch_stats_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            batch_stats = {}
+        if isinstance(batch_stats, dict) and batch_stats.get("parser_version", "").startswith("pdf-"):
+            page_count = batch_stats.get("page_count")
+            counts = batch_stats.get("page_status_counts")
+            if isinstance(page_count, int):
+                page_detail.append(f"PDF 页数：{page_count}")
+            if isinstance(counts, dict):
+                labels = {
+                    "native_text": "原生文本",
+                    "ocr": "OCR",
+                    "pending_ocr": "待 OCR",
+                    "ocr_failed": "OCR 失败",
+                    "needs_review": "待复核",
+                }
+                page_detail.append(
+                    "页面状态："
+                    + "、".join(
+                        f"{labels.get(str(key), str(key))} {int(value)}"
+                        for key, value in counts.items()
+                        if isinstance(value, int) and value
+                    )
+                )
+            ocr_meta = batch_stats.get("ocr_provider")
+            if isinstance(ocr_meta, dict):
+                model_id = ocr_meta.get("model_id")
+                model_version = ocr_meta.get("model_version")
+                if model_id or model_version:
+                    page_detail.append(
+                        f"OCR 模型：{model_id or '未记录'} / {model_version or '未记录'}"
+                    )
+            if batch_stats.get("error"):
+                page_detail.append(f"页面处理边界：{batch_stats['error']}")
+        if page_detail:
+            detail += "\n" + "\n".join(page_detail)
         self.document_detail.setPlainText(
             f"文件：{record['original_name']}\n"
             f"资料类别：{category.label}（{record['classification_status']}）\n"
@@ -1308,16 +1394,60 @@ class WorkbenchPage(QWidget):
             "evidence_only": "evidence_only",
             "control_candidate": "control_candidate",
         }.get(spec.parse_strategy, "registered")
-        document_intake.record_document(
-            self.conn, self.project.project_id, int(record["file_id"]), category=spec.code,
-            parse_status=status,
-            detail=("分类已更新；请点击“按类别重新处理”后再进入对应解析。"
-                    if status == "registered" else
-                    "已重新分类为对上控制基准候选，尚未进入金额计算。" if status == "control_candidate" else
-                    "资料已重新分类为仅归档资料，未进入金额计算。"),
-            parser="",
+        previous_contract = run_contract.get_current_contract(
+            self.conn, self.project.project_id
         )
-        self.refresh_documents()
+        old_category = str(record["category"] or "unclassified")
+        old_status = str(record["parse_status"] or "registered")
+        reason = "资料重新分类；类别变化需重新确认解析范围和运行输入"
+        with self.conn:
+            document_intake.record_document(
+                self.conn, self.project.project_id, int(record["file_id"]), category=spec.code,
+                parse_status=status,
+                detail=("分类已更新；请点击“按类别重新处理”后再进入对应解析。"
+                        if status == "registered" else
+                        "已重新分类为对上控制基准候选，尚未进入金额计算。" if status == "control_candidate" else
+                        "资料已重新分类为仅归档资料，未进入金额计算。"),
+                parser="", commit=False,
+            )
+            audit_id = audit_log.record_audit(
+                self.conn,
+                self.project.project_id,
+                "user",
+                "reclassify_source_file",
+                f"source_file:{int(record['file_id'])}",
+                {
+                    "category": old_category,
+                    "parse_status": old_status,
+                    "run_id": previous_contract.run_id if previous_contract else None,
+                },
+                {"category": spec.code, "parse_status": status},
+                reason,
+                commit=False,
+                run_id=previous_contract.run_id if previous_contract else None,
+                run_signature=previous_contract.signature if previous_contract else None,
+            )
+            current_contract = run_contract.ensure_if_materialized(
+                self.conn, self.project.project_id
+            )
+            if (
+                previous_contract is not None
+                and current_contract is not None
+                and previous_contract.run_id != current_contract.run_id
+            ):
+                settlement_io._rebind_coverage_proofs_for_run(
+                    self.conn,
+                    self.project.project_id,
+                    previous_contract,
+                    current_contract,
+                    reason=reason,
+                )
+            if current_contract is not None:
+                self.conn.execute(
+                    "UPDATE audit_log SET run_id=?, run_signature=? WHERE id=?",
+                    (current_contract.run_id, current_contract.signature, audit_id),
+                )
+        self.refresh_all()
         QMessageBox.information(self, "资料中心", "资料类别已更新；原文件和只读副本未被修改。")
 
     def _process_selected_source_file(self) -> None:

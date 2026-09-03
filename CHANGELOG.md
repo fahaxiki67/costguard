@@ -9,7 +9,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；当前 `v0.1.20` 仍是预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.21` 为预发行/预览候选，不代表正式生产能力。
+
+当前 `v0.1.21` 预发行增量：建立逐页混合 PDF 提取管线和本地 RapidOCR 平台适配，
+把完整性、页状态和模型元数据写入解析批次与 Evidence；真实工程 OCR、人工确认界面、
+Windows onedir 的 OCR 模型资源收集烟测已通过；最终包启动、真实工程 OCR、人工确认界面
+和 Office 真机验证仍保持开放，不将本版本描述为正式生产版。另已关闭未分类合同
+同步入口、非 canonical OCR 批次复用和资料重新分类审计/刷新缺口。
+
+## [0.1.21] - 2026-09-04
+
+预发行候选：逐页 PDF/OCR 边界、离线 RapidOCR 模型完整性校验、资料重新分类审计和
+未分类合同安全隔离已纳入版本。真实工程资料、真实 Microsoft Excel/WPS、最终打包启动
+以及 10k/50k 同环境性能对比仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.20] - 2026-09-03
 

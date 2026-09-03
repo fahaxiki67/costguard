@@ -150,6 +150,25 @@ UI 中点击 Evidence ID 可展开全链路。人工修改写入 `audit_log`，�
 2. **语义层**：表头识别（多行表头扫描、字段词典打分）→ 列映射 → 逐行抽取
    `line_items`，同时记录每个字段来自哪个单元格。语义层可随时在保真层上重放。
 
+### PDF 页级提取与 OCR 边界
+
+PDF 不再以“整份文件是否有文本层”作为成功条件。`core/parsing/pdf_pipeline.py`
+先通过跨平台 `PdfRenderer` 取得声明页数和 `1..N` 的逐页结果，再对无原生文本层的
+页面调用平台层提供的 `OcrProvider`。每一页必须保留下列状态之一：
+`native_text`、`ocr`、`pending_ocr`、`ocr_failed`、`needs_review`；缺页、错序、
+多页或任一未解释页面均 fail-closed，不进入后续合同条款解析。
+
+RapidOCR/ONNX Runtime 仅位于 `platform/ocr.py`，锁定版本的模型随依赖包安装并在使用前校验
+文件存在、版本、大小和 SHA-256；默认不联网、不静默下载、不上传用户文件。解析批次的
+`stats_json` 保存页数、覆盖状态、页状态、文本摘要哈希和模型身份，不重复存储整页
+OCR 原文。条款 Evidence 另保留页码、原文引用、文件 ID、源文件 SHA-256、提取方式、
+OCR 置信度及模型元数据。只有固定 RapidOCR 版本、模型身份、三份 canonical 模型清单、
+大小和 SHA-256 全部匹配时，历史批次才允许复用。
+
+OCR 结果是候选信息，不是金额或合同结论。含 OCR 页的合同资料标记为
+`needs_review`；在人工复核前，候选合同事实不会进入当前 Run Contract。原生文本页和
+通过人工确认后的数据仍沿用现有 Decimal、原始文件只读、Evidence 和运行契约纪律。
+
 ## 6. 计算纪律（ADR-004）
 
 - `Decimal` + `ROUND_HALF_UP`；聚合后再比较，容差仅用于"报告差异"，不用于"调平"。
