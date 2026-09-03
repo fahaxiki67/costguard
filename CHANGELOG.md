@@ -9,7 +9,40 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；当前 `v0.1.17` 仍是预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；当前 `v0.1.18` 仍是预发行/预览候选，不代表正式生产能力。
+
+## [0.1.18] - 2026-09-03
+
+Windows x64 生产化与真实工程验证预发行：不改变解析与计算语义，新增平台层
+与验收工具链；Excel 底稿导出大规模性能、代码签名、真 Excel 真机等仍为
+未关闭门槛。
+
+### Added
+
+- Windows 打包：PyInstaller spec 构建期生成 EXE VERSIONINFO（产品名/版本/
+  Publisher）与 PerMonitorV2 DPI、长路径 manifest；构建脚本新增可选
+  signtool 签名钩子（`JIADUN_SIGN_PFX`）与版本资源校验步骤。
+- 真机验收工具：`scripts/com_roundtrip_check.py`（COM 四模式 + 导出→重算
+  →保存→复开→逐格核对）、`scripts/db_destructive_tests.py`（强杀/锁/
+  移动/同步冲突/旧版迁移 7 场景）、`scripts/golden_case_runner.py`（多期
+  单项目黄金案例 + 独立 Decimal 真值 + 6 类破坏变体）、
+  `scripts/build_golden_decisions.py`（人工 sheet 决策生成）。
+- 项目备份与恢复：`core/backup_restore.py`（SQLite backup API 一致性快照、
+  manifest SHA-256 校验、恢复防覆盖防篡改、integrity_check 含损坏库优雅
+  报告）。
+- 经营合规问题台账：migrations v46 `finding_ledger`（按 fingerprint 跨运行
+  定位）与 `core/ledger.py`（金额影响 Decimal 校验、审计留痕），异常清单
+  导出追加台账状态/金额影响/责任单位/责任事项/处理意见列。
+
+### Fixed
+
+- COM 跳转释放纪律（`platform/spreadsheet_jump.py`）：附着优先 + 进程快照
+  判定实例归属，只 Quit 自己启动的实例；绝不中途调用 `CoUninitialize`
+  （实测会拆掉 GUI 线程 STA 上其他存活代理）；WPS 单进程多会话下不再
+  误杀用户会话。
+- Windows 窗口图标：`app_icon_path` 按平台识别 `.ico`（原仅识别 `.icns`）。
+- 应用入口显式 DPI 取整策略（PassThrough）；工作台新增 Ctrl+F/Ctrl+A/
+  Ctrl+C/Esc 键盘习惯与清单明细多选复制（只读表格不绑定删除类键）。
 
 ## [0.1.17] - 2026-09-02
 
