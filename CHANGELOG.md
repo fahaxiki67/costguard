@@ -14,6 +14,12 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 - 发布后 CI 收尾修复（不改变 v0.1.23 tag 内容，测试/CI 专用）：
   发布一致性 CLI 测试 subprocess 指定 UTF-8 解码；`golden_regression.py` 入口
   统一 UTF-8 输出，修复 cp1252 控制台中文输出崩溃（CI Golden regression 步骤实测暴露）。
+- 签名门禁逐项重哈希核对 SHA256SUMS（`release_checklist.py`）：原先只检查校验和
+  文本是否包含当前版本号字样，登记哈希与实际产物不一致时不会拦截。现按 GitHub
+  Release 扁平命名解析条目，在 `dist/` 与 `dist/installer/` 定位产物并流式重新
+  SHA-256 比对：哈希不一致 → failed；条目不可解析或版本不符 → not_available；
+  核对一致 → conditional。对 v0.1.23 真实交付物实跑通过（便携版 zip 与安装器
+  exe 均核对一致）。
 
 ### 合同事实确认生命周期（阶段 C-1，schema v48）
 
