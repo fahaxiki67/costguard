@@ -67,7 +67,7 @@ class SheetConfirmDialog(QDialog):
         self.conn = conn
         self.project_id = project_id
         self.setWindowTitle("人工确认工作表（表头歧义/无表头/表单）")
-        self.resize(920, 620)
+        self.resize(1120, 780)
         self._sheets: list[dict] = []
         self._col_spins: dict[str, QSpinBox] = {}
         self._auto_fields: set[str] = set()
@@ -118,8 +118,8 @@ class SheetConfirmDialog(QDialog):
         self.preview_table = QTableWidget()
         self.preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.preview_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.preview_table.setMinimumHeight(150)
-        self.preview_table.setMaximumHeight(230)
+        self.preview_table.setMinimumHeight(240)
+        self.preview_table.setMaximumHeight(380)
         self.preview_table.horizontalHeader().sectionClicked.connect(self._preview_column_clicked)
         form.addWidget(self.preview_table)
 
@@ -402,11 +402,16 @@ class SheetConfirmDialog(QDialog):
         for row in range(1, n_rows + 1):
             for col in range(1, n_cols + 1):
                 value = values.get((row, col))
-                self.preview_table.setItem(
-                    row - 1, col - 1,
-                    QTableWidgetItem(str(value) if value not in (None, "") else ""),
-                )
+                text = str(value) if value not in (None, "") else ""
+                item = QTableWidgetItem(text)
+                # 单元格内容可能很长：悬浮显示全文，列宽只给合理宽度 + 横向滚动
+                item.setToolTip(text)
+                self.preview_table.setItem(row - 1, col - 1, item)
         self.preview_table.resizeColumnsToContents()
+        # 列宽钳制：过窄看不清、过宽挤掉其他列；超出部分横向滚动查看
+        for col in range(self.preview_table.columnCount()):
+            width = self.preview_table.columnWidth(col)
+            self.preview_table.setColumnWidth(col, max(72, min(width, 240)))
 
     def _preview_column_clicked(self, column: int):
         """点击预览列直接填入当前选择的字段，仍走互斥列校验。"""
