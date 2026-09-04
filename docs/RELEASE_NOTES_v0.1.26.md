@@ -41,7 +41,9 @@ v0.1.25 及之前的合同确认生命周期、逐页对照复核、对上控制
 
 - 真实工程扫描 PDF 的 OCR 质量回归；脱敏黄金样本登记仍为 0。
 - 真实 Microsoft Excel/WPS（Windows 与 macOS）真机专项。
-- 1万/5万/20万行完整导出基准；Windows 代码签名与 macOS 公证。
+- 真实 Microsoft Excel（Windows Excel 与 macOS Excel）和 WPS（Windows WPS 与
+macOS WPS）四环境真机专项。1万、5万、20万行完整导出基准的同环境实测；
+Windows 代码签名与 macOS 公证。
 
 ## 升级影响
 

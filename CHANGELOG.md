@@ -9,6 +9,16 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
+后续改动将在这里记录；`v0.1.26` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.26] - 2026-09-05
+
+性能修复与缓存层预发行（schema v53）：sheet_cell_digests 缓存表 +
+raw_cell_digest 缓存化（0.07s vs 2.96s）。PDF/Word 结算导入 fail-closed
+转待人工处理。费率规则候选扫描、多期累计分析、控制基准五态比较。
+黄金基线升至 schema 53。
+
+
 后续改动将在这里记录；`v0.1.25` 为预发行/预览候选，不代表正式生产能力。
 
 ## [0.1.25] - 2026-09-04

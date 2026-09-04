@@ -1,6 +1,6 @@
 [project]
 name = "jiadun"
-version = "0.1.25"
+version = "0.1.26"
 description = "Jiadun（价盾）- Engineering Cost & Compliance Intelligence Workbench（工程经营合规智能工作台）"
 requires-python = ">=3.12,<3.13"
 readme = "README.md"

@@ -108,6 +108,18 @@ v0.1.25 交付合同事实确认生命周期（v48）+ PDF 逐页人工对照复
 - [ ] 真实 Microsoft Excel/WPS（Windows 与 macOS）真机专项、50k/200k 完整导出
   基准、Windows 代码签名与 macOS 公证。
 
+## v0.1.26 生产门槛（未全部满足）
+
+v0.1.26 交付性能修复（F-3 缓存化，schema v53）、费率规则、PDF 逐页对照复核
+和多项稳定性修复。以下门槛未全部关闭前，只能标记为预览候选。
+
+- [x] raw_cell_digest 逐 sheet 缓存（真实数据实测 0.07s vs 2.96s）。
+- [x] 迁移运行器 duplicate column 幂等容错。
+- [x] 黄金基线升至 schema 53 并附变更记录。
+- [ ] 真实工程扫描 PDF OCR 质量回归（脱敏黄金样本 0）。
+- [ ] 真实 Microsoft Excel/WPS（Windows 与 macOS）真机专项。
+- [ ] 1万/5万/20万行完整导出基准；Windows 代码签名与 macOS 公证。
+
 ## 阶段三：对上控制基准候选与上限比较（进行中，schema v50）
 
 - [x] 迁移 v50：control_baselines（金额/税口径/范围/supersedes/确认状态）。
