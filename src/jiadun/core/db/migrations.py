@@ -2874,6 +2874,16 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )""",
         ],
     ),
+    # v52：Sheet 清单类型标注（任务 B）。unknown=未识别；boq_detail=分部分项；
+    # measure_unit=单价措施（量×价，与分部分项同构）；measure_total=总价措施
+    # （费率计取，无工程量，GB50500）；summary=汇总/控制页；non_business=非业务。
+    # 仅是内容类型标注，不改变 sheet_status 角色/门控语义。
+    (
+        52,
+        [
+            "ALTER TABLE raw_sheets ADD COLUMN list_kind TEXT NOT NULL DEFAULT 'unknown'",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
