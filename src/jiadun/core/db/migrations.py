@@ -2845,6 +2845,35 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )""",
         ],
     ),
+    # v51：框架/管理性协议费率规则（宪章 §五：费率不是一个百分比）。抽取只产
+    # 候选；确认时必须人工设定 base_type/base_definition（"按结算价3%" 与
+    # "按不含甲供材税前建安费3%" 不是同一条规则）；试算用 Decimal 确定性计算。
+    (
+        51,
+        [
+            """CREATE TABLE IF NOT EXISTS rate_rules (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                doc_id INTEGER REFERENCES contract_docs(id),
+                file_id INTEGER REFERENCES source_files(id),
+                rate_percent TEXT,
+                base_type TEXT NOT NULL DEFAULT 'unset',
+                base_definition TEXT NOT NULL DEFAULT '',
+                tax_basis TEXT NOT NULL DEFAULT 'unknown',
+                cap TEXT,
+                floor TEXT,
+                effective_scope TEXT NOT NULL DEFAULT '',
+                priority INTEGER NOT NULL DEFAULT 0,
+                quote_text TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'candidate',
+                reviewed_at TEXT,
+                reviewed_by TEXT,
+                review_reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER,
+                created_at TEXT NOT NULL
+            )""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

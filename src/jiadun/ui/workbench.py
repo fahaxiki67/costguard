@@ -827,9 +827,12 @@ class WorkbenchPage(QWidget):
         review_btn.clicked.connect(self._open_contract_review)
         baseline_btn = QPushButton("对上控制基准…")
         baseline_btn.clicked.connect(self._open_control_baseline)
+        rate_btn = QPushButton("费率规则（框架协议）…")
+        rate_btn.clicked.connect(self._open_rate_rules)
         for b, name in ((import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
                         (files_btn, None), (confirm_btn, None), (review_btn, None),
-                        (baseline_btn, None), (detect_btn, None), (check_btn, None)):
+                        (baseline_btn, None), (rate_btn, None),
+                        (detect_btn, None), (check_btn, None)):
             if name:
                 b.setObjectName(name)
             btn_row.addWidget(b)
@@ -1089,6 +1092,13 @@ class WorkbenchPage(QWidget):
         from jiadun.ui.dialogs.control_baseline import ControlBaselineDialog
 
         dlg = ControlBaselineDialog(self.conn, self.project.project_id, self)
+        dlg.exec()
+        self.refresh_all()
+
+    def _open_rate_rules(self) -> None:
+        from jiadun.ui.dialogs.rate_rules import RateRulesDialog
+
+        dlg = RateRulesDialog(self.conn, self.project.project_id, self)
         dlg.exec()
         self.refresh_all()
 
