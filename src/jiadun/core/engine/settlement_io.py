@@ -1313,6 +1313,58 @@ def import_settlement_file(
         conn, project_id, sf.file_id, category=document_category,
         parse_status="processing", parser="settlement",
     )
+    # PDF/Word/图片结算清单：表格解析尚不支持（fail-closed 转待人工处理并给出
+    # 可行动指引），不得包装成莫名失败；原件保持只读，等待用户另存 Excel/CSV。
+    if sf.file_type in {"pdf", "doc", "docx", "image"}:
+        guidance = (
+            f"{sf.file_type.upper()} 结算清单暂不支持自动表格解析：原件已只读保留。"
+            "请将该文件另存为 Excel/CSV 后重新导入；或在资料中心把它重新分类为"
+            "合同/审计报告等其他类别（PDF 合同与审计报告走逐页提取管线）。"
+        )
+        from jiadun.core import document_intake as _di
+
+        with run_contract._transaction(conn, "persist_unsupported_settlement"):
+            _di.mark_document_status(
+                conn, project_id, sf.file_id,
+                parse_status="needs_review", detail=guidance,
+                parser="settlement", commit=False,
+            )
+            evidence_api.add_evidence(
+                conn, project_id, "parse_failure",
+                f"文件「{sf.original_name}」为 {sf.file_type.upper()} 格式，"
+                "结算表格解析暂不支持，已登记为待人工处理",
+                steps=[{
+                    "step": "导入物化",
+                    "status": "needs_review",
+                    "reason": guidance,
+                    "action": "另存为 Excel/CSV 后重新导入，或重新分类",
+                }],
+                sources=[{
+                    "file_id": sf.file_id,
+                    "location": "文件级导入管线",
+                    "original_name": sf.original_name,
+                }],
+                commit=False,
+                scope="source",
+            )
+        run_contract.ensure_if_materialized(conn, project_id)
+        return ImportReport(
+            sf.file_id,
+            None,
+            period_no or next_period_no(conn, project_id, direction),
+            -1,
+            "partial",
+            sheets=[
+                SheetReport(
+                    sf.original_name,
+                    "needs_review",
+                    state_code="pending",
+                    notes=[guidance],
+                )
+            ],
+            message=guidance,
+            needs_manual_review=True,
+        )
     try:
         with run_contract._transaction(conn, "import_settlement_file"):
             report = _import_settlement_file(
