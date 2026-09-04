@@ -3016,7 +3016,12 @@ def migrate(db_path: Path, backups_dir: Path | None = None, log: Callable[[str],
                 if version <= ver:
                     continue
                 for sql in scripts:
-                    conn.execute(sql)
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError as oe:
+                        if "duplicate column name" in str(oe):
+                            continue
+                        raise
                 conn.execute(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, datetime.now().isoformat(timespec="seconds")),
