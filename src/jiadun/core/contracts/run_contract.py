@@ -1326,6 +1326,15 @@ def current_contract_gaps(
 
 def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
     def raw_cell_digest(sheet_id: int) -> str:
+        # F-3 性能修复：raw_cells 按 sheet_id 插入后不可变（重解析产生新
+        # sheet_id），摘要落库缓存后复用；真实数据（23 万格）下逐格重编码
+        # 曾耗时 ~100 秒/次刷新。
+        cached = conn.execute(
+            "SELECT digest FROM sheet_cell_digests WHERE sheet_id=?",
+            (int(sheet_id),),
+        ).fetchone()
+        if cached is not None:
+            return str(cached["digest"])
         digest = hashlib.sha256()
         cells = conn.execute(
             """SELECT row, col, raw_value, cached_value, is_formula,
@@ -1346,7 +1355,21 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
                 }).encode("utf-8")
             )
             digest.update(b"\n")
-        return digest.hexdigest()
+        hexdigest = digest.hexdigest()
+        try:
+            conn.execute(
+                """INSERT INTO sheet_cell_digests(sheet_id, digest, cell_count, computed_at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(sheet_id) DO UPDATE SET
+                       digest=excluded.digest, cell_count=excluded.cell_count,
+                       computed_at=excluded.computed_at""",
+                (int(sheet_id), hexdigest, len(cells),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+        except sqlite3.Error:
+            # 缓存写入失败不阻断主流程（下次重算即可）
+            pass
+        return hexdigest
 
     rows = conn.execute(
         """SELECT rs.id, rs.batch_id, rs.sheet_index, rs.sheet_name, rs.period_id,

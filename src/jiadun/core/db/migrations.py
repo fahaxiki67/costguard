@@ -2884,6 +2884,20 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE raw_sheets ADD COLUMN list_kind TEXT NOT NULL DEFAULT 'unknown'",
         ],
     ),
+    # v53：Sheet 单元格摘要缓存（F-3 性能修复）。raw_cells 按 sheet_id 插入后
+    # 不可变（重解析产生新 sheet_id），摘要算一次即可复用；表可随时清空重建，
+    # 不影响摘要语义。
+    (
+        53,
+        [
+            """CREATE TABLE IF NOT EXISTS sheet_cell_digests (
+                sheet_id INTEGER PRIMARY KEY REFERENCES raw_sheets(id),
+                digest TEXT NOT NULL,
+                cell_count INTEGER NOT NULL,
+                computed_at TEXT NOT NULL
+            )""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
