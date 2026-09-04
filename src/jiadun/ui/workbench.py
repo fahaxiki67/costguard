@@ -3168,7 +3168,7 @@ class WorkbenchPage(QWidget):
         try:
             _log = Path.home() / "Desktop" / "ZCODE" / "workbench_refresh_timing.log"
             with open(_log, "a", encoding="utf-8") as fh:
-                msg = "{0} refresh_all {1:.2f}s".format(
+                msg = "{} refresh_all {:.2f}s".format(
                     datetime.now().isoformat(timespec="seconds"), _t.perf_counter() - _t0)
                 fh.write(msg + " | ")
         except OSError:

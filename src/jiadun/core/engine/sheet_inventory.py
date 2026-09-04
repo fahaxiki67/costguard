@@ -158,7 +158,7 @@ def set_sheet_list_kind(
     if row is None:
         raise ValueError(f"Sheet 不存在或不属于当前项目：sheet_id={sheet_id}")
     before = row["list_kind"] or LIST_KIND_UNKNOWN
-    now = datetime.now().isoformat(timespec="seconds")
+    datetime.now().isoformat(timespec="seconds")
     with conn:
         conn.execute(
             "UPDATE raw_sheets SET list_kind=? WHERE id=?",

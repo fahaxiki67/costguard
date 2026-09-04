@@ -49,7 +49,7 @@ def _add_file_with_sheets(conn, pid, tmp_path, name, sheets):
 class TestListWorkbookSheets:
     def test_lists_all_sheets_including_confirmed_and_non_pending(self, project_db):
         conn, pid, tmp = project_db
-        fid = _add_file_with_sheets(
+        _add_file_with_sheets(
             conn, pid, tmp, "多Sheet工作簿.xlsx",
             [
                 ("分部分项清单", "pending", "表头歧义待人工确认", 120),
@@ -69,7 +69,7 @@ class TestListWorkbookSheets:
 
     def test_confirmed_sheet_keeps_human_kind(self, project_db):
         conn, pid, tmp = project_db
-        fid = _add_file_with_sheets(
+        _add_file_with_sheets(
             conn, pid, tmp, "工作簿.xlsx", [("汇总表", "confirmed", "已确认", 10)]
         )
         conn.execute(
@@ -104,7 +104,7 @@ class TestListWorkbookSheets:
 class TestSetSheetListKind:
     def test_human_annotation_requires_reason(self, project_db):
         conn, pid, tmp = project_db
-        fid = _add_file_with_sheets(
+        _add_file_with_sheets(
             conn, pid, tmp, "工作簿.xlsx", [("清单", "pending", "待确认", 30)]
         )
         sheet_id = sheet_inventory.list_workbook_sheets(conn, pid)[0]["sheet_id"]
