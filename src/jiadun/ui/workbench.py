@@ -3153,6 +3153,9 @@ class WorkbenchPage(QWidget):
 
     # ---------- 公共 ----------
     def refresh_all(self):
+        # F-3 诊断探针：逐段计时定位工作台刷新的阻塞点（临时，随 F-3 修复移除）
+        import time as _t
+        _t0 = _t.perf_counter()
         self.status_label.setText(project_status_summary(self.conn, self.project.project_id))
         self.refresh_overview()
         self.refresh_documents()
@@ -3162,6 +3165,14 @@ class WorkbenchPage(QWidget):
         self.refresh_matches()
         self.refresh_export_status()
         self.refresh_version_assets()
+        try:
+            _log = Path.home() / "Desktop" / "ZCODE" / "workbench_refresh_timing.log"
+            with open(_log, "a", encoding="utf-8") as fh:
+                msg = "{0} refresh_all {1:.2f}s".format(
+                    datetime.now().isoformat(timespec="seconds"), _t.perf_counter() - _t0)
+                fh.write(msg + " | ")
+        except OSError:
+            pass
 
     def _notify_import(
         self,
