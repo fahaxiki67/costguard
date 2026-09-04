@@ -141,3 +141,42 @@ F-3 修复（含回归测试：97 pending 表项目打开不挂起）后接续�
   dev 模式进程亦可能）。
 - 推论：若 97 张待确认表使单次 refresh 变慢（如数秒），循环 + 慢刷新 =
   持续未响应——与用户体感一致。探针留存供夜间任务定位触发源。
+
+## 追加（05:15）：F-3 根因实锤——refresh_all 单次 278 秒
+
+### 决定性数据（离屏复现进程探针日志）
+```
+04:16（97 表状态早期）refresh_all ~0.9 秒/次，每 1.3 秒被调用一次
+05:04:38 refresh_all 278.70 秒
+05:09:17 refresh_all 278.17 秒
+```
+导入 7 个真实文件后，refresh_all 从 0.9 秒暴涨到 **278 秒/次**（约 300 倍）。
+UI 线程每次刷新被占 4.6 分钟——这就是用户体感的"卡死/未响应"。
+
+### 阻塞链（py-spy 实抓线程栈）
+```
+refresh_version_assets (workbench.py:2746)
+→ build_report_model (summary.py:2480)
+→ coverage_summary (coverage.py:330)
+→ current_results_available (run_contract.py:695)
+→ _line_item_digest (run_contract.py:1486)
+→ canonical_json (finding.py:31) → json.dumps  ← CPU 热点
+```
+
+### 热点分析
+_line_item_digest 对每行 line_items 做 canonical_json 编码（含 3 个证据列
+的 JSON 解析）。行数本身不大（~290），但真实导入后单行数据体积/证据结构
+膨胀导致总编码时间失控；且 refresh_version_assets 每次刷新都全量重算，
+无缓存无增量。
+
+### 修复方向（按任务书 F/J 纪律，需设计后实施）
+1. 先 cProfile 精确定位（编码 vs 行数 vs 单行体积）；
+2. 摘要增量化的正确性安全方案（分文件/分批次摘要缓存+失效），canonical
+   语义不得变化；
+3. refresh_version_assets 从 UI 线程移走或结果缓存；
+4. 回归测试：同规模真实数据项目 refresh_all < 5 秒。
+
+### 对用户的影响与建议
+**v0.1.25 在真实数据量下每次刷新卡 4.6 分钟——发布 v0.1.26 前必须修复此项**，
+否则新版本对真实用户反而不可用。修复属任务书任务 F（性能）与 E（闭环）交叉，
+已列为最高优先。
