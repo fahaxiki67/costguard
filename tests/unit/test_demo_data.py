@@ -279,7 +279,13 @@ class TestDemoPipeline:
                JOIN contract_docs cd ON cd.id=cf.doc_id WHERE cd.project_id=?""",
             (info.project_id,),
         ).fetchall()
-        assert len(rows) >= 10, f"合同事实过少：{len(rows)}"
+        # 2026-09-05 party 模式改为标签-值邻接后，条款正文里的"发包人应在…"
+        # 片段不再产出 party 候选（13→8）；演示合同本身无当事人声明行，
+        # 阈值按真实键种类断言，而不是固定噪声数量。
+        keys = {r["fact_key"] for r in rows}
+        assert {"contract_amount", "payment_clause", "settlement_clause",
+                "pricing_method"} <= keys, keys
+        assert len(rows) >= 8, f"合同事实过少：{len(rows)}"
         for r in rows:
             assert r["quote_text"], f"{r['fact_key']} 缺少原文引用"
             assert r["location"], f"{r['fact_key']} 缺少位置信息"

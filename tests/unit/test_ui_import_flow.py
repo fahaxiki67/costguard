@@ -349,3 +349,205 @@ def test_main_window_source_file_flow_creates_project_and_imports_file(
         ).fetchone()["n"] == 1
     finally:
         win.close()
+
+
+class TestDragAndDropEventPath:
+    """拖放事件路径（QDragEnterEvent/QDropEvent）回归。
+
+    落事件后必须仍走原有导入校验门控：拖入不支持类型不得绕过检查
+    创建项目/导入文件。offscreen 下弹窗全部打桩，防止模态对话框死锁。
+    """
+
+    # QDropEvent/QDragEnterEvent 不拥有 QMimeData；必须保留 Python 引用，
+    # 否则 GC 回收后事件内 mimeData() 成为悬垂指针（offscreen 段错误）。
+    _alive_mime: list[object] = []
+
+    def _mime_with_files(self, *paths: Path):
+        from PySide6.QtCore import QMimeData, QUrl
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        self._alive_mime.append(mime)
+        return mime
+
+    def _drag_enter_event(self, mime):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtGui import QDragEnterEvent
+
+        return QDragEnterEvent(
+            QPoint(10, 10),
+            Qt.CopyAction,
+            mime,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+
+    def _drop_event(self, mime):
+        from PySide6.QtCore import QPointF, Qt
+        from PySide6.QtGui import QDropEvent
+
+        return QDropEvent(
+            QPointF(10, 10),
+            Qt.CopyAction,
+            mime,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+
+    def test_drop_zone_accepts_local_file_drag_and_emits_paths(self, tmp_path: Path):
+        from PySide6.QtWidgets import QApplication
+
+        from jiadun.ui.file_selection import FileDropZone
+
+        QApplication.instance() or QApplication([])
+        zone = FileDropZone()
+        zone.show()
+        xlsx = tmp_path / "第1期.xlsx"
+        xlsx.write_bytes(b"placeholder")
+
+        enter_with_file = self._drag_enter_event(self._mime_with_files(xlsx))
+        zone.dragEnterEvent(enter_with_file)
+        assert enter_with_file.isAccepted() or enter_with_file.proposedAction()
+
+        enter_without_files = self._drag_enter_event(self._mime_empty())
+        zone.dragEnterEvent(enter_without_files)
+        assert not enter_without_files.isAccepted()
+
+        received: list[list[Path]] = []
+        zone.paths_dropped.connect(received.append)
+        zone.dropEvent(self._drop_event(self._mime_with_files(xlsx)))
+        assert received == [[xlsx]]
+        zone.deleteLater()
+
+    def _mime_empty(self):
+        from PySide6.QtCore import QMimeData
+
+        mime = QMimeData()
+        self._alive_mime.append(mime)
+        return mime
+
+    def test_main_window_drop_keeps_import_gating_for_unsupported_files(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """拖入不支持类型的文件：警告提示，不得绕过门控新建项目。"""
+        from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+        from jiadun.core.models import project as project_model
+        from jiadun.ui.main_window import MainWindow, NewProjectDialog
+
+        QApplication.instance() or QApplication([])
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            lambda _parent, _title, text, *_a, **_k: warnings.append(text),
+        )
+        # 弹窗打桩：任何模态对话框都不允许真正弹出（offscreen 死锁防线）
+        exec_calls: list[str] = []
+
+        def fake_exec(self):
+            exec_calls.append(type(self).__name__)
+            return QDialog.Accepted
+
+        monkeypatch.setattr(NewProjectDialog, "exec", fake_exec)
+        monkeypatch.setattr(
+            project_model, "workspace_roots",
+            lambda **_k: [tmp_path / "ws"],
+        )
+
+        win = MainWindow()
+        try:
+            jpg = tmp_path / "照片.jpg"
+            jpg.write_bytes(b"placeholder")
+            assert win.project_list.count() == 0
+
+            enter = self._drag_enter_event(self._mime_with_files(jpg))
+            win.dragEnterEvent(enter)
+            assert enter.isAccepted()
+
+            win.dropEvent(self._drop_event(self._mime_with_files(jpg)))
+            assert warnings and "没有价盾支持的结算表或合同" in warnings[-1]
+            assert "照片.jpg（不支持的文件类型）" in warnings[-1]
+            # 门控没有被绕过：没有弹出新建项目对话框，也没有新项目
+            assert exec_calls == []
+            assert win.project_list.count() == 0
+        finally:
+            win.close()
+            win.deleteLater()
+
+    def test_main_window_drop_with_supported_file_opens_new_project_flow(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """拖入支持类型文件：走新建项目流程（弹窗打桩），路径透传工作台。"""
+        from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+        from jiadun.core.models import project as project_model
+        from jiadun.ui.main_window import MainWindow, NewProjectDialog
+        from jiadun.ui.workbench import WorkbenchPage
+
+        QApplication.instance() or QApplication([])
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            lambda _parent, _title, text, *_a, **_k: warnings.append(text),
+        )
+
+        def fake_exec(self):
+            self.name_edit.setText("拖拽落地项目")
+            return QDialog.Accepted
+
+        monkeypatch.setattr(NewProjectDialog, "exec", fake_exec)
+        monkeypatch.setattr(
+            project_model, "workspace_roots",
+            lambda **_k: [tmp_path / "ws"],
+        )
+        monkeypatch.setattr(
+            project_model, "set_workspace_root",
+            lambda _root: None,
+        )
+        routed: list[list[Path]] = []
+        monkeypatch.setattr(
+            WorkbenchPage, "_choose_category_and_import",
+            lambda self, paths: routed.append(list(paths)),
+        )
+
+        win = MainWindow()
+        try:
+            docx = tmp_path / "总承包合同.docx"
+            docx.write_bytes(b"placeholder")
+            win.dropEvent(self._drop_event(self._mime_with_files(docx)))
+            assert routed and routed[0] == [docx]
+            assert win.stack.currentIndex() == 1
+        finally:
+            win.close()
+            win.deleteLater()
+
+    def test_workbench_drop_zone_wired_to_import_gating(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """工作台导入区的拖放信号必须接到分类导入门控。"""
+        from PySide6.QtWidgets import QApplication
+
+        from jiadun.core.models import project as project_model
+        from jiadun.ui.file_selection import FileDropZone
+        from jiadun.ui.workbench import WorkbenchPage
+
+        QApplication.instance() or QApplication([])
+        info = project_model.create_project("拖放接线", tmp_path / "ws")
+        info, conn = project_model.open_project(Path(info.workspace_path))
+        routed: list[list[Path]] = []
+        monkeypatch.setattr(
+            WorkbenchPage, "_choose_category_and_import",
+            lambda self, paths: routed.append(list(paths)),
+        )
+        page = WorkbenchPage(conn, info, info.workspace_path, on_back=lambda: None)
+        try:
+            zone = page.findChild(FileDropZone)
+            assert zone is not None and zone.acceptDrops()
+            xlsx = tmp_path / "第2期.xlsx"
+            xlsx.write_bytes(b"placeholder")
+            # 直接发射拖放信号（等价 dropEvent 已提取路径后的路径分发）
+            zone.paths_dropped.emit([xlsx])
+            assert routed and routed[0] == [xlsx]
+        finally:
+            conn.close()
+            page.deleteLater()

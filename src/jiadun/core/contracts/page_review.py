@@ -244,3 +244,74 @@ def mark_document_pages_reviewed(
     )
     run_contract.ensure_run_contract(conn, project_id)
     return {"file_id": int(file_id), "verified_pages": verified_pages}
+
+
+def unverified_review_pages(
+    conn: sqlite3.Connection,
+    project_id: int,
+    file_id: int,
+    page_statuses: dict[int, str],
+) -> list[int]:
+    """给定页级状态，返回仍需人工复核且尚未 verified 的页号。
+
+    供导入/重导入路径判定：应复核页（needs_review/ocr）是否都已经
+    有人工 verified 决定。pending_ocr/ocr_failed 不属于人工复核可
+    解除的范围，不在此判定（它们必须重新解析）。
+    """
+    require = {
+        number for number, status in (page_statuses or {}).items()
+        if status in PAGES_REQUIRING_REVIEW
+    }
+    if not require:
+        return []
+    rows = conn.execute(
+        """SELECT page_number FROM pdf_page_reviews
+           WHERE project_id=? AND file_id=? AND decision='verified'""",
+        (int(project_id), int(file_id)),
+    ).fetchall()
+    verified = {int(r["page_number"]) for r in rows}
+    return sorted(require - verified)
+
+
+def promote_verified_pages(
+    conn: sqlite3.Connection,
+    project_id: int,
+    file_id: int,
+    report,
+):
+    """把已人工 verified 的 needs_review 页提升为可解析（人工确认优先）。
+
+    宪章原则 8：人工确认结果优先，AI/程序不得静默覆盖。低置信 OCR 页
+    /混合文本层页一旦有人工 verified 决定，重新提取时应解除该页的
+    复核门控，而不是把文档打回 needs_review 让人工复核成果失效。
+    只提升 needs_review 页；pending_ocr/ocr_failed 页保持原状。
+
+    返回 (新报告, 被提升的页号列表)；无可提升时返回 (原报告, [])。
+    """
+    from dataclasses import replace
+
+    promoted: list[int] = []
+    pages = []
+    for page in report.pages:
+        if page.status != "needs_review":
+            pages.append(page)
+            continue
+        row = conn.execute(
+            """SELECT decision FROM pdf_page_reviews
+               WHERE project_id=? AND file_id=? AND page_number=?""",
+            (int(project_id), int(file_id), int(page.page_number)),
+        ).fetchone()
+        if row is not None and row["decision"] == "verified":
+            promoted.append(int(page.page_number))
+            pages.append(
+                replace(
+                    page,
+                    status="ocr",
+                    error="低置信/混合页已经人工对照复核，解除页级复核门控",
+                )
+            )
+        else:
+            pages.append(page)
+    if not promoted:
+        return report, []
+    return replace(report, pages=tuple(pages)), promoted

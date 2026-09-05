@@ -78,6 +78,97 @@ class TestExtract:
         assert "tax_clause" in by_key
         assert "breach_clause" in by_key
 
+    def test_party_facts_require_label_value_adjacency(self):
+        """party 字段只接受"标签+分隔符+实体"邻接形态（2026-09-05 真实合同实测）。
+
+        真实 EPC 主合同中每个提及"发包人/承包人"的条款段落都被当作
+        party 事实（单份 3532 条候选中 2314 条为 party 噪声），人工复核
+        队列被淹没。下列正文句子不得产生 party 事实。
+        """
+        noise_paragraphs = [
+            {"index": 1, "text": "地产产品的精品战略，承包人必须严格执行，按发包人指定的标准设计施工图"},
+            {"index": 2, "text": "发包人为了保证开发产品品质，实施集中采购"},
+            {"index": 3, "text": "向承包人支付当期结算价及其增值税总额的75%"},
+            {"index": 4, "text": "工期天数不一致的，以工期总日历天数为准。除非承包人符合本合同明确约定的工期顺延情形"},
+            {"index": 5, "text": "[委托方]（以下简称甲方）：[受托方]（以下简称乙方）"},
+        ]
+        facts = extract.extract_facts(noise_paragraphs)
+        party = [f for f in facts if f["fact_key"] in ("employer_party", "contractor_party")]
+        assert party == [], [f["fact_value"] for f in party]
+
+    def test_party_facts_accept_real_label_forms(self):
+        """真实合同中的标签形态必须仍然命中：冒号式/括号后缀式/为式。"""
+        paragraphs = [
+            {"index": 1, "text": "发包人（全称）：河南泷通置业有限责任公司"},
+            {"index": 2, "text": "发包人(全称) 河南泷通置业有限责任公司"},
+            {"index": 3, "text": "承包人为中国水利水电第五工程局有限公司（联合体牵头人）"},
+            {"index": 4, "text": "【发包人】（甲方）：武汉洺悦领江房地产有限公司"},
+        ]
+        facts = extract.extract_facts(paragraphs)
+        party_values = [f["fact_value"] for f in facts
+                        if f["fact_key"] in ("employer_party", "contractor_party")]
+        assert "河南泷通置业有限责任公司" in party_values
+        assert "中国水利水电第五工程局有限公司" in party_values
+        assert "武汉洺悦领江房地产有限公司" in party_values
+
+    def test_contract_amount_supports_chinese_capital_numerals(self):
+        """合同金额必须支持人民币大写（真实补充协议全部以大写计价）。"""
+        paragraphs = [
+            {"index": 1,
+             "text": "2.3 调整后合同总金额（含增值税）为人民币（大写）叁亿零捌拾叁万柒仟零玖拾元整"},
+            {"index": 2, "text": "主合同金额为人民币大写：肆亿捌仟零叁拾陆万元整"},
+            {"index": 3, "text": "本补充协议金额为人民币（大写）伍佰万元整（¥5,000,000.00）"},
+        ]
+        facts = extract.extract_facts(paragraphs)
+        values = [f["fact_value"] for f in facts
+                  if f["fact_key"] == "contract_amount" and f["fact_value"]]
+        assert any(v == "300837090" for v in values), values
+        assert any(v == "480360000" for v in values), values
+        assert any(v == "5000000" for v in values), values
+
+    def test_contract_amount_keeps_jiao_fen_and_negative_sign(self):
+        """真实合同的角分（贰角伍分）与负数（负壹亿…）不得丢失（2026-09-05 实测）。"""
+        paragraphs = [
+            {"index": 1,
+             "text": "不含增值税签约合同价为：人民币（大写）【壹亿捌仟叁佰壹拾玖万玖仟捌佰柒拾叁元贰角伍分】"},
+            {"index": 2,
+             "text": "2.2 此次补充协议金额为人民币大写：负壹亿柒仟玖佰伍拾贰万柒仟柒佰捌拾捌元整"},
+        ]
+        facts = extract.extract_facts(paragraphs)
+        values = [f["fact_value"] for f in facts
+                  if f["fact_key"] == "contract_amount" and f["fact_value"]]
+        assert any(v == "183199873.25" for v in values), values
+        assert any(v == "-179527788" for v in values), values
+
+    def test_standard_code_numbers_are_not_amounts(self):
+        """规范编号（GB50500-2013）不得被当作合同金额（真实噪声实测）。"""
+        paragraphs = [
+            {"index": 1,
+             "text": "按《建设工程工程量清单计价规范》（GB50500-2013）相关规定计入合同价内"},
+        ]
+        facts = extract.extract_facts(paragraphs)
+        values = [f["fact_value"] for f in facts
+                  if f["fact_key"] == "contract_amount" and f["fact_value"]]
+        assert values == [], values
+
+    def test_chinese_capital_amount_converter_edges(self):
+        """大写金额换算的确定性边界（程序计算，不靠 LLM）。"""
+        convert = extract._parse_chinese_capital_amount
+        assert convert("壹佰元整") == "100"
+        assert convert("叁亿零捌拾叁万柒仟零玖拾元整") == "300837090"
+        assert convert("肆亿捌仟零叁拾陆万元整") == "480360000"
+        assert convert("伍佰万元整") == "5000000"
+        assert convert("玖元整") == "9"
+        assert convert("拾万元整") == "100000"
+        assert convert("壹仟零壹元整") == "1001"
+        assert convert("壹亿捌仟叁佰壹拾玖万玖仟捌佰柒拾叁元贰角伍分") == "183199873.25"
+        assert convert("负壹亿柒仟玖佰伍拾贰万柒仟柒佰捌拾捌元整") == "-179527788"
+        assert convert("玖角") is None  # 只有角没有元，不定标
+        # 非法/不完整输入必须返回 None（不猜值）
+        assert convert("这不是金额") is None
+        assert convert("") is None
+        assert convert("壹拾") is None  # 缺少元单位无法定标
+
     def test_missing_section_not_fabricated(self, tmp_path):
         """没有索赔条款 → 不得编造 claim_clause。"""
         import docx as docx_lib

@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from jiadun.core import document_intake
-from jiadun.core.contracts import docx_parser, run_contract
+from jiadun.core.contracts import docx_parser, page_review, run_contract
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.evidence.finding import Finding
@@ -34,8 +34,87 @@ from jiadun.core.parsing.pdf_pipeline import (
     PdfRenderer,
 )
 
-_MONEY = r"([¥￥]\s*[\d,，]+(?:\s*\.\s*\d+)?\s*(?:万元|亿元|元)?|\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?\s*(?:万元|亿元|元)?|\d{4,}(?:\.\d+)?\s*(?:万元|亿元|元)?)"
+_MONEY = (
+    r"((?:[¥￥]\s*[\d,，]+(?:\s*\.\s*\d+)?\s*(?:万元|亿元|元)?"
+    r"|(?<![A-Za-z0-9.-])\d{1,3}(?:[,，]\d{3})+(?:\.\d+)?\s*(?:万元|亿元|元)?"
+    r"|(?<![A-Za-z0-9.-])\d{4,}(?:\.\d+)?\s*(?:万元|亿元|元)?"
+    r"|(?:负)?[壹贰叁肆伍陆柒捌玖零拾佰仟万亿]{2,32}(?:\s*元)?"
+    r"(?:\s*[壹贰叁肆伍陆柒捌玖零]角)?(?:\s*[壹贰叁肆伍陆柒捌玖零]分)?\s*[整正]?))"
+)
 _DAYS = r"(\d+)\s*(?:个)?\s*(日历天|工作日|天|日内)"
+
+# 中文大写金额（人民币大写计价是真实合同的主流形态）；换算是确定性程序计算。
+_CAPITAL_DIGIT_VALUES = {
+    "零": 0, "壹": 1, "贰": 2, "叁": 3, "肆": 4,
+    "伍": 5, "陆": 6, "柒": 7, "捌": 8, "玖": 9,
+}
+_CAPITAL_SECTION_UNITS = {"拾": 10, "佰": 100, "仟": 1000}
+_CAPITAL_MAGNITUDES = {"万": 10**4, "亿": 10**8}
+_CAPITAL_CLEAN_RE = re.compile(r"人民币|大写|整|正|[：:（）()\s【】\[\]]")
+_CAPITAL_FULL_RE = re.compile(
+    r"(负)?([零壹贰叁肆伍陆柒捌玖拾佰仟万亿]+)(万元|亿元|元)?"
+    r"([零壹贰叁肆伍陆柒捌玖]角)?([零壹贰叁肆伍陆柒捌玖]分)?"
+)
+
+
+def _parse_chinese_capital_amount(text: str) -> str | None:
+    """把"叁亿零捌拾叁万柒仟零玖拾元整"换算为确定性数字字符串。
+
+    支持角分（贰角伍分 → .25）与负号（负壹亿… → 负值）；无法定标
+    （缺元单位且无万亿量级，如"壹拾"/"玖角"）或含非法字符时返回
+    None，绝不猜值。亿/万节按中文数位规则逐段累计。
+    """
+    cleaned = _CAPITAL_CLEAN_RE.sub("", text or "")
+    m = _CAPITAL_FULL_RE.fullmatch(cleaned)
+    if not m:
+        return None
+    negative = bool(m.group(1))
+    number = m.group(2)
+    unit = m.group(3) or ""
+    jiao = m.group(4)
+    fen = m.group(5)
+    if not number:
+        return None
+    # 定标要求：有元单位/角/分，或数字本身终止在万/亿量级（如"叁亿"）
+    if not (unit or jiao or fen) and number[-1] not in _CAPITAL_MAGNITUDES:
+        return None
+    total = 0
+    wan_section = 0
+    section = 0
+    digit = 0
+    for ch in number:
+        if ch in _CAPITAL_DIGIT_VALUES:
+            digit = _CAPITAL_DIGIT_VALUES[ch]
+        elif ch in _CAPITAL_SECTION_UNITS:
+            section += (digit or 1) * _CAPITAL_SECTION_UNITS[ch]
+            digit = 0
+        elif ch in _CAPITAL_MAGNITUDES:
+            if ch == "万":
+                wan_section = (wan_section + section + digit) * 10**4
+            else:
+                total = (total + wan_section + section + digit) * 10**8
+                wan_section = 0
+            section = 0
+            digit = 0
+        else:
+            return None
+    amount = total + wan_section + section + digit
+    if unit == "万元":
+        amount *= 10**4
+    elif unit == "亿元":
+        amount *= 10**8
+    cents = 0
+    if jiao:
+        cents += _CAPITAL_DIGIT_VALUES[jiao[0]] * 10
+    if fen:
+        cents += _CAPITAL_DIGIT_VALUES[fen[0]]
+    from decimal import Decimal
+
+    result = Decimal(amount) + (Decimal(cents) / Decimal(100) if cents else Decimal(0))
+    if negative:
+        result = -result
+    text_result = str(result)
+    return text_result
 
 
 @dataclass
@@ -44,12 +123,112 @@ class FactPattern:
     trigger: re.Pattern  # 是否进入提取
     value: re.Pattern | None  # 值提取（可选）
     confidence: float
+    # party 类：提取不到干净的标签-值邻接时不产出候选（真实合同每个
+    # 条款段落都提及发包人/承包人，零散句子片段会淹没人工复核队列）。
+    party_guard: bool = False
+    # "为/是"式标签要求值以实体特征结尾（公司/集团/院…），排除
+    # "发包人为了保证品质"这类句子片段。
+    require_entity: bool = False
+
+
+# party 标签的邻接形态（2026-09-05 真实 EPC 合同实测校准）：
+# 1. 冒号式：发包人（全称）：XXX / 【发包人】（甲方）：XXX
+# 2. 括号后缀+空白式：发包人(全称) XXX
+# 3. 为/是式：承包人为XXX公司（值必须含实体特征）
+_PARTY_CLOSERS = r"[\]】〕）)]?"
+_PARTY_SUFFIX = r"(?:[（(][^）)]{0,12}[）)])?"
+_PARTY_VALUE = r"([^\s，。；、：:（）()\[\]【】〔「」『']{2,40})"
+_PARTY_ENTITY_MARKERS = (
+    "公司", "集团", "联合体", "事务所", "委员会", "政府", "单位", "研究院",
+    "设计院", "大学", "学校", "医院", "中心", "局", "院", "部", "厂", "合作社",
+)
+_PARTY_BAD_STARTS = (
+    "为了", "保证", "严格", "要求", "必须", "指定", "负责", "审批", "支付",
+    "提交", "实施", "施工", "签订", "承担", "应", "须", "必", "不", "未",
+    "已", "经", "在", "将", "对", "由", "向", "按", "与", "和", "或", "并",
+    "且", "的", "了", "其", "该", "本", "各", "每", "凡", "如", "若", "当",
+    "因", "从", "至", "以", "为", "是", "又", "均", "即", "于",
+)
+
+
+_PARTY_LABEL_VALUES = {
+    "发包人", "承包人", "总承包人", "甲方", "乙方", "建设单位", "施工单位",
+    "发包方", "承包方", "分包人", "分包方", "监理", "委托方", "受托方",
+    "联合体牵头人", "联合体成员", "牵头方", "成员方",
+}
+
+
+def _party_value_accepted(raw: str | None, *, entity_required: bool) -> str | None:
+    """过滤句子片段/占位符，只放行干净的当事人实体值。"""
+    value = (raw or "").strip()
+    if not (2 <= len(value) <= 40):
+        return None
+    if value.startswith(("（", "(", "[", "【", "〔", "{", "『", "「")):
+        return None
+    if "以下简称" in value[:8]:
+        return None
+    if value in {"全称", "简称", "名称", "全称）", "简称）"}:
+        return None
+    if value in _PARTY_LABEL_VALUES:
+        # 签字栏"发包人： 承包人（盖章）："——值本身是另一个标签
+        return None
+    if any(value.startswith(bad) for bad in _PARTY_BAD_STARTS):
+        return None
+    if entity_required and not any(marker in value for marker in _PARTY_ENTITY_MARKERS):
+        return None
+    return value
+
+
+def _party_patterns(key: str, labels: str) -> list[FactPattern]:
+    """按三种真实邻接形态构造 party 提取模式。"""
+    return [
+        FactPattern(
+            key,
+            re.compile(f"({labels})"),
+            re.compile(
+                f"{labels}{_PARTY_CLOSERS}{_PARTY_SUFFIX}?[ \\t]*[：:][ \\t]*{_PARTY_VALUE}"
+            ),
+            0.9,
+            party_guard=True,
+        ),
+        FactPattern(
+            key,
+            re.compile(f"({labels})"),
+            re.compile(
+                f"{labels}{_PARTY_SUFFIX}[ \\t]+{_PARTY_VALUE}"
+            ),
+            0.85,
+            party_guard=True,
+        ),
+        FactPattern(
+            key,
+            re.compile(f"({labels})"),
+            re.compile(
+                f"{labels}[ \\t]*(?:为|是)[ \\t]*{_PARTY_VALUE}"
+            ),
+            0.85,
+            party_guard=True,
+            require_entity=True,
+        ),
+    ]
 
 
 FACT_PATTERNS: list[FactPattern] = [
-    FactPattern("contractor_party", re.compile(r"(承包人|承包方|乙方|施工单位)"), re.compile(r"(?:承包人|承包方|乙方|施工单位)[：:为\s]*([^\s，。；、，]{2,30})"), 0.9),
-    FactPattern("employer_party", re.compile(r"(发包人|发包方|甲方|建设单位)"), re.compile(r"(?:发包人|发包方|甲方|建设单位)[：:为\s]*([^\s，。；、，]{2,30})"), 0.9),
-    FactPattern("contract_amount", re.compile(r"(合同价[款格]?|合同总价|签约合同价|合同金额)"), re.compile(r"(?:合同价[款格]?|合同总价|签约合同价|合同金额)[^0-9]{0,20}" + _MONEY), 0.9),
+    *_party_patterns(
+        "contractor_party", r"(?:承包人|承包方|乙方|施工单位)"
+    ),
+    *_party_patterns(
+        "employer_party", r"(?:发包人|发包方|甲方|建设单位)"
+    ),
+    FactPattern(
+        "contract_amount",
+        re.compile(r"(合同价[款格]?|合同总价|签约合同价|合同总?金额|协议金额|总金额)"),
+        re.compile(
+            r"(?:合同价[款格]?|合同总价|签约合同价|合同总?金额|协议金额|总金额)"
+            r"[^0-9]{0,24}?" + _MONEY
+        ),
+        0.9,
+    ),
     FactPattern("duration", re.compile(r"(工期|计划开工|计划竣工|开工日期|竣工日期)"), re.compile(r"工期[^。]{0,60}?" + _DAYS), 0.8),
     FactPattern("pricing_method", re.compile(r"(固定总价|固定单价|可调价格|可调单价|成本加酬金|单价合同|总价合同)"), re.compile(r"(固定总价|固定单价|可调价格|可调单价|成本加酬金|单价合同|总价合同)"), 0.9),
     FactPattern("price_adjustment", re.compile(r"(调价|价格调整|价差|价格波动|人工费调整|信息价)"), None, 0.6),
@@ -69,8 +248,13 @@ _DAY_RE = re.compile(_DAYS)
 _TIME_LIMIT_KEYS = {"payment_clause", "settlement_clause", "claim_clause", "duration"}
 
 
-def _norm_money(m: str) -> str:
-    return re.sub(r"\s+", "", m or "").replace(",", "").replace("，", "")
+def _norm_money(m: str) -> str | None:
+    text = re.sub(r"\s+", "", m or "")
+    # 仅大写专用字（壹贰叁…拾佰仟）才走大写换算；"万亿"在数字金额
+    # （如 5000 万元）和普通文本中也出现，不能作为触发条件。
+    if re.search(r"[壹贰叁肆伍陆柒捌玖拾佰仟]", text):
+        return _parse_chinese_capital_amount(text)
+    return text.replace(",", "").replace("，", "")
 
 
 def extract_facts(paras: list[dict]) -> list[dict]:
@@ -94,10 +278,21 @@ def extract_facts(paras: list[dict]) -> list[dict]:
             elif pat.value:
                 m = pat.value.search(text)
                 if m:
-                    value = _norm_money(m.group(1)) if m.lastindex else None
-                    if value is None:
-                        value = m.group(0)[:60]
-                    conf = pat.confidence
+                    raw = m.group(1)
+                    if pat.party_guard:
+                        raw = _party_value_accepted(
+                            raw, entity_required=pat.require_entity
+                        )
+                    if raw:
+                        value = _norm_money(raw) if m.lastindex else None
+                        if value is None:
+                            value = m.group(0)[:60]
+                        conf = pat.confidence
+                    else:
+                        # party 类提取不到干净值：不产出句子片段噪声
+                        continue
+                elif pat.party_guard:
+                    continue  # party 类没有干净邻接值时不产出候选
                 elif pat.confidence < 0.9:
                     conf = 0.4  # 有值模式但未匹配到具体值
             facts.append(
@@ -461,6 +656,21 @@ def import_contract(
             reusable = _reusable_pdf_batch(conn, sf.file_id, sf.sha256)
             if reusable is not None:
                 batch_status = str(reusable["status"])
+                if batch_status == "needs_review":
+                    # 人工确认结果优先：应复核页全部 verified 时，重导入
+                    # 不得把已完成的复核打回 needs_review。
+                    try:
+                        stats = json.loads(reusable["stats_json"] or "{}")
+                        page_statuses = {
+                            int(p["page_no"]): str(p.get("status") or "")
+                            for p in (stats.get("pages") or [])
+                        }
+                    except (TypeError, ValueError, KeyError):
+                        page_statuses = {}
+                    if not page_review.unverified_review_pages(
+                        conn, project_id, sf.file_id, page_statuses
+                    ):
+                        batch_status = "parsed"
                 detail = (
                     "同一只读原件已完成逐页 PDF 提取，未重复写入合同事实"
                     if batch_status == "parsed"
@@ -509,17 +719,42 @@ def import_contract(
         )
     except PdfExtractionPending as exc:
         report = exc.report
-        status = _pdf_processing_status(report)
-        with conn:
-            _persist_pdf_batch(
-                conn, sf.file_id, report, status=status, source_sha256=sf.sha256
+        # 人工确认结果优先：已 verified 的应复核页解除门控后重试一次；
+        # 只有当全部应复核页都已人工核实时才可能恢复为可解析。
+        resolved_report, promoted_pages = page_review.promote_verified_pages(
+            conn, project_id, sf.file_id, report
+        )
+        if resolved_report.parse_ready and ftype == "pdf":
+            with conn:
+                evidence_api.add_evidence(
+                    conn, project_id, "pdf_page_review",
+                    f"重新提取应用人工页级复核（第 "
+                    f"{','.join(str(n) for n in promoted_pages)} 页已核实），"
+                    "低置信/混合页门控解除，条款以候选写入",
+                    steps=[{
+                        "step": "人工页级复核应用于重新提取",
+                        "file_id": int(sf.file_id),
+                        "promoted_pages": promoted_pages,
+                    }],
+                    sources=[{"file_id": int(sf.file_id)}],
+                    commit=False,
+                )
+            parsed = docx_parser.ContractParseResult(
+                docx_parser.paragraphs_from_report(resolved_report),
+                resolved_report,
             )
-            document_intake.mark_document_status(
-                conn, project_id, sf.file_id, parse_status=status,
-                detail=str(exc), parser=parser_name, commit=False,
-            )
-        _refresh_contract_after_pdf_failure(conn, project_id)
-        raise
+        else:
+            status = _pdf_processing_status(report)
+            with conn:
+                _persist_pdf_batch(
+                    conn, sf.file_id, report, status=status, source_sha256=sf.sha256
+                )
+                document_intake.mark_document_status(
+                    conn, project_id, sf.file_id, parse_status=status,
+                    detail=str(exc), parser=parser_name, commit=False,
+                )
+            _refresh_contract_after_pdf_failure(conn, project_id)
+            raise
     except PdfPipelineError as exc:
         report = exc.report
         if report is not None:
@@ -561,13 +796,28 @@ def import_contract(
     paras = parsed.paragraphs
     pdf_report = parsed.pdf_report
     final_status = _pdf_processing_status(pdf_report) if pdf_report else "parsed"
+    if final_status == "needs_review" and pdf_report is not None:
+        # 应复核页（OCR/低置信页）全部已人工 verified 时，文档门控直接
+        # 解析为 parsed（与 mark_document_pages_reviewed 语义一致），
+        # 不得因重新导入把已完成的人工复核打回 needs_review。
+        if not page_review.unverified_review_pages(
+            conn, project_id, sf.file_id,
+            {page.page_number: page.status for page in pdf_report.pages},
+        ):
+            final_status = "parsed"
     if pdf_report:
         ocr_pages = [
             page.page_number
             for page in pdf_report.pages
             if page.extraction_method == "ocr"
         ]
-        if ocr_pages:
+        if final_status == "parsed" and ocr_pages:
+            final_detail = (
+                f"PDF 已逐页提取 {pdf_report.page_count} 页；OCR/低置信页 "
+                f"{','.join(str(page) for page in ocr_pages)} 已人工对照复核，"
+                "候选条款需逐条人工确认"
+            )
+        elif ocr_pages:
             final_detail = (
                 f"PDF 已逐页提取 {pdf_report.page_count} 页；OCR 页面 "
                 f"{','.join(str(page) for page in ocr_pages)} 需人工复核，"
