@@ -41,6 +41,8 @@ class ImportReport:
     sheets: list[SheetReport] = field(default_factory=list)
     message: str = ""
     needs_manual_review: bool = False
+    # 任务书 B4：重解析人工决策结转统计（carried/skipped_* 计数）
+    carry_forward: dict = field(default_factory=dict)
 
 
 _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
@@ -1924,7 +1926,24 @@ def _import_settlement_file(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
          for pid in period_ids), default=0,
     )
-    has_pending = role_gated or form_routed or structural_gate
+    # 任务书 B4：重解析后按「同名 + 单元格摘要一致」结转上一批次的人工
+    # 确认（sheet_status 与 list_kind）。人工确认优先于机器门控——结转
+    # 会覆盖本批次机器写入的 pending；内容变化的 Sheet 保持待确认。
+    from jiadun.core.engine.sheet_inventory import carry_forward_sheet_decisions
+
+    report.carry_forward = carry_forward_sheet_decisions(
+        conn, project_id, sf.file_id, batch_id, actor="system"
+    )
+    if report.carry_forward.get("carried"):
+        # 结转后以数据库实际状态重算本文件剩余待确认数量，报告不得虚报
+        # pending（全部结转成功时应如实回到 ok）。
+        remaining_pending = conn.execute(
+            "SELECT COUNT(*) AS c FROM raw_sheets WHERE batch_id=? AND sheet_status='pending'",
+            (batch_id,),
+        ).fetchone()["c"]
+        has_pending = remaining_pending > 0
+    else:
+        has_pending = role_gated or form_routed or structural_gate
     if parsed_any and not has_pending and not parse_partial:
         report.status = "ok"
     elif parsed_any:

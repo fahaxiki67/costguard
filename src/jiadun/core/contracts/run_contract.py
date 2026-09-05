@@ -28,6 +28,7 @@ from typing import Any
 
 from jiadun import branding
 from jiadun.core.db import migrations
+from jiadun.core.engine.sheet_digest import sheet_cell_digest
 from jiadun.core.evidence.finding import canonical_json, stable_fingerprint
 from jiadun.version import app_version
 
@@ -36,7 +37,9 @@ LEGACY_STALE_SIGNATURE = "legacy:stale"
 # 的 ``legacy:stale`` 分开，便于读取面和审计记录区分“历史旧数据”和“本次
 # 校核尝试失效”。两者都不会匹配当前 Run Contract 签名。
 INVALIDATED_RUN_SIGNATURE = "run:invalidated"
-CONTRACT_FORMAT_VERSION = 1
+# v2（2026-09-05）：sheet_scope 纳入 list_kind（任务书 B5 角色变更失效），
+# 摘要计算收敛到 engine.sheet_digest 单一实现。旧签名全部失效并重建。
+CONTRACT_FORMAT_VERSION = 2
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _TRANSACTION_COMMIT_FAILURE_ATTR = "_jiadun_transaction_commit_failure"
 FAIL_CLOSED_STATUS = "unavailable"
@@ -1325,42 +1328,16 @@ def current_contract_gaps(
 
 
 def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
+    # F-3 性能修复：摘要计算委托 engine.sheet_digest（缓存感知，算法唯一），
+    # 同一次构建内再作记忆化避免重复扫描。
     _cell_digest_memo: dict[int, str] = {}
 
     def raw_cell_digest(sheet_id: int) -> str:
-        """逐 Sheet 单元格 SHA-256；同一次构建内结果记忆化避免重复扫描。"""
         if sheet_id in _cell_digest_memo:
             return _cell_digest_memo[sheet_id]
-        cached = conn.execute(
-            "SELECT digest FROM sheet_cell_digests WHERE sheet_id=?",
-            (int(sheet_id),),
-        ).fetchone()
-        if cached is not None:
-            _cell_digest_memo[sheet_id] = str(cached["digest"])
-            return _cell_digest_memo[sheet_id]
-        digest = hashlib.sha256()
-        cells = conn.execute(
-            """SELECT row, col, raw_value, cached_value, is_formula,
-                              is_number_stored_as_text, num_fmt
-                 FROM raw_cells WHERE sheet_id=? ORDER BY row, col""",
-            (int(sheet_id),),
-        ).fetchall()
-        for cell in cells:
-            digest.update(
-                canonical_json({
-                    "row": int(cell["row"]),
-                    "col": int(cell["col"]),
-                    "raw_value": cell["raw_value"],
-                    "cached_value": cell["cached_value"],
-                    "is_formula": int(cell["is_formula"] or 0),
-                    "is_number_stored_as_text": int(cell["is_number_stored_as_text"] or 0),
-                    "num_fmt": cell["num_fmt"] or "",
-                }).encode("utf-8")
-            )
-            digest.update(b"\n")
-        hexdigest = digest.hexdigest()
-        _cell_digest_memo[sheet_id] = hexdigest
-        return hexdigest
+        value = sheet_cell_digest(conn, int(sheet_id))
+        _cell_digest_memo[sheet_id] = value
+        return value
 
     rows = conn.execute(
         """SELECT rs.id, rs.batch_id, rs.sheet_index, rs.sheet_name, rs.period_id,
@@ -1368,6 +1345,7 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
                   rs.hidden_rows_json, rs.hidden_cols_json,
                   rs.sheet_status, rs.sheet_status_reason,
                   rs.sheet_status_updated_at, rs.sheet_status_actor,
+                  rs.list_kind,
                   pb.file_id, pb.parser, pb.parsed_at, pb.status AS batch_status,
                   pb.stats_json AS batch_stats_json, sf.sha256 AS file_sha256
            FROM raw_sheets rs
@@ -1399,6 +1377,9 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
             "sheet_status_reason": row["sheet_status_reason"],
             "sheet_status_updated_at": row["sheet_status_updated_at"],
             "sheet_status_actor": row["sheet_status_actor"],
+            # B5：清单类型（人工角色标注）纳入合同范围。角色变更即签名变化，
+            # 旧运行自动失效，旧结果不得伪装为当前分析。
+            "list_kind": row["list_kind"],
             "n_rows": int(row["n_rows"]),
             "n_cols": int(row["n_cols"]),
             "merged_ranges": _loads(row["merged_ranges_json"], []),

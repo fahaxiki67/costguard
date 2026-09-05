@@ -48,6 +48,9 @@ class SheetRecord:
     sheet_name: str
     n_rows: int
     n_cols: int
+    # 工作簿级可见状态：openpyxl 的 sheet_state（visible/hidden/veryHidden）。
+    # 无法取得时保持 None，展示层必须作「未知」，不得默认可见。
+    visible_state: str | None = None
     merged_ranges: list[str] = field(default_factory=list)
     hidden_rows: list[int] = field(default_factory=list)
     hidden_cols: list[int] = field(default_factory=list)
@@ -315,6 +318,7 @@ def parse_xlsx(path: Path) -> ParseResult:
                 sheet_name=ws.title,
                 n_rows=ws.max_row or 0,
                 n_cols=ws.max_column or 0,
+                visible_state=str(getattr(ws, "sheet_state", None) or "") or None,
                 merged_ranges=[str(r) for r in ws.merged_cells.ranges],
                 hidden_rows=sorted(r for r, dim in ws.row_dimensions.items() if dim.hidden),
                 hidden_cols=sorted(
@@ -419,11 +423,19 @@ def parse_xls(path: Path) -> ParseResult:
              "limitations": limitations, "capability_limited": True}
     for idx in range(book.nsheets):
         sh = book.sheet_by_index(idx)
+        # xlrd Book.sheet_visibility：0=visible、1=hidden、2=veryHidden；
+        # 越界/异常时保持 None（未知），不得默认可见。
+        _vis_map = {0: "visible", 1: "hidden", 2: "veryHidden"}
+        try:
+            _vis = _vis_map.get(int(book.sheet_visibility[idx]))
+        except (AttributeError, IndexError, TypeError, ValueError):
+            _vis = None
         sheet = SheetRecord(
             sheet_index=idx,
             sheet_name=sh.name,
             n_rows=sh.nrows,
             n_cols=sh.ncols,
+            visible_state=_vis,
             hidden_rows=sorted(r for r, info in getattr(sh, "rowinfo_map", {}).items() if info.hidden),
             hidden_cols=sorted(c for c, info in getattr(sh, "colinfo_map", {}).items() if info.hidden),
             formula_metadata={
@@ -916,11 +928,13 @@ def persist_parse_result(
         for sheet in result.sheets:
             cur = conn.execute(
                 """INSERT INTO raw_sheets(batch_id, sheet_index, sheet_name, n_rows, n_cols,
+                   visible_state,
                    merged_ranges_json, hidden_rows_json, hidden_cols_json,
                    auto_filter_ref, filter_conditions_json, table_ranges_json,
                    filter_state, formula_metadata_json)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (batch_id, sheet.sheet_index, sheet.sheet_name, sheet.n_rows, sheet.n_cols,
+                 sheet.visible_state,
                  _dumps(sheet.merged_ranges), _dumps(sheet.hidden_rows), _dumps(sheet.hidden_cols),
                  sheet.auto_filter_ref, _dumps(sheet.filter_conditions), _dumps(sheet.table_ranges),
                  sheet.filter_state, _dumps(sheet.formula_metadata)),

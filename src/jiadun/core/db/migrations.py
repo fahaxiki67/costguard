@@ -2898,6 +2898,33 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )""",
         ],
     ),
+    # v54：工作簿级 Sheet 可见状态（visible/hidden/veryHidden）。历史批次
+    # 该列为 NULL——解析器当时未捕获，展示时必须作「未知」处理，不得默认可见。
+    # 同时为 v53 摘要缓存补失效触发器：缓存表的「插入后不可变」前提依赖
+    # raw_cells 不可变；一旦 raw_cells 被改（旧库/外部 SQL 绕过触发器），
+    # 陈旧摘要会掩盖内容漂移，使范围快照闸门失明。任何 raw_cells 写入都
+    # 必须删除对应 Sheet 的缓存摘要，下次构建强制重算。
+    (
+        54,
+        [
+            "ALTER TABLE raw_sheets ADD COLUMN visible_state TEXT",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_cell_digests_invalidate_insert
+               AFTER INSERT ON raw_cells
+               BEGIN
+                   DELETE FROM sheet_cell_digests WHERE sheet_id=NEW.sheet_id;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_cell_digests_invalidate_update
+               AFTER UPDATE ON raw_cells
+               BEGIN
+                   DELETE FROM sheet_cell_digests WHERE sheet_id=NEW.sheet_id;
+               END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_sheet_cell_digests_invalidate_delete
+               AFTER DELETE ON raw_cells
+               BEGIN
+                   DELETE FROM sheet_cell_digests WHERE sheet_id=OLD.sheet_id;
+               END""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
