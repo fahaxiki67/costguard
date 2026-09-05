@@ -852,7 +852,8 @@ class WorkbenchPage(QWidget):
         self._import_thread: QThread | None = None
         self._import_worker: ImportWorker | None = None
         self.import_drop_zone = FileDropZone(
-            "将资料文件、资料文件夹或打包资料拖到这里（支持递归导入与人工分类）"
+            "将结算书、合同或整个资料文件夹拖到这里\n"
+            "（递归导入，逐项人工分类确认，原文件不会被修改）"
         )
         self.import_drop_zone.paths_dropped.connect(self._choose_category_and_import)
         v.addWidget(self.import_drop_zone)

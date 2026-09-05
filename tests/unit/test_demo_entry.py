@@ -41,16 +41,16 @@ def test_provision_demo_project_end_to_end(tmp_path: Path) -> None:
             " GROUP BY direction", (info.project_id,)).fetchall()
         by_dir = {r["direction"]: r["n"] for r in periods}
         assert by_dir == {"upward": 3, "downward": 3}
-        # 合同文档已导入
+        # 合同文档已导入（演示合同 + 市场实测教训合同）
         ndocs = conn.execute(
             "SELECT COUNT(*) n FROM contract_docs WHERE project_id=?",
             (info.project_id,)).fetchone()["n"]
-        assert ndocs == 1
+        assert ndocs == 2
         # 演示文件作为只读副本入库存放（ADR-005）
         n_files = conn.execute(
             "SELECT COUNT(*) n FROM source_files WHERE project_id=?",
             (info.project_id,)).fetchone()["n"]
-        assert n_files == 4
+        assert n_files == 5
     finally:
         conn.close()
 

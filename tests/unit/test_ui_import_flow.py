@@ -95,6 +95,56 @@ def test_drop_zone_ignores_empty_local_file_url():
     assert FileDropZone.paths_from_mime(mime) == []
 
 
+def test_classify_import_file_is_case_insensitive():
+    from jiadun.ui.file_selection import classify_import_file
+
+    assert classify_import_file("结算.XLSX") == "settlement"
+    assert classify_import_file("合同.Docx") == "contract"
+    assert classify_import_file("合同.PDF") == "contract"
+    assert classify_import_file("图纸.DWG") is None
+    assert classify_import_file("无扩展名") is None
+
+
+def test_scan_import_paths_skips_hidden_files_and_reports_unsupported_reason(
+    tmp_path: Path,
+):
+    from jiadun.ui.file_selection import scan_import_paths
+
+    folder = tmp_path / "结算资料"
+    folder.mkdir()
+    visible = folder / "对上结算第1期.xlsx"
+    hidden = folder / ".系统配置.xlsx"
+    archive = folder / "扫描件.zip"
+    for path in (visible, hidden, archive):
+        path.write_bytes(b"x")
+
+    selection = scan_import_paths([folder])
+
+    assert selection.files == (visible,)
+    reasons = {path.name: reason for path, reason in selection.skipped_reasons}
+    assert "对上结算第1期.xlsx" not in reasons
+    assert reasons["扫描件.zip"] == "不支持的文件类型"
+    # 隐藏文件属系统噪声：直接忽略，不进入"已跳过"清单打扰用户。
+    assert ".系统配置.xlsx" not in reasons
+
+
+def test_preferred_project_name_uses_cost_business_names(tmp_path: Path):
+    from jiadun.ui.file_selection import preferred_project_name
+
+    folder = tmp_path / "市民中心项目结算资料"
+    folder.mkdir()
+    single = tmp_path / "市民中心EPC总承包合同.docx"
+    single.write_bytes(b"x")
+    first, second = tmp_path / "第1期.xlsx", tmp_path / "第2期.xlsx"
+    first.write_bytes(b"x")
+    second.write_bytes(b"x")
+
+    assert preferred_project_name([folder]) == "市民中心项目结算资料"
+    assert preferred_project_name([single], [single]) == "市民中心EPC总承包合同"
+    assert preferred_project_name([first, second], [first, second]) == tmp_path.name
+    assert preferred_project_name([], []) == "新建工程项目"
+
+
 def test_workbench_parse_failure_is_not_reported_as_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

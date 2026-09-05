@@ -18,10 +18,10 @@ def test_synthetic_registry_matches_without_updating_registry():
     report = golden_regression.run_golden_regression(REGISTRY)
 
     assert report["status"] == "passed", report
-    assert report["available_case_count"] == 1
+    assert report["available_case_count"] == 2
     assert report["real_case_count"] == 0
     assert report["mismatch_case_count"] == 0
-    assert report["comparison_status_counts"] == {"PASS": 1, "PENDING": 1}
+    assert report["comparison_status_counts"] == {"PASS": 2, "PENDING": 1}
     assert report["overall_comparison_status"] == "PENDING"
     assert report["results"][0]["comparison_status"] == "PASS"
     assert REGISTRY.read_bytes() == before
@@ -33,7 +33,7 @@ def test_golden_suite_runs_anonymized_registry_and_reports_real_coverage():
     assert report["registry_count"] == 2
     assert report["real_case_count"] == 0
     assert report["not_available_case_count"] == 2
-    assert report["comparison_status_counts"] == {"PASS": 1, "PENDING": 2}
+    assert report["comparison_status_counts"] == {"PASS": 2, "PENDING": 2}
     assert report["overall_comparison_status"] == "PENDING"
     assert any(
         item["registry"].endswith("anonymized_golden_cases/cases.json")

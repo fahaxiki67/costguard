@@ -28,6 +28,7 @@ DEMO_FILES = [
     "演示-对下结算-第1至3期.xlsx",
     "演示-对下结算-附表.xlsx",
     "演示-合同摘录-合成.docx",
+    "演示-市场实测教训-合同摘录-合成.docx",
 ]
 # 文档级/Sheet 级语义门控词：演示数据除刻意的"人材机汇总"Sheet 外不得命中
 GATE_WORDS = ("汇总", "核销", "台账", "summary", "reconciliation", "ledger")

@@ -50,6 +50,7 @@ F_UP = "演示-对上结算-第1至3期.xlsx"
 F_DOWN = "演示-对下结算-第1至3期.xlsx"
 F_DOWN_APPEND = "演示-对下结算-附表.xlsx"
 F_CONTRACT = "演示-合同摘录-合成.docx"
+F_MARKET = "演示-市场实测教训-合同摘录-合成.docx"
 
 
 def _sha256(path: Path) -> str:
@@ -391,6 +392,55 @@ def build_contract(path: Path) -> None:
     _normalize_zip(path)
 
 
+# 市场实测教训的合成复述（2026-09 真实资料实测三类修复的防回归语料）：
+# 1. 人民币大写金额（含角分与负号）必须换算为精确 Decimal 金额事实；
+# 2. 当事人只认「标签-值邻接」三形态（冒号/括号后缀/为式），主体守卫词
+#    （如"项目部"）与规范编号（GB50500-2013）不得产生候选；
+# 3. 同段多天数/多百分比各自成候选，不得取首个数值冒充付款时限或费率。
+# 全部主体名称带"示例"前缀，均为虚构。
+MARKET_PARAGRAPHS = [
+    "一、协议价款（人民币大写）",
+    "1.1 本协议暂定合同价款为人民币壹亿捌仟叁佰壹拾玖万玖仟捌佰柒拾叁元贰角伍分。",
+    "1.2 累计冲减后调整的协议金额为人民币负壹亿柒仟玖佰伍拾贰万柒仟柒佰捌拾捌元整（合成复述数值，非真实数据）。",
+    "1.3 本工程计价执行《建设工程工程量清单计价规范》GB50500-2013 及现行计价定额。",
+    "二、协议当事人",
+    "2.1 发包人：示例置业发展有限公司。",
+    "2.2 承包人（协作方）：示例建设集团股份有限公司。",
+    "2.3 监理单位为示例工程监理咨询有限公司。",
+    "三、审核与支付时限（同段多天数）",
+    "3.1 承包人应在收到变更资料后 7 日内提交变更报价，监理单位应在 14 日内完成审核，发包人应在收到审核意见后 28 天内完成价款支付。",
+    "四、费率与比例（同段多百分比、基数不同）",
+    "4.1 协作方管理费按不含甲供材税前建安费的 4.9% 计取，采购保管费按 0.2% 计取。",
+    "4.2 进度款按当月经确认已完成工程量价款的 85% 支付，质量保证金按工程价款结算总额的 3% 预留。",
+    "五、噪声与守卫（不应产生当事人或金额候选）",
+    "5.1 本协议未尽事宜按主合同约定执行；承包人项目部应遵守现场安全管理规定。",
+    "5.2 分部分项工程量清单项目编码采用十二位全国统一编码（合成说明）。",
+]
+
+
+def build_market_contract(path: Path) -> None:
+    import docx
+
+    doc = docx.Document()
+    doc.add_heading("示例框架协作协议补充条款（市场实测教训·合成复述）", level=0)
+    doc.add_paragraph(
+        "本文件为程序生成的合成演示文档：把 2026-09 真实资料实测暴露的三类"
+        "解析教训（人民币大写金额、当事人标签邻接、同段多天数/多百分比）"
+        "固化为可重复回归的合成语料，全部主体与数值均为虚构复述。")
+    for text in MARKET_PARAGRAPHS:
+        if text[0] in "一二三四五" and text[1] == "、":
+            doc.add_heading(text, level=1)
+        else:
+            doc.add_paragraph(text)
+    props = doc.core_properties
+    props.author = DEMO_CREATOR
+    props.last_modified_by = DEMO_CREATOR
+    props.created = FIXED_DATETIME
+    props.modified = FIXED_DATETIME
+    doc.save(path)
+    _normalize_zip(path)
+
+
 # ---------------------------------------------------------------------------
 # 期望值（manifest）：预期值以实际导入管线行为为准，并由 tests/unit/test_demo_data.py 锁定
 # ---------------------------------------------------------------------------
@@ -447,6 +497,24 @@ EXPECTATIONS = {
         "coverage": ["合同演示文本", "完全合成的原文引用", "合同风险提示演示"],
         "known_limitations": ["条款提取为初步能力，自动结果不等于业务结论"],
     },
+    F_MARKET: {
+        "data_type": "docx", "direction": "contract", "periods": [],
+        "expected_parsed_rows": {"paragraphs": len(MARKET_PARAGRAPHS)},
+        "expected_anomalies": ["条款提取结果须逐条人工核对原文引用"],
+        "expected_matching": "不参与清单匹配；期望门控行为由黄金基线锁定",
+        "coverage": [
+            "人民币大写金额（含角分/负号）精确换算",
+            "当事人标签-值邻接三形态（冒号/括号后缀/为式）",
+            "主体守卫词（项目部）不产生当事人候选",
+            "规范编号 GB50500-2013 不误识为金额",
+            "同段多天数各自成候选（7/14/28）",
+            "同段多百分比各自成候选（4.9%/0.2%/85%/3%）",
+        ],
+        "known_limitations": [
+            "大写金额换算的期望值（183199873.25 / -179527788.00）来自"
+            "2026-09 真实资料实测的合成复述，非真实业务数据",
+        ],
+    },
 }
 
 DISCLAIMER = ("本目录全部内容为 scripts/generate_demo_data.py 程序生成的合成演示数据，"
@@ -492,9 +560,10 @@ def generate(out_dir: Path) -> dict:
     build_downward(out_dir / F_DOWN)
     build_downward_append(out_dir / F_DOWN_APPEND)
     build_contract(out_dir / F_CONTRACT)
+    build_market_contract(out_dir / F_MARKET)
 
     files = []
-    for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT):
+    for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT, F_MARKET):
         exp = EXPECTATIONS[name]
         files.append({
             "file_name": name,
@@ -517,7 +586,7 @@ def generate(out_dir: Path) -> dict:
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     sums = "\n".join(f"{_sha256(out_dir / name)}  {name}" for name in
-                     (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT)) + "\n"
+                     (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT, F_MARKET)) + "\n"
     (out_dir / "SHA256SUMS").write_text(sums, encoding="utf-8")
     return manifest
 
@@ -545,7 +614,7 @@ def main() -> int:
             tmp = Path(td) / "demo"
             generate(tmp)
             bad = []
-            for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT,
+            for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT, F_MARKET,
                          "manifest.json", "SHA256SUMS"):
                 a, b = target / name, tmp / name
                 if not a.exists() or _sha256(a) != _sha256(b):
@@ -560,7 +629,7 @@ def main() -> int:
 
     generate(args.out)
     print(f"已生成演示数据：{args.out}")
-    for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT):
+    for name in (F_UP, F_DOWN, F_DOWN_APPEND, F_CONTRACT, F_MARKET):
         p = args.out / name
         print(f"  {name}  {_sha256(p)[:16]}…  {p.stat().st_size} bytes")
     return 0

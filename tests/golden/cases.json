@@ -266,6 +266,67 @@
       "case_kind": "sanitized_real",
       "availability": "not_available",
       "reason": "尚未登记经过脱敏、授权和哈希核验的真实项目；不得用合成演示数据冒充真实黄金案例。"
+    },
+    {
+      "case_id": "market_lessons_v1",
+      "case_version": "1",
+      "case_kind": "synthetic_demo",
+      "availability": "available",
+      "project_name": "黄金回归-市场实测教训-合同",
+      "inputs": [
+        {
+          "path": "examples/demo/演示-市场实测教训-合同摘录-合成.docx",
+          "type": "docx",
+          "direction": "contract",
+          "sha256": "67126f04596946d470d5726b97d15ef9f175ffd7d985b4d5509ea0397b7dead5"
+        }
+      ],
+      "expected": {
+        "file_count": 1,
+        "sheet_count": 0,
+        "automatic_recognition_count": 0,
+        "pending_sheet_count": 0,
+        "period_count": 0,
+        "detail_row_count": 0,
+        "period_amounts": {},
+        "cumulative_amounts": {},
+        "crosscheck": {
+          "count": 0,
+          "by_verification_level": {},
+          "by_status": {},
+          "sufficient_period_count": 0,
+          "period_ids": [],
+          "evidence_linked_count": 0,
+          "coverage_proof_statuses": {}
+        },
+        "matches": {
+          "count": 0,
+          "by_level": {},
+          "group_keys": [],
+          "partition": {
+            "candidate_group_keys": [],
+            "non_match_group_keys": []
+          }
+        },
+        "anomalies": {
+          "count": 0,
+          "rule_ids": []
+        },
+        "evidence": {
+          "current_count": 7,
+          "historical_count": 0,
+          "by_kind": {
+            "contract_fact": 7
+          },
+          "key_kinds": []
+        },
+        "run_contract": {
+          "schema_version": 54,
+          "run_id_present": true,
+          "signature_present": true
+        }
+      },
+      "case_notes": "2026-09 市场真实资料实测三类解析教训的合成复述（fa4677a）：人民币大写金额（含角分/负号）精确换算、当事人标签-值邻接三形态且主体守卫词不产候选、规范编号 GB50500-2013 不误识为金额；时限类候选取首个天数、全部事实保持 candidate 待人工复核。"
     }
   ]
 }

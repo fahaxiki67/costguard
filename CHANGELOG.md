@@ -11,6 +11,38 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.26` 为预发行/预览候选，不代表正式生产能力。
 
+### 接力三轮：OCR 质量回归 / 导出性能 / 市场教训金样本（2026-09-06）
+
+- 导出与校核性能（profiling 实锤后修复）：一次导出重复触发 22 次
+  Run Contract 门控，Sheet/明细摘要每次全量重算（10k 项目 441 万次
+  canonical_json、导出 144.7s）。新增进程内只读窗口缓存
+  （数据库文件 + PRAGMA data_version + conn.total_changes 写指纹；
+  指纹相等蕴含零写入），任何写入立即失效重算——绕过触发器直改
+  raw_cells 值的漂移可见性由既有特征测试锁定，不因缓存减弱。
+  实测（同机同种子 10k）：导出 144.7s→26.6s（-82%）、双向校核
+  38.8s→14.1s（-64%）、导入持平、导出产物字节一致；50k 全链路
+  （含导出）实测通过。新增 `scripts/export_profile.py`（宪章 §七
+  阶段内 profiling 工具）。XlsxWriter 替换未做：序列化仅 20.7s 且
+  宪章要求实机验证后才可替换。
+- OCR 质量回归用例集（`test_ocr_quality_regression.py`，23 项）：
+  页级状态流转全矩阵（native_text/ocr/pending_ocr/ocr_failed/
+  needs_review）、置信度阈值边界、覆盖完整性 fail-closed、数据结构
+  不变量；RapidOCR 实机质量回归（`JIADUN_TEST_REAL_OCR=1` 门控，
+  真实渲染+真实识别，本机实测置信度 0.97）。
+- OCR 增强 provider 骨架：`PaddleOcrProvider` 显式启用（本地模型 +
+  SHA-256 清单 + 模型身份必填；未安装/目录缺失/文件被替换一律拒绝，
+  不自动安装下载；det/rec/cls 角色词表；2.x/3.x 双签名与返回形态），
+  14 项伪造模块测试。真实 PaddleOCR 引擎行为待实机验证（PENDING）。
+- 市场实测教训金样本：新增确定性合成语料
+  `演示-市场实测教训-合同摘录-合成.docx`（大写金额含角分/负号→
+  183199873.25/-179527788 精确换算、当事人标签邻接三形态+守卫噪声、
+  GB50500-2013 不误识为金额）；登记黄金案例 `market_lessons_v1`
+  （7 条 contract_fact 证据全部 candidate，期望逐条人工核对）+
+  单元级锁定 4 项；黄金回归双案例 PASS。
+- UI：工作台拖拽区文案贴近造价业务（结算书/合同/资料文件夹、原文件
+  只读）；拖拽导入边界测试补 4 项（大小写扩展名、隐藏文件、跳过原因
+  明细、项目命名建议）。
+
 ### 结论性框架闭环（schema v54，接力二轮）
 
 - 迁移 v54：`control_conclusions`（对上控制基准结论快照）与
