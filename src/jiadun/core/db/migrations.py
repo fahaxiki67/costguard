@@ -2898,6 +2898,42 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             )""",
         ],
     ),
+    # v54：对上控制基准结论与费率试算落库（只追加，不覆盖——宪章原则 10
+    # 历史记录不可篡改）。compare_upward_result 每次比较写一条结论快照；
+    # apply_rate_rule_to_settlement 每次试算写一条应用快照（含被阻断的
+    # pending/incomparable 尝试，失败尝试也是审计事实）。报告导出从这两张
+    # 表读取结构化结论，每条带 evidence_id 可回溯。
+    (
+        54,
+        [
+            """CREATE TABLE IF NOT EXISTS control_conclusions (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                baseline_id INTEGER NOT NULL REFERENCES control_baselines(id),
+                period_id INTEGER REFERENCES settlement_periods(id),
+                baseline_amount TEXT NOT NULL,
+                settlement_amount TEXT NOT NULL,
+                status TEXT NOT NULL,
+                delta TEXT,
+                reason TEXT NOT NULL,
+                evidence_id INTEGER,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS rate_rule_applications (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                rule_id INTEGER NOT NULL REFERENCES rate_rules(id),
+                base_type TEXT NOT NULL,
+                base_amount TEXT,
+                fee TEXT,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                detail_json TEXT NOT NULL DEFAULT '{}',
+                evidence_id INTEGER,
+                created_at TEXT NOT NULL
+            )""",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

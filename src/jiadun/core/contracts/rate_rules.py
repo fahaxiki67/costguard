@@ -5,15 +5,21 @@
 - 候选确认时必须人工设定 base_type 与 base_definition——"按结算价 3%"
   与"按不含甲供材税前建安费 3%"不是同一条规则；
 - 试算用 Decimal 确定性计算，支持上限（cap）/下限（floor）；
-- 全部流转写入审计 Evidence。
+- 确认后的规则可按 base_type 从对上/对下期次合计或唯一已确认合同价款
+  事实解析基数（resolve_rate_base）：税口径未确认/混用/不一致一律阻断
+  （PENDING/INCOMPARABLE），金额缺失行阻断合计（缺失绝不按 0 参与计算），
+  多条候选并存时阻断（CONFLICT，不自动挑选）；
+- 全部流转与试算尝试（含被阻断的）写审计 Evidence，应用快照只追加不覆盖。
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from datetime import datetime
 from decimal import Decimal
 
+from jiadun.core.engine.control_baseline import normalize_tax_basis
 from jiadun.core.engine.money import round2, to_decimal
 from jiadun.core.evidence import evidence as evidence_api
 
@@ -29,6 +35,20 @@ BASE_TYPES = (
 RATE_CANDIDATE = "candidate"
 RATE_CONFIRMED = "confirmed"
 RATE_REJECTED = "rejected"
+
+# 基数解析状态：resolved=可确定性解析；其余一律阻断试算（fail-closed）。
+BASE_RESOLVED = "resolved"
+BASE_PENDING = "pending"            # 事实未确认/数据缺失，待人工补足
+BASE_INCOMPARABLE = "incomparable"  # 税口径不一致/混用，不得加总或换算
+BASE_CONFLICT = "conflict"          # 多个候选并存，禁止自动挑选
+BASE_MANUAL_REQUIRED = "manual_required"  # custom 基数必须人工给出金额
+
+# base_type → 期次方向映射（实体工程量清单算法不在此模块，不混用）。
+_BASE_DIRECTION = {
+    "upward_settlement_amount": "upward",
+    "upward_settlement_excl_tax": "upward",
+    "downward_settlement_amount": "downward",
+}
 
 # 触发词：出现即认为该句可能包含费率约定（保守收集，宁可多出候选）。
 # 真实协议语料（民权框架协议）实测补充：利润率/采保/上缴/缴纳/保证金。
@@ -230,6 +250,7 @@ def confirm_rate_rule(
         raise ValueError("必须选择计取基数类型（base_type），不能留空")
     if not (base_definition or "").strip():
         raise ValueError("必须填写计取基数说明（base_definition）")
+    tax_basis_canonical = normalize_tax_basis(tax_basis)
     row = conn.execute(
         "SELECT id, status, rate_percent FROM rate_rules WHERE id=? AND project_id=?",
         (int(rule_id), int(project_id)),
@@ -251,7 +272,7 @@ def confirm_rate_rule(
                    cap=?, floor=?, effective_scope=?, priority=?, rate_percent=?,
                    reviewed_at=?, reviewed_by=?, review_reason=?
                WHERE id=?""",
-            (base_type, base_definition.strip(), tax_basis,
+            (base_type, base_definition.strip(), tax_basis_canonical,
              None if cap is None else str(cap), None if floor is None else str(floor),
              effective_scope.strip(), int(priority), final_rate,
              now, reviewed_by, base_definition.strip(),
@@ -266,7 +287,7 @@ def confirm_rate_rule(
                 "rate_percent": final_rate,
                 "base_type": base_type,
                 "base_definition": base_definition.strip(),
-                "tax_basis": tax_basis,
+                "tax_basis": tax_basis_canonical,
                 "reviewed_by": reviewed_by,
             }],
             sources=[{"rule_id": int(rule_id)}],
@@ -295,13 +316,223 @@ def reject_rate_rule(
     return {"rule_id": int(rule_id), "status": "rejected"}
 
 
+def _compute_fee(rate_percent: str, base: Decimal, cap, floor) -> tuple[Decimal, dict[str, str]]:
+    """确定性费用计算：base × rate%，先 floor 后 cap（Decimal，round2）。"""
+    rate = to_decimal(rate_percent) / Decimal("100")
+    fee = round2(base * rate)
+    detail: dict[str, str] = {"base_amount": str(base), "rate_percent": str(rate_percent)}
+    if floor is not None:
+        floor_dec = to_decimal(floor)
+        if fee < floor_dec:
+            detail["floor_applied"] = str(floor_dec)
+            fee = floor_dec
+    if cap is not None:
+        cap_dec = to_decimal(cap)
+        if fee > cap_dec:
+            detail["cap_applied"] = str(cap_dec)
+            fee = cap_dec
+    return fee, detail
+
+
+def _period_amount_facts(
+    conn: sqlite3.Connection, project_id: int, direction: str, period_id: int | None
+) -> dict:
+    """收集某方向（或指定期次）的期次合计事实：总额、缺失金额行数、税口径集合。"""
+    where = "sp.project_id=? AND sp.direction=?"
+    params: list[object] = [int(project_id), direction]
+    if period_id is not None:
+        where += " AND sp.id=?"
+        params.append(int(period_id))
+    periods = conn.execute(
+        f"""SELECT sp.id, sp.period_no, sp.title, sp.tax_mode
+            FROM settlement_periods sp WHERE {where} ORDER BY sp.period_no""",
+        params,
+    ).fetchall()
+    breakdown: list[dict] = []
+    tax_modes: set[str] = set()
+    missing_rows = 0
+    total = Decimal("0")
+    for p in periods:
+        rows = conn.execute(
+            "SELECT amount FROM line_items WHERE period_id=?",
+            (p["id"],),
+        ).fetchall()
+        missing = sum(1 for r in rows if r["amount"] is None)
+        known = sum(
+            (to_decimal(r["amount"]) for r in rows if r["amount"] is not None),
+            Decimal("0"),
+        )
+        missing_rows += missing
+        mode = normalize_tax_basis(p["tax_mode"])
+        tax_modes.add(mode)
+        breakdown.append({
+            "period_id": int(p["id"]),
+            "period_no": int(p["period_no"]),
+            "title": p["title"],
+            "tax_mode": mode,
+            "detail_rows": len(rows),
+            "missing_amount_rows": missing,
+            "amount_total": str(known),
+        })
+        total += known
+    return {
+        "direction": direction,
+        "periods": breakdown,
+        "tax_modes": sorted(tax_modes),
+        "missing_amount_rows": missing_rows,
+        "total": total,
+    }
+
+
+def resolve_rate_base(
+    conn: sqlite3.Connection,
+    project_id: int,
+    rule_id: int,
+    *,
+    period_id: int | None = None,
+    custom_amount=None,
+) -> dict:
+    """按已确认规则的 base_type 解析计取基数（只产事实，不做费用计算）。
+
+    - custom：必须由人工给出 custom_amount；
+    - upward/downward 期次合计：税口径未确认→pending；混用→incomparable；
+      与规则税口径不一致→incomparable；存在金额缺失行→pending（缺失≠0）；
+    - contract_amount：只有唯一一条已确认合同价款事实才 resolved，
+      零条 pending、多条 conflict（禁止自动挑选）。
+    """
+    row = conn.execute(
+        "SELECT * FROM rate_rules WHERE id=? AND project_id=?",
+        (int(rule_id), int(project_id)),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"费率规则不存在或不属于当前项目：id={rule_id}")
+    if row["status"] != RATE_CONFIRMED:
+        raise ValueError("只有已确认的费率规则才能解析基数；候选不得参与金额计算")
+    base_type = str(row["base_type"])
+    rule_tax = normalize_tax_basis(row["tax_basis"])
+    result: dict = {
+        "rule_id": int(rule_id),
+        "base_type": base_type,
+        "rule_tax_basis": rule_tax,
+        "base_amount": None,
+        "status": None,
+        "reason": "",
+        "breakdown": {},
+    }
+
+    if base_type == "custom":
+        if custom_amount is None or str(custom_amount).strip() == "":
+            result["status"] = BASE_MANUAL_REQUIRED
+            result["reason"] = "custom 基数必须由人工给出金额；程序不猜测"
+        else:
+            try:
+                base = to_decimal(custom_amount)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"人工基数不是可识别数值：{custom_amount!r}") from exc
+            result["status"] = BASE_RESOLVED
+            result["base_amount"] = str(base)
+            result["breakdown"] = {"custom_amount": str(base)}
+        return result
+
+    if base_type in _BASE_DIRECTION:
+        direction = _BASE_DIRECTION[base_type]
+        facts = _period_amount_facts(conn, int(project_id), direction, period_id)
+        result["breakdown"] = facts
+        if not facts["periods"]:
+            result["status"] = BASE_PENDING
+            result["reason"] = f"尚无{('对上' if direction == 'upward' else '对下')}结算期次资料"
+            return result
+        if facts["missing_amount_rows"] > 0:
+            result["status"] = BASE_PENDING
+            result["reason"] = (
+                f"期次明细存在 {facts['missing_amount_rows']} 行金额缺失；"
+                "缺失不按 0 参与合计，请先补齐或人工处理"
+            )
+            return result
+        modes = facts["tax_modes"]
+        if "unknown" in modes:
+            result["status"] = BASE_PENDING
+            result["reason"] = "期次税口径未确认；请先在期次上人工确认含税/不含税口径"
+            return result
+        if len(modes) > 1:
+            result["status"] = BASE_INCOMPARABLE
+            result["reason"] = f"期次税口径混用（{('、'.join(modes))}）；不同口径不得直接加总"
+            return result
+        period_mode = modes[0]
+        if base_type == "upward_settlement_excl_tax" and period_mode != "excl_tax":
+            # 不含税基数不得从含税合计自动换算——换算需要税率事实，禁止猜测。
+            result["status"] = BASE_INCOMPARABLE
+            result["reason"] = (
+                f"不含税基数要求期次为 excl_tax，当前为 {period_mode}；"
+                "禁止用猜测的税率自动换算"
+            )
+            return result
+        if rule_tax != "unknown" and rule_tax != period_mode:
+            result["status"] = BASE_INCOMPARABLE
+            result["reason"] = f"费率规则税口径（{rule_tax}）与期次口径（{period_mode}）不一致"
+            return result
+        if rule_tax == "unknown":
+            result["status"] = BASE_PENDING
+            result["reason"] = "费率规则的税口径未确认；请先在确认时选择含税/不含税"
+            return result
+        result["status"] = BASE_RESOLVED
+        result["base_amount"] = str(facts["total"])
+        return result
+
+    if base_type == "contract_amount":
+        rows = conn.execute(
+            """SELECT cf.id, cf.fact_value, cd.title AS doc_title
+               FROM contract_facts cf JOIN contract_docs cd ON cd.id=cf.doc_id
+               WHERE cd.project_id=? AND cf.fact_key='contract_amount'
+                 AND cf.review_status='confirmed'""",
+            (int(project_id),),
+        ).fetchall()
+        # 占位型事实（fact_value 为空）不是金额事实：不参与挑选，但在
+        # breakdown 里如实记录，不静默消失。
+        amount_facts: list[tuple[int, Decimal, str]] = []
+        excluded: list[dict] = []
+        for f in rows:
+            try:
+                amount_facts.append((int(f["id"]), to_decimal(f["fact_value"]), f["doc_title"]))
+            except Exception:  # noqa: BLE001 — 非金额事实显式排除
+                excluded.append({"fact_id": int(f["id"]), "doc_title": f["doc_title"],
+                                 "reason": "非可解析金额"})
+        result["breakdown"] = {
+            "confirmed_contract_amount_facts": [
+                {"fact_id": fid, "doc_title": title} for fid, _, title in amount_facts
+            ],
+            "excluded_non_amount_facts": excluded,
+        }
+        if not amount_facts:
+            result["status"] = BASE_PENDING
+            result["reason"] = (
+                "没有已确认（confirmed）且为可解析金额的合同价款事实；"
+                "候选事实或空值事实不得参与计算"
+            )
+            return result
+        if len(amount_facts) > 1:
+            result["status"] = BASE_CONFLICT
+            result["reason"] = (
+                f"存在 {len(amount_facts)} 条已确认合同价款金额事实；"
+                "请人工明确以哪份合同为准（系统不自动挑选）"
+            )
+            return result
+        fact_id, base, _ = amount_facts[0]
+        result["status"] = BASE_RESOLVED
+        result["base_amount"] = str(base)
+        result["breakdown"]["fact_id"] = fact_id
+        return result
+
+    raise ValueError(f"未知基数类型：{base_type!r}（请重新确认该费率规则）")
+
+
 def apply_rate_rule(
     conn: sqlite3.Connection,
     project_id: int,
     rule_id: int,
     base_amount,
 ) -> dict:
-    """对给定基数做确定性费率试算（仅 confirmed 规则；Decimal 精确）。"""
+    """对人工给定基数做确定性费率试算（仅 confirmed 规则；Decimal 精确）。"""
     row = conn.execute(
         "SELECT * FROM rate_rules WHERE id=? AND project_id=?",
         (int(rule_id), int(project_id)),
@@ -311,19 +542,7 @@ def apply_rate_rule(
     if row["status"] != RATE_CONFIRMED:
         raise ValueError("只有已确认的费率规则才能试算；候选不得参与金额计算")
     base = to_decimal(base_amount)
-    rate = to_decimal(row["rate_percent"]) / Decimal("100")
-    fee = round2(base * rate)
-    detail: dict[str, str] = {"base_amount": str(base), "rate_percent": str(row["rate_percent"])}
-    if row["floor"] is not None:
-        floor = to_decimal(row["floor"])
-        if fee < floor:
-            detail["floor_applied"] = str(floor)
-            fee = floor
-    if row["cap"] is not None:
-        cap = to_decimal(row["cap"])
-        if fee > cap:
-            detail["cap_applied"] = str(cap)
-            fee = cap
+    fee, detail = _compute_fee(row["rate_percent"], base, row["cap"], row["floor"])
     with conn:
         ev_id = evidence_api.add_evidence(
             conn, int(project_id), "rate_rule_apply",
@@ -345,3 +564,102 @@ def apply_rate_rule(
         "detail": detail,
         "evidence_id": ev_id,
     }
+
+
+def apply_rate_rule_to_settlement(
+    conn: sqlite3.Connection,
+    project_id: int,
+    rule_id: int,
+    *,
+    period_id: int | None = None,
+    custom_amount=None,
+) -> dict:
+    """按规则 base_type 从项目事实解析基数并试算（框架/管理性协议专用路径）。
+
+    与实体工程量清单算法完全独立：基数只来自期次合计/已确认合同事实/人工
+    输入，税口径与缺失数据 fail-closed。基数解析被阻断时不计算费用，
+    但仍把阻断事实写入 rate_rule_applications 与 Evidence（失败尝试可审计）。
+    """
+    resolution = resolve_rate_base(
+        conn, int(project_id), int(rule_id),
+        period_id=period_id, custom_amount=custom_amount,
+    )
+    row = conn.execute(
+        "SELECT rate_percent, cap, floor, quote_text FROM rate_rules WHERE id=?",
+        (int(rule_id),),
+    ).fetchone()
+    fee: Decimal | None = None
+    detail: dict = {}
+    if resolution["status"] == BASE_RESOLVED:
+        base = to_decimal(resolution["base_amount"])
+        fee, detail = _compute_fee(row["rate_percent"], base, row["cap"], row["floor"])
+    now = datetime.now().isoformat(timespec="seconds")
+    detail_payload = {
+        "resolution": resolution["breakdown"],
+        "compute": detail,
+        "rule_tax_basis": resolution["rule_tax_basis"],
+    }
+    with conn:
+        ev_id = evidence_api.add_evidence(
+            conn, int(project_id), "rate_rule_apply_settlement",
+            f"费率规则 #{rule_id} 按基数类型 {resolution['base_type']} 试算："
+            + (f"基数 {resolution['base_amount']} × {row['rate_percent']}% = {fee}"
+               if fee is not None
+               else f"未计算（{resolution['status']}：{resolution['reason']}）"),
+            steps=[{
+                "step": "费率按确认基数试算",
+                "rule_id": int(rule_id),
+                "base_type": resolution["base_type"],
+                "base_status": resolution["status"],
+                "base_amount": resolution["base_amount"],
+                "rate_percent": str(row["rate_percent"]),
+                "fee": None if fee is None else str(fee),
+                "reason": resolution["reason"],
+                **({"compute": detail} if detail else {}),
+            }],
+            sources=[{"rule_id": int(rule_id)}],
+            commit=False,
+        )
+        cur = conn.execute(
+            """INSERT INTO rate_rule_applications(
+                   project_id, rule_id, base_type, base_amount, fee, status,
+                   reason, detail_json, evidence_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (int(project_id), int(rule_id), resolution["base_type"],
+             resolution["base_amount"], None if fee is None else str(fee),
+             resolution["status"], resolution["reason"],
+             json.dumps(detail_payload, ensure_ascii=False, sort_keys=True, default=str),
+             ev_id, now),
+        )
+        application_id = int(cur.lastrowid)
+    return {
+        "application_id": application_id,
+        "rule_id": int(rule_id),
+        "base_type": resolution["base_type"],
+        "base_status": resolution["status"],
+        "base_amount": resolution["base_amount"],
+        "reason": resolution["reason"],
+        "rate_percent": str(row["rate_percent"]),
+        "fee": None if fee is None else str(fee),
+        "compute_detail": detail,
+        "breakdown": resolution["breakdown"],
+        "evidence_id": ev_id,
+    }
+
+
+def list_rate_applications(
+    conn: sqlite3.Connection, project_id: int, *, rule_id: int | None = None
+) -> list[dict]:
+    """费率试算应用快照（只追加历史，按时间倒序返回全部，含被阻断尝试）。"""
+    sql = """SELECT ra.id, ra.rule_id, ra.base_type, ra.base_amount, ra.fee,
+                    ra.status, ra.reason, ra.detail_json, ra.evidence_id,
+                    ra.created_at, rr.rate_percent, rr.quote_text, rr.status AS rule_status
+             FROM rate_rule_applications ra
+             LEFT JOIN rate_rules rr ON rr.id=ra.rule_id
+             WHERE ra.project_id=?"""
+    params: list[object] = [int(project_id)]
+    if rule_id is not None:
+        sql += " AND ra.rule_id=?"
+        params.append(int(rule_id))
+    sql += " ORDER BY ra.id DESC"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]

@@ -40,7 +40,14 @@ BASE_TYPE_ZH = {
     "downward_settlement_amount": "按对下结算价",
     "custom": "自定义基数",
 }
-TAX_OPTIONS = [("unknown", "未确认"), ("included", "含税"), ("excluded", "不含税")]
+TAX_OPTIONS = [("unknown", "未确认"), ("incl_tax", "含税"), ("excl_tax", "不含税")]
+_APPLY_STATUS_ZH = {
+    "resolved": "已计算",
+    "pending": "待补事实（未计算）",
+    "incomparable": "不可比（未计算）",
+    "conflict": "候选并存（未计算）",
+    "manual_required": "需人工基数（未计算）",
+}
 
 
 class RateRulesDialog(QDialog):
@@ -126,6 +133,16 @@ class RateRulesDialog(QDialog):
         self.calc_label = QLabel("")
         calc_row.addWidget(self.calc_label, 1)
         layout.addLayout(calc_row)
+        # 按确认基数（期次合计/合同价款）试算：税口径与缺失数据 fail-closed。
+        settle_row = QHBoxLayout()
+        self.settle_btn = QPushButton("按确认基数试算（期次合计/合同价款）")
+        self.settle_btn.setToolTip(
+            "基数从项目事实解析：对上/对下期次合计或唯一已确认合同价款；\n"
+            "税口径未确认/混用/不一致、金额缺失行、多候选并存时阻断（不计算）")
+        self.settle_btn.clicked.connect(self._apply_to_settlement)
+        settle_row.addWidget(self.settle_btn)
+        settle_row.addStretch(1)
+        layout.addLayout(settle_row)
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
@@ -274,3 +291,39 @@ class RateRulesDialog(QDialog):
         if result["detail"].get("floor_applied"):
             extra += f"（已按下限 {result['detail']['floor_applied']} 兜底）"
         self.calc_label.setText(f"费用 = {result['fee']} 元{extra}")
+
+    def _apply_to_settlement(self) -> None:
+        rule = self._selected_rule()
+        if rule is None:
+            return
+        custom_amount = self.calc_edit.text().strip() or None
+        try:
+            result = rate_rules.apply_rate_rule_to_settlement(
+                self.conn, self.project_id, int(rule["id"]),
+                custom_amount=custom_amount,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法试算", str(exc))
+            return
+        except Exception:  # noqa: BLE001 — UI 层兜底
+            _LOG.exception("费率按确认基数试算失败")
+            QMessageBox.critical(self, "试算失败", "试算未能完成，请重试。")
+            return
+        status = _APPLY_STATUS_ZH.get(result["base_status"], result["base_status"])
+        if result["fee"] is not None:
+            extra = ""
+            if result["compute_detail"].get("cap_applied"):
+                extra += f"（已按上限 {result['compute_detail']['cap_applied']} 封顶）"
+            if result["compute_detail"].get("floor_applied"):
+                extra += f"（已按下限 {result['compute_detail']['floor_applied']} 兜底）"
+            body = (
+                f"费用 = {result['fee']} 元（基数 {result['base_amount']}"
+                f" × {result['rate_percent']}%）{extra}"
+            )
+        else:
+            body = f"未计算：{result['reason']}"
+        QMessageBox.information(
+            self, "按确认基数试算",
+            f"结果：{status}\n{body}\n\n（试算记录 #{result['application_id']} 已存档，"
+            "可在 Excel「费率规则与试算」表与结论报告中追溯）",
+        )

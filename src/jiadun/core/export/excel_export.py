@@ -1066,6 +1066,139 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
     _autowidth(ws)
 
 
+_CONCLUSION_STATUS_ZH = {
+    "PASS": "PASS（未超基准）",
+    "FAIL": "FAIL（超基准，不构成违规认定）",
+    "PENDING": "PENDING（待人工确认）",
+    "INCOMPARABLE": "INCOMPARABLE（不可比）",
+    "CONTROL_CONFLICT": "CONTROL_CONFLICT（基准冲突）",
+}
+
+
+def export_control_conclusions(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+    """对上控制基准结论表：每次比较一条快照（只追加），五态如实呈现，不强行 PASS。"""
+    from jiadun.core.engine import control_baseline as cb
+
+    ws = wb.create_sheet("对上控制基准结论")
+    ws.append(["结论ID", "状态", "基准编号", "基准金额", "基准出处", "结算期次",
+               "结算合计", "差额(+超基准)", "说明", "证据ID", "生成时间"])
+    _style_header(ws, 1, 11)
+    conclusions = cb.list_control_conclusions(conn, project_id)
+    if not conclusions:
+        ws.append(["", "暂无结论：尚未执行对上控制基准比较（见工作台「对上控制基准…」）",
+                   None, None, None, None, None, None,
+                   "无结论不等于通过（fail-closed）", None, None])
+    for c in conclusions:
+        period_text = (
+            f"第 {c['period_no']} 期·{c['period_title']}"
+            if c.get("period_no") is not None else "（未绑定期次）"
+        )
+        row_idx = ws.max_row + 1
+        ws.cell(row=row_idx, column=1, value=c["id"])
+        ws.cell(row=row_idx, column=2,
+                value=_CONCLUSION_STATUS_ZH.get(c["status"], c["status"]))
+        ws.cell(row=row_idx, column=3, value=c["baseline_id"])
+        ws.cell(row=row_idx, column=4, value=_num(c["baseline_amount"], money=True))
+        ws.cell(row=row_idx, column=5,
+                value=_normalize_business_text(c.get("baseline_source") or ""))
+        ws.cell(row=row_idx, column=6, value=period_text)
+        ws.cell(row=row_idx, column=7, value=_num(c["settlement_amount"], money=True))
+        if c["delta"] is not None:
+            ws.cell(row=row_idx, column=8, value=_num(c["delta"], money=True))
+        ws.cell(row=row_idx, column=9,
+                value=_normalize_business_text(c["reason"]))
+        ws.cell(row=row_idx, column=10, value=c["evidence_id"])
+        ws.cell(row=row_idx, column=11, value=c["created_at"])
+        for col in (4, 7, 8):
+            ws.cell(row=row_idx, column=col).number_format = MONEY_FMT
+    _autowidth(ws)
+
+
+_BASE_TYPE_ZH = {
+    "unset": "未设置",
+    "upward_settlement_amount": "对上结算合计",
+    "upward_settlement_excl_tax": "对上结算合计（不含税）",
+    "contract_amount": "合同价款（已确认事实）",
+    "downward_settlement_amount": "对下结算合计",
+    "custom": "人工自定义基数",
+}
+
+_RATE_APPLY_STATUS_ZH = {
+    "resolved": "已计算",
+    "pending": "待补事实（未计算）",
+    "incomparable": "不可比（未计算）",
+    "conflict": "候选并存（未计算）",
+    "manual_required": "需人工基数（未计算）",
+}
+
+
+def export_rate_rules_sheet(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+    """费率规则与试算表：候选/已确认规则逐条 + 每次试算快照（含被阻断尝试）。"""
+    from jiadun.core.contracts import rate_rules
+
+    ws = wb.create_sheet("费率规则与试算")
+    ws.append(["规则ID", "比例%", "基数类型", "基数说明", "税口径", "上限", "下限",
+               "状态", "原文引用", "来源资料", "确认时间"])
+    _style_header(ws, 1, 11)
+    rules = rate_rules.list_rate_rules(conn, project_id)
+    tax_zh = {"unknown": "未确认", "incl_tax": "含税", "excl_tax": "不含税"}
+    from jiadun.core.engine.control_baseline import normalize_tax_basis
+    status_zh = {"candidate": "候选（待人工确认）", "confirmed": "已确认",
+                 "rejected": "已拒绝"}
+    if not rules:
+        ws.append(["", "暂无费率候选：尚未导入框架/管理性协议或未扫描费率条款", None, None,
+                   None, None, None, "无规则不等于免计取（fail-closed）", None, None, None])
+    for r in rules:
+        row_idx = ws.max_row + 1
+        ws.cell(row=row_idx, column=1, value=r["id"])
+        if r["rate_percent"] is not None:
+            ws.cell(row=row_idx, column=2, value=_num(r["rate_percent"]))
+        ws.cell(row=row_idx, column=3,
+                value=_BASE_TYPE_ZH.get(r["base_type"], r["base_type"]))
+        ws.cell(row=row_idx, column=4,
+                value=_normalize_business_text(r["base_definition"] or "（未确认基数）"))
+        ws.cell(row=row_idx, column=5,
+                value=tax_zh.get(normalize_tax_basis(r["tax_basis"]),
+                                 normalize_tax_basis(r["tax_basis"])))
+        if r["cap"] is not None:
+            ws.cell(row=row_idx, column=6, value=_num(r["cap"], money=True))
+        if r["floor"] is not None:
+            ws.cell(row=row_idx, column=7, value=_num(r["floor"], money=True))
+        ws.cell(row=row_idx, column=8,
+                value=status_zh.get(r["status"], r["status"]))
+        ws.cell(row=row_idx, column=9,
+                value=_normalize_business_text(r["quote_text"] or ""))
+        ws.cell(row=row_idx, column=10, value=r["original_name"] or "")
+        ws.cell(row=row_idx, column=11, value=r["reviewed_at"] or "")
+    if rules:
+        ws.append([])
+        ws.append(["试算记录（时间倒序；含被阻断的尝试）"])
+        ws.append(["试算ID", "规则ID", "比例%", "基数类型", "基数金额", "费用",
+                   "结果", "说明", "证据ID", "时间"])
+        _style_header(ws, ws.max_row, 10)
+        for a in rate_rules.list_rate_applications(conn, project_id):
+            row_idx = ws.max_row + 1
+            ws.cell(row=row_idx, column=1, value=a["id"])
+            ws.cell(row=row_idx, column=2, value=a["rule_id"])
+            if a["rate_percent"] is not None:
+                ws.cell(row=row_idx, column=3, value=_num(a["rate_percent"]))
+            ws.cell(row=row_idx, column=4,
+                    value=_BASE_TYPE_ZH.get(a["base_type"], a["base_type"]))
+            if a["base_amount"] is not None:
+                ws.cell(row=row_idx, column=5, value=_num(a["base_amount"], money=True))
+            if a["fee"] is not None:
+                ws.cell(row=row_idx, column=6, value=_num(a["fee"], money=True))
+            ws.cell(row=row_idx, column=7,
+                    value=_RATE_APPLY_STATUS_ZH.get(a["status"], a["status"]))
+            ws.cell(row=row_idx, column=8,
+                    value=_normalize_business_text(a["reason"]))
+            ws.cell(row=row_idx, column=9, value=a["evidence_id"])
+            ws.cell(row=row_idx, column=10, value=a["created_at"])
+            for col in (5, 6):
+                ws.cell(row=row_idx, column=col).number_format = MONEY_FMT
+    _autowidth(ws)
+
+
 def export_anomaly_lists(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
     """异常清单 + 待核实事项清单。"""
     scope, scope_params = run_contract.current_scope(conn, project_id, "a")
@@ -1629,6 +1762,8 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     for direction in _project_directions(conn, project_id):
         export_settlement_summary(conn, project_id, wb, direction=direction)
     export_updown_comparison(conn, project_id, wb)
+    export_control_conclusions(conn, project_id, wb)
+    export_rate_rules_sheet(conn, project_id, wb)
     export_diff_sheets(conn, project_id, wb)
     export_diff_radar_sheet(conn, project_id, wb)
     export_project_versions_sheets(conn, project_id, wb)

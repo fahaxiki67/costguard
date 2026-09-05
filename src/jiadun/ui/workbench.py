@@ -120,7 +120,12 @@ def _export_files(export_dir: Path, kind: str) -> list[Path]:
     仍是历史证据，不能因品牌迁移在界面上消失。这里仅扫描文件名，不改名、
     不覆盖，也不改变 Run Contract 对 current/stale 的判定。
     """
-    suffix = "审核底稿_*.xlsx" if kind == "excel" else "管理层摘要_*.docx"
+    suffixes = {
+        "excel": "审核底稿_*.xlsx",
+        "docx": "管理层摘要_*.docx",
+        "md": "结论报告_*.md",
+    }
+    suffix = suffixes[kind]
     prefixes = (
         branding.PRODUCT_DISPLAY_NAME,
         branding.PRODUCT_NAME,
@@ -1935,10 +1940,12 @@ class WorkbenchPage(QWidget):
             f"已执行 {coverage['executed_count']}，跳过 {coverage['skipped_count']}，"
             f"失败 {coverage['failed_count']}）"
         )
+        conclusion_text = self._control_conclusion_summary()
         self.anomaly_summary_label.setText(
             f"高风险 {counts['high']} 项　中风险 {counts['medium']} 项　"
             f"待处理 {counts['pending']} 项　暂不处理 {counts['deferred']} 项　"
             f"已处理 {counts['processed']} 项　{coverage_text}"
+            + (f"　{conclusion_text}" if conclusion_text else "")
         )
         t = self.anomaly_table
         t.setSortingEnabled(False)
@@ -2287,6 +2294,27 @@ class WorkbenchPage(QWidget):
         match_split.setSizes([700, 300])
         v.addWidget(match_split, 1)
         return w
+
+    def _control_conclusion_summary(self) -> str:
+        """问题中心顶部的对上控制基准结论概览（只读；非 PASS 结论均为待关注项）。"""
+        try:
+            rows = self.conn.execute(
+                """SELECT status, COUNT(*) AS n FROM control_conclusions
+                   WHERE project_id=? GROUP BY status""",
+                (self.project.project_id,),
+            ).fetchall()
+        except Exception:  # noqa: BLE001 — 概览失败不阻断问题中心
+            _LOG.exception("读取控制基准结论概览失败")
+            return ""
+        if not rows:
+            return ""
+        counts = {r["status"]: int(r["n"]) for r in rows}
+        attention = sum(n for s, n in counts.items() if s != "PASS")
+        parts = "、".join(f"{s} {n}" for s, n in sorted(counts.items()))
+        return (
+            f"对上控制基准结论 {sum(counts.values())} 条（{parts}；"
+            f"待关注 {attention} 条，详见「对上控制基准…」/结论报告）"
+        )
 
     def _apply_match_filters(self):
         """只隐藏表格行，不删除当前运行的匹配候选。"""
@@ -2950,6 +2978,8 @@ class WorkbenchPage(QWidget):
         excel_btn.clicked.connect(self._export_excel)
         doc_btn = QPushButton("导出 Word 摘要")
         doc_btn.clicked.connect(self._export_docx)
+        md_btn = QPushButton("导出结论报告（Markdown）")
+        md_btn.clicked.connect(self._export_conclusions_md)
         all_btn = QPushButton("全部生成")
         all_btn.setObjectName("btnPrimary")
         all_btn.clicked.connect(self._export_all)
@@ -2969,6 +2999,12 @@ class WorkbenchPage(QWidget):
                 "docx", "Word 管理层摘要", "适用：管理层汇报与决策前阅读",
                 "包含：审核范围、关键指标、Top 风险、待决策事项与限制",
                 doc_btn,
+            ),
+            (
+                "md", "结论报告（Markdown）", "适用：对上控制基准结论与费率规则的结构化留档",
+                "包含：五态结论（INCOMPARABLE/CONTROL_CONFLICT 如实呈现）、"
+                "费率规则与试算、每条结论的证据编号",
+                md_btn,
             ),
         ):
             card = QGroupBox(title)
@@ -3024,7 +3060,7 @@ class WorkbenchPage(QWidget):
                 f"数据库不可写，当前结果不可用{suffix}；不能登记或生成当前 Excel/Word 成果。"
             )
             export_dir = Path(self.project_dir) / "exports"
-            for key, kind in (("excel", "excel"), ("docx", "docx")):
+            for key, kind in (("excel", "excel"), ("docx", "docx"), ("md", "md")):
                 card = getattr(self, "export_card_values", {}).get(key)
                 if not card:
                     continue
@@ -3048,10 +3084,12 @@ class WorkbenchPage(QWidget):
         registry_by_kind = {
             "excel": run_contract.export_status(self.conn, pid, "excel_workbook"),
             "docx": run_contract.export_status(self.conn, pid, "management_summary_docx"),
+            "md": run_contract.export_status(self.conn, pid, "conclusions_markdown"),
         }
         for key, file_kind in (
             ("excel", "excel"),
             ("docx", "docx"),
+            ("md", "md"),
         ):
             card = getattr(self, "export_card_values", {}).get(key)
             if not card:
@@ -3104,8 +3142,24 @@ class WorkbenchPage(QWidget):
         platform_paths.reveal_in_file_manager(path)
         QMessageBox.information(self, "导出完成", f"已导出：\n{path}")
 
+    def _export_conclusions_md(self):
+        from jiadun.core.export import conclusions_report
+
+        try:
+            path = conclusions_report.export_conclusions_report(
+                self.conn, self.project.project_id, Path(self.project_dir) / "exports")
+        except run_contract.CurrentResultsUnavailableError as exc:
+            QMessageBox.warning(self, "导出不可用", str(exc))
+            return
+        except Exception:  # noqa: BLE001 — 普通界面不显示技术异常
+            QMessageBox.warning(self, "导出失败", "结论报告生成失败，请检查导出目录权限后重试。")
+            return
+        self.refresh_export_status()
+        platform_paths.reveal_in_file_manager(path)
+        QMessageBox.information(self, "导出完成", f"已导出：\n{path}")
+
     def _export_all(self):
-        """按固定顺序生成两类成果；任一失败都保留另一类已生成文件。"""
+        """按固定顺序生成全部成果；任一失败都保留其他已生成文件。"""
         try:
             run_contract.require_current_results_available(
                 self.conn, self.project.project_id, operation="全部成果导出"
@@ -3113,25 +3167,35 @@ class WorkbenchPage(QWidget):
         except run_contract.CurrentResultsUnavailableError as exc:
             QMessageBox.warning(self, "导出不可用", str(exc))
             return
+        from jiadun.core.export import conclusions_report
+
         excel_path = None
         docx_path = None
+        md_path = None
         failures = []
         try:
             excel_path = excel_export.export_workbook(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
         except run_contract.CurrentResultsUnavailableError as exc:
             failures.append(f"Excel：{exc}")
-        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续另一类导出
+        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续其他导出
             failures.append(f"Excel：{exc}")
         try:
             docx_path = excel_export.export_management_summary_docx(
                 self.conn, self.project.project_id, Path(self.project_dir) / "exports")
         except run_contract.CurrentResultsUnavailableError as exc:
             failures.append(f"Word：{exc}")
-        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续另一类导出
+        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续其他导出
             failures.append(f"Word：{exc}")
+        try:
+            md_path = conclusions_report.export_conclusions_report(
+                self.conn, self.project.project_id, Path(self.project_dir) / "exports")
+        except run_contract.CurrentResultsUnavailableError as exc:
+            failures.append(f"结论报告：{exc}")
+        except Exception as exc:  # noqa: BLE001 — 保留失败信息并继续其他导出
+            failures.append(f"结论报告：{exc}")
         self.refresh_export_status()
-        created = [str(path) for path in (excel_path, docx_path) if path]
+        created = [str(path) for path in (excel_path, docx_path, md_path) if path]
         if created:
             platform_paths.reveal_in_file_manager(Path(created[0]))
             suffix = "审核尚未完成" if "审核尚未完成" in self.export_status_label.text() else ""

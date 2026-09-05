@@ -47,11 +47,16 @@ RESULT_ZH = {
     "INCOMPARABLE": "不可比较（INCOMPARABLE）",
     "CONTROL_CONFLICT": "基准冲突（CONTROL_CONFLICT）",
 }
-TAX_OPTIONS = [("unknown", "未确认"), ("included", "含税"), ("excluded", "不含税")]
+TAX_OPTIONS = [
+    ("unknown", "未确认"),
+    ("incl_tax", "含税"),
+    ("excl_tax", "不含税"),
+]
 
 
 def _tax_label(code: str) -> str:
-    return dict(TAX_OPTIONS).get(code, code)
+    return dict(TAX_OPTIONS).get(cb.normalize_tax_basis(code),
+                                 cb.normalize_tax_basis(code))
 
 
 class ControlBaselineDialog(QDialog):
@@ -129,6 +134,21 @@ class ControlBaselineDialog(QDialog):
         self.period_total_label = QLabel("明细合计：—")
         period_row.addWidget(self.period_total_label)
         cv.addLayout(period_row)
+        # 期次税口径是比较的前置事实（未确认 → PENDING）；提供人工确认入口。
+        tax_row = QHBoxLayout()
+        tax_row.addWidget(QLabel("期次税口径："))
+        self.period_tax_combo = QComboBox()
+        for code, label in TAX_OPTIONS:
+            if code != "unknown":
+                self.period_tax_combo.addItem(label, code)
+        tax_row.addWidget(self.period_tax_combo)
+        period_tax_btn = QPushButton("确认税口径…")
+        period_tax_btn.setToolTip(
+            "人工确认选中期的含税/不含税口径（写入审计 Evidence）；未确认的比较会停在 PENDING")
+        period_tax_btn.clicked.connect(self._confirm_period_tax)
+        tax_row.addWidget(period_tax_btn)
+        tax_row.addStretch(1)
+        cv.addLayout(tax_row)
         self.compare_btn = QPushButton("与选中基准比较")
         self.compare_btn.clicked.connect(self._compare)
         cv.addWidget(self.compare_btn, 0)
@@ -208,8 +228,9 @@ class ControlBaselineDialog(QDialog):
             self.period_total_label.setText("明细合计：—")
             return
         for p in self._periods:
+            tax_text = _tax_label(str(p.get("tax_mode") or "unknown"))
             self.period_combo.addItem(
-                f"第 {p['period_no']} 期 · {p['title']}（{p['detail_rows']} 行明细）",
+                f"第 {p['period_no']} 期 · {p['title']}（{p['detail_rows']} 行明细，税口径：{tax_text}）",
                 p["period_id"],
             )
         self._show_period_total()
@@ -221,6 +242,37 @@ class ControlBaselineDialog(QDialog):
                 self.period_total_label.setText(f"明细合计：{p['amount_total']} 元")
                 return
         self.period_total_label.setText("明细合计：—")
+
+    def _confirm_period_tax(self) -> None:
+        period_id = self.period_combo.currentData()
+        period = next(
+            (p for p in getattr(self, "_periods", []) if p["period_id"] == period_id), None
+        )
+        if period is None:
+            QMessageBox.information(self, "无法确认", "请先导入对上结算期次资料。")
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        tax_mode = self.period_tax_combo.currentData()
+        reason, ok = QInputDialog.getText(
+            self, "确认期次税口径",
+            f"第 {period['period_no']} 期标记为「{_tax_label(tax_mode)}」的核对依据"
+            "（必填，如：结算表表头注明不含税单价）：",
+        )
+        if not ok:
+            return
+        try:
+            cb.set_period_tax_mode(
+                self.conn, self.project_id, int(period_id), tax_mode, reason=reason
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法确认", str(exc))
+            return
+        except Exception:  # noqa: BLE001 — UI 层兜底
+            _LOG.exception("确认期次税口径失败")
+            QMessageBox.critical(self, "写入失败", "税口径确认未能写入数据库，请重试。")
+            return
+        self._load_periods()
 
     def _selected_baseline(self) -> dict | None:
         row = self.table.currentRow()
@@ -288,6 +340,7 @@ class ControlBaselineDialog(QDialog):
                 self.conn, self.project_id, int(baseline["id"]),
                 period["amount_total"],
                 settlement_tax_basis=str(period.get("tax_mode") or "unknown"),
+                period_id=int(period["period_id"]),
             )
         except ValueError as exc:
             QMessageBox.warning(self, "无法比较", str(exc))
@@ -297,7 +350,8 @@ class ControlBaselineDialog(QDialog):
             QMessageBox.critical(self, "比较失败", "比较未能完成，请重试。")
             return
         lines = [
-            f"结论：{RESULT_ZH.get(result['status'], result['status'])}",
+            f"结论：{RESULT_ZH.get(result['status'], result['status'])}"
+            f"（结论 #{result.get('conclusion_id', '—')}，已存档可导出）",
             f"基准 #{result['baseline_id']}：{result['baseline_amount']} 元",
             f"对上结算合计（第 {period['period_no']} 期）：{result['settlement_amount']} 元",
             f"差额：{result['delta'] if result['delta'] is not None else '—'} 元",

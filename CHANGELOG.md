@@ -11,6 +11,36 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.26` 为预发行/预览候选，不代表正式生产能力。
 
+### 结论性框架闭环（schema v54，接力二轮）
+
+- 迁移 v54：`control_conclusions`（对上控制基准结论快照）与
+  `rate_rule_applications`（费率试算应用快照）两张只追加表（历史不覆盖）。
+- 税口径词表收口：基准/费率/期次三处统一归一到 `incl_tax/excl_tax/unknown`
+  （canonical），旧值 `included/excluded` 读侧兼容——修复同义口径被误判
+  INCOMPARABLE 的词表不一致缺陷；确认与登记入口写侧归一存储。
+- 期次税口径人工确认 `set_period_tax_mode`（依据必填、写审计 Evidence），
+  补齐比较与费率基数的前置事实闭环。
+- 比较结论持久化：`compare_upward_result` 可绑定期次并把五态结论
+  （PASS/FAIL/PENDING/INCOMPARABLE/CONTROL_CONFLICT）追加存档。
+- 费率基数自动解析 `resolve_rate_base`（按 base_type）：
+  对上/对下期次合计（税口径未确认→pending、混用→incomparable、
+  与规则不一致→incomparable、金额缺失行→pending 缺失不按 0）、
+  唯一已确认合同价款事实（多条并存→conflict 不自动挑选；空值占位事实
+  显式排除不参与）、custom 须人工给基数；不含税基数禁止从含税合计按
+  猜测税率换算。`apply_rate_rule_to_settlement` 按解析基数 Decimal 试算
+  （cap/floor），被阻断的尝试也落档可审计。
+- 报告导出：Excel 新增「对上控制基准结论」「费率规则与试算」两表；
+  新增 Markdown 结论报告（`conclusions_report`，登记为
+  `conclusions_markdown` 受控成果）；无结论明示"无结论不等于通过"。
+- UI：控制基准对话框支持期次税口径确认与结论存档提示；费率对话框新增
+  「按确认基数试算」；问题中心汇总行显示结论计数（非 PASS 计为待关注）；
+  成果导出新增结论报告卡片并纳入「全部生成」。
+- 修复并行在制改动引入的 `_DAYS` 单捕获组与 `m2.group(2)` 不一致崩溃
+  （恢复单位捕获组，语义与 HEAD 一致）。
+- 黄金基线 schema 53→54（附变更记录）；并行会话未提交的 extract.py
+  party_guard/大写金额改动造成的 contract_fact 计数差异未并入基线，
+  待该任务收口后处理（当前 golden 回归按设计 FAIL，不得视为通过）。
+
 ## [0.1.26] - 2026-09-05
 
 性能修复与缓存层预发行（schema v53）：sheet_cell_digests 缓存表 +
