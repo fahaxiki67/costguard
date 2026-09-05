@@ -1324,43 +1324,99 @@ def current_contract_gaps(
     return list(dict.fromkeys(gaps))
 
 
+def compute_sheet_cell_digest(
+    conn: sqlite3.Connection, sheet_id: int
+) -> tuple[str, int]:
+    """全量扫描一个 Sheet 的 raw_cells，返回（SHA-256, 单元格数）。
+
+    序列化格式是 Run Contract 语义的一部分，读路径（_sheet_scope）与任何
+    未来的持久化写回路径必须共用本函数，防止两处字段映射漂移导致同一份
+    数据算出两个"正确"摘要。
+    """
+    digest = hashlib.sha256()
+    cells = conn.execute(
+        """SELECT row, col, raw_value, cached_value, is_formula,
+                          is_number_stored_as_text, num_fmt
+             FROM raw_cells WHERE sheet_id=? ORDER BY row, col""",
+        (int(sheet_id),),
+    ).fetchall()
+    for cell in cells:
+        digest.update(
+            canonical_json({
+                "row": int(cell["row"]),
+                "col": int(cell["col"]),
+                "raw_value": cell["raw_value"],
+                "cached_value": cell["cached_value"],
+                "is_formula": int(cell["is_formula"] or 0),
+                "is_number_stored_as_text": int(cell["is_number_stored_as_text"] or 0),
+                "num_fmt": cell["num_fmt"] or "",
+            }).encode("utf-8")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest(), len(cells)
+
+
+def _connection_state_fingerprint(conn: sqlite3.Connection) -> tuple[str, int, int]:
+    """连接视角的数据库状态指纹：数据库文件 + 任何连接的任何写操作。
+
+    - ``PRAGMA database_list`` 的主库路径：区分不同项目库，防连接对象
+      回收后 id 复用把别的库的摘要错接到新连接；
+    - ``conn.total_changes``：本连接自打开以来的 INSERT/UPDATE/DELETE 数；
+    - ``PRAGMA data_version``：其他连接提交后递增（本连接提交不变化）。
+    三者合并后：指纹相等 ⇒ 记忆化以来数据库零写入 ⇒ 摘要可安全复用；
+    任何写入（导入/人工确认/外部直改库）都会使指纹变化并强制重算。
+    """
+    main_path = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
+    data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
+    return main_path, data_version, int(conn.total_changes)
+
+
+# 进程内、按连接标识的只读窗口缓存（Sheet 摘要 / 明细摘要等纯函数值）。
+# 不跨进程信任持久摘要表：「绕过触发器改 raw_cells 值仍能被读路径发现」
+# 是已固化的产品保证（test_verification_rejects_raw_cell_content_drift），
+# 盲信持久缓存会把值级漂移隐藏到缓存失效为止；进程内 + 写指纹失效则
+# 保留全部漂移可见性，同时把同一次导出里数十次门控的重复全表扫描
+# 压缩为每个只读窗口一次。sqlite3.Connection 不支持弱引用，改用 id 键 +
+# 状态指纹防 id 复用错接，并设容量上限防止长驻进程缓慢泄漏。
+_READ_WINDOW_MEMO: dict[int, dict[str, Any]] = {}
+_READ_WINDOW_MEMO_LIMIT = 64
+_READ_WINDOW_MEMO_LOCK = threading.Lock()
+
+
+def _read_window_values(conn: sqlite3.Connection) -> dict[Any, Any]:
+    """返回当前连接只读窗口的值缓存；指纹变化（任何写入）时整体重置。
+
+    缓存值必须是数据库状态的纯函数（如 SHA-256 摘要）。写入一旦发生
+    ——导入、人工确认、line_items 修正或外部直改库——指纹改变，旧值
+    全部弃用，漂移重新可见。
+    """
+    with _READ_WINDOW_MEMO_LOCK:
+        state = _READ_WINDOW_MEMO.get(id(conn))
+        fingerprint = _connection_state_fingerprint(conn)
+        if state is None or state["fingerprint"] != fingerprint:
+            if len(_READ_WINDOW_MEMO) >= _READ_WINDOW_MEMO_LIMIT:
+                _READ_WINDOW_MEMO.clear()
+            state = {"fingerprint": fingerprint, "values": {}}
+            _READ_WINDOW_MEMO[id(conn)] = state
+        return state["values"]
+
+
 def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
-    _cell_digest_memo: dict[int, str] = {}
+    values = _read_window_values(conn)
 
     def raw_cell_digest(sheet_id: int) -> str:
-        """逐 Sheet 单元格 SHA-256；同一次构建内结果记忆化避免重复扫描。"""
-        if sheet_id in _cell_digest_memo:
-            return _cell_digest_memo[sheet_id]
-        cached = conn.execute(
-            "SELECT digest FROM sheet_cell_digests WHERE sheet_id=?",
-            (int(sheet_id),),
-        ).fetchone()
+        """逐 Sheet 单元格 SHA-256；只读窗口内跨门控调用复用结果。
+
+        复用前提是窗口内数据库零写入（进入窗口时已做写指纹核验）；
+        持久摘要表 sheet_cell_digests 不进入读取面，避免跨进程盲信。
+        """
+        key = ("sheet_cell_digest", int(sheet_id))
+        cached = values.get(key)
         if cached is not None:
-            _cell_digest_memo[sheet_id] = str(cached["digest"])
-            return _cell_digest_memo[sheet_id]
-        digest = hashlib.sha256()
-        cells = conn.execute(
-            """SELECT row, col, raw_value, cached_value, is_formula,
-                              is_number_stored_as_text, num_fmt
-                 FROM raw_cells WHERE sheet_id=? ORDER BY row, col""",
-            (int(sheet_id),),
-        ).fetchall()
-        for cell in cells:
-            digest.update(
-                canonical_json({
-                    "row": int(cell["row"]),
-                    "col": int(cell["col"]),
-                    "raw_value": cell["raw_value"],
-                    "cached_value": cell["cached_value"],
-                    "is_formula": int(cell["is_formula"] or 0),
-                    "is_number_stored_as_text": int(cell["is_number_stored_as_text"] or 0),
-                    "num_fmt": cell["num_fmt"] or "",
-                }).encode("utf-8")
-            )
-            digest.update(b"\n")
-        hexdigest = digest.hexdigest()
-        _cell_digest_memo[sheet_id] = hexdigest
-        return hexdigest
+            return cached
+        digest, _cell_count = compute_sheet_cell_digest(conn, int(sheet_id))
+        values[key] = digest
+        return digest
 
     rows = conn.execute(
         """SELECT rs.id, rs.batch_id, rs.sheet_index, rs.sheet_name, rs.period_id,
@@ -1470,6 +1526,12 @@ def _strip_derived_flags(value: Any) -> Any:
 
 
 def _line_item_digest(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
+    # 明细摘要同样只读窗口内复用：一次导出的几十次门控各自重算
+    # line_items 全量摘要（10k 项目约每次 1s）是 profiling 实锤热点；
+    # line_items 的合法修正（人工改数）会写库 → 写指纹变化 → 缓存重置。
+    cached = _read_window_values(conn).get(("line_item_digest", int(project_id)))
+    if cached is not None:
+        return dict(cached)
     rows = conn.execute(
         """SELECT li.period_id, li.sheet_id, li.code, li.name, li.feature, li.unit,
                   li.quantity, li.unit_price, li.amount, li.tax_rate,
@@ -1500,7 +1562,9 @@ def _line_item_digest(conn: sqlite3.Connection, project_id: int) -> dict[str, An
         digest.update(canonical_json(record).encode("utf-8"))
         digest.update(b"\n")
         count += 1
-    return {"line_item_count": count, "line_items_sha256": digest.hexdigest()}
+    result = {"line_item_count": count, "line_items_sha256": digest.hexdigest()}
+    _read_window_values(conn)[("line_item_digest", int(project_id))] = dict(result)
+    return result
 
 
 def _aliases(conn: sqlite3.Connection, project_id: int) -> list[dict[str, Any]]:
