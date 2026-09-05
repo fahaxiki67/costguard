@@ -9,7 +9,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.26` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.27` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.27] - 2026-09-06
+
+Sheet 角色确认服务层预发行（schema v54，运行合同格式 v2）：全工作簿
+Sheet 清单（可见状态/行列/建议角色/置信度/理由）、角色枚举扩展
+（对上/对下/其他费用）、过滤模式（全部/仅待确认/仅建议参与）、重解析
+人工决策结转（同名+摘要一致才结转，批量 Evidence）、list_kind 纳入
+Run Contract（角色变更→签名变化→旧运行失效）。摘要缓存失效触发器
+（raw_cells 任何写入即删缓存，防内容漂移失明）。黄金基线升至 schema 54。
+Sheet 清单 UI、真实 OCR 质量回归、Excel/WPS 四环境真机（macOS Excel、
+Windows Excel、macOS WPS、Windows WPS）、50k/200k 性能、签名与公证
+仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.26] - 2026-09-05
 
