@@ -236,11 +236,11 @@
           ]
         },
         "evidence": {
-          "current_count": 126,
+          "current_count": 121,
           "historical_count": 7,
           "by_kind": {
             "anomaly": 42,
-            "contract_fact": 13,
+            "contract_fact": 8,
             "cross_check": 6,
             "line_item_source": 57,
             "sheet_coverage_proof": 7,
