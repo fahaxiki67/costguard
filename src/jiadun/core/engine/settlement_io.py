@@ -1680,16 +1680,22 @@ def _import_settlement_file(
         # 已入保真层（raw_sheets/raw_cells），数据零丢失；人工确认角色后可
         # 通过既有重解析入口参与。
         visible_state = str(getattr(sheet, "visible_state", "") or "").strip().lower()
-        if visible_state in {"hidden", "veryhidden"}:
+        visibility_unknown = visible_state not in {"visible", "hidden", "veryhidden"}
+        if visible_state in {"hidden", "veryhidden"} or visibility_unknown:
+            visibility_reason = (
+                f"隐藏工作表（{visible_state}）"
+                if not visibility_unknown
+                else f"工作表可见性未知（{sf.file_type}解析器未提供可见性）"
+            )
             set_sheet_status(
                 conn, sheet_id, "pending",
-                reason=f"隐藏工作表（{visible_state}）：未经人工确认角色前不写入结算模型；"
+                reason=f"{visibility_reason}：未经人工确认角色前不写入结算模型；"
                        "请确认该 Sheet 是否参与对上/对下后再重新解析",
                 actor="system",
             )
             report.sheets.append(SheetReport(
                 sheet.sheet_name, "needs_review",
-                notes=[f"检测到隐藏工作表（{visible_state}）：为避免底稿/草稿数据混入结算，"
+                notes=[f"检测到{visibility_reason}：为避免底稿/草稿数据混入结算，"
                        "已保留原始网格并转为待人工确认"],
                 state_code="pending"))
             role_gated = True

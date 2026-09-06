@@ -258,6 +258,18 @@ class TestWorkbench:
             "规则完全匹配（待人工确认）", "高概率匹配", "疑似匹配", "不可比", "待补资料"
         }
 
+    def test_match_detail_reads_project_feature(self, wb_page):
+        from jiadun.core.matching import matching
+
+        groups = matching.match_items(wb_page.conn, wb_page.project.project_id)
+        assert groups
+        matching.save_matches(wb_page.conn, wb_page.project.project_id, groups)
+        wb_page.refresh_matches()
+
+        wb_page._show_match_detail(0, 0)
+
+        assert "项目特征" in wb_page.match_detail_panel.toPlainText()
+
     def test_match_mirror_filters_keep_rows_and_search(self, wb_page):
         from jiadun.core.matching import matching
 

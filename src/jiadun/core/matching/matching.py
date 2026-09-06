@@ -176,7 +176,8 @@ def _match_items_for_direction(
             g.codes.add((r["code"] or "").strip())
             g.units.add(_norm_unit(r["unit"]))
 
-    # 同名异码融合：名称归一化相同的编码组合并为一个高概率组
+    # 同名异码融合：名称归一化相同的编码组合按连通分量并为高概率组。
+    # 一次遍历逐组删除会漏掉 A-x、B-x、B-y、C-y 这类传递关系。
     code_groups = [g for g in groups.values() if g.group_key.startswith("code:")]
     by_name: dict[str, list[MatchGroup]] = {}
     for g in code_groups:
@@ -187,11 +188,30 @@ def _match_items_for_direction(
             bucket = by_name.setdefault(nm, [])
             if g not in bucket:  # 同组多个名称变体只登记一次
                 bucket.append(g)
+    parent = {g.group_key: g.group_key for g in code_groups}
+
+    def find(key: str) -> str:
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    for same_name_groups in by_name.values():
+        if same_name_groups:
+            first = same_name_groups[0].group_key
+            for other in same_name_groups[1:]:
+                parent[find(other.group_key)] = find(first)
+
+    components: dict[str, list[MatchGroup]] = {}
+    for g in code_groups:
+        components.setdefault(find(g.group_key), []).append(g)
+
     merged_keys: set[str] = set()
-    for gs in by_name.values():
-        if len(gs) > 1:
-            base = gs[0]
-            for other in gs[1:]:
+    merged_by_name: dict[str, list[MatchGroup]] = {}
+    for component in components.values():
+        base = component[0]
+        if len(component) > 1:
+            for other in component[1:]:
                 base.item_ids.extend(other.item_ids)
                 base.names |= other.names
                 base.codes |= other.codes
@@ -201,6 +221,11 @@ def _match_items_for_direction(
             base.method = "name_merge"
             base.score = 0.8
             base.notes.append(f"同名异码 {sorted(base.codes)}，已合并为高概率组，请复核")
+        for name in base.names:
+            nm = normalize_name(name)
+            if nm and base not in merged_by_name.setdefault(nm, []):
+                merged_by_name[nm].append(base)
+    by_name = merged_by_name
 
     # 无编码行：名称精确 / 别名库 → 独立组或并入同名编码组
     assigned_ids = {iid for g in groups.values() for iid in g.item_ids}
@@ -332,7 +357,10 @@ def _match_items_for_direction(
                 # 两个高概率组（如 name_exact）高度相似但不合并：至少留下
                 # 疑似相关提示，避免复核队列完全看不到两者可能指同一清单。
                 ga.notes.append(f"与「{nb}」相似 {score:.0f}%，疑似相关，请人工核对")
-    return sorted(result, key=lambda g: g.group_key)
+    return sorted(
+        (group for group in result if group.group_key not in used),
+        key=lambda g: g.group_key,
+    )
 
 
 def match_items(

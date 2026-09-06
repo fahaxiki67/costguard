@@ -421,13 +421,21 @@ def parse_xls(path: Path) -> ParseResult:
     result = ParseResult(parser="xlrd", status="partial")
     stats = {"n_sheets": 0, "n_cells": 0, "n_formulas": 0, "n_text_numbers": 0,
              "limitations": limitations, "capability_limited": True}
+    visibility_values = getattr(book, "sheet_visibility", None)
+    if visibility_values is None:
+        # xlrd 2.0.x exposes the BIFF sheet state only through this private
+        # compatibility attribute. If neither source exists, keep visibility
+        # unknown so the import layer can fail closed.
+        visibility_values = getattr(book, "_sheet_visibility", None)
+    if visibility_values is None:
+        limitations.append("xls: 工作表 hidden/veryHidden 可见性无法取得")
     for idx in range(book.nsheets):
         sh = book.sheet_by_index(idx)
         # xlrd Book.sheet_visibility：0=visible、1=hidden、2=veryHidden；
         # 越界/异常时保持 None（未知），不得默认可见。
         _vis_map = {0: "visible", 1: "hidden", 2: "veryHidden"}
         try:
-            _vis = _vis_map.get(int(book.sheet_visibility[idx]))
+            _vis = _vis_map.get(int(visibility_values[idx]))
         except (AttributeError, IndexError, TypeError, ValueError):
             _vis = None
         sheet = SheetRecord(
@@ -488,7 +496,9 @@ def _xls_cell_text(cell) -> str:
 def parse_csv(path: Path) -> ParseResult:
     result = ParseResult(parser="csv", status="ok")
     stats = {"n_sheets": 1, "n_cells": 0, "n_formulas": 0, "n_text_numbers": 0}
-    sheet = SheetRecord(sheet_index=0, sheet_name=path.stem, n_rows=0, n_cols=0)
+    sheet = SheetRecord(
+        sheet_index=0, sheet_name=path.stem, n_rows=0, n_cols=0, visible_state="visible"
+    )
     n_rows = 0
     with open(path, encoding="utf-8-sig", newline="") as f:
         for row in csv.reader(f):

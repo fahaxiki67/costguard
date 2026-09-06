@@ -2435,7 +2435,7 @@ class WorkbenchPage(QWidget):
         if item_ids:
             placeholders = ",".join("?" for _ in item_ids)
             selected_rows = self.conn.execute(
-                f"""SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
+                f"""SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price,
                            li.amount, sp.period_no, sp.direction
                     FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
                     WHERE li.id IN ({placeholders}) AND sp.project_id=?
@@ -2449,7 +2449,7 @@ class WorkbenchPage(QWidget):
             if key.startswith("code:"):
                 key_kind, key_value = "code", key[5:]
                 comparison_rows = self.conn.execute(
-                    """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
+                    """SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price,
                               li.amount, sp.period_no, sp.direction
                        FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
                        WHERE sp.project_id=? AND li.code=?
@@ -2461,7 +2461,7 @@ class WorkbenchPage(QWidget):
                 key_kind, key_value = "name", key[5:]
                 comparison_rows = [
                     candidate for candidate in self.conn.execute(
-                        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
+                        """SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price,
                                   li.amount, sp.period_no, sp.direction
                            FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
                            WHERE sp.project_id=?
