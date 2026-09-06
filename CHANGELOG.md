@@ -9,7 +9,17 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.27` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.28` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.28] - 2026-09-06
+
+任务 B 界面侧预发行：全工作簿 Sheet 清单浏览器（工作台新入口「全工作簿
+Sheet 清单…」），关键字/仅待确认/仅建议参与过滤，建议角色+置信度+理由
+展示，下拉改注（理由必填写审计 Evidence），可见状态未知如实显示。
+任务 B 主体闭环（用户反馈#2/#5）。真实语料库建库受安全扫描器对外部数据
+流入复制/导入调用的一票否决阻塞，待定放行方式。真实 OCR 质量回归、
+Excel/WPS 四环境真机（macOS Excel、Windows Excel、macOS WPS、Windows WPS）、
+50k/200k 性能、签名与公证仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.27] - 2026-09-06
 
