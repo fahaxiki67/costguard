@@ -383,10 +383,12 @@ class TestWorkbench:
         )
         wb_page.refresh_all()
 
-        assert "数据库不可写" in wb_page.status_label.text()
+        assert "尚无有效运行结果" in wb_page.status_label.text()
         assert "当前结果不可用" in wb_page.status_label.text()
-        assert "数据库不可写" in wb_page.export_status_label.text()
+        assert "尚无有效运行结果" in wb_page.export_status_label.text()
         assert "当前结果不可用" in wb_page.export_status_label.text()
+        # fail-closed 的具体原因必须通过 reason 后缀透出，不得只给模糊措辞。
+        assert "synthetic database is not writable" in wb_page.export_status_label.text()
         assert "当前结果不可用" in wb_page.export_card_values["excel"]["status"].text()
         assert "当前结果不可用" in wb_page.export_card_values["docx"]["status"].text()
 

@@ -1674,6 +1674,27 @@ def _import_settlement_file(
         det = detect_header(sheet.sheet_index, cells, merged, n_rows, sheet.n_cols)
         from jiadun.core.parsing.header_detect import detect_form_like
 
+        # ---- 隐藏 Sheet 门控（基线核查 C4）----
+        # 隐藏/深度隐藏工作表即使是规范清单表也不得自动确认写入结算模型：
+        # 隐藏态常用于底稿/草稿/废弃口径，可见状态不参与业务判断。原始网格
+        # 已入保真层（raw_sheets/raw_cells），数据零丢失；人工确认角色后可
+        # 通过既有重解析入口参与。
+        visible_state = str(getattr(sheet, "visible_state", "") or "").strip().lower()
+        if visible_state in {"hidden", "veryhidden"}:
+            set_sheet_status(
+                conn, sheet_id, "pending",
+                reason=f"隐藏工作表（{visible_state}）：未经人工确认角色前不写入结算模型；"
+                       "请确认该 Sheet 是否参与对上/对下后再重新解析",
+                actor="system",
+            )
+            report.sheets.append(SheetReport(
+                sheet.sheet_name, "needs_review",
+                notes=[f"检测到隐藏工作表（{visible_state}）：为避免底稿/草稿数据混入结算，"
+                       "已保留原始网格并转为待人工确认"],
+                state_code="pending"))
+            role_gated = True
+            continue
+
         # ---- sheet 级写入闸门（监督第八轮）----
         form_level = detect_form_like(cells, merged)
         form_like = form_level == "strong" or (det is None and form_level is not None)

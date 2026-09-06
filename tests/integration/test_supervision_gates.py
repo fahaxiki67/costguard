@@ -109,13 +109,16 @@ class TestDirectionSeparation:
 
     def test_aggregate_by_direction_not_crossed(self, mixed_direction_project):
         info, conn, pdir, up_pid, down_pid = mixed_direction_project
+        # 聚合键含归一特征与单位（fix/v0127-evidence-gates 口径）：
+        # 同码同名同单位仍是同一清单，方向之间绝不互串。
+        k1 = excel_export.group_key_of("K1", "同一清单", "", "m3")
         ups = {a.item_key: a for a in excel_export.aggregate_project(conn, info.project_id, direction="upward")}
         downs = {a.item_key: a for a in excel_export.aggregate_project(conn, info.project_id, direction="downward")}
-        assert ups["code:K1"].cum_amount == Decimal("100")
-        assert downs["code:K1"].cum_amount == Decimal("200")
+        assert ups[k1].cum_amount == Decimal("100")
+        assert downs[k1].cum_amount == Decimal("200")
         # per_period 键为 period_id，两方向各自一期，互不串
-        assert list(ups["code:K1"].per_period) == [up_pid]
-        assert list(downs["code:K1"].per_period) == [down_pid]
+        assert list(ups[k1].per_period) == [up_pid]
+        assert list(downs[k1].per_period) == [down_pid]
         # 只有调用方明确声明项目跨方向展示时，才允许全项目 = 300
         with pytest.raises(ValueError, match="direction"):
             excel_export.aggregate_project(conn, info.project_id)
@@ -124,7 +127,7 @@ class TestDirectionSeparation:
                 conn, info.project_id, include_all_directions=True
             )
         }
-        assert alls["code:K1"].cum_amount == Decimal("300")
+        assert alls[k1].cum_amount == Decimal("300")
 
     def test_summary_sheets_separated(self, mixed_direction_project):
         info, conn, pdir, *_ = mixed_direction_project

@@ -265,7 +265,8 @@ class TestAggregate:
         aggs = aggregate.aggregate_project(conn, info.project_id)
         # 每个清单的累计 = DB 内同组各期非小计行之和（同源核对）
         rows = conn.execute(
-            """SELECT li.quantity, li.amount, li.code, li.name, sp.period_no FROM line_items li
+            """SELECT li.quantity, li.amount, li.code, li.name, li.feature, li.unit,
+               sp.period_no FROM line_items li
                JOIN settlement_periods sp ON sp.id=li.period_id
                WHERE sp.project_id=? AND (li.flags_json NOT LIKE '%"subtotal": true%')""",
             (info.project_id,),
@@ -273,7 +274,7 @@ class TestAggregate:
         assert rows
         by_key = {}
         for r in rows:
-            key = aggregate.group_key_of(r["code"], r["name"] or "")
+            key = aggregate.group_key_of(r["code"], r["name"] or "", r["feature"], r["unit"])
             by_key.setdefault(key, [D(0), D(0)])
             if r["quantity"]:
                 by_key[key][0] += D(r["quantity"])

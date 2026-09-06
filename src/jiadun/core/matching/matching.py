@@ -299,6 +299,23 @@ def _match_items_for_direction(
                 continue
             score = fuzz.token_set_ratio(normalize_name(na), normalize_name(nb))
             if score >= SIM_CONFIRMED:
+                merged_units = ga.units | gb.units
+                if len(merged_units) > 1:
+                    # 名称高度相似但归一单位不同：与同名精确/同码路径同口径，
+                    # 必须判不可比并禁止合并（原则 7/9）。两组行保留在同一组内
+                    # 供人工拆分，组内保留双单位证据，绝不产出 probable 候选。
+                    ga.item_ids.extend(gb.item_ids)
+                    ga.names |= gb.names
+                    ga.codes |= gb.codes
+                    ga.units = merged_units
+                    ga.level = INCOMPARABLE
+                    ga.method = "fuzzy_name"
+                    ga.score = 0.0
+                    ga.notes.append(
+                        f"名称相似 {score:.0f}%，但单位不一致 {sorted(merged_units)}：不可比，禁止合并"
+                    )
+                    used.add(gb.group_key)
+                    break
                 ga.item_ids.extend(gb.item_ids)
                 ga.names |= gb.names
                 ga.level = PROBABLE
@@ -311,6 +328,10 @@ def _match_items_for_direction(
                 ga.level = SUSPECTED
                 ga.score = score / 100
                 ga.notes.append(f"与「{nb}」相似 {score:.0f}%，疑似匹配待人工确认")
+            elif score >= SIM_SUSPECTED:
+                # 两个高概率组（如 name_exact）高度相似但不合并：至少留下
+                # 疑似相关提示，避免复核队列完全看不到两者可能指同一清单。
+                ga.notes.append(f"与「{nb}」相似 {score:.0f}%，疑似相关，请人工核对")
     return sorted(result, key=lambda g: g.group_key)
 
 

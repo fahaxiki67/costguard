@@ -505,21 +505,28 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
     - 缺失值不补 0：整期无有效值 → None（待补资料）。
     """
     rows = conn.execute(
-        """SELECT li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
+        """SELECT li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price, li.amount,
                   li.flags_json, sp.period_no AS pno, sp.direction AS dir
            FROM line_items li JOIN settlement_periods sp ON sp.id = li.period_id
            WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
         (project_id,),
     ).fetchall()
-    # 归组键与 aggregate.group_key_of 同口径：code 优先；同方向同码跨期改名
-    # 仍是同一序列（名称变化逐期保留并加变更提示，不按名称拆分）。
+    # 归组键与 aggregate.group_key_of 同口径：code 优先，名称归一，特征/单位
+    # 归一后参与键——不同单位天然分行，绝不跨单位求差（名称变化逐期保留并加
+    # 变更提示，不按名称拆分）。
+    from jiadun.core.matching.matching import normalize_name
+
     series: dict[tuple[str, str], dict[int, dict]] = {}
     series_names: dict[tuple[str, str], set] = {}
     for r in rows:
         flags = json.loads(r["flags_json"] or "{}")
         if flags.get("subtotal"):
             continue
-        key = (r["dir"] or "unknown", "code:" + r["code"] if r["code"] else "name:" + (r["name"] or ""))
+        base = "code:" + r["code"] if r["code"] else "name:" + normalize_name(r["name"] or "")
+        key = (
+            (r["dir"] or "unknown"),
+            base + f"|f:{normalize_name(r['feature'] or '')}|u:{_norm_unit_local(r['unit'])}",
+        )
         by_period = series.setdefault(key, {})
         series_names.setdefault(key, set()).add(r["name"] or "")
         pp = by_period.setdefault(int(r["pno"]), {
@@ -559,9 +566,11 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
     out = []
     for key, by_period in series.items():
         direction, key_str = key
-        code = key_str[5:] if key_str.startswith("code:") else ""
+        base_key = key_str[5:] if key_str.startswith("code:") else ""
+        code = base_key.split("|f:", 1)[0]
         out.append({
             "direction": direction, "code": code,
+            "item_key": key_str,
             "names": series_names[key], "by_period": by_period,
         })
     return sorted(out, key=lambda x: (x["direction"], x["code"]))
@@ -589,7 +598,8 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
     - 按 direction 分组，同方向内按 period_no 比较；对上与对下绝不互比；
     - 归组 code 优先（同码跨期改名仍是同一序列，名称逐期保留并加变更提示）；
     - 单价来自可追溯原始 unit_price；同期同组多价 → 标"多价待复核"，不得平均；
-    - 不可比/缺失期是断点：清空比较基准，后续可比期作为新首期，绝不跨越强行比较；
+    - 不可比/缺失期/期间不连续是断点：清空比较基准，后续可比期作为新首期，
+      绝不跨越强行比较；
     - 差异列保留公式；缺失不补 0。
     """
     titles = (("单价差异表", "unit_price"), ("工程量差异表", "quantity"), ("金额差异表", "amount"))
@@ -601,13 +611,30 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
         ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
         _style_header(ws, 1, 8)
         series = all_series[field]
+        # 逻辑清单（不含单位）的多单位视图：同名同特征存在多个单位桶时，
+        # 每行都要让读者看到"分行列示、不可比跨单位比较"，不得静默拆行。
+        units_by_logical: dict[tuple[str, str], set] = {}
+        for item_series in series:
+            item_key: str = item_series["item_key"]
+            base = item_key.rsplit("|u:", 1)[0]
+            units_by_logical.setdefault((item_series["direction"], base), set()).add(
+                item_key.rsplit("|u:", 1)[1]
+            )
         r = 1
         for item in series:
+            multi_units = sorted(units_by_logical.get(
+                (item["direction"], item["item_key"].rsplit("|u:", 1)[0]), set()
+            ))
+            multi_note = (
+                f"；同类清单存在多个单位 {multi_units}，分行列示，不可比跨单位比较"
+                if len(multi_units) > 1 else ""
+            )
             ordered = sorted(item["by_period"].items(), key=lambda kv: kv[1]["period_no"])
             names = item["names"]
             first_name = item["by_period"][ordered[0][0]].get("name", "") if ordered else ""
-            prev: Decimal | None = None  # 上一可比期数值；不可比/缺失/单位变化即断点
+            prev: Decimal | None = None  # 上一可比期数值；不可比/缺失/单位变化/期间不连续即断点
             prev_units: set | None = None
+            prev_pno: int | None = None
             for _pid, pp in ordered:
                 r += 1
                 pno = pp["period_no"]
@@ -647,30 +674,46 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                     and prev_units
                     and not (pp["units"] & prev_units)
                 )
+                # 期间不连续：归一单位拆分（如 m² 期插在 m³ 序列中间）或缺失期
+                # 造成的空档。绝不跨空档取"上期值"——那会把不可比期静默隐藏
+                # （基线核查 C5 实证：第3期跨过 m² 期直接取到第1期）。
+                period_gap = prev_pno is not None and pno != prev_pno + 1
                 if isinstance(cur_val, Decimal) and unit_mismatch:
                     ws.cell(row=r, column=7, value="不可比（与上期单位不一致）")
                     ws.cell(row=r, column=8, value="不可比")
                     prev = None
                     prev_units = set(pp["units"])
                 elif isinstance(cur_val, Decimal):
-                    if prev is not None:
+                    if period_gap:
+                        ws.cell(row=r, column=7, value=(
+                            f"期间不连续（第{prev_pno}期与本期间存在不可比/缺失期），不做跨期比较"
+                        ))
+                        ws.cell(row=r, column=8, value="不可比" + multi_note)
+                    elif prev is not None:
                         ws.cell(row=r, column=6, value=prev)
                         ws.cell(row=r, column=7, value=f"=E{r}-F{r}")
                         if prev != 0:
                             ws.cell(row=r, column=8, value=f'=IF(F{r}=0,"不可比",(E{r}-F{r})/F{r})')
                             ws.cell(row=r, column=8).number_format = "0.00%"
                         else:
-                            ws.cell(row=r, column=8, value="不可比（上期为 0）")
+                            ws.cell(row=r, column=8, value="不可比（上期为 0）" + multi_note)
                     else:
-                        ws.cell(row=r, column=8, value="首期（无上期可比）")
+                        if multi_note:
+                            # 多单位逻辑清单的独立单位桶首期：差异列必须可见地
+                            # 说明"分行列示、不可比"，不得表现为普通首期。
+                            ws.cell(row=r, column=7, value="不可比" + multi_note)
+                            ws.cell(row=r, column=8, value="不可比")
+                        else:
+                            ws.cell(row=r, column=8, value="首期（无上期可比）")
                     prev = cur_val
                     prev_units = set(pp["units"]) if pp["units"] else None
                 else:
                     # 不可比/缺失期：断点——清空基准，绝不与前后期强行比较
                     ws.cell(row=r, column=7, value="不可比" if isinstance(cur_val, str) else "待补资料")
-                    ws.cell(row=r, column=8, value="不可比")
+                    ws.cell(row=r, column=8, value="不可比" + multi_note)
                     prev = None
                     prev_units = None
+                prev_pno = pno
                 for c in (5, 6, 7):
                     if isinstance(ws.cell(row=r, column=c).value, Decimal):
                         ws.cell(row=r, column=c).number_format = MONEY_FMT
@@ -1000,8 +1043,8 @@ def export_historical_price_sheet(
 def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction: str) -> dict[str, dict]:
     """按方向聚合：item_key -> {qty, amount, names}。缺失值不补 0。"""
     rows = conn.execute(
-        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
-                  li.flags_json FROM line_items li
+        """SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price,
+                  li.amount, li.flags_json FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
            WHERE sp.project_id=? AND sp.direction=?""",
         (project_id, direction),
@@ -1011,7 +1054,7 @@ def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction
         flags = json.loads(r["flags_json"] or "{}")
         if flags.get("subtotal"):
             continue
-        key = group_key_of(r["code"], r["name"] or "")
+        key = group_key_of(r["code"], r["name"] or "", r["feature"], r["unit"])
         agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
         agg["names"].add(r["name"] or "")
         assessment, _qty_missing, _price_missing = assess_amount(r)
@@ -1036,12 +1079,25 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
     if not up and not down:
         ws.append(["", "无可比数据：请先在期次管理中标记对上/对下方向", None, None, None, None, None,
                    "期次方向未标记时无法对比（不可比，不做强行比较）"])
+    # 同一逻辑清单（不含单位）在两侧各有单位桶且互不相同 → 该清单两侧单位
+    # 不同，分行列示后必须提示不可比，避免被误读为"一侧缺失"。
+    def _logical_units(bucket: dict[str, dict]) -> dict[str, set]:
+        result: dict[str, set] = {}
+        for key, _agg in bucket.items():
+            result.setdefault(key.rsplit("|u:", 1)[0], set()).add(
+                key.rsplit("|u:", 1)[1] if "|u:" in key else ""
+            )
+        return result
+
+    up_logical = _logical_units(up)
+    down_logical = _logical_units(down)
     keys = sorted(set(up) | set(down))
     r = 1
     for key in keys:
         r += 1
         u, d = up.get(key), down.get(key)
-        code = key[5:] if key.startswith("code:") else ""
+        base_key = key.rsplit("|u:", 1)[0]
+        code = base_key[5:].split("|f:", 1)[0] if base_key.startswith("code:") else ""
         names = sorted((u or d or {}).get("names") or {""})
         ws.cell(row=r, column=1, value=code)
         ws.cell(row=r, column=2, value=names[0])
@@ -1057,6 +1113,10 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
         if u and d and u["amount"] is not None and d["amount"] is not None:
             ws.cell(row=r, column=7, value=f"=E{r}-F{r}")
             ws.cell(row=r, column=7).number_format = MONEY_FMT
+        elif base_key in up_logical and base_key in down_logical and (
+            up_logical[base_key] != down_logical[base_key]
+        ):
+            ws.cell(row=r, column=8, value="同类清单两侧单位不同，分行列示（不可比，不做差值）")
         else:
             ws.cell(row=r, column=8, value="待补资料（一侧缺失，不做比较）")
         if u and d and set(map(str, u["names"])) != set(map(str, d["names"])):

@@ -1218,7 +1218,20 @@ def _signature_item(root: Path, version: str | None) -> dict[str, Any]:
             "not_available",
             detail="当前没有可核验的 dist/SHA256SUMS.txt。",
         )
-    text = sums.read_text(encoding="utf-8", errors="replace")
+    # read_bytes+decode 而非 read_text：read_text 默认通用换行会把 \r\n
+    # 归一成 \n，CRLF 检查将永远测不到（v0.1.27 发布资产即 CRLF 实证）。
+    text = sums.read_bytes().decode("utf-8", errors="replace")
+    if "\r" in text:
+        # CRLF 行尾会让 macOS/Linux 的 `shasum -c`/`sha256sum -c` 按带 \r 的
+        # 文件名寻找条目，开箱即报 FAILED open or read（v0.1.27 实证）。
+        # 拒绝签发签名证据，要求以 LF 重新生成。
+        return _item(
+            "package_signature",
+            "安装包签名状态",
+            "failed",
+            detail="SHA256SUMS.txt 含 CRLF 行尾：标准 `shasum -c`/`sha256sum -c` "
+                   "会因行尾 \\r 找不到条目（fail-closed）；请用 LF 行尾重新生成。",
+        )
     version_token = f"{version}-" if version else ""
     has_current = version_token in text or (version is not None and f"{version}." in text)
 

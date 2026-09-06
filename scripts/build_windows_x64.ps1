@@ -168,7 +168,10 @@ $lines = foreach ($a in $artifacts) {
     $h = (Get-FileHash $a -Algorithm SHA256).Hash.ToLower()
     "$h  $(Split-Path $a -Leaf)"
 }
-$lines | Set-Content -Encoding ascii "dist/SHA256SUMS.txt"
+# SHA256SUMS 必须用 LF 行尾：Set-Content 在 Windows 上默认写 CRLF，
+# 会让 macOS/Linux 的 `shasum -c`/`sha256sum -c` 直接 FAILED open or read。
+$sumsText = (($lines -join "`n") + "`n")
+[IO.File]::WriteAllText((Join-Path $RepoRoot "dist/SHA256SUMS.txt"), $sumsText)
 
 Write-Host ""
 Write-Host "构建完成" -ForegroundColor Green

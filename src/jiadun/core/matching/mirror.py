@@ -242,6 +242,15 @@ def build_mirror_comparison(
     rows = _load_match_rows(conn, project_id, row)
     upward = _aggregate_side(rows, "upward")
     downward = _aggregate_side(rows, "downward")
+    # 两侧各只有一种归一单位且互不相同时，数量/单价/金额属于不同计量口径
+    # （如 m² 对 m³），差值没有业务含义，必须整行判不可比而不是给出数值差。
+    upward_units = {_normal_unit(v) for v in upward["unit_values"] if v not in (None, "")}
+    downward_units = {_normal_unit(v) for v in downward["unit_values"] if v not in (None, "")}
+    cross_unit_incomparable = (
+        len(upward_units) == 1
+        and len(downward_units) == 1
+        and upward_units != downward_units
+    )
     labels = {
         "code": "编码", "name": "名称", "feature": "项目特征", "unit": "单位",
         "quantity": "数量", "unit_price": "单价", "amount": "金额",
@@ -250,9 +259,14 @@ def build_mirror_comparison(
     for field in MIRROR_FIELDS:
         left = upward[field]
         right = downward[field]
-        difference, status = _compare_value(left, right, field)
-        if left is None or right is None:
-            status = "待补资料/缺一侧"
+        if cross_unit_incomparable and field in NUMERIC_FIELDS:
+            # 跨单位不可比较"某侧缺值"优先级更高：整行处于不同计量口径时，
+            # 即使某侧恰好缺失也不得表述成"待补资料"（补了也不能比）。
+            difference, status = None, "不可比（两侧单位不同）"
+        else:
+            difference, status = _compare_value(left, right, field)
+            if left is None or right is None:
+                status = "待补资料/缺一侧"
         if upward["multiple_values"] or downward["multiple_values"]:
             status = "待人工确认（同侧多值）"
         rate = None
@@ -271,6 +285,8 @@ def build_mirror_comparison(
         reason = "任一方向没有对应清单行，不能认定匹配"
     elif upward["multiple_values"] or downward["multiple_values"]:
         reason = "同一方向存在多个候选值，需人工逐项确认"
+    elif cross_unit_incomparable:
+        reason = "两侧单位不同（如 m² 对 m³），数量/单价/金额不可比，不做差值计算"
     else:
         reason = row["review_note"] or "按当前匹配规则生成左右镜像复核"
     evidence_rows = conn.execute(

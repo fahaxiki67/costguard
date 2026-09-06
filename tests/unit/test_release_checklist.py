@@ -732,3 +732,18 @@ def test_signature_item_rejects_stale_version_even_if_hashes_match(tmp_path):
 
     assert item["status"] == "not_available"
     assert "不包含当前版本" in item["detail"]
+
+
+def test_signature_item_rejects_crlf_sums(tmp_path):
+    """SHA256SUMS.txt 含 CRLF 行尾时必须 failed：shasum -c 等标准校验器开箱即败。"""
+    zip_digest = _write_signature_artifact(
+        tmp_path / "dist" / "Jiadun-0.1.99-windows-x64-portable.zip", b"zip-bytes"
+    )
+    (tmp_path / "dist" / "SHA256SUMS.txt").write_bytes(
+        f"{zip_digest}  Jiadun-0.1.99-windows-x64-portable.zip\r\n".encode("ascii")
+    )
+
+    item = release_checklist._signature_item(tmp_path, "0.1.99")
+
+    assert item["status"] == "failed"
+    assert "CRLF" in item["detail"]

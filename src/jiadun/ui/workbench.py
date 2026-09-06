@@ -411,7 +411,7 @@ def project_status_summary(conn, project_id: int) -> str:
     if not summary.run_availability["available"]:
         # 运行级边界优先于所有历史统计；不要把 current_scope 的空集显示成
         # “尚未校核”，也不要让旧成功结果继续成为工作台的当前状态。
-        return f"项目状态：{summary.statuses['project_status']} · 数据库不可写 · 当前结果不可用"
+        return f"项目状态：{summary.statuses['project_status']} · 尚无有效运行结果 · 当前结果不可用"
     source_files = summary.source_files
     n = summary.pending["sheets"]
     high_open = summary.pending["high_risk"]
@@ -753,7 +753,7 @@ class WorkbenchPage(QWidget):
             self.overview_values[key].setText(value)
         if not summary.run_availability["available"]:
             self._next_action = "crosscheck"
-            suggestion = "数据库不可写，当前结果不可用；请修复写入问题后重新运行校核"
+            suggestion = "尚无有效运行结果，当前结果不可用；请完成人工确认或重新运行校核"
         elif summary.statuses["project_status_code"] == "cannot_conclude":
             self._next_action = "crosscheck" if period_total else "import"
             suggestion = (
@@ -3021,7 +3021,7 @@ class WorkbenchPage(QWidget):
             reason = availability.get("reason")
             suffix = f"（{reason}）" if reason else ""
             self.export_status_label.setText(
-                f"数据库不可写，当前结果不可用{suffix}；不能登记或生成当前 Excel/Word 成果。"
+                f"尚无有效运行结果，当前结果不可用{suffix}；不能登记或生成当前 Excel/Word 成果。"
             )
             export_dir = Path(self.project_dir) / "exports"
             for key, kind in (("excel", "excel"), ("docx", "docx")):
@@ -3038,7 +3038,7 @@ class WorkbenchPage(QWidget):
                 else:
                     card["generated"].setText("最近生成：—")
                 card["status"].setText(
-                    "文件状态：当前结果不可用（数据库不可写，旧文件不得视为 current）"
+                    "文件状态：当前结果不可用（尚无有效运行结果，旧文件不得视为 current）"
                 )
             return
         self.export_status_label.setText(_export_review_status_text(summary))

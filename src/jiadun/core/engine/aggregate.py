@@ -156,10 +156,23 @@ def _add_decimal(current: Decimal | None, value: Decimal | None) -> Decimal | No
     return value if current is None else current + value
 
 
-def group_key_of(code: str | None, name: str) -> str:
+def group_key_of(code: str | None, name: str, feature: str | None = "", unit: str | None = "") -> str:
+    """聚合归组键：code/归一名称 + 归一特征 + 归一单位。
+
+    单位必须参与归组：m² 与 m³ 即便同名同码也是不同计量口径，绝不允许进入
+    同一累计（不同单位不可比，禁止跨单位求和）。特征参与归组：同名称不同
+    特征的清单行语义不同，也不得合并。名称归一与 matching.normalize_name
+    同口径（去空白/标点、全角转半角、小写），保证"水泥砂浆 楼地面"与
+    "水泥砂浆楼地面"聚合为同一清单。
+    """
+    from jiadun.core.anomalies.rules import _norm_unit
+    from jiadun.core.matching.matching import normalize_name
+
+    feature_part = normalize_name(feature or "")
+    unit_part = _norm_unit(unit or "")
     if code:
-        return f"code:{code}"
-    return f"name:{name}"
+        return f"code:{code}|f:{feature_part}|u:{unit_part}"
+    return f"name:{normalize_name(name)}|f:{feature_part}|u:{unit_part}"
 
 
 def load_line_items(conn: sqlite3.Connection, project_id: int,
@@ -248,7 +261,7 @@ def aggregate_project(
         if flags.get("subtotal"):
             continue
         name = row["name"] or f"<第{row['period_no']}期第{row['id']}行无名称>"
-        key = group_key_of(row["code"], name)
+        key = group_key_of(row["code"], name, row["feature"], row["unit"])
         agg = aggs.setdefault(key, ItemAggregate(item_key=key, code=row["code"] or "", name=name))
 
         qty, qty_missing = _dec_or_none(row["quantity"])
@@ -380,6 +393,22 @@ def aggregate_project(
                 agg.wavg_price = weighted_avg_price(effective_amt_total, qty_total)
         elif effective_amt_total is None or agg.quantity_required:
             agg.status = "incomplete"
+    # 同码/同名+同特征存在多个单位桶：键中含单位已经天然分行累计，这里补
+    # 显式"不可比"标记，防止 UI/报表把多个单位桶误读为同一清单的多个期次。
+    logical_buckets: dict[str, list[ItemAggregate]] = {}
+    for agg in aggs.values():
+        base = agg.item_key.rsplit("|u:", 1)[0]
+        logical_buckets.setdefault(base, []).append(agg)
+    for bucket in logical_buckets.values():
+        if len(bucket) < 2:
+            continue
+        unit_parts = sorted(agg.item_key.rsplit("|u:", 1)[1] for agg in bucket)
+        for agg in bucket:
+            if agg.status == "ok":
+                agg.status = "incomparable"
+            agg.warnings.append(
+                f"同名同特征存在多个单位 {unit_parts}：不同单位不可比，未跨单位汇总"
+            )
     if flag_updates and persist_derived_flags:
         with conn:
             conn.executemany("UPDATE line_items SET flags_json=? WHERE id=?", flag_updates)
