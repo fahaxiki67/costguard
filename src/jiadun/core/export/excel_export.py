@@ -474,17 +474,18 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     aggs = aggregate_project(conn, project_id, direction=direction)
     ws = wb.create_sheet(f"{_business_direction(direction)}累计表")
     header = ["清单编码", "清单名称", "单位"] + [f"第{p['period_no']}期金额" for p in periods] + \
-             ["累计数量", "累计金额", "加权平均单价", "状态"]
+             ["累计数量", "累计金额", "加权平均单价", "项目特征", "状态"]
     ws.append(header)
     _style_header(ws, 1, len(header))
     for agg in aggs:
-        row = [agg.code, agg.name, ""]
+        row = [agg.code, agg.name, agg.unit]
         for p in periods:
             pp = agg.per_period.get(p["id"])  # period_id 键：防对上/对下同期号串表
             row.append(_num(pp["effective_amount"], money=True) if pp else None)
         row.append(_num(agg.cum_qty))
         row.append(_num(agg.cum_amount, money=True))
         row.append(_num(agg.wavg_price, money=True))
+        row.append(agg.feature)
         status = {"ok": "正常", "incomplete": "待补资料", "incomparable": "不可比"}[agg.status]
         row.append(status + ("；".join(agg.warnings[:2]) if agg.warnings else ""))
         ws.append(row)
@@ -531,7 +532,8 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
         series_names.setdefault(key, set()).add(r["name"] or "")
         pp = by_period.setdefault(int(r["pno"]), {
             "qty": None, "amount": None, "effective_amount": None,
-            "amount_source": "missing", "prices": set(), "units": set(), "qty_missing": False,
+            "amount_source": "missing", "prices": set(), "units": set(), "features": set(),
+            "qty_missing": False,
             "period_no": int(r["pno"]), "name": r["name"] or "",
         })
         if r["quantity"] is not None:
@@ -563,6 +565,8 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
                 pass
         if r["unit"]:
             pp["units"].add(_norm_unit_local(r["unit"]))
+        if r["feature"]:
+            pp["features"].add(str(r["feature"]).strip())
     out = []
     for key, by_period in series.items():
         direction, key_str = key
@@ -608,8 +612,9 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
 
     for title, field in titles:
         ws = wb.create_sheet(title)
-        ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
-        _style_header(ws, 1, 8)
+        ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率",
+                   "项目特征", "单位"])
+        _style_header(ws, 1, 10)
         series = all_series[field]
         # 逻辑清单（不含单位）的多单位视图：同名同特征存在多个单位桶时，
         # 每行都要让读者看到"分行列示、不可比跨单位比较"，不得静默拆行。
@@ -665,6 +670,8 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                 ws.cell(row=r, column=3, value=name_cell)
                 ws.cell(row=r, column=4, value=f"第{pno}期")
                 ws.cell(row=r, column=5, value=cur_val)
+                ws.cell(row=r, column=9, value="；".join(sorted(pp["features"])))
+                ws.cell(row=r, column=10, value="；".join(sorted(pp["units"])))
 
                 # 跨期单位变化：与上一可比期单位无交集 → 不可比断点
                 unit_mismatch = (
@@ -1055,8 +1062,15 @@ def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction
         if flags.get("subtotal"):
             continue
         key = group_key_of(r["code"], r["name"] or "", r["feature"], r["unit"])
-        agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
+        agg = out.setdefault(
+            key,
+            {"qty": None, "amount": None, "names": set(), "features": set(), "units": set()},
+        )
         agg["names"].add(r["name"] or "")
+        if r["feature"]:
+            agg["features"].add(str(r["feature"]).strip())
+        if r["unit"]:
+            agg["units"].add(_norm_unit_local(r["unit"]))
         assessment, _qty_missing, _price_missing = assess_amount(r)
         for field, val in (("qty", r["quantity"]), ("amount", assessment.effective)):
             if val is not None:  # "0" 是有效值参与累计；缺失(None)不参与也不补 0
@@ -1072,8 +1086,9 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
     """对上对下对比表：同一清单的对上累计 vs 对下累计（差异列为公式）。"""
     ws = wb.create_sheet("对上对下对比表")
     ws.append(["清单编码", "清单名称", "对上累计数量", "对下累计数量", "对上累计金额",
-               "对下累计金额", "金额差异(公式)", "口径说明"])
-    _style_header(ws, 1, 8)
+               "对下累计金额", "金额差异(公式)", "口径说明", "对上特征", "对下特征",
+               "对上单位", "对下单位"])
+    _style_header(ws, 1, 12)
     up = _aggregate_by_direction(conn, project_id, "upward")
     down = _aggregate_by_direction(conn, project_id, "downward")
     if not up and not down:
@@ -1121,6 +1136,10 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
             ws.cell(row=r, column=8, value="待补资料（一侧缺失，不做比较）")
         if u and d and set(map(str, u["names"])) != set(map(str, d["names"])):
             ws.cell(row=r, column=8, value="两侧名称不一致，请核实归组")
+        ws.cell(row=r, column=9, value="；".join(sorted((u or {}).get("features", set()))))
+        ws.cell(row=r, column=10, value="；".join(sorted((d or {}).get("features", set()))))
+        ws.cell(row=r, column=11, value="；".join(sorted((u or {}).get("units", set()))))
+        ws.cell(row=r, column=12, value="；".join(sorted((d or {}).get("units", set()))))
         for c in (3, 4, 5, 6):
             ws.cell(row=r, column=c).number_format = MONEY_FMT
     _autowidth(ws)

@@ -15,6 +15,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
+from jiadun.core.anomalies.rules import _norm_unit
 from jiadun.core.contracts import run_contract
 from jiadun.core.engine.money import (
     Decimal,
@@ -33,6 +34,8 @@ class ItemAggregate:
     item_key: str  # 归组键：code 优先；无 code 用 'name:<名称>'
     code: str
     name: str
+    feature: str = ""
+    unit: str = ""
     # period_id -> raw/calculated/effective amounts；键用 period_id 防止对上/对下同期号串表。
     # amount/raw_amount 保留原始合价；effective_amount 仅用于可复算累计和持久化。
     per_period: dict[int, dict] = field(default_factory=dict)
@@ -165,7 +168,6 @@ def group_key_of(code: str | None, name: str, feature: str | None = "", unit: st
     同口径（去空白/标点、全角转半角、小写），保证"水泥砂浆 楼地面"与
     "水泥砂浆楼地面"聚合为同一清单。
     """
-    from jiadun.core.anomalies.rules import _norm_unit
     from jiadun.core.matching.matching import normalize_name
 
     feature_part = normalize_name(feature or "")
@@ -262,7 +264,16 @@ def aggregate_project(
             continue
         name = row["name"] or f"<第{row['period_no']}期第{row['id']}行无名称>"
         key = group_key_of(row["code"], name, row["feature"], row["unit"])
-        agg = aggs.setdefault(key, ItemAggregate(item_key=key, code=row["code"] or "", name=name))
+        agg = aggs.setdefault(
+            key,
+            ItemAggregate(
+                item_key=key,
+                code=row["code"] or "",
+                name=name,
+                feature=(row["feature"] or "").strip(),
+                unit=_norm_unit(row["unit"] or ""),
+            ),
+        )
 
         qty, qty_missing = _dec_or_none(row["quantity"])
         amount_assessment, amount_quantity_missing, _price_missing = assess_amount(row)
