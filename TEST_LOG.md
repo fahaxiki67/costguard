@@ -92,6 +92,13 @@
 - 隔离 `inspect_file` 重放两次：导入成功，目标页均为 `confirmed`、2 行明细；其余 3 个 Sheet 保持角色待确认，整体 `partial`/待人工。
 - 该探针验证人工映射后的材料明细抽取和剩余角色门控，不形成材料采购或结算金额结论。
 
+### 2026-09-08 03:22：提交绑定的完整私有验收
+
+- 运行：`run_20260908_032216_052490`；运行命令、Git commit、代码树哈希、源码哈希和工作树洁净状态保存在被忽略的 `local_private_data/real_acceptance/acceptance_run_manifest_20260908.json`。
+- 绑定提交：`07d7a265`；23/23 文件导入成功，处理前后副本 SHA-256 一致，修改副本为空。
+- T-ERG-05 `材料调差` 仍为 9 行明细、2 行汇总且整体待人工；T-ERG-08 仍为 `pending_wps_with_findings`、`difference_open`，没有把提交绑定误写成正式业务通过。
+- 报告期次表的字段已改为“候选控制内部状态”，并明确该状态只描述当前文件内 A/B/C 候选路径关系，不代表与其他源表或汇总层一致。
+
 ## 回归验证
 
 - `QT_QPA_PLATFORM=offscreen uv run pytest -q`：全套测试退出码 0（100%，3 个跳过）；仅有既有 `zipfile` 重复条目警告，无失败。

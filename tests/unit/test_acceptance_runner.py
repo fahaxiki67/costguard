@@ -1166,6 +1166,8 @@ def test_acceptance_report_labels_candidate_control_and_lists_open_bridge(tmp_pa
     assert "C/候选控制" in text
     assert "A/B结果一致性" in text
     assert "结果一致（共享抽取器，独立性未证明）" in text
+    assert "候选控制内部状态" in text
+    assert "A/B/C候选内部一致" in text
     assert "C来源" in text
     assert "F.1 分部分项清单（第188行第8列）" in text
     assert "## 人工控制桥接与差异" in text

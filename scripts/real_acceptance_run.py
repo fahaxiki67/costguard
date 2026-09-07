@@ -39,6 +39,11 @@ CONTROL_STATUS_ZH = {
     "passed": "控制值一致", "difference_open": "控制差异待复核",
     "bridged_pending_review": "已记录桥接，待复核",
 }
+CANDIDATE_CONTROL_STATUS_ZH = {
+    "match": "A/B/C候选内部一致",
+    "diff": "候选控制与 A 存在差异",
+    "not_available": "候选控制不可用",
+}
 AB_STATUS_ZH = {
     "match": "一致", "diff": "存在差异", "incomplete": "数据不完整",
     "ab_passed": "结果一致（共享抽取器，独立性未证明）",
@@ -583,7 +588,9 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
             level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                         "insufficient": "校核不充分"}
             lines.append("")
-            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C候选值 | C来源 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
+            lines.append("> “候选控制内部状态”仅表示当前文件内 A/B/C 候选路径关系，不代表与其他源表或汇总层一致。")
+            lines.append("")
+            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C候选值 | C来源 | A-B差 | 控制差 | 候选控制内部状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
             lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for c in dpc:
                 lines.append(
@@ -593,7 +600,7 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
                     f"| {_report_value(c.get('A'))} | {_report_value(c.get('B'))} | {_report_value(c.get('C_subtotal'))} "
                     f"| {_control_source_label(c.get('C_source'))} | {_report_value(c.get('diff_ab'))} "
                     f"| {_report_value(c.get('control_diff'))} | "
-                    f"{CONTROL_STATUS_ZH.get(c.get('control_status'), '待复核')} "
+                    f"{CANDIDATE_CONTROL_STATUS_ZH.get(c.get('control_status'), '待复核')} "
                     f"| {_report_value(c.get('detail_rows'))} | {_report_value(c.get('excluded_subtotal_rows'))} "
                     f"| {_report_value(c.get('excluded_title_rows'))} | {_report_value(c.get('pending_sheets'))} "
                     f"| {_report_value(c.get('range_unproven_sheets', 0))} |")
