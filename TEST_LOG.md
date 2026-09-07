@@ -123,6 +123,12 @@
 - 根因是文件名含“汇总/核销/台账”语义，系统按文件级角色门控，不把分析汇总表强行抽取为结算明细；结果与预期 fail-closed 行为一致。
 - 源文件哈希、代码提交/树哈希和两次输出摘要保存在被忽略的 `local_private_data/real_acceptance/role_gate_probe_20260908.json`；未修改原始资料，不形成材料核销或结算金额结论。
 
+### 2026-09-08 04:15：双江财务台账角色门控探针
+
+- T-SJ-08 财务付款台账在临时隔离项目中只读重放两次；两次均导入成功、整体 `partial`，21 个 Sheet 全部保持角色待确认。
+- 台账类多 Sheet 文件未被强行写入结算明细；源文件哈希、代码提交/树哈希和两次输出摘要保存在被忽略的 `local_private_data/real_acceptance/ledger_role_gate_probe_20260908.json`。
+- 该探针只验证台账边界和 fail-closed 门控，不形成付款、结算或责任结论。
+
 ## 回归验证
 
 - `QT_QPA_PLATFORM=offscreen uv run pytest -q`：全套测试退出码 0（100%，3 个跳过）；仅有既有 `zipfile` 重复条目警告，无失败。
