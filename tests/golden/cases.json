@@ -254,7 +254,7 @@
           ]
         },
         "run_contract": {
-          "schema_version": 54,
+          "schema_version": 55,
           "run_id_present": true,
           "signature_present": true
         }

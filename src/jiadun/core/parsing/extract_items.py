@@ -40,10 +40,11 @@ class ItemDraft:
     unit_price: FieldSource | None = None
     amount: FieldSource | None = None
     tax_rate: FieldSource | None = None
+    tax_amount: FieldSource | None = None
     flags: dict = field(default_factory=dict)
 
 
-NUMERIC_FIELDS = {"quantity", "unit_price", "amount"}
+NUMERIC_FIELDS = {"quantity", "unit_price", "amount", "tax_amount"}
 
 
 def _text_at(cells: dict[tuple[int, int], str], anchors, row: int, col: int | None) -> str:
@@ -248,6 +249,7 @@ def persist_line_items(
                     it.unit_price.value if it.unit_price else None,
                     it.amount.value if it.amount else None,
                     it.tax_rate.value if it.tax_rate else None,
+                    it.tax_amount.value if it.tax_amount else None,
                     _evid_json(it.quantity),
                     _evid_json(it.unit_price),
                     _evid_json(it.amount),
@@ -256,8 +258,9 @@ def persist_line_items(
             )
         conn.executemany(
             """INSERT INTO line_items(period_id, sheet_id, code, name, feature, unit,
-               quantity, unit_price, amount, tax_rate, qty_evid, price_evid, amount_evid, flags_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               quantity, unit_price, amount, tax_rate, tax_amount,
+               qty_evid, price_evid, amount_evid, flags_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             rows,
         )
         n = conn.execute(

@@ -1895,6 +1895,45 @@ def _import_settlement_file(
              stored_start, stored_end, range_status, range_method,
              json.dumps(range_evidence, ensure_ascii=False)),
         )
+        # 任务书任务 C：税口径自动识别——只认表头明确文本（含税/不含税/价税合计），
+        # 独立税金列与税率数值不构成口径依据（C1/C5）；识别结果与依据写审计
+        # Evidence，人工可用「全工作簿 Sheet 清单」对话框改判（set_sheet_tax_basis）。
+        _header_texts = []
+        for _hr in range(det.header_row_lo, det.header_row_hi + 1):
+            for _col in range(1, sheet.n_cols + 1):
+                _t = str(cells.get((_hr, _col)) or "").strip()
+                if _t:
+                    _header_texts.append(_t)
+        from jiadun.core.engine.tax_basis import detect_tax_basis
+
+        _basis, _tax_reason = detect_tax_basis(" ".join(_header_texts))
+        from datetime import datetime as _dt
+
+        conn.execute(
+            """UPDATE raw_sheets SET tax_basis=?, tax_basis_source='auto',
+               tax_basis_reason=?, tax_basis_updated_at=?, tax_basis_actor='system'
+               WHERE id=? AND tax_basis_source IS NOT 'human'""",
+            (_basis, f"自动识别：{_tax_reason}",
+             _dt.now().isoformat(timespec="seconds"), sheet_id),
+        )
+        if _basis != "unknown" or "税金" in _tax_reason or "税额" in _tax_reason:
+            evidence_api.add_evidence(
+                conn, project_id, "tax_basis_detected",
+                f"Sheet「{sheet.sheet_name}」税口径自动识别：{_basis}（{_tax_reason}）",
+                steps=[{
+                    "step": "税口径表头文本识别",
+                    "sheet_id": sheet_id,
+                    "basis": _basis,
+                    "reason": _tax_reason,
+                    "note": "仅明确文本构成依据；税率数值与税金列不推断口径",
+                }],
+                sources=[{
+                    "sheet_id": sheet_id,
+                    "sheet_name": sheet.sheet_name,
+                    "original_name": sf.original_name,
+                }],
+                commit=False,
+            )
         period_ids.add(period_id)
 
         extract_items.persist_line_items(

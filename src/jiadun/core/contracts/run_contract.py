@@ -39,7 +39,9 @@ LEGACY_STALE_SIGNATURE = "legacy:stale"
 INVALIDATED_RUN_SIGNATURE = "run:invalidated"
 # v2（2026-09-05）：sheet_scope 纳入 list_kind（任务书 B5 角色变更失效），
 # 摘要计算收敛到 engine.sheet_digest 单一实现。旧签名全部失效并重建。
-CONTRACT_FORMAT_VERSION = 2
+# v3（2026-09-07）：sheet_scope 纳入 tax_basis/tax_basis_source（任务书 C
+# 税口径：口径变化即旧运行失效）。旧签名全部失效并重建。
+CONTRACT_FORMAT_VERSION = 3
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _TRANSACTION_COMMIT_FAILURE_ATTR = "_jiadun_transaction_commit_failure"
 FAIL_CLOSED_STATUS = "unavailable"
@@ -1345,7 +1347,7 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
                   rs.hidden_rows_json, rs.hidden_cols_json,
                   rs.sheet_status, rs.sheet_status_reason,
                   rs.sheet_status_updated_at, rs.sheet_status_actor,
-                  rs.list_kind,
+                  rs.list_kind, rs.tax_basis, rs.tax_basis_source,
                   pb.file_id, pb.parser, pb.parsed_at, pb.status AS batch_status,
                   pb.stats_json AS batch_stats_json, sf.sha256 AS file_sha256
            FROM raw_sheets rs
@@ -1380,6 +1382,10 @@ def _sheet_scope(conn: sqlite3.Connection, project_id: int) -> list[dict[str, An
             # B5：清单类型（人工角色标注）纳入合同范围。角色变更即签名变化，
             # 旧运行自动失效，旧结果不得伪装为当前分析。
             "list_kind": row["list_kind"],
+            # 任务 C6-10：税口径纳入合同范围。口径变化（含人工改判）即旧
+            # 运行失效——不同口径下的金额不可混用。
+            "tax_basis": row["tax_basis"],
+            "tax_basis_source": row["tax_basis_source"],
             "n_rows": int(row["n_rows"]),
             "n_cols": int(row["n_cols"]),
             "merged_ranges": _loads(row["merged_ranges_json"], []),

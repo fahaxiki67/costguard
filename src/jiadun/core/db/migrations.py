@@ -2925,6 +2925,22 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
                END""",
         ],
     ),
+    # v55：税口径结构化（任务书任务 C）。raw_sheets.tax_basis 记录该 Sheet
+    # 金额的含税/不含税状态：unknown=未确认（默认，不因"通常不含税"自动
+    # 认定）；included/excluded 只能来自表头明确文本（auto）或人工标注
+    # （human）；税率数值不构成口径依据。line_items.tax_amount 保存独立
+    # 税金/税额列的原值（有该列本身不推断口径，只登记事实）。
+    (
+        55,
+        [
+            "ALTER TABLE raw_sheets ADD COLUMN tax_basis TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE raw_sheets ADD COLUMN tax_basis_source TEXT",
+            "ALTER TABLE raw_sheets ADD COLUMN tax_basis_reason TEXT",
+            "ALTER TABLE raw_sheets ADD COLUMN tax_basis_updated_at TEXT",
+            "ALTER TABLE raw_sheets ADD COLUMN tax_basis_actor TEXT",
+            "ALTER TABLE line_items ADD COLUMN tax_amount TEXT",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -161,7 +161,7 @@ def list_workbook_sheets(
         for row in conn.execute(
             """SELECT rs.id AS sheet_id, rs.sheet_name, rs.n_rows, rs.n_cols,
                       rs.sheet_status, rs.sheet_status_reason, rs.list_kind,
-                      rs.visible_state,
+                      rs.visible_state, rs.tax_basis, rs.tax_basis_reason,
                       th.needs_review, th.col_map_json
                FROM raw_sheets rs
                LEFT JOIN table_headers th ON th.sheet_id=rs.id
@@ -186,7 +186,7 @@ def list_workbook_sheets(
                 item["suggest_confidence"] = confidence
                 if item["sheet_status"] == "confirmed":
                     reason += "（该页已人工确认进入结算模型）"
-                header_hint = _header_feature_hint(item.get("col_map_json"))
+                header_hint = _tax_feature_hint(item.get("tax_basis_reason"))
                 if header_hint:
                     reason += f"；{header_hint}"
                 item["suggest_reason"] = reason
@@ -203,29 +203,20 @@ def list_workbook_sheets(
     return result
 
 
-def _header_feature_hint(col_map_json: str | None) -> str:
-    """从表头列映射提取可读特征提示（如检测到合价/金额列）。"""
-    if not col_map_json:
+def _tax_feature_hint(tax_basis_reason: str | None) -> str:
+    """从导入时写下的税口径识别理由提取可读提示（表头文字级事实）。"""
+    text = str(tax_basis_reason or "")
+    if not text:
         return ""
-    try:
-        import json
-
-        col_map = json.loads(col_map_json)
-    except (TypeError, ValueError):
-        return ""
-    if not isinstance(col_map, dict):
-        return ""
-    labels = " ".join(str(v) for v in col_map.values())
-    hints = []
-    if "合价" in labels or "总价" in labels or "金额" in labels:
-        hints.append("检测到合价/金额列")
-    if "单价" in labels:
-        hints.append("检测到单价列")
-    if "工程量" in labels or "数量" in labels:
-        hints.append("检测到工程量/数量列")
-    if "税" in labels:
-        hints.append("检测到税金相关列")
-    return "；".join(hints)
+    if "口径冲突" in text:
+        return "表头含税/不含税说法冲突"
+    if "不含税" in text:
+        return "表头明确标注不含税"
+    if "含税" in text or "价税合计" in text:
+        return "表头明确标注含税/价税合计"
+    if "税金" in text or "税额" in text:
+        return "检测到独立税金/税额列（口径待人工确认）"
+    return ""
 
 
 def set_sheet_list_kind(
@@ -325,7 +316,9 @@ def carry_forward_sheet_decisions(
     def _sheet_rows(batch_id: int) -> dict[str, dict]:
         rows = conn.execute(
             """SELECT id, sheet_name, sheet_index, sheet_status, sheet_status_reason,
-                      sheet_status_updated_at, sheet_status_actor, list_kind
+                      sheet_status_updated_at, sheet_status_actor, list_kind,
+                      tax_basis, tax_basis_source, tax_basis_reason,
+                      tax_basis_updated_at, tax_basis_actor
                FROM raw_sheets WHERE batch_id=? ORDER BY sheet_index""",
             (int(batch_id),),
         ).fetchall()
@@ -357,11 +350,16 @@ def carry_forward_sheet_decisions(
             continue
         conn.execute(
             """UPDATE raw_sheets SET sheet_status=?, sheet_status_reason=?,
-                   sheet_status_updated_at=?, sheet_status_actor=?, list_kind=?
+                   sheet_status_updated_at=?, sheet_status_actor=?, list_kind=?,
+                   tax_basis=?, tax_basis_source=?, tax_basis_reason=?,
+                   tax_basis_updated_at=?, tax_basis_actor=?
                WHERE id=?""",
             (old["sheet_status"], old["sheet_status_reason"],
              old["sheet_status_updated_at"], old["sheet_status_actor"],
-             old["list_kind"], int(new_row["id"])),
+             old["list_kind"],
+             old["tax_basis"], old["tax_basis_source"], old["tax_basis_reason"],
+             old["tax_basis_updated_at"], old["tax_basis_actor"],
+             int(new_row["id"])),
         )
         carried_steps.append({
             "step": "重解析人工决策结转",
@@ -370,6 +368,7 @@ def carry_forward_sheet_decisions(
             "sheet_name": name,
             "sheet_status": old["sheet_status"],
             "list_kind": old["list_kind"],
+            "tax_basis": old["tax_basis"],
             "content_sha256": old_digest,
         })
 

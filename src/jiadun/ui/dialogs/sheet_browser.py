@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from jiadun.core.engine import sheet_inventory
+from jiadun.core.engine import tax_basis as tax_basis_api
 
 _LOG = logging.getLogger(__name__)
 
@@ -95,10 +96,10 @@ class SheetBrowserDialog(QDialog):
         layout.addLayout(filter_row)
 
         # ---- 清单表 ----
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             ["文件", "Sheet 名", "可见", "行×列", "状态",
-             "建议角色", "置信度", "建议理由", "人工标注"]
+             "建议角色", "置信度", "建议理由", "人工标注", "税口径", "税口径依据"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(7, QHeaderView.Stretch)
@@ -108,6 +109,7 @@ class SheetBrowserDialog(QDialog):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.selectionModel().currentRowChanged.connect(self._sync_combos)
         layout.addWidget(self.table, 1)
 
         # ---- 标注区 ----
@@ -117,10 +119,16 @@ class SheetBrowserDialog(QDialog):
         for kind in sheet_inventory.LIST_KINDS:
             self.kind_combo.addItem(_kind_label(kind), kind)
         note_row.addWidget(self.kind_combo)
+        note_row.addWidget(QLabel("税口径："))
+        self.tax_combo = QComboBox()
+        for basis in tax_basis_api.TAX_BASES:
+            self.tax_combo.addItem(tax_basis_api.BASIS_ZH[basis], basis)
+        note_row.addWidget(self.tax_combo)
         note_row.addWidget(QLabel("标注理由（必填，写入审计）："))
         self.reason_edit = QLineEdit()
         self.reason_edit.setPlaceholderText(
-            "例如：表头含 编码/名称/工程量/单价/合价，判定为分部分项清单"
+            "例如：表头含 编码/名称/工程量/单价/合价，判定为分部分项清单；"
+            "或「表头写明不含税单价」"
         )
         note_row.addWidget(self.reason_edit, 1)
         self.annotate_btn = QPushButton("保存标注")
@@ -155,6 +163,11 @@ class SheetBrowserDialog(QDialog):
             grid = f"{item['n_rows']}×{item['n_cols']}"
             visible = VISIBLE_ZH.get(item["visible_state"] or "", "未知")
             status = STATUS_ZH.get(str(item["sheet_status"] or ""), str(item["sheet_status"] or ""))
+            tax_reason = str(item.get("tax_basis_reason") or "")
+            tax_label = tax_basis_api.BASIS_ZH.get(
+                str(item.get("tax_basis") or "unknown"), "未确认")
+            if tax_reason and tax_reason.startswith("自动识别："):
+                tax_reason = tax_reason[len("自动识别："):]
             values = [
                 str(item["original_name"] or ""),
                 str(item["sheet_name"]),
@@ -165,6 +178,8 @@ class SheetBrowserDialog(QDialog):
                 str(item["suggest_confidence"] or ""),
                 str(item["suggest_reason"] or ""),
                 _kind_label(item["list_kind"]) if item["list_kind"] else "",
+                tax_label,
+                tax_reason,
             ]
             for c, text in enumerate(values):
                 cell = QTableWidgetItem(text)
@@ -181,22 +196,64 @@ class SheetBrowserDialog(QDialog):
             return None
         return self._rows[row]
 
+    def _sync_combos(self, current_row: int, _previous: int = -1) -> None:
+        """选中行时把下拉同步到该行已存值，防止保存时误改未触碰的项。"""
+        if current_row < 0 or current_row >= len(self._rows):
+            return
+        item = self._rows[current_row]
+        kind_index = self.kind_combo.findData(
+            str(item.get("list_kind") or sheet_inventory.LIST_KIND_UNKNOWN))
+        if kind_index >= 0:
+            self.kind_combo.setCurrentIndex(kind_index)
+        basis_index = self.tax_combo.findData(
+            str(item.get("tax_basis") or tax_basis_api.TAX_BASIS_UNKNOWN))
+        if basis_index >= 0:
+            self.tax_combo.setCurrentIndex(basis_index)
+
     def _annotate(self) -> None:
         sheet = self._selected_sheet()
         if sheet is None:
             return
         kind = self.kind_combo.currentData()
+        basis = self.tax_combo.currentData()
         reason = self.reason_edit.text().strip()
-        try:
-            sheet_inventory.set_sheet_list_kind(
-                self.conn, self.project_id, int(sheet["sheet_id"]), kind, reason=reason
-            )
-        except ValueError as exc:
-            QMessageBox.warning(self, "无法标注", str(exc))
+        if not reason:
+            QMessageBox.warning(self, "无法标注", "标注理由必填（写入审计）。")
             return
-        except Exception:  # noqa: BLE001 — UI 层兜底
-            _LOG.exception("写入 Sheet 标注失败")
-            QMessageBox.critical(self, "写入失败", "标注未能写入数据库，请重试。")
+        stored_kind = str(sheet.get("list_kind") or sheet_inventory.LIST_KIND_UNKNOWN)
+        stored_basis = str(sheet.get("tax_basis") or tax_basis_api.TAX_BASIS_UNKNOWN)
+        changed = False
+        if kind != stored_kind:
+            try:
+                sheet_inventory.set_sheet_list_kind(
+                    self.conn, self.project_id, int(sheet["sheet_id"]), kind,
+                    reason=reason,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "无法标注清单类型", str(exc))
+                return
+            except Exception:  # noqa: BLE001 — UI 层兜底
+                _LOG.exception("写入 Sheet 标注失败")
+                QMessageBox.critical(self, "写入失败", "标注未能写入数据库，请重试。")
+                return
+            changed = True
+        if basis != stored_basis:
+            try:
+                tax_basis_api.set_sheet_tax_basis(
+                    self.conn, self.project_id, int(sheet["sheet_id"]), basis,
+                    reason=reason,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "无法标注税口径", str(exc))
+                return
+            except Exception:  # noqa: BLE001 — UI 层兜底
+                _LOG.exception("写入税口径标注失败")
+                QMessageBox.critical(self, "写入失败", "标注未能写入数据库，请重试。")
+                return
+            changed = True
+        if not changed:
+            QMessageBox.information(
+                self, "无变化", "清单类型与税口径均未变化，无需保存。")
             return
         self.reason_edit.clear()
         self._reload()

@@ -547,7 +547,7 @@ def _sheet_structural_risks(
         confirmed_map = {}
     key_columns: set[int] = set()
     for field_name, column in confirmed_map.items():
-        if field_name not in {"quantity", "unit_price", "amount", "tax_rate"}:
+        if field_name not in {"quantity", "unit_price", "amount", "tax_rate", "tax_amount"}:
             continue
         try:
             key_columns.add(int(column))
