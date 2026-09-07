@@ -10,6 +10,7 @@ from jiadun.core.parsing.excel_parser import parse_file  # noqa: E402
 from jiadun.core.parsing.header_detect import (  # noqa: E402
     FIELD_DICT,
     detect_header,
+    is_grand_total_row,
     is_subtotal_row,
 )
 
@@ -71,10 +72,17 @@ class TestSubtotal:
         assert is_subtotal_row("", "合计（含税）")
         assert is_subtotal_row("", "合计（不含税）")
 
+    def test_prefixed_tax_qualified_total(self):
+        assert is_subtotal_row("", "2024年1月份材料调差合计（含税）")
+        assert is_subtotal_row("", "2024年1月份材料调差合计（不含税）")
+        assert is_grand_total_row("", "2024年1月份材料调差合计（含税）")
+        assert is_grand_total_row("", "2024年1月份材料调差合计（不含税）")
+
     def test_negative_not_confused(self):
         assert not is_subtotal_row("钢筋合计用量表", "")
         assert not is_subtotal_row("C25混凝土垫层", "010501001001")
         assert not is_subtotal_row("", "平整场地")
+        assert not is_subtotal_row("", "合计（含9.313%税价）")
 
 
 class TestFieldDictZimuAlias:

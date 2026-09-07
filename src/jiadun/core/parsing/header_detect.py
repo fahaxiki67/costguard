@@ -58,6 +58,8 @@ def is_grand_total_row(name_text: str, first_cell_text: str) -> bool:
         t = _norm_ws(text)
         if not t:
             continue
+        if _TAX_QUALIFIED_TOTAL.search(t):
+            return True
         for w in GRAND_TOTAL_WORDS:
             if t == w:
                 return True
@@ -625,6 +627,7 @@ def max_col_of(cells: dict[tuple[int, int], str]) -> int:
 _SUBTOTAL_TRIM = re.compile(
     r"[\s0-9一二三四五六七八九十第\.、（）()\-—:：,，ⅠⅡⅢ]+|含税|不含税|分部分项|部分|[章节类段页]"
 )
+_TAX_QUALIFIED_TOTAL = re.compile(r"(?:合计|总计)[（(](?:含税|不含税)[）)]$")
 
 
 def _norm_ws(text: str) -> str:
@@ -645,6 +648,8 @@ def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
         t = _norm_ws(text)
         if not t:
             continue
+        if _TAX_QUALIFIED_TOTAL.search(t):
+            return True
         for w in SUBTOTAL_WORDS:
             if t == w:
                 return True
