@@ -42,6 +42,21 @@
 
 两页均使用临时隔离项目各独立重放两次；候选行数、状态、范围和结构风险完全一致；原始副本 SHA-256 处理前后相同。金额和数量仅保存在被忽略的私有摘要中，不形成业务结论。
 
+### 2026-09-08 02:12：真实总计行回归修复
+
+- 复现：西航港 `计量计价清单明细` 的“合计（含税）/合计（不含税）”位于首列；修复前 `is_subtotal_row` 未识别税口径后缀，真实重放会把总计行留在候选明细路径。
+- 红测试：`tests/unit/test_header_detect.py::TestSubtotal::test_tax_qualified_total_in_leading_column` 在修复前失败。
+- 根因修复：`_SUBTOTAL_TRIM` 增加 `含税|不含税`，只扩展税口径后缀识别，不改变金额或源数据。
+- 同一红测试修复后通过；相关表头、行抽取、结算管线、C 路径测试通过。
+- 修复后真实重放：105 行候选，其中 103 行明细、2 行汇总行；各独立重放两次一致，原始副本哈希未变化。
+
+### 2026-09-08 02:20：修复后完整私有验收
+
+- 运行：`run_20260908_022047_096540`（完整结果保存在被忽略的 `local_private_data/real_acceptance/work/`）。
+- 结果：23/23 文件导入成功；处理前后副本 SHA-256 一致；无副本被修改。
+- T-ERG-08：148 组技术复算、47 条异常、134 项匹配、226/226 证据可溯源；`technical_execution_complete=true`、`verification_level=insufficient`、`control_status=difference_open`、`wps=pending_manual`、整体 `pending_wps_with_findings`。
+- 既有 OLE2 inconsistency 警告仍出现，命令正常退出；该警告不等于 WPS/Excel 复核通过。
+
 ## 回归验证
 
 - `tests/unit/test_acceptance_runner.py`

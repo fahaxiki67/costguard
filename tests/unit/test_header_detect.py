@@ -67,6 +67,10 @@ class TestSubtotal:
         assert is_subtotal_row("合计", "")
         assert is_subtotal_row("一、二部分 小计", "A.1")
 
+    def test_tax_qualified_total_in_leading_column(self):
+        assert is_subtotal_row("", "合计（含税）")
+        assert is_subtotal_row("", "合计（不含税）")
+
     def test_negative_not_confused(self):
         assert not is_subtotal_row("钢筋合计用量表", "")
         assert not is_subtotal_row("C25混凝土垫层", "010501001001")
