@@ -9,7 +9,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.28` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.29` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.29] - 2026-09-07
+
+税口径模型预发行（schema v55，运行合同格式 v3，任务书任务 C/反馈#4）：
+Sheet 级税口径结构化（未确认/含税/不含税+来源+理由+审计字段）；表头明确
+文本自动识别（含税/不含税/价税合计，税率数值不构成口径依据）；独立税金
+列识别并登记 line_items.tax_amount（只记事实不推口径）；Sheet 清单浏览器
+人工改判（理由必填写 Evidence）；口径变化使旧运行失效；口径不一致/未确认
+比较降级 PENDING/INCOMPARABLE；重解析结转携带人工税口径。合同↔Sheet 口径
+冲突检测进 Finding、真实语料库、真实 OCR 质量回归、Excel/WPS 四环境真机
+（macOS Excel、Windows Excel、macOS WPS、Windows WPS）、50k/200k 性能、
+签名与公证仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.28] - 2026-09-06
 

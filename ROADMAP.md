@@ -108,6 +108,25 @@ v0.1.25 交付合同事实确认生命周期（v48）+ PDF 逐页人工对照复
 - [ ] 真实 Microsoft Excel/WPS（Windows 与 macOS）真机专项、50k/200k 完整导出
   基准、Windows 代码签名与 macOS 公证。
 
+## v0.1.29 生产门槛（未全部满足）
+
+v0.1.29 交付任务 C（税口径模型：结构化 + 明确文本识别 + 独立税金列登记 +
+Evidence + 人工改判 + 口径冲突降级，schema v55，合同格式 v3）。以下门槛
+未全部关闭前，只能标记为预览候选。
+
+- [x] 税口径结构化（unknown/included/excluded + 来源/理由/审计字段）。
+- [x] 表头明确文本自动识别（含税/不含税/价税合计；「不含税」子串陷阱已处理）。
+- [x] 独立税金/税额列识别与事实登记（line_items.tax_amount，不推断口径）。
+- [x] 人工改判（Sheet 清单浏览器下拉，理由必填写 Evidence）+ 结转携带。
+- [x] 口径变化→Run Contract 签名变化→旧运行失效；口径不一致比较降级
+  PENDING/INCOMPARABLE（tax_basis_comparable）。
+- [ ] 合同条款税口径 ↔ Sheet 口径冲突检测进 Finding（C6-6 剩余项）。
+- [ ] 真实语料库（Golden 候选第一批隔离副本+导入验证）——受安全扫描器
+  阻塞，待用户拍板放行方式。
+- [ ] 真实工程扫描 PDF OCR 质量回归（脱敏黄金样本 0）。
+- [ ] 真实 Microsoft Excel/WPS（Windows 与 macOS）真机专项。
+- [ ] 1万/5万/20万行完整导出基准；Windows 代码签名与 macOS 公证。
+
 ## v0.1.28 生产门槛（未全部满足）
 
 v0.1.28 交付任务 B 界面侧（全工作簿 Sheet 清单浏览器：过滤/建议/人工标注）
