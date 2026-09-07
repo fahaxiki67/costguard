@@ -57,6 +57,13 @@
 - T-ERG-08：148 组技术复算、47 条异常、134 项匹配、226/226 证据可溯源；`technical_execution_complete=true`、`verification_level=insufficient`、`control_status=difference_open`、`wps=pending_manual`、整体 `pending_wps_with_findings`。
 - 既有 OLE2 inconsistency 警告仍出现，命令正常退出；该警告不等于 WPS/Excel 复核通过。
 
+### 2026-09-08 02:49：独立复核收口
+
+- 复核提交：`19d8248`；结论：解析规则修复有条件通过，正式资料验收/生产发布仍不通过。
+- 复核确认 XHG-05/SJ-07 的结果来自临时隔离人工探针，不能写成最新完整运行已自动完成结算链路；文档已补充该边界。
+- 复核确认 XHG-05 应拆分工程量明细、税金/费用行和汇总行；私有探针摘要已同步修正，未修改源文件和原始金额。
+- WPS/Excel 实机复核、范围完整性、A/B 独立性及跨层桥接差异仍列为待补证；本次不扩大税价标签识别范围。
+
 ## 回归验证
 
 - `tests/unit/test_acceptance_runner.py`
