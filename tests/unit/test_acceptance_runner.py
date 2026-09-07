@@ -1080,3 +1080,166 @@ def test_inspect_file_pdf_uses_gui_equivalent_contract_path(tmp_path, monkeypatc
     # provider 为 None 时元数据必须留痕为 disabled，不得伪造成已用 OCR
     assert tp["ocr_provider"] == "disabled"
     assert isinstance(tp["n_facts"], int)
+
+
+def test_acceptance_report_labels_candidate_control_and_lists_open_bridge(tmp_path):
+    """验收报告必须区分候选 C 控制值，并显式列出待复核桥接。"""
+    import scripts.real_acceptance_run as runner
+
+    report = {
+        "generated_at": "2026-09-08T00:00:00",
+        "environment": {
+            "jiadun_version": "0.1.test",
+            "system": "Darwin",
+            "machine": "arm64",
+            "python": "3.12",
+        },
+        "preflight": {},
+        "hash_check": {},
+        "corpus_sha256": {},
+        "per_file": [
+            {
+                "test_id": "T-ERG-08",
+                "steps": {
+                    "import": True,
+                    "technical_execution_status": "settlement_pipeline_complete",
+                    "technical_validation_status": "with_findings",
+                    "verification_level": "insufficient",
+                    "range_unproven_sheets": 1,
+                    "ab_check_status": "ab_passed",
+                    "control_status": "difference_open",
+                    "anomaly_status": "checked_with_findings",
+                    "evidence_trace_status": "available",
+                    "wps": "pending_manual",
+                    "overall_acceptance_status": "pending_wps_with_findings",
+                },
+                "settlement_parse": {
+                    "status": "ok_after_manual_confirmation",
+                    "sheets": [
+                        {
+                            "name": "F.1 分部分项清单",
+                            "status": "pending",
+                            "n_items": 168,
+                            "n_subtotal": 1,
+                            "confidence": 1.0,
+                            "notes": [],
+                        }
+                    ],
+                },
+                "dual_path_check": [
+                    {
+                        "period_no": 1,
+                        "direction": "upward",
+                        "status": "match",
+                        "verification_level": "insufficient",
+                        "A": "123.45",
+                        "B": "123.45",
+                        "C_subtotal": "123.45",
+                        "C_source": {
+                            "sheet_name": "F.1 分部分项清单",
+                            "row": 188,
+                            "col": 8,
+                        },
+                        "diff_ab": "0.00",
+                        "control_diff": "0.00",
+                        "control_status": "match",
+                    }
+                ],
+                "acceptance_controls": [
+                    {
+                        "kind": "bridge",
+                        "summary": "F.1 与 E.4 汇总层桥接待复核",
+                        "status": "evidence_recorded",
+                    },
+                    {
+                        "kind": "difference",
+                        "summary": "两层金额差额待补证，未调平",
+                        "status": "open_pending_review",
+                    }
+                ],
+            }
+        ],
+    }
+
+    output = runner.write_acceptance_report(report, tmp_path / "report.md")
+    text = output.read_text(encoding="utf-8")
+    assert "C/候选控制" in text
+    assert "A/B结果一致性" in text
+    assert "结果一致（共享抽取器，独立性未证明）" in text
+    assert "C来源" in text
+    assert "F.1 分部分项清单（第188行第8列）" in text
+    assert "## 人工控制桥接与差异" in text
+    assert "两层金额差额待补证，未调平" in text
+
+
+def test_post_manual_sheet_snapshot_reads_current_state_and_counts(tmp_path):
+    """人工决定后，报告快照必须来自当前 raw_sheets/line_items，而非旧解析报告。"""
+    import sqlite3
+
+    import scripts.real_acceptance_run as runner
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE raw_sheets (
+            id INTEGER PRIMARY KEY, batch_id INTEGER, sheet_index INTEGER,
+            sheet_name TEXT, sheet_status TEXT, sheet_status_reason TEXT,
+            period_id INTEGER
+        );
+        CREATE TABLE table_headers (
+            sheet_id INTEGER, confidence REAL, data_range_status TEXT,
+            data_range_method TEXT
+        );
+        CREATE TABLE line_items (
+            id INTEGER PRIMARY KEY, sheet_id INTEGER, flags_json TEXT
+        );
+        """
+    )
+    conn.executemany(
+        """INSERT INTO raw_sheets
+           (id, batch_id, sheet_index, sheet_name, sheet_status, sheet_status_reason, period_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (1, 7, 0, "E.4", "non_business", "人工确认为非结算证据页", None),
+            (2, 7, 1, "F.1", "pending", "人工确认结算清单角色并抽取 2 行；结构性证据缺口", 3),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO table_headers VALUES (2, 0.9, 'unproven', 'manual_confirmation')"
+    )
+    conn.executemany(
+        "INSERT INTO line_items (sheet_id, flags_json) VALUES (2, ?)",
+        [("{}",), ("{}",), ('{"subtotal": true}',), ('{"subtotal": true}',)],
+    )
+    old = [
+        {"name": "E.4", "status": "needs_role_review", "n_items": 0, "n_subtotal": 0},
+        {"name": "F.1", "status": "needs_role_review", "n_items": 0, "n_subtotal": 0},
+    ]
+
+    refreshed = runner._snapshot_settlement_sheets(conn, 7, old)
+
+    assert refreshed[0]["state_code"] == "non_business"
+    assert refreshed[0]["n_items"] == 0
+    assert refreshed[1]["state_code"] == "pending"
+    assert refreshed[1]["n_items"] == 2
+    assert refreshed[1]["n_subtotal"] == 2
+    assert "结构性证据缺口" in refreshed[1]["notes"][0]
+
+
+def test_pending_sheet_status_keeps_role_mapping_and_form_boundaries():
+    """普通 pending 工作表也要保留角色、映射和表单边界。"""
+    import scripts.real_acceptance_run as runner
+
+    assert runner._sheet_status_label({
+        "state_code": "pending",
+        "sheet_status_reason": "整文件需角色确认",
+    }) == "待人工角色确认"
+    assert runner._sheet_status_label({
+        "state_code": "pending",
+        "sheet_status_reason": "未识别到可靠表头，等待人工指定角色、表头和字段映射",
+    }) == "待人工映射"
+    assert runner._sheet_status_label({
+        "state_code": "pending",
+        "sheet_status_reason": "检测为键值对表单，等待人工确认是否为非业务表",
+    }) == "非结算表单，待人工复核"

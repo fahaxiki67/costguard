@@ -47,6 +47,15 @@ def _kind_label(code: str) -> str:
     return KIND_ZH.get(code, code)
 
 
+def _status_label(item: dict) -> str:
+    """区分角色已确认但结构/范围仍待复核，避免状态语义混淆。"""
+    status = str(item["sheet_status"])
+    reason = str(item["sheet_status_reason"] or "")
+    if status == "pending" and "人工确认" in reason and "抽取" in reason:
+        return "已确认抽取，待结构/范围复核"
+    return SHEET_LABELS.get(status, status)
+
+
 class KindSelectDialog(QDialog):
     """标注清单类型：类型 + 必填理由（写入审计 Evidence）。"""
 
@@ -150,7 +159,7 @@ class SheetInventoryDialog(QDialog):
             values = [
                 item["original_name"],
                 item["sheet_name"],
-                SHEET_LABELS.get(str(item["sheet_status"]), str(item["sheet_status"])),
+                _status_label(item),
                 f"{item['n_rows']}×{item['n_cols']}",
                 _kind_label(str(item["suggested_kind"])),
                 item["suggest_reason"],

@@ -41,7 +41,8 @@ CONTROL_STATUS_ZH = {
 }
 AB_STATUS_ZH = {
     "match": "一致", "diff": "存在差异", "incomplete": "数据不完整",
-    "ab_passed": "一致", "ab_checked_with_differences": "存在差异",
+    "ab_passed": "结果一致（共享抽取器，独立性未证明）",
+    "ab_checked_with_differences": "存在差异",
     "failed": "未通过", "not_applicable_or_not_run": "未运行或不适用",
 }
 VALIDATION_STATUS_ZH = {
@@ -112,6 +113,89 @@ def _report_value(value: object) -> str:
     if value is None or value == "":
         return "未记录"
     return str(value)
+
+
+def _control_source_label(source: object) -> str:
+    """把 C 候选控制值的实际来源压缩成可读位置，不宣称跨层已对平。"""
+    if not isinstance(source, dict):
+        return "未记录"
+    if isinstance(source.get("items"), list):
+        return f"{len(source['items'])} 个来源"
+    sheet = str(source.get("sheet_name") or "未记录")
+    row = source.get("row")
+    col = source.get("col")
+    if row not in (None, "") and col not in (None, ""):
+        return f"{sheet}（第{row}行第{col}列）"
+    return sheet
+
+
+def _sheet_status_label(sheet: dict) -> str:
+    """显示人工决定后的结构化 Sheet 状态，不把角色与范围复核混为一谈。"""
+    status = str(sheet.get("state_code") or sheet.get("status") or "")
+    reason = str(sheet.get("sheet_status_reason") or "")
+    if status == "non_business":
+        return "非业务表"
+    if status == "pending" and "人工确认" in reason and "抽取" in reason:
+        return "已确认抽取，待结构/范围复核"
+    if status == "pending" and "表单" in reason:
+        return "非结算表单，待人工复核"
+    if status == "pending" and (
+        "表头" in reason or "字段映射" in reason or "范围" in reason
+    ):
+        return "待人工映射"
+    if status == "pending" and ("角色确认" in reason or "指定角色" in reason):
+        return "待人工角色确认"
+    if status == "confirmed":
+        return "已确认"
+    return SHEET_STATUS_ZH.get(status, "待复核")
+
+
+def _snapshot_settlement_sheets(
+    conn: object, batch_id: int | None, previous: list[dict]
+) -> list[dict]:
+    """从当前数据库刷新人工决定后的 Sheet 状态与实际行数。"""
+    if batch_id is None:
+        return previous
+    rows = conn.execute(
+        """SELECT rs.id, rs.sheet_index, rs.sheet_name, rs.sheet_status,
+                  rs.sheet_status_reason, th.confidence
+             FROM raw_sheets rs
+             LEFT JOIN table_headers th ON th.sheet_id=rs.id
+            WHERE rs.batch_id=? ORDER BY rs.sheet_index, rs.id""",
+        (int(batch_id),),
+    ).fetchall()
+    if not rows:
+        return previous
+    old_by_name = {str(item.get("name")): item for item in previous}
+    snapshots = []
+    for row in rows:
+        count_rows = conn.execute(
+            "SELECT flags_json FROM line_items WHERE sheet_id=? ORDER BY id",
+            (int(row["id"]),),
+        ).fetchall()
+        n_subtotal = 0
+        for item in count_rows:
+            try:
+                flags = json.loads(item["flags_json"] or "{}")
+            except (TypeError, ValueError):
+                flags = {}
+            n_subtotal += int(bool(isinstance(flags, dict) and flags.get("subtotal")))
+        old = old_by_name.get(str(row["sheet_name"]), {})
+        reason = str(row["sheet_status_reason"] or "")
+        snapshots.append({
+            "name": row["sheet_name"],
+            "status": row["sheet_status"] or old.get("status", "pending"),
+            "state_code": row["sheet_status"] or "pending",
+            "sheet_status_reason": reason,
+            "n_items": len(count_rows) - n_subtotal,
+            "n_subtotal": n_subtotal,
+            "confidence": (
+                row["confidence"] if row["confidence"] is not None
+                else old.get("confidence")
+            ),
+            "notes": [reason] if reason else list(old.get("notes") or []),
+        })
+    return snapshots
 
 
 def _safe_support_limit(value: object) -> str:
@@ -439,7 +523,7 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
         "技术流程与 WPS 人工门槛分列记录。对适用的表格导出，只要 WPS 尚未完成实际打开、"
         "重算、保存、重开，整体不得标记为通过。",
         "",
-        "| 测试编号 | 导入 | 技术执行 | 技术校验 | 校核级别 | 取数范围未证明 | A/B独立复算 | C/源表控制 | 异常 | 证据链 | WPS | 整体状态 |",
+        "| 测试编号 | 导入 | 技术执行 | 技术校验 | 校核级别 | 取数范围未证明 | A/B结果一致性 | C/候选控制 | 异常 | 证据链 | WPS | 整体状态 |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ])
     for rec in results:
@@ -491,7 +575,7 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
                 note = _safe_report_note(
                     (sh.get("notes") or [""])[0] if sh.get("notes") else "")
                 lines.append(
-                    f"| {_report_value(sh.get('name'))[:52]} | {SHEET_STATUS_ZH.get(sh.get('status'), '待复核')} "
+                    f"| {_report_value(sh.get('name'))[:52]} | {_sheet_status_label(sh)} "
                     f"| {_report_value(sh.get('n_items'))} | {_report_value(sh.get('n_subtotal'))} "
                     f"| {_report_value(sh.get('confidence'))} | {note} |")
         dpc = rec.get("dual_path_check")
@@ -499,15 +583,16 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
             level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                         "insufficient": "校核不充分"}
             lines.append("")
-            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C控制值 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
-            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+            lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C候选值 | C来源 | A-B差 | 控制差 | 控制状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
+            lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
             for c in dpc:
                 lines.append(
                     f"| {_report_value(c.get('period_no'))} | {DIRECTION_ZH.get(c.get('direction'), '未标记')} "
                     f"| {level_zh.get(c.get('verification_level'), '待复核')} "
                     f"| {CHECK_STATUS_ZH.get(c.get('status'), '待复核')} "
                     f"| {_report_value(c.get('A'))} | {_report_value(c.get('B'))} | {_report_value(c.get('C_subtotal'))} "
-                    f"| {_report_value(c.get('diff_ab'))} | {_report_value(c.get('control_diff'))} | "
+                    f"| {_control_source_label(c.get('C_source'))} | {_report_value(c.get('diff_ab'))} "
+                    f"| {_report_value(c.get('control_diff'))} | "
                     f"{CONTROL_STATUS_ZH.get(c.get('control_status'), '待复核')} "
                     f"| {_report_value(c.get('detail_rows'))} | {_report_value(c.get('excluded_subtotal_rows'))} "
                     f"| {_report_value(c.get('excluded_title_rows'))} | {_report_value(c.get('pending_sheets'))} "
@@ -528,6 +613,17 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
         if gating:
             lines.append(f"- 人工门控：{'、'.join(gating)}（未经确认不写入结算模型）")
         lines.append("")
+    controls = [
+        (rec.get("test_id"), item)
+        for rec in results
+        for item in (rec.get("acceptance_controls") or [])
+    ]
+    if controls:
+        lines.extend(["", "## 人工控制桥接与差异", ""])
+        for test_id, item in controls:
+            status = item.get("status")
+            status_zh = "待人工复核" if status == "open_pending_review" else "已记录"
+            lines.append(f"- **{test_id}**：{status_zh}：{_report_value(item.get('summary'))}")
     lines.extend(["", "## 逐文件限制", ""])
     for rec in results:
         steps = rec.get("steps") or {}
@@ -804,6 +900,9 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                 if unresolved_gated:
                     rec["role_review"] = {"needs_manual_review": True,
                                           "sheets": sorted(unresolved_gated)}
+                rec["settlement_parse"]["sheets"] = _snapshot_settlement_sheets(
+                    conn, report.batch_id, rec["settlement_parse"].get("sheets") or []
+                )
                 if unresolved_form or unresolved_gated or decision_errors:
                     return rec
 
@@ -894,6 +993,7 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
                      "A": str(c.path_a_total) if c.path_a_total is not None else None,
                      "B": str(c.path_b_total) if c.path_b_total is not None else None,
                      "C_subtotal": str(c.raw_subtotal) if c.raw_subtotal is not None else None,
+                     "C_source": c.c_control_source,
                      "diff_ab": str(c.diff_ab) if c.diff_ab is not None else None,
                      "control_diff": (
                          str(c.control_diff) if c.control_diff is not None else None

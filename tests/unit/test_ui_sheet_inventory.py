@@ -230,5 +230,5 @@ class TestSheetInventoryDialog:
             ],
         )
         dlg = _open_dialog(project_db)
-        assert dlg.table.item(0, 2).text() == "待确认"
+        assert dlg.table.item(0, 2).text() == "已确认抽取，待结构/范围复核"
         assert "结构性证据缺口" in dlg.table.item(0, 2).toolTip()
