@@ -41,6 +41,32 @@ def wb_page(tmp_path, app):
 
 
 class TestWorkbench:
+    def test_period_action_buttons_wrap_inside_workbench_width(self, tmp_path, app):
+        from PySide6.QtWidgets import QPushButton
+
+        from jiadun.core.models import project as pm
+        from jiadun.ui.workbench import WorkbenchPage
+
+        info = pm.create_project("操作栏换行", tmp_path / "ws")
+        info, conn = pm.open_project(Path(info.workspace_path))
+        page = WorkbenchPage(conn, info, info.workspace_path, on_back=lambda: None)
+        page.resize(1100, 700)
+        page.show()
+        app.processEvents()
+        try:
+            tab = page.tabs.widget(0)
+            labels = {
+                "选择结算文件…", "导入资料文件夹…", "导入合同/纪要…", "查看已导入资料…",
+                "人工确认清单页…", "全工作簿 Sheet 清单…", "合同条款确认…", "对上控制基准…",
+                "费率规则（框架协议）…", "运行异常检测", "双向校核",
+            }
+            buttons = [b for b in tab.findChildren(QPushButton) if b.text() in labels]
+            assert {b.text() for b in buttons} == labels
+            assert len({b.y() for b in buttons}) >= 2
+            assert all(0 <= b.geometry().left() and b.geometry().right() < tab.width() for b in buttons)
+        finally:
+            page.close()
+            conn.close()
     def test_tabs_present(self, wb_page):
         names = [wb_page.tabs.tabText(i) for i in range(wb_page.tabs.count())]
         assert names == [

@@ -812,7 +812,6 @@ class WorkbenchPage(QWidget):
     def _period_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
-        btn_row = QHBoxLayout()
         import_btn = QPushButton("选择结算文件…")
         import_btn.setObjectName("btnPrimary")
         import_btn.clicked.connect(self._import_files)
@@ -826,6 +825,8 @@ class WorkbenchPage(QWidget):
         detect_btn.clicked.connect(self._run_anomalies)
         check_btn = QPushButton("双向校核")
         check_btn.clicked.connect(self._run_crosscheck)
+        sheet_list_btn = QPushButton("全工作簿 Sheet 清单…")
+        sheet_list_btn.clicked.connect(self._open_sheet_inventory)
         confirm_btn = QPushButton("人工确认清单页…")
         confirm_btn.clicked.connect(self._open_sheet_confirm)
         review_btn = QPushButton("合同条款确认…")
@@ -834,15 +835,21 @@ class WorkbenchPage(QWidget):
         baseline_btn.clicked.connect(self._open_control_baseline)
         rate_btn = QPushButton("费率规则（框架协议）…")
         rate_btn.clicked.connect(self._open_rate_rules)
-        for b, name in ((import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
-                        (files_btn, None), (confirm_btn, None), (review_btn, None),
-                        (baseline_btn, None), (rate_btn, None),
-                        (detect_btn, None), (check_btn, None)):
+        # 操作数量多，窄窗口下单行会被压缩或裁切；拆两行保证全部可见可点。
+        btn_rows = (QHBoxLayout(), QHBoxLayout())
+        period_actions = (
+            (import_btn, "btnPrimary"), (folder_btn, None), (contract_btn, None),
+            (files_btn, None), (sheet_list_btn, None), (confirm_btn, None),
+            (review_btn, None), (baseline_btn, None), (rate_btn, None),
+            (detect_btn, None), (check_btn, None),
+        )
+        for i, (b, name) in enumerate(period_actions):
             if name:
                 b.setObjectName(name)
-            btn_row.addWidget(b)
-        btn_row.addStretch(1)
-        v.addLayout(btn_row)
+            btn_rows[i // 6].addWidget(b)
+        btn_rows[1].addStretch(1)
+        v.addLayout(btn_rows[0])
+        v.addLayout(btn_rows[1])
         self.import_progress_label = QLabel("")
         self.import_progress_label.setStyleSheet(
             f"color: {theme.TEXT_SECONDARY}; background: transparent;")
@@ -1084,6 +1091,13 @@ class WorkbenchPage(QWidget):
 
     def _open_sheet_confirm(self):
         dlg = SheetConfirmDialog(self.conn, self.project.project_id, self)
+        dlg.exec()
+        self.refresh_all()
+
+    def _open_sheet_inventory(self) -> None:
+        from jiadun.ui.dialogs.sheet_inventory import SheetInventoryDialog
+
+        dlg = SheetInventoryDialog(self.conn, self.project.project_id, self)
         dlg.exec()
         self.refresh_all()
 
