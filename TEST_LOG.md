@@ -64,8 +64,25 @@
 - 复核确认 XHG-05 应拆分工程量明细、税金/费用行和汇总行；私有探针摘要已同步修正，未修改源文件和原始金额。
 - WPS/Excel 实机复核、范围完整性、A/B 独立性及跨层桥接差异仍列为待补证；本次不扩大税价标签识别范围。
 
+### 2026-09-08 03:00：旧版 XLS 前缀税口径总计修复
+
+- 真实样本：二道沟 T-ERG-05 的旧版 `.xls` 工作表 `材料调差`；页末标签为“2024年1月份材料调差合计（含税/不含税）”。
+- 复现：修复前两个标签未被 `is_subtotal_row`/`is_grand_total_row` 识别，尾部数值行会被当作孤立尾注剔除，无法形成控制行证据。
+- 红测试：`tests/unit/test_header_detect.py::TestSubtotal::test_prefixed_tax_qualified_total` 修复前失败。
+- 根因修复：增加精确的“合计/总计 + （含税/不含税）”末尾模式；保留“合计（含9.313%税价）”负例不识别，未扩大为任意税率文本。
+- 同一红测试及表头、行抽取、C 路径、覆盖证明和验收/UI 相关测试修复后通过。
+- 真实隔离重放两次：导入成功，整体 `partial`/待人工，`材料调差` 保留 9 行明细和 2 行汇总；旧版 XLS 公式缓存、合并单元格拓扑和筛选可见行仍无法由当前解析器证明。
+
+### 2026-09-08 03:02：修复后完整私有验收
+
+- 运行：`run_20260908_030208_074502`（完整结果保存在被忽略的 `local_private_data/real_acceptance/work/`）。
+- 结果：23/23 文件导入成功；处理前后副本 SHA-256 一致；无副本被修改。
+- T-ERG-05 的 `材料调差` 从修复前 `n_subtotal=0` 变为 `n_subtotal=2`，其余旧版 XLS 结构性门控保持；T-ERG-08 的技术复算、候选控制值、开放桥接差异和 WPS 待人工状态未发生回归。
+- 既有 OLE2 inconsistency 警告仍出现，命令正常退出；该警告不等于 WPS/Excel 复核通过。
+
 ## 回归验证
 
+- `QT_QPA_PLATFORM=offscreen uv run pytest -q`：全套测试退出码 0（100%，3 个跳过）；仅有既有 `zipfile` 重复条目警告，无失败。
 - `tests/unit/test_acceptance_runner.py`
 - `tests/unit/test_ui_sheet_inventory.py`
 - `tests/unit/test_ui_workbench.py`
