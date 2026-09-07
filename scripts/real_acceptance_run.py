@@ -40,7 +40,7 @@ CONTROL_STATUS_ZH = {
     "bridged_pending_review": "已记录桥接，待复核",
 }
 CANDIDATE_CONTROL_STATUS_ZH = {
-    "match": "A/B/C候选内部一致",
+    "match": "A/C候选控制一致",
     "diff": "候选控制与 A 存在差异",
     "not_available": "候选控制不可用",
 }
@@ -588,7 +588,7 @@ def write_acceptance_report(report: dict, output_path: Path | None = None) -> Pa
             level_zh = {"sufficient": "校核充分", "findings": "校核有发现",
                         "insufficient": "校核不充分"}
             lines.append("")
-            lines.append("> “候选控制内部状态”仅表示当前文件内 A/B/C 候选路径关系，不代表与其他源表或汇总层一致。")
+            lines.append("> “候选控制内部状态”仅表示 A 与 C 候选控制值的比较；A/B 结果另列，不代表与其他源表或汇总层一致。")
             lines.append("")
             lines.append("| 期次 | 方向 | 校核级别 | A/B状态 | A | B | C候选值 | C来源 | A-B差 | 控制差 | 候选控制内部状态 | 参与明细 | 排除小计 | 排除标题 | 待人工表 | 范围未证明 |")
             lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")

@@ -1167,11 +1167,34 @@ def test_acceptance_report_labels_candidate_control_and_lists_open_bridge(tmp_pa
     assert "A/B结果一致性" in text
     assert "结果一致（共享抽取器，独立性未证明）" in text
     assert "候选控制内部状态" in text
-    assert "A/B/C候选内部一致" in text
+    assert "A/C候选控制一致" in text
     assert "C来源" in text
     assert "F.1 分部分项清单（第188行第8列）" in text
     assert "## 人工控制桥接与差异" in text
     assert "两层金额差额待补证，未调平" in text
+
+
+@pytest.mark.parametrize("b,ab_status", [("90", "diff"), (None, "incomplete"), ("100", "match")])
+def test_candidate_control_match_does_not_claim_b_matches(tmp_path, b, ab_status):
+    import scripts.real_acceptance_run as runner
+
+    report = {
+        "generated_at": "synthetic",
+        "environment": dict(jiadun_version="test", system="test", machine="test", python="test"),
+        "per_file": [{
+            "test_id": "SYNTHETIC",
+            "settlement_parse": {"sheets": [{"name": "synthetic"}]},
+            "dual_path_check": [{
+                "period_no": 1, "status": ab_status, "A": "100", "B": b,
+                "C_subtotal": "100", "control_status": "match",
+            }],
+        }],
+    }
+    text = runner.write_acceptance_report(report, tmp_path / "report.md").read_text()
+    row = next(line for line in text.splitlines() if line.startswith("| 1 |"))
+    assert "A/C候选控制一致" in row
+    assert "A/B/C候选内部一致" not in row
+    assert runner.CHECK_STATUS_ZH[ab_status] in row
 
 
 def test_post_manual_sheet_snapshot_reads_current_state_and_counts(tmp_path):
