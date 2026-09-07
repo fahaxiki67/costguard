@@ -1041,20 +1041,76 @@ def inspect_file(test_id: str, purpose: str, copy: Path, project_parent: Path,
             from jiadun.core.contracts import docx_parser
             from jiadun.core.contracts import extract as contract_extract
             try:
-                paras = docx_parser.parse_contract(stored, sf.file_type)
-                facts = contract_extract.extract_facts(paras)
-                rec["text_parse"] = {
-                    "ok": True, "n_paragraphs": len(paras), "n_facts": len(facts),
-                    "fact_keys": sorted({f["fact_key"] for f in facts}),
-                    "samples": [
-                        {"key": f["fact_key"], "value": f["fact_value"],
-                         "location": f"段落/页 {f['location']}",
-                         "quote": f["quote_text"][:80], "confidence": f["confidence"]}
-                        for f in facts[:6]
-                    ],
-                }
+                if sf.file_type == "pdf":
+                    # GUI 同路径：import_contract + 本机 OCR provider（与
+                    # workbench._load_local_ocr_provider 一致）。provider
+                    # 不可用时保持 pending_ocr（fail-closed），不得伪装成功。
+                    from jiadun.platform.ocr import get_default_ocr_provider
+
+                    contract_extract.import_contract(
+                        conn, info.project_id, pdir, copy,
+                        ocr_provider=get_default_ocr_provider())
+                    facts = contract_extract.list_contract_facts(
+                        conn, info.project_id)
+                    batch = conn.execute(
+                        """SELECT pb.status, pb.stats_json FROM parse_batches pb
+                           JOIN source_files sf2 ON sf2.id=pb.file_id
+                           WHERE sf2.project_id=? AND pb.parser='pdf_hybrid'
+                           ORDER BY pb.parsed_at DESC, pb.id DESC LIMIT 1""",
+                        (info.project_id,),
+                    ).fetchone()
+                    stats = (json.loads(batch["stats_json"])
+                             if batch and batch["stats_json"] else {})
+                    provider_meta = stats.get("ocr_provider") or {}
+                    rec["text_parse"] = {
+                        "ok": True,
+                        "path": "import_contract_gui_equivalent",
+                        "batch_status": str(batch["status"]) if batch else "",
+                        "coverage_complete": bool(stats.get("coverage_complete")),
+                        "page_count": int(stats.get("page_count", 0) or 0),
+                        "page_status_counts": stats.get("page_status_counts") or {},
+                        "ocr_provider": provider_meta.get("id")
+                        if isinstance(provider_meta, dict) else None,
+                        "n_facts": len(facts),
+                        "fact_keys": sorted({f["fact_key"] for f in facts}),
+                        "samples": [
+                            {"key": f["fact_key"], "value": f["fact_value"],
+                             "location": str(f["location"])[:40],
+                             "quote": str(f["quote_text"])[:80],
+                             "confidence": f["confidence"],
+                             "review_status": f["review_status"]}
+                            for f in facts[:6]
+                        ],
+                    }
+                else:
+                    paras = docx_parser.parse_contract(stored, sf.file_type)
+                    facts = contract_extract.extract_facts(paras)
+                    rec["text_parse"] = {
+                        "ok": True, "n_paragraphs": len(paras), "n_facts": len(facts),
+                        "fact_keys": sorted({f["fact_key"] for f in facts}),
+                        "samples": [
+                            {"key": f["fact_key"], "value": f["fact_value"],
+                             "location": f"段落/页 {f['location']}",
+                             "quote": f["quote_text"][:80], "confidence": f["confidence"]}
+                            for f in facts[:6]
+                        ],
+                    }
             except NotImplementedError as exc:
-                rec["text_parse"] = {"ok": False, "expected_limit": str(exc)}
+                partial: dict[str, object] = {"ok": False, "expected_limit": str(exc)}
+                # PdfExtractionPending 携带页级快照：OCR 已跑但有页未闭合时，
+                # 逐页状态必须留痕，不能把部分成功写成整档成功。
+                report = getattr(exc, "report", None)
+                stats = report.as_stats() if report is not None else None
+                if stats:
+                    provider_meta = stats.get("ocr_provider") or {}
+                    partial.update({
+                        "page_count": int(stats.get("page_count", 0) or 0),
+                        "page_status_counts": stats.get("page_status_counts") or {},
+                        "coverage_complete": bool(stats.get("coverage_complete")),
+                        "ocr_provider": provider_meta.get("id")
+                        if isinstance(provider_meta, dict) else None,
+                    })
+                rec["text_parse"] = partial
             except Exception as exc:  # noqa: BLE001
                 rec["text_parse"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             return rec

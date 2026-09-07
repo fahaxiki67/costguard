@@ -211,3 +211,24 @@ class TestSheetInventoryDialog:
         dlg = _open_dialog(project_db)
         assert dlg.table.item(0, 4).text() == "非业务表"  # 建议列显示已人工标注
         assert dlg.table.item(0, 6).text() == "非业务表"
+
+    def test_status_tooltip_carries_reason(self, project_db):
+        """确认抽取后仍有结构性缺口时，状态列 tooltip 必须给出原因。"""
+        conn, pid, tmp_path = project_db
+        _add_file_with_sheets(
+            conn,
+            pid,
+            tmp_path,
+            "a.xlsx",
+            [
+                (
+                    "清单明细",
+                    "pending",
+                    "人工确认结算清单角色并抽取 168 行；仍存在结构性证据缺口：明细区存在合并单元格",
+                    188,
+                ),
+            ],
+        )
+        dlg = _open_dialog(project_db)
+        assert dlg.table.item(0, 2).text() == "待确认"
+        assert "结构性证据缺口" in dlg.table.item(0, 2).toolTip()

@@ -160,6 +160,10 @@ class SheetInventoryDialog(QDialog):
                 self.table.setItem(r, c, QTableWidgetItem(str(text)))
             payload = self.table.item(r, 0)
             payload.setData(Qt.ItemDataRole.UserRole, dict(item))
+            # 状态可能仍有缺口（如确认抽取后存在结构性风险），原因必须可见
+            status_reason = str(item["sheet_status_reason"] or "").strip()
+            if status_reason:
+                self.table.item(r, 2).setToolTip(status_reason)
         self.summary_label.setText(
             f"共 {len(rows)} 个工作表（每文件最新批次）；建议类型仅为候选，以人工标注为准。"
         )

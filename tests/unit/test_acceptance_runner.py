@@ -1024,3 +1024,59 @@ class TestAcceptanceControls:
             }
         finally:
             conn.close()
+
+
+def _make_text_pdf(path):
+    """手工构造最小合法单页文本 PDF（pdfplumber/pypdf 均可读，无外部依赖）。"""
+    content = b"BT /F1 24 Tf 72 720 Td (jiadun acceptance pdf path) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n"
+        + content + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_pos = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_pos}\n%%EOF"
+    ).encode()
+    path.write_bytes(bytes(out))
+
+
+def test_inspect_file_pdf_uses_gui_equivalent_contract_path(tmp_path, monkeypatch):
+    """runner 对 PDF 必须与 GUI 同路径（import_contract），并记录页级状态与 provider。
+
+    扫描 PDF 在 provider 不可用时保持 pending_ocr（fail-closed）是 extract 层
+    既有测试锁定的行为；这里锁定的是 runner 的接线与 text_parse 留痕结构。
+    """
+    monkeypatch.setattr(
+        "jiadun.platform.ocr.get_default_ocr_provider", lambda: None
+    )
+    import scripts.real_acceptance_run as runner
+
+    copy = tmp_path / "语料.pdf"
+    _make_text_pdf(copy)
+    project_parent = tmp_path / "work"
+    project_parent.mkdir()
+    rec = runner.inspect_file("T-PDF-TEST", "文本PDF路径", copy, project_parent)
+    tp = rec["text_parse"]
+    assert tp["ok"] is True
+    assert tp["path"] == "import_contract_gui_equivalent"
+    assert tp["page_count"] == 1
+    assert tp["page_status_counts"]["native_text"] == 1
+    assert tp["coverage_complete"] is True
+    # provider 为 None 时元数据必须留痕为 disabled，不得伪造成已用 OCR
+    assert tp["ocr_provider"] == "disabled"
+    assert isinstance(tp["n_facts"], int)
