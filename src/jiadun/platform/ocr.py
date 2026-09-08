@@ -58,6 +58,10 @@ class RapidOcrProvider:
 
     def __init__(self) -> None:
         try:
+            import onnxruntime
+
+            # 本地 OCR 禁止遥测；在加载引擎前关闭运行时遥测事件。
+            onnxruntime.disable_telemetry_events()
             import rapidocr_onnxruntime
         except ImportError as exc:
             raise OcrProviderUnavailable(
