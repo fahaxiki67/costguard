@@ -610,3 +610,61 @@ class TestExcelExport:
         )
         assert "合成测试数据" not in text
         assert "人工复核" in text and "业务审批" in text
+
+
+class TestSettlementSummaryScopeAnnotation:
+    """Issue #4③：结算累计表必须显著标注行数口径（参与明细/排除小计）。
+
+    A=B 数字相等不能证明行集完整；口径标注让"金额一致"与"行集完整"
+    成为两个独立可审的面。无当前校核结果时必须写"不可用"，不得静默。
+    """
+
+    def test_annotation_lists_row_counts_after_crosscheck(self, tmp_path):
+        from tests.integration.test_aggregate_crosscheck import _make_amount_case
+        from jiadun.core.engine import aggregate, crosscheck
+
+        info, conn, period_id = _make_amount_case(tmp_path)
+        try:
+            aggs = aggregate.aggregate_project(conn, info.project_id)
+            aggregate.persist_period_totals(conn, info.project_id, aggs)
+            crosscheck.run_crosscheck_project(conn, info.project_id)
+            path = excel_export.export_workbook(conn, info.project_id, tmp_path / "exports")
+            import openpyxl
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["对下结算累计表"]
+            # 首行数据仍从第 2 行开始：标注只能追加在表尾，不得改变既有读取面
+            assert ws.cell(row=2, column=4).value == Decimal("200")
+            annotations = [
+                str(row[1])
+                for row in ws.iter_rows(min_row=2, values_only=True)
+                if row[0] == "口径标注"
+            ]
+            assert annotations, "累计表缺少口径标注行"
+            assert any("数据来源：当前 A/B/C 校核结果" in text for text in annotations)
+            period_lines = [text for text in annotations if text.startswith("第")]
+            assert len(period_lines) == 1, period_lines
+            assert "参与累计明细" in period_lines[0]
+            assert "排除小计" in period_lines[0]
+            assert "校核级别=" in period_lines[0]
+        finally:
+            conn.close()
+
+    def test_annotation_marks_missing_crosscheck_as_unusable(self, tmp_path):
+        from tests.integration.test_aggregate_crosscheck import _make_amount_case
+
+        info, conn, period_id = _make_amount_case(tmp_path)
+        try:
+            path = excel_export.export_workbook(conn, info.project_id, tmp_path / "exports")
+            import openpyxl
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["对下结算累计表"]
+            annotations = [
+                str(row[1])
+                for row in ws.iter_rows(min_row=2, values_only=True)
+                if row[0] == "口径标注"
+            ]
+            assert any("无当前校核结果" in text and "不可用" in text for text in annotations)
+        finally:
+            conn.close()
