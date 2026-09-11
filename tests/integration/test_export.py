@@ -621,6 +621,7 @@ class TestSettlementSummaryScopeAnnotation:
 
     def test_annotation_lists_row_counts_after_crosscheck(self, tmp_path):
         from tests.integration.test_aggregate_crosscheck import _make_amount_case
+
         from jiadun.core.engine import aggregate, crosscheck
 
         info, conn, period_id = _make_amount_case(tmp_path)
