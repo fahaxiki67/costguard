@@ -31,6 +31,7 @@ from jiadun.core.engine.settlement_io import (
 )
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.labels import direction_label
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 from jiadun.core.parsing.header_detect import (
     HeaderDetection,
     build_anchor_map,
@@ -92,6 +93,8 @@ class CheckResult:
     unrecognized_rows: int = 0
     classified_detail_rows: int = 0  # 覆盖证明识别的明细行数
     business_rows_used: int = 0      # 实际有有效金额并参与累计的业务行数
+    deduction_total: Decimal | None = None  # B12 扣款行合计（负向调整，不入正向累计）
+    group_rows_excluded: int = 0            # B9 排除的层级行数
     coverage_proof_status: str = "unproven"
     ab_row_set_status: str = "unknown"
     ab_row_set_hash: str | None = None
@@ -996,7 +999,7 @@ def _ensure_c_control_evidence(
         ).fetchall()
         subtotal_rows = [
             row for row in rows
-            if bool(_loads_flags(row["flags_json"]).get("subtotal"))
+            if is_non_detail_flags(row["flags_json"])
         ]
         sources = []
         for row in subtotal_rows:
@@ -1263,7 +1266,7 @@ def _consistency_findings(
     ).fetchall()
     prices: dict[tuple[str, str, str, str], set[Decimal]] = {}
     for row in all_rows:
-        if _loads_flags(row["flags_json"]).get("subtotal"):
+        if is_non_detail_flags(row["flags_json"]):
             continue
         price = _dec_or_none(row["unit_price"])
         key = (
@@ -1316,7 +1319,25 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
            WHERE li.period_id=?""",
         (period_id,),
     ).fetchall()
-    detail_rows = [r for r in rows if not json.loads(r["flags_json"] or "{}").get("subtotal")]
+    # B9 修复：求和口径排除小计/合计行与树状结算表的分组/层级行
+    # （"一/（一）/1.1/第X部分/其中/合同内"），它们的金额是各级小计，
+    # 混入求和会层层重复累计（盲测实证 3~13 倍虚高）。
+    # B12：扣款行（"合同扣款项"节下的罚款/电费等）是负向调整，不入正向下
+    # 面求和口径；单独汇总为 deduction_total 供呈现与核对。
+    detail_rows = []
+    deduction_rows = []
+    group_rows_count = 0
+    for r in rows:
+        f = json.loads(r["flags_json"] or "{}")
+        if f.get("subtotal"):
+            continue
+        if f.get("group_row"):
+            group_rows_count += 1
+            continue
+        if f.get("deduction"):
+            deduction_rows.append(r)
+        else:
+            detail_rows.append(r)
     summary_a = _sum_line_item_amounts(detail_rows)
     total_a = summary_a.total
 
@@ -1603,6 +1624,11 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
     else:
         diff_ab = total_a - total_b
         status = "diff" if formula_mismatch_rows else ("match" if abs(diff_ab) <= TOL else "diff")
+        if formula_mismatch_rows and abs(diff_ab) <= TOL:
+            notes.append(
+                "A/B 两路径金额一致，但存在原始金额与数量×单价不符的行，"
+                "整体状态仍为「存在差异」（B10 语义澄清）"
+            )
 
     # C 是源表控制值，不是 A/B 独立复算的一部分。单独记录，避免 A/B 一致时
     # 把尚未解释的源表差异误写成“全部通过”。
@@ -1613,6 +1639,11 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         control_status = "match" if abs(control_diff) <= TOL else "diff"
         if control_status == "diff":
             notes.append(f"A路径与C原表控制额差异{control_diff}，保持待复核，未调平")
+            if abs(control_diff) > max(abs(total_a) * Decimal("0.001"), Decimal("1")):
+                notes.append(
+                    "A路径与C原表控制额偏差超过0.1%，疑似抽取层或控制行口径问题，"
+                    "应在审核问题中心按高优先级处理（B10）"
+                )
     if control_note:
         notes.append(control_note)
 
@@ -1823,6 +1854,10 @@ def check_period(conn: sqlite3.Connection, period_id: int) -> CheckResult:
         verification_level=verification_level,
         detail_rows=detail_count,
         excluded_subtotal_rows=len(subtotal_rows),
+        deduction_total=(
+            _sum_line_item_amounts(deduction_rows).total if deduction_rows else None
+        ),
+        group_rows_excluded=group_rows_count,
         excluded_title_rows=excluded_title_rows,
         pending_sheets=pending_sheets,
         range_unproven_sheets=range_unproven_sheets,

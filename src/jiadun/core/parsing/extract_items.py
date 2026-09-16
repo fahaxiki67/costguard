@@ -6,19 +6,45 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from jiadun.core.engine.money import NotANumberError, to_decimal
+
+# B12：扣款节标题（合同扣款项/应扣款明细/扣款）与小节切换识别
+_DEDUCTION_SECTION_RE = re.compile(r"扣款|应扣|罚款扣|暂扣")
+_SECTION_TOP_RE = re.compile(r"^[一二三四五六七八九十]{1,3}$")
 from jiadun.core.labels import direction_label
 from jiadun.core.parsing.header_detect import (
     HeaderDetection,
+    _GROUP_DOTTED,
+    _GROUP_PLAIN_NUM,
+    _norm_ws,
     build_anchor_map,
     data_rows_range,
     is_grand_total_row,
+    is_group_row,
     is_subtotal_row,
 )
+
+
+def is_non_detail_flags(flags_json: str | None) -> bool:
+    """行级 flags 是否属于不应参与累计的行（小计/合计/树状层级行）。
+
+    B9 修复的共享口径：line_items 的求和/匹配/导出口径一律先用本函数
+    过滤；行与数值仍完整入库，原文可在保真层回溯。
+    """
+    if not flags_json:
+        return False
+    try:
+        flags = json.loads(flags_json)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(flags, dict):
+        return False
+    return bool(flags.get("subtotal") or flags.get("group_row"))
 
 
 @dataclass
@@ -75,6 +101,18 @@ def extract_items(
     start, end = data_range if data_range is not None else data_rows_range(cells, det, max_row)
     items: list[ItemDraft] = []
     skip_stats = stats if stats is not None else {}
+    # sheet 级树状表判定（B9）：数据区存在点分编码行（"1.1"/"1.1.1"）→
+    # 本表是树状多级表，单段数字序号行（"1 车站"）才是层级行；普通平铺表
+    # （只有 1/2/3 序号）不受影响。
+    code_col = det.col_map.get("code")
+    tree_table = False
+    in_deduction_section = False
+    if code_col is not None:
+        for r in range(start, end + 1):
+            t = _text_at(cells, anchors, r, code_col).strip()
+            if t and _GROUP_DOTTED.match(t):
+                tree_table = True
+                break
     for r in range(start, end + 1):
         row_cells = {f: _text_at(cells, anchors, r, det.col_map.get(f)) for f in det.col_map}
         if not any(row_cells.values()):
@@ -89,6 +127,31 @@ def extract_items(
         item.flags["subtotal"] = is_subtotal_row(name_src, lead_text)
         if item.flags["subtotal"]:
             item.flags["grand_total"] = is_grand_total_row(name_src, lead_text)
+        # B9 修复：树状结算表的分组/层级行（"一/（一）/1.1/第X部分/其中/合同内"
+        # 等）携带各级小计，与明细一起求和会层层重复累计。标记后行与数值仍
+        # 完整入库（供人工核对与异常检测），求和口径由 crosscheck 过滤。
+        item.flags["group_row"] = is_group_row(
+            code_src,
+            lead_text,
+            name_src,
+            has_unit=bool(row_cells.get("unit")),
+            has_unit_price=bool(row_cells.get("unit_price")),
+        ) or (
+            tree_table
+            and not item.flags["subtotal"]
+            and _GROUP_PLAIN_NUM.match(_norm_ws(code_src) or _norm_ws(lead_text) or "") is not None
+            and not row_cells.get("unit")
+            and not row_cells.get("unit_price")
+        )
+        # B12：树状表"扣款项"节（"六 合同扣款项"等）下的明细行是扣减项，
+        # 正向金额计入会虚增结算额；标记 deduction 后求和口径单列为扣减
+        # 合计（负向呈现），不静默丢弃。节范围到下一个同级节标题/合计为止。
+        if item.flags["group_row"] and _DEDUCTION_SECTION_RE.search(name_src or lead_text):
+            in_deduction_section = True
+        elif item.flags["subtotal"] or (item.flags["group_row"] and _SECTION_TOP_RE.match(_norm_ws(code_src) or "")):
+            in_deduction_section = False
+        if in_deduction_section and not item.flags["group_row"] and not item.flags["subtotal"]:
+            item.flags["deduction"] = True
         # 分部/章节标题行：只有名称（或编码），无任何数值 → 标记并跳过。
         # 有编码但无数值的行（如"缺数量清单行"）不在此列——它们有名称+编码，
         # 数值缺失走待补资料流程；本分支仅针对真实结算书分部标题行

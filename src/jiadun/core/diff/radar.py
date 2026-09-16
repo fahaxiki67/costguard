@@ -30,6 +30,7 @@ from jiadun.core.engine.aggregate import assess_amount
 from jiadun.core.engine.money import NotANumberError, to_decimal
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.evidence.finding import canonical_json
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 
@@ -175,8 +176,8 @@ def _load_period_rows(conn: sqlite3.Connection, period_id: int) -> list[dict[str
     result = []
     for row in rows:
         item = _row_dict(row)
-        if item["flags"].get("subtotal"):
-            continue
+        if item["flags"].get("subtotal") or item["flags"].get("group_row"):
+            continue  # 小计/合计/层级行不入差值雷达（B9）
         result.append(item)
     return result
 

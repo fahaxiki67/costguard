@@ -657,6 +657,56 @@ def is_subtotal_row(name_text: str, first_cell_text: str) -> bool:
     return False
 
 
+_GROUP_CN_NUM = re.compile(r"^[一二三四五六七八九十]{1,3}$")
+_GROUP_CN_PAREN = re.compile(r"^[（(][一二三四五六七八九十]{1,3}[)）]$")
+_GROUP_PART = re.compile(r"^第?[一二三四五六七八九十\d]{1,4}部分$")
+_GROUP_DOTTED = re.compile(r"^\d{1,4}(?:\.\d{1,4})+$")
+_GROUP_PLAIN_NUM = re.compile(r"^\d{1,3}$")
+_GROUP_KEYWORDS = ("其中", "合同内", "合同外", "开累")
+
+
+def is_group_row(
+    code_text: str,
+    lead_text: str,
+    name_text: str,
+    *,
+    has_unit: bool = False,
+    has_unit_price: bool = False,
+) -> bool:
+    """识别树状结算表的分组/层级行（B9 修复）。
+
+    多级结算表（对上产值表、验工计价表、五局分包结算明细）的各级节点行
+    （"一"、"（一）"、"1.1"、"第X部分"、"其中"、"合同内"）携带该层小计
+    金额；与叶子明细一起求和会层层重复累计（盲测实证：对下明细普遍 3 倍、
+    验工计价 13 倍虚高）。本函数保守识别这类行并打 ``group_row`` 标记，
+    求和口径应排除（原文与数值仍完整入库供人工核对）。
+
+    规则（命中任一即视为层级行，均要求文本整体匹配防误伤）：
+    - 中文数字序列（"一"、"十一"）或带括号的中文数字；
+    - "第X部分/X部分" 形态；
+    - 编码/名称/行首整体等于分组关键词（"其中/合同内/合同外/开累"）；
+    - 纯点分编号且至少两段（"1.1"、"1.1.1"）；真实清单编码（08B001、
+      010101011001 等）不会命中；
+    - 单段短数字（1-3 位）且该行既无单位又无单价——层级行
+      （"1 车站"）不带单位/单价，而明细行（"1 机械钻孔灌注桩 m 60.4"）
+      通常带；两可时不标，宁可保守。
+    """
+    candidates = (_norm_ws(code_text), _norm_ws(lead_text), _norm_ws(name_text))
+    for t in candidates:
+        if not t:
+            continue
+        if _GROUP_CN_NUM.match(t) or _GROUP_CN_PAREN.match(t) or _GROUP_PART.match(t):
+            return True
+        if t in _GROUP_KEYWORDS:
+            return True
+        if _GROUP_DOTTED.match(t):
+            return True
+    # 单段纯数字序号（"1 车站"vs"1 机械钻孔灌注桩 m 60.4"）单看一行无法与
+    # 缺资料明细行区分，本轮不做行级判定（保守优先，防误伤）；树状表的单段
+    # 数字层级行由 extract_items 的 sheet 级上下文（存在点分编码行）补充判定。
+    return False
+
+
 def detect_form_like(cells: dict[tuple[int, int], str],
                      merged_ranges: list[str]) -> str | None:
     """检测键值对表单结构（如支付审批单）。

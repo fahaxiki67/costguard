@@ -951,6 +951,33 @@ class WorkbenchPage(QWidget):
         self._import_thread = None
 
     def _on_background_import_finished(self, result: dict) -> None:
+        # B2 防御回查：界面计数必须与持久层一致。"报成功但库里没有"是
+        # fail-open 事故（盲测实证：GUI 报导入完成而 originals/source_files
+        # 全空），宁可报错也不能让用户误以为资料已入库。
+        try:
+            expected = int(result["ok"]) + len(result["partial"])
+            stored = int(
+                self.conn.execute(
+                    """SELECT COUNT(*) FROM document_intake WHERE project_id=?""",
+                    (self.project.project_id,),
+                ).fetchone()[0]
+            )
+        except Exception:  # noqa: BLE001 - 回查本身失败不得中断收尾
+            stored = expected
+        if expected > 0 and stored <= 0:
+            self.import_progress_label.setText(
+                "后台导入异常：界面报告成功但数据库无登记，已按失败处理（B2 回查）。"
+            )
+            self._notify_import(
+                0,
+                ["持久层回查失败：界面报告导入成功，但数据库无任何登记；"
+                 "请重启应用后重试，若仍失败请携带控制台日志反馈"],
+                int(result["pending"]),
+                skipped=len(result["skipped"]), partial=list(result["partial"]),
+                skipped_details=result["skipped_details"],
+            )
+            self.refresh_all()
+            return
         self.import_progress_label.setText("后台导入已完成；已刷新资料中心。")
         self._notify_import(
             int(result["ok"]), list(result["fail"]), int(result["pending"]),

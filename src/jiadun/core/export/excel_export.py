@@ -32,6 +32,7 @@ from jiadun.core.engine.money import NotANumberError, round2, to_decimal
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.parsing import import_manifest
 from jiadun.core.reporting import ProjectSummary, build_report_model
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 
@@ -516,9 +517,8 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
     series: dict[tuple[str, str], dict[int, dict]] = {}
     series_names: dict[tuple[str, str], set] = {}
     for r in rows:
-        flags = json.loads(r["flags_json"] or "{}")
-        if flags.get("subtotal"):
-            continue
+        if is_non_detail_flags(r["flags_json"]):
+            continue  # 小计/合计/层级行不入汇总（B9）
         key = (r["dir"] or "unknown", "code:" + r["code"] if r["code"] else "name:" + (r["name"] or ""))
         by_period = series.setdefault(key, {})
         series_names.setdefault(key, set()).add(r["name"] or "")
@@ -1008,9 +1008,8 @@ def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction
     ).fetchall()
     out: dict[str, dict] = {}
     for r in rows:
-        flags = json.loads(r["flags_json"] or "{}")
-        if flags.get("subtotal"):
-            continue
+        if is_non_detail_flags(r["flags_json"]):
+            continue  # 小计/合计/层级行不入汇总（B9）
         key = group_key_of(r["code"], r["name"] or "")
         agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
         agg["names"].add(r["name"] or "")
@@ -1247,8 +1246,8 @@ def export_audit_worksheet(conn: sqlite3.Connection, project_id: int, wb: Workbo
     r = 1
     for row in rows:
         flags = json.loads(row["flags_json"] or "{}")
-        if flags.get("subtotal"):
-            continue
+        if is_non_detail_flags(row["flags_json"]):
+            continue  # 小计/合计/层级行不出现在明细导出（B9）
         source_evidence_id = flags.get("source_evidence_id")
         r += 1
         # 缺失仅按 is None 判断：Decimal("0") 是有效值必须保留（监督门槛 1）

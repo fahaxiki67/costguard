@@ -58,7 +58,7 @@ def test_rule_zh_covers_all_rules_in_engine():
                       "file_id", "filter_conditions", "filter_conditions_json",
                       "filter_state", "formula_cache_status", "merge_anchor_copy",
                       "original_name", "sheet_name", "table_ranges", "table_ranges_json",
-                      "filter_visibility_unknown"}
+                      "filter_visibility_unknown", "group_row", "subtotal", "grand_total"}
     rule_like = {i for i in ids if i not in known_internal}
     missing = [i for i in sorted(rule_like) if i not in labels.RULE_ZH]
     assert not missing, f"以下规则 ID 缺少中文映射：{missing}"

@@ -962,6 +962,22 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
             if not isinstance(pno, int) or pno < 1:
                 raise ValueError("确认期次必须为正整数")
+            # B8：期次是项目级 (period_no, direction)，不同分包合同的同名期号
+            # （各自的"第3期"）写入同一期次会混算。已有期次属于其它文件时
+            # fail-closed 阻断，要求人工改期号或明确确认合并。
+            clash = conn.execute(
+                """SELECT sp.source_file_id, sf.original_name FROM settlement_periods sp
+                   LEFT JOIN source_files sf ON sf.id=sp.source_file_id
+                   WHERE sp.project_id=? AND sp.period_no=? AND sp.direction=?""",
+                (project_id, pno, direction),
+            ).fetchone()
+            if clash and clash["source_file_id"] is not None and int(clash["source_file_id"]) != int(meta["file_id"]):
+                raise ValueError(
+                    f"期次撞号（B8 防混算）：{direction} 方向第 {pno} 期已属于文件"
+                    f"「{clash['original_name'] or clash['source_file_id']}」。"
+                    f"当前文件「{meta['original_name']}」不能写入同一期次；"
+                    "请改用该文件自己的期号，或在资料中心确认两文件确属同一合同后合并"
+                )
             period_id = ensure_period(
                 conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
                 direction=direction, commit=False)

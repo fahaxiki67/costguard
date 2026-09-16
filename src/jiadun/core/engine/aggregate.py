@@ -16,6 +16,7 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from jiadun.core.contracts import run_contract
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 from jiadun.core.engine.money import (
     Decimal,
     NotANumberError,
@@ -245,8 +246,10 @@ def aggregate_project(
     flag_updates: list[tuple[str, int]] = []
     for row in load_line_items(conn, project_id, direction=direction):
         flags = json.loads(row["flags_json"] or "{}")
-        if flags.get("subtotal"):
-            continue
+        if is_non_detail_flags(row["flags_json"]):
+            continue  # 小计/合计/层级行不入累计（B9）
+        if flags.get("deduction"):
+            continue  # 扣款行负向调整，不入正向累计（B12）
         name = row["name"] or f"<第{row['period_no']}期第{row['id']}行无名称>"
         key = group_key_of(row["code"], name)
         agg = aggs.setdefault(key, ItemAggregate(item_key=key, code=row["code"] or "", name=name))

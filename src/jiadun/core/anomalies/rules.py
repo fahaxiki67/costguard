@@ -15,6 +15,7 @@ from jiadun.core.engine.money import round2
 from jiadun.core.evidence.finding import Finding
 from jiadun.core.labels import DIRECTION_ZH, direction_label
 from jiadun.core.parsing.header_detect import is_subtotal_row
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 
@@ -60,10 +61,12 @@ def _rows(conn, project_id: int):
 
 
 def _is_subtotal(flags_json: str | None) -> bool:
+    """小计/合计/树状层级行统一视为非明细行（B9：group_row 一并排除）。"""
     try:
-        return bool(json.loads(flags_json or "{}").get("subtotal"))
+        flags = json.loads(flags_json or "{}")
     except json.JSONDecodeError:
         return False
+    return bool(flags.get("subtotal") or flags.get("group_row")) if isinstance(flags, dict) else False
 
 
 def _is_amount_adjustment(name: str | None) -> bool:
@@ -670,6 +673,20 @@ def rule_formula_semantics(conn, project_id) -> list[Finding]:
             refs = _formula_refs(formula)
             name = cells.get((row_no, int(name_col)), "") if isinstance(name_col, int) else ""
             lead = "".join(cells.get((row_no, col), "") for col in range(1, min_col + 1))
+            # B9/B11：树状表层级行（G 行，含"1.1 站点"等）的合价公式本就是
+            # 对下级求和（SUM/SUBTOTAL 引用），不是数量×单价；按"行级 group
+            # 标记 + 同行行首无单位价"跳过量价语义核对，控制值语义核对保留。
+            row_flags = conn.execute(
+                "SELECT flags_json FROM line_items WHERE sheet_id=? AND flags_json LIKE ?",
+                (s["id"], f'%"row": {row_no},%'),
+            ).fetchone()
+            if row_flags:
+                try:
+                    rf = json.loads(row_flags["flags_json"] or "{}")
+                except json.JSONDecodeError:
+                    rf = {}
+                if isinstance(rf, dict) and rf.get("group_row"):
+                    continue
             if is_subtotal_row(name, lead):
                 amount_letter = _column_letter(amount_col)
                 if not any(column == amount_letter and start <= ref_row <= end for column, ref_row in refs):
@@ -699,6 +716,28 @@ def rule_formula_semantics(conn, project_id) -> list[Finding]:
                 rf"{re.escape(quantity_letter)}{row_no}\*{re.escape(price_letter)}{row_no}"
                 rf"|{re.escape(price_letter)}{row_no}\*{re.escape(quantity_letter)}{row_no}"
             )
+            # B11：五局/広联等结算模板的"至本期末累计金额=上期金额+本期金额"
+            # （=F10+H10）是合法累计语义，不是量价积。同行单元格纯相加公式
+            # （每个引用都是同行其它列）不做量价语义核对。
+            # 相加的列必须是"非工程量、非单价"的其它列（如上期金额+本期金额）；
+            # 若引用了工程量/单价列（C2+D2 之类）则仍是语义错误，保留报出。
+            qty_letter = _column_letter(quantity_col) if isinstance(quantity_col, int) else None
+            price_letter2 = _column_letter(price_col) if isinstance(price_col, int) else None
+            additive_refs = {
+                (column, ref_row) for column, ref_row in refs
+                if ref_row == row_no and column not in (qty_letter, price_letter2)
+            }
+            additive_pattern = re.compile(
+                r"^=(?:[A-Z]{1,3}%s[+\-])+(?:[A-Z]{1,3}%s)$" % (row_no, row_no)
+            )
+            if (
+                additive_refs
+                and additive_refs == {
+                    (column, ref_row) for column, ref_row in refs if ref_row == row_no
+                }
+                and additive_pattern.match(compact_formula)
+            ):
+                continue
             if not expected <= set(refs) or not product_pattern.search(compact_formula):
                 out.append(Finding(
                     "formula_semantics_mismatch", "high", "sheet", s["id"],
