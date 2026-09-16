@@ -186,6 +186,13 @@ def remember_workspace(
         seen.add(key)
         deduped.append(value)
 
+    # O3：登记表封顶，防止无限累积（盲测实证单机可积到上千条开发残留）。
+    # 当前空间永远置顶保留；超出上限的历史条目截断。不删除"已不存在"的
+    # 条目——目录可能暂时离线（外置盘/网络卷），用户仍需"打开已有项目"
+    # 指回原位置。
+    _MAX_KNOWN_WORKSPACES = 50
+    deduped = deduped[:_MAX_KNOWN_WORKSPACES]
+
     settings["known_workspaces"] = deduped
     if make_default or (set_default_if_missing and not settings.get("workspace_root")):
         settings["workspace_root"] = str(root)
