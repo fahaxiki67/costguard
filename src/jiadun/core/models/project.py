@@ -18,6 +18,9 @@ from jiadun.platform import paths as platform_paths
 
 _SETTINGS_FILE = platform_paths.settings_file()
 
+# O3：known_workspaces 登记表封顶，防止无限累积（盲测实证单机可积到上千条开发残留）。
+_MAX_KNOWN_WORKSPACES = 50
+
 
 class ProjectError(Exception):
     pass
@@ -186,11 +189,9 @@ def remember_workspace(
         seen.add(key)
         deduped.append(value)
 
-    # O3：登记表封顶，防止无限累积（盲测实证单机可积到上千条开发残留）。
-    # 当前空间永远置顶保留；超出上限的历史条目截断。不删除"已不存在"的
-    # 条目——目录可能暂时离线（外置盘/网络卷），用户仍需"打开已有项目"
-    # 指回原位置。
-    _MAX_KNOWN_WORKSPACES = 50
+    # O3：登记表封顶。当前空间永远置顶保留；超出上限的历史条目截断。
+    # 不删除"已不存在"的条目——目录可能暂时离线（外置盘/网络卷），
+    # 用户仍需"打开已有项目"指回原位置。
     deduped = deduped[:_MAX_KNOWN_WORKSPACES]
 
     settings["known_workspaces"] = deduped

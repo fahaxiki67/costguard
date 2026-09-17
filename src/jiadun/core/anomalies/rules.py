@@ -15,7 +15,6 @@ from jiadun.core.engine.money import round2
 from jiadun.core.evidence.finding import Finding
 from jiadun.core.labels import DIRECTION_ZH, direction_label
 from jiadun.core.parsing.header_detect import is_subtotal_row
-from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 
@@ -728,7 +727,7 @@ def rule_formula_semantics(conn, project_id) -> list[Finding]:
                 if ref_row == row_no and column not in (qty_letter, price_letter2)
             }
             additive_pattern = re.compile(
-                r"^=(?:[A-Z]{1,3}%s[+\-])+(?:[A-Z]{1,3}%s)$" % (row_no, row_no)
+                rf"^=(?:[A-Z]{{1,3}}{row_no}[+\-])+(?:[A-Z]{{1,3}}{row_no})$"
             )
             if (
                 additive_refs

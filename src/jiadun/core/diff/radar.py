@@ -30,7 +30,6 @@ from jiadun.core.engine.aggregate import assess_amount
 from jiadun.core.engine.money import NotANumberError, to_decimal
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.evidence.finding import canonical_json
-from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 

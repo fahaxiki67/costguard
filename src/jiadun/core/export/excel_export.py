@@ -31,8 +31,8 @@ from jiadun.core.engine.aggregate import aggregate_project, assess_amount, group
 from jiadun.core.engine.money import NotANumberError, round2, to_decimal
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.parsing import import_manifest
-from jiadun.core.reporting import ProjectSummary, build_report_model
 from jiadun.core.parsing.extract_items import is_non_detail_flags
+from jiadun.core.reporting import ProjectSummary, build_report_model
 
 D = Decimal
 

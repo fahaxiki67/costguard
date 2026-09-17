@@ -12,15 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from jiadun.core.engine.money import NotANumberError, to_decimal
-
-# B12：扣款节标题（合同扣款项/应扣款明细/扣款）与小节切换识别
-_DEDUCTION_SECTION_RE = re.compile(r"扣款|应扣|罚款扣|暂扣")
-_SECTION_TOP_RE = re.compile(r"^[一二三四五六七八九十]{1,3}$")
 from jiadun.core.labels import direction_label
 from jiadun.core.parsing.header_detect import (
-    HeaderDetection,
     _GROUP_DOTTED,
     _GROUP_PLAIN_NUM,
+    HeaderDetection,
     _norm_ws,
     build_anchor_map,
     data_rows_range,
@@ -28,6 +24,10 @@ from jiadun.core.parsing.header_detect import (
     is_group_row,
     is_subtotal_row,
 )
+
+# B12：扣款节标题（合同扣款项/应扣款明细/扣款）与小节切换识别
+_DEDUCTION_SECTION_RE = re.compile(r"扣款|应扣|罚款扣|暂扣")
+_SECTION_TOP_RE = re.compile(r"^[一二三四五六七八九十]{1,3}$")
 
 
 def is_non_detail_flags(flags_json: str | None) -> bool:

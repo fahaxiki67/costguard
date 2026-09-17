@@ -16,7 +16,6 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from jiadun.core.contracts import run_contract
-from jiadun.core.parsing.extract_items import is_non_detail_flags
 from jiadun.core.engine.money import (
     Decimal,
     NotANumberError,
@@ -24,6 +23,7 @@ from jiadun.core.engine.money import (
     to_decimal,
     weighted_avg_price,
 )
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 AMOUNT_TOL = D("0.02")
