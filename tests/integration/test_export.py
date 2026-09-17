@@ -669,3 +669,34 @@ class TestSettlementSummaryScopeAnnotation:
             assert any("无当前校核结果" in text and "不可用" in text for text in annotations)
         finally:
             conn.close()
+
+    def test_annotation_distinguishes_db_error_from_missing_crosscheck(self, tmp_path):
+        """独立复核回归（2026-09-18）：数据库读取异常不得与"没跑校核"共用文案。
+
+        crosscheck_results 表损坏/迁移缺失若被静默折算成"无当前校核结果"，
+        导出面上真实故障不可见。异常路径必须显式可辨，同时保持
+        "不视为通过"的保守语义，不阻断导出。
+        """
+        from tests.integration.test_aggregate_crosscheck import _make_amount_case
+
+        info, conn, period_id = _make_amount_case(tmp_path)
+        try:
+            conn.execute("DROP TABLE crosscheck_results")
+            conn.commit()
+            import openpyxl
+
+            wb = openpyxl.Workbook()
+            excel_export.export_settlement_summary(
+                conn, info.project_id, wb, direction="downward"
+            )
+            ws = wb["对下结算累计表"]
+            annotations = [
+                str(row[1])
+                for row in ws.iter_rows(min_row=2, values_only=True)
+                if row[0] == "口径标注"
+            ]
+            assert annotations, "累计表缺少口径标注行"
+            assert any("校核结果读取异常" in text and "不视为通过" in text for text in annotations)
+            assert not any("无当前校核结果" in text for text in annotations)
+        finally:
+            conn.close()

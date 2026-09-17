@@ -494,6 +494,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     # 排除的小计行数。A/B 数字相等不能证明行集完整，行数口径是独立审计面。
     # 数据只读当前运行的 crosscheck_results；无当前校核结果时明确写"不可用"，
     # 不给出静默的肯定语义，也不从 line_items 另算一套口径来补值。
+    scope_error: str | None = None
     try:
         scope, scope_params = run_contract.current_scope(conn, project_id, "cr")
         check_rows = conn.execute(
@@ -503,8 +504,12 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
                  WHERE cr.project_id=? AND {scope}""",
             (project_id, *scope_params),
         ).fetchall()
-    except (sqlite3.Error, ValueError, TypeError):
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        # 数据库真实故障（表损坏/迁移缺失/schema 漂移）不得与"没跑校核"共用
+        # 同一文案，否则导出面上故障不可见。保留 fail-safe：不阻断导出、不补值、
+        # 不给出肯定口径，只把异常类别显式写进标注（同 _current_crosscheck_path_notice）。
         check_rows = []
+        scope_error = type(exc).__name__
     check_by_period = {int(row["period_id"]): row for row in check_rows}
     ws.append([
         "口径标注",
@@ -513,7 +518,12 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     ])
     for period in periods:
         check = check_by_period.get(int(period["id"]))
-        if check is None:
+        if scope_error is not None:
+            text = (
+                f"第{period['period_no']}期：校核结果读取异常（{scope_error}），"
+                "行数口径不可用（不视为通过）"
+            )
+        elif check is None:
             text = f"第{period['period_no']}期：无当前校核结果，行数口径不可用（不视为通过）"
         else:
             text = (
