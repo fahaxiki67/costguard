@@ -9,7 +9,7 @@
 #
 # 纪律：
 # - 只清理可再生输出（build/ dist/），绝不触碰用户工程资料；
-# - 全量测试/lint/演示数据确定性/隐私审计都是硬门槛；
+# - 发布一致性(B6)/全量测试/lint/演示数据确定性/隐私审计都是硬门槛；
 # - 无 Developer ID 时 ad-hoc 本地签名，不宣称公证或"无 Gatekeeper 提示"。
 set -euo pipefail
 
@@ -37,6 +37,9 @@ echo "  macOS $(sw_vers -productVersion) / arm64 / Python $PYV"
 
 # ---- 2. 质量门槛 ----
 if [[ $SKIP_CHECKS -eq 0 ]]; then
+  log "发布一致性校验（B6：git 干净/不落后 origin/版本一致/lint）"
+  uv run python scripts/verify_release_consistency.py || \
+    fail "发布一致性校验未通过（B6）——详见上方输出"
   log "质量门槛：ruff + 全量测试"
   uv run ruff check src scripts tests || fail "ruff 未通过"
   uv run python -m pytest tests/ || fail "全量测试未通过"

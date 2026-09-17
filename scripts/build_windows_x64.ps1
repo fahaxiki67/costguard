@@ -1,6 +1,6 @@
 ﻿# Jiadun Windows x64 构建脚本（可重复、失败即非零退出）。
 # 与 scripts/build_macos_arm64.sh 同一门禁纪律：
-#   环境(arch/Python3.12) → ruff+全量测试 → 演示数据确定性 → 只清理可再生输出
+#   环境(arch/Python3.12) → 发布一致性(B6) → ruff+全量测试 → 演示数据确定性 → 只清理可再生输出
 #   → PyInstaller 构建 → PE 架构校验 → 隐私审计 → 便携 zip + Inno 安装器 → SHA256
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/build_windows_x64.ps1 [-SkipChecks]
 
@@ -34,6 +34,9 @@ Write-Host "  Windows x64 / Python $pyv"
 
 # ---- 2. 质量门槛 ----
 if (-not $SkipChecks) {
+    Step "发布一致性校验（B6：git 干净/不落后 origin/版本一致/lint）"
+    & uv run python scripts/verify_release_consistency.py
+    if ($LASTEXITCODE -ne 0) { Fail "发布一致性校验未通过（B6）——详见上方输出" }
     Step "质量门槛：ruff + 全量测试"
     & uv run ruff check src scripts tests
     if ($LASTEXITCODE -ne 0) { Fail "ruff 未通过" }
