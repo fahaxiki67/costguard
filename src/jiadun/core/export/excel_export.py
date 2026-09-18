@@ -489,10 +489,52 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
         status = {"ok": "正常", "incomplete": "待补资料", "incomparable": "不可比"}[agg.status]
         row.append(status + ("；".join(agg.warnings[:2]) if agg.warnings else ""))
         ws.append(row)
+    data_end = ws.max_row
+    # Issue #4③：累计表必须随表显著标注行数口径——参与累计的明细行数与被
+    # 排除的小计行数。A/B 数字相等不能证明行集完整，行数口径是独立审计面。
+    # 数据只读当前运行的 crosscheck_results；无当前校核结果时明确写"不可用"，
+    # 不给出静默的肯定语义，也不从 line_items 另算一套口径来补值。
+    scope_error: str | None = None
+    try:
+        scope, scope_params = run_contract.current_scope(conn, project_id, "cr")
+        check_rows = conn.execute(
+            f"""SELECT cr.period_id, cr.detail_rows, cr.excluded_subtotal_rows,
+                       cr.verification_level
+                  FROM crosscheck_results cr
+                 WHERE cr.project_id=? AND {scope}""",
+            (project_id, *scope_params),
+        ).fetchall()
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        # 数据库真实故障（表损坏/迁移缺失/schema 漂移）不得与"没跑校核"共用
+        # 同一文案，否则导出面上故障不可见。保留 fail-safe：不阻断导出、不补值、
+        # 不给出肯定口径，只把异常类别显式写进标注（同 _current_crosscheck_path_notice）。
+        check_rows = []
+        scope_error = type(exc).__name__
+    check_by_period = {int(row["period_id"]): row for row in check_rows}
+    ws.append([
+        "口径标注",
+        "数据来源：当前 A/B/C 校核结果；A=B 且行数口径完整也不代表业务结论正确，"
+        "校核级别与证据见校核结果表和证据索引",
+    ])
+    for period in periods:
+        check = check_by_period.get(int(period["id"]))
+        if scope_error is not None:
+            text = (
+                f"第{period['period_no']}期：校核结果读取异常（{scope_error}），"
+                "行数口径不可用（不视为通过）"
+            )
+        elif check is None:
+            text = f"第{period['period_no']}期：无当前校核结果，行数口径不可用（不视为通过）"
+        else:
+            text = (
+                f"第{period['period_no']}期：参与累计明细 {int(check['detail_rows'] or 0)} 行，"
+                f"排除小计 {int(check['excluded_subtotal_rows'] or 0)} 行，"
+                f"校核级别={check['verification_level'] or 'unknown'}"
+            )
+        ws.append(["口径标注", text])
     _autowidth(ws)
-    n = ws.max_row
-    if n > 1:
-        for r in range(2, n + 1):
+    if data_end > 1:
+        for r in range(2, data_end + 1):
             for c in range(4, len(header)):
                 ws.cell(row=r, column=c).number_format = MONEY_FMT
     return ws.title

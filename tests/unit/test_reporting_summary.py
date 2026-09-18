@@ -20,7 +20,13 @@ def test_report_model_has_one_shared_summary_and_no_approval_upgrade(tmp_path: P
     info, conn = project_model.open_project(Path(info.workspace_path))
     summary = build_project_summary(conn, info.project_id)
     model = build_report_model(conn, info.project_id)
-    assert summary.as_dict() == model.management_summary.as_dict()
+    # Each builder call stamps its own display timestamp; compare the shared
+    # business facts without making the test depend on a one-second boundary.
+    summary_dict = summary.as_dict()
+    management_dict = model.management_summary.as_dict()
+    summary_dict.pop("report_date")
+    management_dict.pop("report_date")
+    assert summary_dict == management_dict
     assert model.project_summary is model.management_summary.project_summary
     assert summary.data_cutoff is None
     assert summary.data_cutoff_status == "not_available"
