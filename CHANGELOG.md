@@ -9,7 +9,19 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.29` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；`v0.1.30` 为预发行/预览候选，不代表正式生产能力。
+
+## [0.1.30] - 2026-09-18
+
+结算累计表导出标注修复预发行（Issue #4③）：
+
+- 对上/对下结算累计表在表尾标注参与累计的明细行数、排除的小计行数和当前校核级别；
+  无当前校核结果时明确写“行数口径不可用（不视为通过）”。
+- 数据库读取异常与“没有校核结果”使用不同的失败安全文案，避免真实故障被静默折算为空结果。
+- macOS arm64 与 Windows x64 CI、全量测试、Ruff 和 Windows 打包流水线在 PR 上通过。
+
+本版仍为预览候选，`production_release_ready=false`；真实黄金案例、OCR 质量、Microsoft
+Excel/WPS 真机、1万/5万/20万行性能、代码签名与公证仍为 `PENDING / NOT VERIFIED`。
 
 ## [0.1.29] - 2026-09-07
 
