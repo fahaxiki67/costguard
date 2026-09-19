@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
+import secrets
 import signal
 import subprocess
 import sys
@@ -153,7 +153,10 @@ def scenario_kill(mode: str) -> dict:
 
     with tempfile.TemporaryDirectory(prefix=f"cg_kill_{mode}_") as td:
         ws = Path(td) / "JiadunProjects-ws"
-        killed = _spawn_and_kill(mode, ws, delay=random.uniform(0.4, 2.2))
+        # 杀进程时机取加密随机延迟（0.4–2.2s）：手动混沌测试每次节奏不同，
+        # 避免总在同一进度点命中；secrets 无偏采样毫秒精度区间。
+        delay = 0.4 + secrets.randbelow(1801) / 1000.0
+        killed = _spawn_and_kill(mode, ws, delay=delay)
         if not killed["ok"]:
             return {"scenario": f"kill_{mode}", "ok": False, **killed}
         verify = _verify_reopen(ws, expect_results_usable=False)

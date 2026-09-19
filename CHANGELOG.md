@@ -11,6 +11,18 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；`v0.1.30` 为预发行/预览候选，不代表正式生产能力。
 
+控制基准比较结论进入统一 Finding 生命周期（ROADMAP v0.1.25 遗留项，任务书任务 E3）：
+
+- `compare_upward_result` 的五态结论可通过 `record_comparison_finding` 登记为
+  `rule_id=control_baseline_cap` 的审核问题（`subject_type=control_baseline`），
+  自动出现在审核问题中心、汇总计数、Excel 异常清单与新增「控制基准比较」导出页、
+  Word 报告 Top 风险事项，并绑定当前 Run Contract 签名。
+- 同一基准再次比较时旧结论连同证据按快照语义转历史（不删除、不篡改），不同基准
+  结论互不覆盖；重跑异常检测不清扫该规则（输入未变时结论仍然成立）。
+- FAIL 结论保持只报告超出金额，不构成违规、责任或最终审定结论；工作台
+  「对上控制基准…」对话框比较后自动写入审核问题中心，写入失败时明确提示
+  且不伪装成功。
+
 ## [0.1.30] - 2026-09-18
 
 结算累计表导出标注修复预发行（Issue #4③）：

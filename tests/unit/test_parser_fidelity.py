@@ -51,6 +51,34 @@ class TestClean:
         assert source_sheet["n_rows"] == 2
         assert source_sheet["n_cols"] == 5
 
+    def test_source_census_rejects_dtd_entities(self, tmp_path):
+        """workbook.xml 携带内部 DTD 实体的不可信工作簿必须 fail-closed 拒绝。
+
+        标准库 ElementTree 会展开内部实体（billion laughs）；盘点走
+        defusedxml，实体定义出现时 census 记为 unavailable 并保留原因，
+        绝不以展开后的内容继续。
+        """
+        import zipfile
+
+        path = tmp_path / "entity-boobytrap.xlsx"
+        entity_xml = (
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            b'<!DOCTYPE workbook [<!ENTITY a "'
+            + b"x" * 4096
+            + b'"><!ENTITY b "&a;&a;">]>'
+
+            b'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            b"<sheets><sheet name=&a; sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>"
+        )
+        with zipfile.ZipFile(path, "w") as package:
+            package.writestr("xl/workbook.xml", entity_xml)
+            package.writestr("xl/_rels/workbook.xml.rels", "<Relationships/>")
+
+        census = excel_parser._source_workbook_census(path, "xlsx")
+
+        assert census["status"] == "unavailable"
+        assert "EntitiesForbidden" in str(census["reason"])
+
 
 class TestMessy:
     @pytest.fixture(scope="class")

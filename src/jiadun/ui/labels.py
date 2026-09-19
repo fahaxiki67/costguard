@@ -54,6 +54,8 @@ RULE_ZH = {
     "formula_control_semantics_mismatch": "控制金额公式语义与来源值不一致",
     "formula_untrusted_cache": "公式缓存未经过本程序重算验证",
     "filter_visibility_unknown": "筛选后的实际可见行无法确认",
+    "control_baseline_cap": "对上控制基准上限比较",
+    "contract_risk": "合同关键条款风险",
 }
 
 # 匹配方法
@@ -138,6 +140,7 @@ SUBJECT_TYPE_ZH = {
     "sheet": "工作表",
     "project": "项目",
     "contract_doc": "合同文档",
+    "control_baseline": "控制基准",
 }
 
 

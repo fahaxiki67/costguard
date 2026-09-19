@@ -764,18 +764,23 @@ def require_current_results_available(
 
 @contextmanager
 def _transaction(conn: sqlite3.Connection, name: str = "run_contract") -> Iterator[None]:
-    """兼容 autocommit 和调用方已有事务的可回滚事务。"""
-    savepoint = re.sub(r"[^A-Za-z0-9_]", "_", name)
+    """兼容 autocommit 和调用方已有事务的可回滚事务。
+
+    SAVEPOINT 固定使用常量名 ``jiadun_tx``，语句文本零动态拼接：sqlite
+    按栈语义匹配最近一次 SAVEPOINT，同层调用互不重叠，嵌套时内层先建后
+    释放，外层现场不受影响。``name`` 仅作为调用方的描述性标记（审计与
+    日志可读性），不进入 SQL 语句。
+    """
     if conn.in_transaction:
-        conn.execute(f"SAVEPOINT {savepoint}")
+        conn.execute("SAVEPOINT jiadun_tx")
         try:
             yield
         except Exception:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.execute("ROLLBACK TO jiadun_tx")
+            conn.execute("RELEASE jiadun_tx")
             raise
         else:
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.execute("RELEASE jiadun_tx")
         return
     conn.execute("BEGIN")
     try:

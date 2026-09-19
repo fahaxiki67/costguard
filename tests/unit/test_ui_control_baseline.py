@@ -101,3 +101,12 @@ class TestControlBaselineDialog:
         assert "PASS" in text
         assert "差额：-86500.00 元" in text
         assert "不构成违规或责任认定" in text
+        # 比较结论自动写入审核问题中心（fail-closed：失败时不得伪装成功）
+        assert "已写入审核问题中心" in text
+        row = conn.execute(
+            """SELECT rule_id, severity, subject_type FROM anomalies
+               WHERE rule_id='control_baseline_cap'"""
+        ).fetchone()
+        assert row is not None
+        assert row["severity"] == "info"
+        assert row["subject_type"] == "control_baseline"

@@ -713,33 +713,55 @@ class TestCrossCheck:
         )[0]
         assert first.verification_level == "sufficient"
         signature = run_contract.current_run_signature(conn, info.project_id)
-        trigger_name = f"block_rerun_{failure_target}"
+        # 触发器 DDL 为常量字面量；运行期目标 (project_id, period_id, signature)
+        # 经 UDF 谓词闭包比较，触发体保持 RAISE(ABORT)，异常类型与消息契约不变。
         if failure_target == "evidence":
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER INSERT ON evidence
-                WHEN NEW.kind='cross_check'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic rerun evidence failure');
-                END"""
+            conn.execute(
+                """CREATE TRIGGER block_rerun_evidence
+                    AFTER INSERT ON evidence
+                    WHEN NEW.kind='cross_check'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic rerun evidence failure');
+                    END"""
+            )
             error_message = "synthetic rerun evidence failure"
         elif failure_target == "period_totals":
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER UPDATE OF cross_check_status ON period_totals
-                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic rerun period_totals failure');
-                END"""
+            def _synthetic_rerun_target(new_pid, new_period):
+                return 1 if (int(new_pid), int(new_period)) == (
+                    int(info.project_id), int(period_id)
+                ) else 0
+
+            conn.create_function("synthetic_rerun_target", 2, _synthetic_rerun_target)
+            conn.execute(
+                """CREATE TRIGGER block_rerun_period_totals
+                    AFTER UPDATE OF cross_check_status ON period_totals
+                    WHEN synthetic_rerun_target(NEW.project_id, NEW.period_id)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic rerun period_totals failure');
+                    END"""
+            )
             error_message = "synthetic rerun period_totals failure"
         else:
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER UPDATE ON crosscheck_results
-                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
-                  AND NEW.run_signature='{signature}'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic rerun crosscheck_results failure');
-                END"""
+            def _synthetic_rerun_target(new_pid, new_period, new_signature):
+                return 1 if (
+                    (int(new_pid), int(new_period))
+                    == (int(info.project_id), int(period_id))
+                    and str(new_signature) == signature
+                ) else 0
+
+            conn.create_function(
+                "synthetic_rerun_signature_target", 3, _synthetic_rerun_target
+            )
+            conn.execute(
+                """CREATE TRIGGER block_rerun_crosscheck_results
+                    AFTER UPDATE ON crosscheck_results
+                    WHEN synthetic_rerun_signature_target(
+                        NEW.project_id, NEW.period_id, NEW.run_signature)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic rerun crosscheck_results failure');
+                    END"""
+            )
             error_message = "synthetic rerun crosscheck_results failure"
-        conn.execute(trigger_sql)
         try:
             with pytest.raises(sqlite3.IntegrityError, match=error_message):
                 crosscheck.run_crosscheck(
@@ -788,7 +810,13 @@ class TestCrossCheck:
                 conn, info.project_id, run_kind=coverage.AGGREGATE_VALIDATION
             )["status"] == coverage.FAILED
         finally:
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            # DROP 语句逐分支使用字面量：参数化值只决定走哪个分支，不进入 SQL 文本。
+            if failure_target == "evidence":
+                conn.execute("DROP TRIGGER IF EXISTS block_rerun_evidence")
+            elif failure_target == "period_totals":
+                conn.execute("DROP TRIGGER IF EXISTS block_rerun_period_totals")
+            else:
+                conn.execute("DROP TRIGGER IF EXISTS block_rerun_crosscheck_results")
 
     def test_invalidation_commit_retries_then_failed_coverage_hides_old_success(
         self, project_multi
@@ -1119,45 +1147,91 @@ class TestCrossCheck:
         )[0]
         assert first.verification_level == "sufficient"
         signature = run_contract.current_run_signature(conn, info.project_id)
-        trigger_name = f"block_invalidation_{failure_target}"
+        # 触发器 DDL 为常量字面量；运行期目标 (project_id, period_id, signature)
+        # 经 UDF 谓词闭包比较（失效化签名取常量 INVALIDATED_RUN_SIGNATURE），
+        # 触发体保持 RAISE(ABORT)，异常类型与消息契约不变。
         if failure_target == "crosscheck_results":
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER UPDATE OF run_signature ON crosscheck_results
-                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
-                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic invalidation crosscheck_results failure');
-                END"""
+            def _synthetic_invalidation_target(new_pid, new_period, new_signature):
+                return 1 if (
+                    (int(new_pid), int(new_period))
+                    == (int(info.project_id), int(period_id))
+                    and str(new_signature) == run_contract.INVALIDATED_RUN_SIGNATURE
+                ) else 0
+
+            conn.create_function(
+                "synthetic_invalidation_target", 3, _synthetic_invalidation_target
+            )
+            conn.execute(
+                """CREATE TRIGGER block_invalidation_crosscheck_results
+                    AFTER UPDATE OF run_signature ON crosscheck_results
+                    WHEN synthetic_invalidation_target(
+                        NEW.project_id, NEW.period_id, NEW.run_signature)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic invalidation crosscheck_results failure');
+                    END"""
+            )
             error_message = "synthetic invalidation crosscheck_results failure"
         elif failure_target == "period_totals":
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER INSERT ON period_totals
-                WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
-                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic invalidation period_totals failure');
-                END"""
+            def _synthetic_invalidation_target(new_pid, new_period, new_signature):
+                return 1 if (
+                    (int(new_pid), int(new_period))
+                    == (int(info.project_id), int(period_id))
+                    and str(new_signature) == run_contract.INVALIDATED_RUN_SIGNATURE
+                ) else 0
+
+            conn.create_function(
+                "synthetic_invalidation_target", 3, _synthetic_invalidation_target
+            )
+            conn.execute(
+                """CREATE TRIGGER block_invalidation_period_totals
+                    AFTER INSERT ON period_totals
+                    WHEN synthetic_invalidation_target(
+                        NEW.project_id, NEW.period_id, NEW.run_signature)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic invalidation period_totals failure');
+                    END"""
+            )
             error_message = "synthetic invalidation period_totals failure"
         elif failure_target == "evidence":
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER UPDATE OF run_signature ON evidence
-                WHEN NEW.project_id={info.project_id}
-                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic invalidation evidence failure');
-                END"""
+            def _synthetic_invalidation_target(new_pid, new_signature):
+                return 1 if (
+                    int(new_pid) == int(info.project_id)
+                    and str(new_signature) == run_contract.INVALIDATED_RUN_SIGNATURE
+                ) else 0
+
+            conn.create_function(
+                "synthetic_invalidation_target", 2, _synthetic_invalidation_target
+            )
+            conn.execute(
+                """CREATE TRIGGER block_invalidation_evidence
+                    AFTER UPDATE OF run_signature ON evidence
+                    WHEN synthetic_invalidation_target(NEW.project_id, NEW.run_signature)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic invalidation evidence failure');
+                    END"""
+            )
             error_message = "synthetic invalidation evidence failure"
         else:
-            trigger_sql = f"""CREATE TRIGGER {trigger_name}
-                AFTER UPDATE OF run_signature ON detection_runs
-                WHEN NEW.project_id={info.project_id}
-                  AND NEW.run_kind='{coverage.AGGREGATE_VALIDATION}'
-                  AND NEW.run_signature='{run_contract.INVALIDATED_RUN_SIGNATURE}'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic invalidation detection coverage failure');
-                END"""
+            def _synthetic_invalidation_target(new_pid, new_kind, new_signature):
+                return 1 if (
+                    int(new_pid) == int(info.project_id)
+                    and str(new_kind) == coverage.AGGREGATE_VALIDATION
+                    and str(new_signature) == run_contract.INVALIDATED_RUN_SIGNATURE
+                ) else 0
+
+            conn.create_function(
+                "synthetic_invalidation_target", 3, _synthetic_invalidation_target
+            )
+            conn.execute(
+                """CREATE TRIGGER block_invalidation_detection_coverage
+                    AFTER UPDATE OF run_signature ON detection_runs
+                    WHEN synthetic_invalidation_target(
+                        NEW.project_id, NEW.run_kind, NEW.run_signature)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic invalidation detection coverage failure');
+                    END"""
+            )
             error_message = "synthetic invalidation detection coverage failure"
-        conn.execute(trigger_sql)
         try:
             with pytest.raises(sqlite3.IntegrityError, match=error_message):
                 crosscheck.run_crosscheck(
@@ -1196,7 +1270,19 @@ class TestCrossCheck:
             assert coverage_summary["fail_closed"] is True
             assert coverage_summary["status"] != coverage.COMPLETE
         finally:
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            # DROP 语句逐分支使用字面量：参数化值只决定走哪个分支，不进入 SQL 文本。
+            if failure_target == "crosscheck_results":
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS block_invalidation_crosscheck_results"
+                )
+            elif failure_target == "period_totals":
+                conn.execute("DROP TRIGGER IF EXISTS block_invalidation_period_totals")
+            elif failure_target == "evidence":
+                conn.execute("DROP TRIGGER IF EXISTS block_invalidation_evidence")
+            else:
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS block_invalidation_detection_coverage"
+                )
 
         _reopened, reopened = pm.open_project(workspace)
         try:
@@ -1467,9 +1553,44 @@ class TestCrossCheck:
         monkeypatch.setattr(run_contract, "clear_fail_closed_state", real_clear)
 
     def _assert_crosscheck_persistence_failure(
-        self, tmp_path, *, trigger_name, trigger_sql, error_message
+        self, tmp_path, *, trigger_key, error_message
     ):
         info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+        # 触发器 DDL 为常量字面量；运行期目标 (project_id, period_id) 经 UDF
+        # 谓词闭包比较，触发体保持 RAISE(ABORT)，异常类型与消息契约不变。
+        def _synthetic_fail_target(new_pid, new_period):
+            return 1 if (int(new_pid), int(new_period)) == (
+                int(info.project_id), int(period_id)
+            ) else 0
+
+        conn.create_function("synthetic_fail_target", 2, _synthetic_fail_target)
+        if trigger_key == "evidence":
+            conn.execute(
+                """CREATE TRIGGER fail_crosscheck_evidence_after_insert
+                    AFTER INSERT ON evidence
+                    WHEN NEW.kind='cross_check'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic crosscheck evidence failure');
+                    END"""
+            )
+        elif trigger_key == "period_totals":
+            conn.execute(
+                """CREATE TRIGGER fail_crosscheck_period_totals_after_update
+                    AFTER UPDATE OF cross_check_status ON period_totals
+                    WHEN synthetic_fail_target(NEW.project_id, NEW.period_id)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic period_totals failure');
+                    END"""
+            )
+        else:
+            conn.execute(
+                """CREATE TRIGGER fail_crosscheck_results_after_insert
+                    AFTER INSERT ON crosscheck_results
+                    WHEN synthetic_fail_target(NEW.project_id, NEW.period_id)
+                    BEGIN
+                        SELECT RAISE(ABORT, 'synthetic crosscheck_results failure');
+                    END"""
+            )
         try:
             aggs = aggregate.aggregate_project(conn, info.project_id)
             aggregate.persist_period_totals(conn, info.project_id, aggs)
@@ -1482,7 +1603,6 @@ class TestCrossCheck:
             ).fetchone()
             assert before["cross_check_status"] == "pending"
             assert before["evidence_id"] is None
-            conn.execute(trigger_sql)
 
             with pytest.raises(sqlite3.IntegrityError, match=error_message):
                 crosscheck.run_crosscheck(
@@ -1526,7 +1646,18 @@ class TestCrossCheck:
             assert set(json.loads(run["failed_json"])) == expected_paths
             assert error_message in run["error_summary"]
         finally:
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            if trigger_key == "evidence":
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS fail_crosscheck_evidence_after_insert"
+                )
+            elif trigger_key == "period_totals":
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS fail_crosscheck_period_totals_after_update"
+                )
+            else:
+                conn.execute(
+                    "DROP TRIGGER IF EXISTS fail_crosscheck_results_after_insert"
+                )
             conn.close()
 
     def test_crosscheck_evidence_failure_after_partial_write_rolls_back_and_records_coverage(
@@ -1535,13 +1666,7 @@ class TestCrossCheck:
         """Evidence 已插入后失败时，整期业务写入和覆盖结果均回滚/失败。"""
         self._assert_crosscheck_persistence_failure(
             tmp_path,
-            trigger_name="fail_crosscheck_evidence_after_insert",
-            trigger_sql="""CREATE TRIGGER fail_crosscheck_evidence_after_insert
-                AFTER INSERT ON evidence
-                WHEN NEW.kind='cross_check'
-                BEGIN
-                    SELECT RAISE(ABORT, 'synthetic crosscheck evidence failure');
-                END""",
+            trigger_key="evidence",
             error_message="synthetic crosscheck evidence failure",
         )
 
@@ -1550,13 +1675,18 @@ class TestCrossCheck:
     ):
         """period_totals 已被触发更新后失败时，部分结果不得提交。"""
         info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+
+        def _synthetic_fail_target(new_pid, new_period):
+            return 1 if int(new_period) == int(period_id) else 0
+
+        conn.create_function("synthetic_fail_target", 2, _synthetic_fail_target)
         try:
             aggs = aggregate.aggregate_project(conn, info.project_id)
             aggregate.persist_period_totals(conn, info.project_id, aggs)
             conn.execute(
-                f"""CREATE TRIGGER fail_crosscheck_period_totals_after_update
+                """CREATE TRIGGER fail_crosscheck_period_totals_after_update
                     AFTER UPDATE OF cross_check_status ON period_totals
-                    WHEN NEW.period_id={period_id}
+                    WHEN synthetic_fail_target(NEW.project_id, NEW.period_id)
                     BEGIN
                         SELECT RAISE(ABORT, 'synthetic period_totals failure');
                     END"""
@@ -1574,13 +1704,20 @@ class TestCrossCheck:
     ):
         """crosscheck_results 已写入前序表后失败时，整期结果不得半成功。"""
         info, conn, period_id = _make_amount_case(tmp_path, raw_amount="200")
+
+        def _synthetic_fail_target(new_pid, new_period):
+            return 1 if (int(new_pid), int(new_period)) == (
+                int(info.project_id), int(period_id)
+            ) else 0
+
+        conn.create_function("synthetic_fail_target", 2, _synthetic_fail_target)
         try:
             aggs = aggregate.aggregate_project(conn, info.project_id)
             aggregate.persist_period_totals(conn, info.project_id, aggs)
             conn.execute(
-                f"""CREATE TRIGGER fail_crosscheck_results_after_insert
+                """CREATE TRIGGER fail_crosscheck_results_after_insert
                     AFTER INSERT ON crosscheck_results
-                    WHEN NEW.project_id={info.project_id} AND NEW.period_id={period_id}
+                    WHEN synthetic_fail_target(NEW.project_id, NEW.period_id)
                     BEGIN
                         SELECT RAISE(ABORT, 'synthetic crosscheck_results failure');
                     END"""

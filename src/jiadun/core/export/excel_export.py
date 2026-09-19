@@ -109,8 +109,13 @@ RULE_ZH_CN = {
     "header_needs_review": "表头识别待复核",
     "missing_columns": "缺少必需列",
     "missing_key_column": "缺少关键列",
+    "control_baseline_cap": "对上控制基准上限比较",
+    "contract_risk": "合同关键条款风险",
 }
-SUBJECT_ZH = {"line_item": "清单行", "period": "期次", "sheet": "工作表", "project": "项目"}
+SUBJECT_ZH = {
+    "line_item": "清单行", "period": "期次", "sheet": "工作表", "project": "项目",
+    "control_baseline": "控制基准",
+}
 ANOMALY_STATUS_ZH = {
     "new": "新发现",
     "pending_review": "待复核",
@@ -1217,6 +1222,49 @@ def export_contract_risks(conn: sqlite3.Connection, project_id: int, wb: Workboo
     _autowidth(ws)
 
 
+def export_control_baseline_compares(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
+    """控制基准比较结论清单（五态上限比较；只报差额，不认定违规/责任）。"""
+    ws = wb.create_sheet("控制基准比较")
+    ws.append(["编号", "级别", "比较状态", "基准编号", "基准金额（元）",
+               "结算合计（元）", "差额（元）", "结算期次", "说明", "证据ID"])
+    _style_header(ws, 1, 10)
+    scope, scope_params = run_contract.current_scope(conn, project_id, "a")
+    rows = conn.execute(
+        f"""SELECT a.id, a.severity, a.message, a.evidence_id, a.raw_values_json
+           FROM anomalies a
+           WHERE a.project_id=? AND {scope} AND a.rule_id='control_baseline_cap'
+           ORDER BY a.id""",
+        (project_id, *scope_params),
+    ).fetchall()
+    sev_zh = {"high": "高", "medium": "中", "low": "低", "info": "提示"}
+    status_zh = {
+        "PASS": "未超上限（PASS）", "FAIL": "超上限（FAIL）",
+        "PENDING": "待确认（PENDING）", "INCOMPARABLE": "不可比较（INCOMPARABLE）",
+        "CONTROL_CONFLICT": "基准冲突（CONTROL_CONFLICT）",
+    }
+    for i, r in enumerate(rows, start=1):
+        try:
+            raw = json.loads(r["raw_values_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        period_no = raw.get("period_no")
+        ws.append([
+            i,
+            sev_zh.get(r["severity"], r["severity"]),
+            status_zh.get(str(raw.get("status") or ""), "—"),
+            f"#{raw.get('baseline_id', '—')}",
+            raw.get("baseline_amount") or "—",
+            raw.get("settlement_amount") or "—",
+            raw.get("delta") if raw.get("delta") is not None else "—",
+            f"第 {period_no} 期" if period_no is not None else "—",
+            _normalize_business_text(r["message"]),
+            r["evidence_id"],
+        ])
+    _autowidth(ws)
+
+
 def export_evidence_index(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
     ws = wb.create_sheet("证据索引")
     ws.append([
@@ -1676,6 +1724,7 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     export_historical_price_sheet(conn, project_id, wb)
     export_anomaly_lists(conn, project_id, wb)
     export_contract_risks(conn, project_id, wb)
+    export_control_baseline_compares(conn, project_id, wb)
     export_evidence_index(conn, project_id, wb)
     export_audit_worksheet(conn, project_id, wb)
     for ws in wb.worksheets:

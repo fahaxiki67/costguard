@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import os
 import sys
 from pathlib import Path
 
@@ -29,10 +30,15 @@ def inventory(root: Path) -> list[dict]:
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
+        relative = path.relative_to(root)
+        # rglob 结果必然位于 root 之下；越界只可能是遍历中目录树被改写
+        # （符号表/联接点变动等），此时跳过该文件而不是写进盘点清单。
+        if relative.is_absolute() or os.pardir in relative.parts:
+            continue
         stat = path.stat()
         rows.append(
             {
-                "relative_path": path.relative_to(root).as_posix(),
+                "relative_path": relative.as_posix(),
                 "file_name": path.name,
                 "extension": path.suffix.lower().lstrip("."),
                 "size_bytes": stat.st_size,
@@ -64,10 +70,26 @@ def main() -> int:
         return 1
 
     rows = [r for r in inventory(root) if r["size_bytes"] >= args.min_size]
-    args.out.mkdir(parents=True, exist_ok=True)
+    out_dir = args.out.resolve()
+    if not out_dir.exists():
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if not out_dir.is_dir():
+        print(f"FAIL: 输出目录不可用：{out_dir}", file=sys.stderr)
+        return 1
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = args.out / f"inventory_{root.name}_{stamp}.csv"
-    with open(out_file, "w", encoding="utf-8-sig", newline="") as handle:
+    out_file = out_dir / f"inventory_{root.name}_{stamp}.csv"
+    # 安全写出边界：CSV 只能落在 --out 目录内，且不得写回被盘点的资料树。
+    out_file_resolved = out_file.resolve()
+    if out_file_resolved.parent != out_dir:
+        print(f"FAIL: 输出路径越出输出目录：{out_file}", file=sys.stderr)
+        return 1
+    if out_file_resolved == root or root in out_file_resolved.parents:
+        print(
+            "FAIL: 输出不得写回被盘点的资料目录（--out 不应位于 --root 之下）",
+            file=sys.stderr,
+        )
+        return 1
+    with out_file.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=HEADER)
         writer.writeheader()
         writer.writerows(rows)

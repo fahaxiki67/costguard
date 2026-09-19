@@ -12,15 +12,23 @@
 - PENDING：税口径未确认、候选未确认等无法确认的情形；
 - FAIL：结算结果超过已确认控制基准（给出超出金额，不认定违规/责任）；
 - PASS：结算结果未超过。
+
+比较结论通过 :func:`record_comparison_finding` 进入审核问题中心
+（``rule_id='control_baseline_cap'``），随导出进入异常清单与报告；结论
+只报告差额与状态，不构成违规或责任认定。
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from decimal import Decimal
 
+from jiadun.core.contracts import run_contract
 from jiadun.core.engine.money import to_decimal
 from jiadun.core.evidence import evidence as evidence_api
+from jiadun.core.evidence import finding_lifecycle
+from jiadun.core.evidence.finding import Finding
 
 BASELINE_CANDIDATE = "candidate"
 BASELINE_CONFIRMED = "confirmed"
@@ -325,4 +333,242 @@ def compare_upward_result(
         "delta": None if delta is None else str(delta),
         "reason": reason,
         "evidence_id": ev_id,
+    }
+
+
+# ---- 比较结论进入审核问题中心（ROADMAP v0.1.25 遗留项）----
+
+COMPARISON_RULE_ID = "control_baseline_cap"
+
+# 五态 → 审核问题中心级别。FAIL 是预算保护红线但只报差额；PASS 仅作
+# 信息性结论留痕；PENDING/INCOMPARABLE 属于口径与确认问题。
+_COMPARISON_SEVERITY = {
+    COMPARE_FAIL: "high",
+    COMPARE_CONTROL_CONFLICT: "medium",
+    COMPARE_PENDING: "low",
+    COMPARE_INCOMPARABLE: "low",
+    COMPARE_PASS: "info",
+}
+
+_COMPARISON_IMPACT = {
+    COMPARE_FAIL: "对上结算结果超过已确认控制基准，差额原因需人工复核",
+    COMPARE_CONTROL_CONFLICT: "有效控制基准并存，人工裁决取代关系前不存在可信上限结论",
+    COMPARE_PENDING: "基准或口径未确认，暂不能形成上限结论",
+    COMPARE_INCOMPARABLE: "范围或税口径不同，不得直接比较差额",
+    COMPARE_PASS: "结算结果在已确认控制基准内，供报告与审计留痕",
+}
+
+_COMPARISON_LIMITATIONS = [
+    "比较结论只报告差额或状态，不构成违规、责任或最终审定结论",
+    "基准金额、结算明细或口径变化后结论不再代表当前状态，需重新比较",
+]
+
+_COMPARISON_RECOMMENDATION = (
+    "复核基准范围/税口径与对上结算期次的一致性；差额确认后按人工流程处理，"
+    "不得自动调平或修改原始数据"
+)
+
+
+def _comparison_finding(
+    result: dict,
+    *,
+    period_no: int | None,
+) -> Finding:
+    """把 compare_upward_result 输出整理成审核问题中心 Finding。"""
+    status = str(result["status"])
+    baseline_id = int(result["baseline_id"])
+    delta = result.get("delta")
+    prefix = f"对上结算第 {int(period_no)} 期合计 {result['settlement_amount']} 元" \
+        if period_no is not None else f"对上结算合计 {result['settlement_amount']} 元"
+    if status == COMPARE_FAIL:
+        message = (
+            f"{prefix}超过已确认控制基准 #{baseline_id}"
+            f"（{result['baseline_amount']} 元）{delta} 元；仅报告差额，"
+            "不构成违规或责任认定"
+        )
+    elif status == COMPARE_PASS and delta is not None:
+        message = (
+            f"{prefix}未超过已确认控制基准 #{baseline_id}"
+            f"（{result['baseline_amount']} 元，结余 {abs(Decimal(delta))} 元）"
+        )
+    else:
+        message = f"控制基准 #{baseline_id} 上限比较：{result['reason']}"
+    raw_values = {
+        "baseline_id": baseline_id,
+        "baseline_amount": result["baseline_amount"],
+        "settlement_amount": result["settlement_amount"],
+        "delta": delta,
+        "status": status,
+    }
+    if period_no is not None:
+        raw_values["period_no"] = int(period_no)
+    return Finding(
+        COMPARISON_RULE_ID,
+        _COMPARISON_SEVERITY[status],
+        "control_baseline",
+        baseline_id,
+        message,
+        {
+            "raw_values": raw_values,
+            "compare_evidence_id": result.get("evidence_id"),
+            "reason": result["reason"],
+            "impact": _COMPARISON_IMPACT[status],
+            "limitations": list(_COMPARISON_LIMITATIONS),
+            "recommendation": _COMPARISON_RECOMMENDATION,
+            "confidence": "high",
+        },
+    )
+
+
+def record_comparison_finding(
+    conn: sqlite3.Connection,
+    project_id: int,
+    result: dict,
+    *,
+    period_no: int | None = None,
+) -> dict:
+    """把一次上限比较结论登记进审核问题中心（同一基准只保留最新快照）。
+
+    快照语义与合同风险检查一致：同一基准再次比较时，旧结论连同证据转为
+    历史（不删除、不篡改），新结论从"新发现"开始；不同基准的结论互不
+    覆盖。运行异常检测不会清扫本规则（输入未变时结论仍然成立）。
+    """
+    status = str(result.get("status") or "")
+    if status not in _COMPARISON_SEVERITY:
+        raise ValueError(f"未知的控制基准比较状态：{status!r}")
+    baseline_id = int(result["baseline_id"])
+    active_contract = run_contract.ensure_run_contract(conn, project_id)
+    finding = _comparison_finding(result, period_no=period_no)
+    now = datetime.now().isoformat(timespec="seconds")
+    history_rows = conn.execute(
+        """SELECT id, finding_id, fingerprint, status, lifecycle_status,
+                  resolved_note, created_at, run_signature, run_id
+           FROM anomalies
+           WHERE project_id=? AND rule_id=? AND subject_id=? AND subject_type=?
+             AND fingerprint=? ORDER BY id""",
+        (int(project_id), COMPARISON_RULE_ID, baseline_id, "control_baseline",
+         finding.fingerprint),
+    ).fetchall()
+    repeated_history = [
+        {
+            "anomaly_id": int(row["id"]),
+            "finding_id": row["finding_id"],
+            "legacy_status": row["status"],
+            "lifecycle_status": row["lifecycle_status"],
+            "reason": row["resolved_note"],
+            "created_at": row["created_at"],
+            "run_signature": row["run_signature"],
+            "run_id": row["run_id"],
+        }
+        for row in history_rows
+    ]
+    with run_contract._transaction(conn, "persist_control_baseline_compare"):
+        old_rows = conn.execute(
+            """SELECT id, finding_id, fingerprint, lifecycle_status, status,
+                      evidence_id, run_signature, run_id
+               FROM anomalies
+               WHERE project_id=? AND rule_id=? AND subject_type='control_baseline'
+                 AND subject_id=?
+                 AND COALESCE(lifecycle_status, 'new') <> 'historical'""",
+            (int(project_id), COMPARISON_RULE_ID, baseline_id),
+        ).fetchall()
+        evidence_api.mark_historical(
+            conn,
+            int(project_id),
+            {
+                int(row["evidence_id"])
+                for row in old_rows if row["evidence_id"] is not None
+            },
+            "该基准已产生新的上限比较结论，旧结论保留为历史",
+            actor="system",
+            commit=False,
+        )
+        for row in old_rows:
+            before_status = finding_lifecycle.lifecycle_status(row)
+            conn.execute(
+                """UPDATE anomalies
+                   SET status='stale', lifecycle_status='historical',
+                       resolved_note=COALESCE(
+                           resolved_note,
+                           '该基准已产生新的上限比较结论，旧结论保留为历史'
+                       ), lifecycle_updated_at=?, lifecycle_updated_by='system'
+                   WHERE id=? AND project_id=?""",
+                (now, int(row["id"]), int(project_id)),
+            )
+            conn.execute(
+                """INSERT INTO finding_status_events(
+                       project_id, anomaly_id, finding_id, fingerprint,
+                       before_status, after_status, reason, actor, occurred_at,
+                       run_signature, run_id, evidence_id, audit_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(project_id), int(row["id"]), row["finding_id"], row["fingerprint"],
+                    before_status, "historical",
+                    "该基准已产生新的上限比较结论，旧结论保留为历史",
+                    "system", now, row["run_signature"], row["run_id"],
+                    row["evidence_id"], None,
+                ),
+            )
+        record = finding.as_record()
+        ev_id = evidence_api.add_evidence(
+            conn,
+            int(project_id),
+            COMPARISON_RULE_ID,
+            finding.message,
+            steps=[{
+                "step": "控制基准上限比较结论入册",
+                "rule_id": COMPARISON_RULE_ID,
+                "finding_id": finding.finding_id,
+                "fingerprint": finding.fingerprint,
+                "status": status,
+                "delta": result.get("delta"),
+                "reason": result["reason"],
+                "compare_evidence_id": result.get("evidence_id"),
+                "impact": finding.impact,
+                "limitations": finding.limitations,
+                "recommendation": finding.recommendation,
+            }],
+            sources=[{
+                "baseline_id": baseline_id,
+                "baseline_amount": result["baseline_amount"],
+                "settlement_amount": result["settlement_amount"],
+                "status": status,
+                **({"period_no": int(period_no)} if period_no is not None else {}),
+            }],
+            commit=False,
+            run_signature=active_contract.signature,
+            run_id=active_contract.run_id,
+            finding_id=finding.finding_id,
+            scope="current",
+        )
+        cur = conn.execute(
+            """INSERT INTO anomalies(
+                   project_id, rule_id, severity, subject_type, subject_id,
+                   evidence_id, message, status, created_at, run_signature, run_id,
+                   finding_id, fingerprint, confidence, detection_mode,
+                   raw_values_json, normalized_values_json, impact,
+                   limitations_json, recommendation, lifecycle_status,
+                   repeat_history_json)
+               VALUES (?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                int(project_id), COMPARISON_RULE_ID, finding.severity,
+                "control_baseline", baseline_id,
+                ev_id, finding.message, now, active_contract.signature,
+                active_contract.run_id,
+                record["finding_id"], record["fingerprint"], record["confidence"],
+                record["detection_mode"],
+                json.dumps(record["raw_values"], ensure_ascii=False, default=str),
+                json.dumps(record["normalized_values"], ensure_ascii=False, default=str),
+                finding.impact,
+                json.dumps(finding.limitations, ensure_ascii=False, default=str),
+                finding.recommendation, "new",
+                json.dumps(repeated_history, ensure_ascii=False, default=str),
+            ),
+        )
+    return {
+        "anomaly_id": int(cur.lastrowid),
+        "finding_id": finding.finding_id,
+        "evidence_id": ev_id,
+        "severity": finding.severity,
+        "status": status,
     }

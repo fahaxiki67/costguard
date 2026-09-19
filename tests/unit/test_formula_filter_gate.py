@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 
 import openpyxl
 import pytest
+from defusedxml.ElementTree import fromstring as safe_fromstring
 from openpyxl.worksheet.filters import AutoFilter
 from openpyxl.worksheet.table import Table
 
@@ -66,7 +67,8 @@ def _set_formula_cache(path: Path, values: dict[str, str]) -> None:
         for item in source.infolist():
             payload = source.read(item.filename)
             if item.filename == "xl/worksheets/sheet1.xml":
-                root = ElementTree.fromstring(payload)
+                # 与产品解析层同一入口：defusedxml 拒绝 DTD/实体展开。
+                root = safe_fromstring(payload)
                 for cell in root.iter(f"{namespace}c"):
                     coordinate = cell.attrib.get("r")
                     if coordinate not in values:

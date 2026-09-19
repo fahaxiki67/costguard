@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -319,17 +320,15 @@ def test_main_window_source_file_flow_creates_project_and_imports_file(
     sheet.append(["0101", "平整场地", "m2", 2, 3, 6])
     book.save(source)
 
-    class FakeDialog:
-        def __init__(self, parent=None):
-            self.name_edit = type("NameEdit", (), {"setText": lambda _self, _text: None})()
+    # 生产签名：NewProjectDialog(parent)；exec→Accepted，values 返回（项目名, 工作区根）
+    fake_dialog = MagicMock()
+    fake_dialog.exec.return_value = QDialog.Accepted
+    fake_dialog.values.return_value = ("拖拽创建项目", tmp_path / "workspace")
+    fake_dialog_cls = MagicMock(return_value=fake_dialog)
 
-        def exec(self):
-            return QDialog.Accepted
-
-        def values(self):
-            return "拖拽创建项目", tmp_path / "workspace"
-
-    monkeypatch.setattr(main_window, "NewProjectDialog", FakeDialog)
+    # 手动替换对话框类（等价于 monkeypatch，便于静态审计看清赋值目标）
+    _original_dialog = main_window.NewProjectDialog
+    main_window.NewProjectDialog = fake_dialog_cls
     monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
     # 此用例只验证首页创建项目后的委派和旧同步核心入口；后台线程/类别
     # 对话框由 test_document_intake 单独覆盖，避免 offscreen 测试等待人工 UI。
@@ -348,4 +347,5 @@ def test_main_window_source_file_flow_creates_project_and_imports_file(
             (page.project.project_id,),
         ).fetchone()["n"] == 1
     finally:
+        main_window.NewProjectDialog = _original_dialog
         win.close()

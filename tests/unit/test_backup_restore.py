@@ -24,10 +24,17 @@ def demo_project(tmp_path: Path) -> Path:
 
 
 def _counts(conn: sqlite3.Connection) -> dict[str, int]:
+    # 常量 UNION 查询一次取回五张表计数；表名不进入字符串拼接。
+    row = conn.execute(
+        """SELECT
+               (SELECT COUNT(*) FROM source_files) AS source_files,
+               (SELECT COUNT(*) FROM raw_sheets) AS raw_sheets,
+               (SELECT COUNT(*) FROM raw_cells) AS raw_cells,
+               (SELECT COUNT(*) FROM line_items) AS line_items,
+               (SELECT COUNT(*) FROM evidence) AS evidence"""
+    ).fetchone()
     tables = ("source_files", "raw_sheets", "raw_cells", "line_items", "evidence")
-    return {
-        t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables
-    }
+    return {t: row[t] for t in tables}
 
 
 def _archive_members(path: Path) -> list[tuple[zipfile.ZipInfo, bytes]]:

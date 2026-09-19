@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
+from defusedxml.ElementTree import fromstring as _safe_fromstring
+
 from jiadun.core.engine.money import NotANumberError, to_decimal
 
 # 前多少行参与表头识别
@@ -637,6 +639,15 @@ def _ooxml_part_target(target: str) -> str:
     return posixpath.normpath(posixpath.join("xl", target))
 
 
+def _parse_ooxml_part(data: bytes) -> ElementTree.Element:
+    """解析 OOXML ZIP 部件；DTD/内部实体一律拒绝（defusedxml fail-closed）。
+
+    源工作簿是典型不可信输入；标准库 ElementTree 会展开内部 DTD 实体
+    （billion laughs），这里统一走 defusedxml 入口，防止资源耗尽。
+    """
+    return _safe_fromstring(data)
+
+
 def _source_xlsx_census(path: Path) -> dict[str, object]:
     """从 OOXML 包目录独立盘点源工作簿的 Sheet 顺序与使用范围。
 
@@ -648,8 +659,8 @@ def _source_xlsx_census(path: Path) -> dict[str, object]:
     workbook_part = "xl/workbook.xml"
     rels_part = "xl/_rels/workbook.xml.rels"
     with zipfile.ZipFile(path) as package:
-        workbook_root = ElementTree.fromstring(package.read(workbook_part))
-        rels_root = ElementTree.fromstring(package.read(rels_part))
+        workbook_root = _parse_ooxml_part(package.read(workbook_part))
+        rels_root = _parse_ooxml_part(package.read(rels_part))
         relationships = {
             rel.attrib.get("Id", ""): _ooxml_part_target(rel.attrib.get("Target", ""))
             for rel in rels_root.findall(f"{{{_OOXML_PACKAGE_REL_NS}}}Relationship")
@@ -663,7 +674,7 @@ def _source_xlsx_census(path: Path) -> dict[str, object]:
             target = relationships.get(rel_id)
             if not target or target not in package.namelist():
                 raise ValueError(f"Sheet 关系缺失：{sheet.attrib.get('name', '')}")
-            worksheet_root = ElementTree.fromstring(package.read(target))
+            worksheet_root = _parse_ooxml_part(package.read(target))
             dimension_ref, shape, range_method = _worksheet_shape(worksheet_root)
             populated_cell_count, populated_row_count, content_digest = (
                 _worksheet_content_fingerprint(worksheet_root)

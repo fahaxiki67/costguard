@@ -309,6 +309,26 @@ class TestSourceFileImport:
         finally:
             conn.close()
 
+    def test_rejects_malformed_digest(self, proj, tmp_path, monkeypatch):
+        """摘要形态守卫：哈希输出异常时必须拒绝入库（防副本文件名越界）。"""
+        info, conn = project_model.open_project(Path(proj.workspace_path))
+        try:
+            src = tmp_path / "bad-digest.xlsx"
+            src.write_bytes(b"content")
+            monkeypatch.setattr(
+                source_file, "sha256_of", lambda _path: "../../evil/../../escape"
+            )
+            with pytest.raises(source_file.SourceFileError, match="invalid sha256"):
+                source_file.import_file(
+                    conn, proj.project_id, Path(proj.workspace_path), src
+                )
+            # originals/ 不得产生任何越界文件
+            originals = Path(proj.workspace_path) / "originals"
+            assert not (originals / "escape").exists()
+            assert list(originals.glob("**/*escape*")) == []
+        finally:
+            conn.close()
+
     def test_foreign_keys_enforced(self, proj):
         conn = migrations.connect(Path(proj.workspace_path) / "project.db")
         try:
@@ -397,8 +417,17 @@ class TestSchemaCopyMigration:
                 "projects": 1, "source_files": 1, "settlement_periods": 1,
                 "line_items": 1, "item_aliases": 1,
             }
+            # 常量 UNION 查询一次取回五张表计数；表名不进入字符串拼接。
+            count_row = conn.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM projects) AS projects,
+                       (SELECT COUNT(*) FROM source_files) AS source_files,
+                       (SELECT COUNT(*) FROM settlement_periods) AS settlement_periods,
+                       (SELECT COUNT(*) FROM line_items) AS line_items,
+                       (SELECT COUNT(*) FROM item_aliases) AS item_aliases"""
+            ).fetchone()
             for table, expected in counts.items():
-                n = conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+                n = count_row[table]
                 assert n == expected, f"{table} 记录数在迁移后变化"
             row = conn.execute(
                 "SELECT stored_path, sha256 FROM source_files WHERE id=1"

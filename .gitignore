@@ -51,3 +51,6 @@ build/
 *.local.md
 TODO.private.md
 .v2c/
+
+# 本地安全工具状态（Mimosa 钩子/扫描的会话数据，不属于仓库内容）
+.mimosa/

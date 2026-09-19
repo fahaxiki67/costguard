@@ -130,8 +130,14 @@ def _import(db, name_maker):
 
 
 def _counts(conn):
-    return {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-            for t in ("settlement_periods", "line_items", "period_totals")}
+    # 常量 UNION 查询一次取回三张表计数；表名不进入字符串拼接。
+    row = conn.execute(
+        """SELECT
+               (SELECT COUNT(*) FROM settlement_periods) AS settlement_periods,
+               (SELECT COUNT(*) FROM line_items) AS line_items,
+               (SELECT COUNT(*) FROM period_totals) AS period_totals"""
+    ).fetchone()
+    return {t: row[t] for t in ("settlement_periods", "line_items", "period_totals")}
 
 
 class TestGate:

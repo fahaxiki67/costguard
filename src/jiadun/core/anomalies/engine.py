@@ -230,12 +230,14 @@ def run_anomalies(conn: sqlite3.Connection, project_id: int, rules=None) -> list
         # 每次检测都是一个新的不可变检测快照。旧自动 Finding 无论本次是否
         # 仍然命中，都必须保留为历史，不能 DELETE 后丢失关闭/复核轨迹；新
         # Finding 通过 repeat_history_json 引用这些历史行，但不得继承其状态。
+        # contract_risk 与 control_baseline_cap 是输入绑定的确定性快照规则，
+        # 由各自的登记入口负责历史化（输入未变时结论仍然成立），不随本清扫。
         old_rows = conn.execute(
             """SELECT id, finding_id, fingerprint, lifecycle_status, status,
                       evidence_id, run_signature, run_id
             FROM anomalies
             WHERE project_id=? AND detection_mode IN ('automated', 'technical_failure')
-                 AND rule_id <> 'contract_risk'
+                 AND rule_id NOT IN ('contract_risk', 'control_baseline_cap')
                  AND (run_signature IS NOT NULL OR run_id IS NOT NULL)
                  AND COALESCE(lifecycle_status, 'new') <> 'historical'""",
             (project_id,),

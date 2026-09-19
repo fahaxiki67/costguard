@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+# hexdigest() 的形态契约（64 位小写十六进制）；originals/ 副本文件名以此为唯一寻址。
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
 
 FILE_TYPE_BY_SUFFIX = {
     ".xlsx": "xlsx",
@@ -69,21 +73,35 @@ def import_file(
 
     ``commit=False`` 供结算导入的外层事务使用；副本文件本身仍按只读资产
     写入，数据库登记会随调用方事务一起提交或回滚。
+
+    边界纪律：输入必须是已存在的常规文件（symlink 解析到最终目标后校验）；
+    副本与 .importing 中间文件一律只允许落在 ``originals`` 根目录内，
+    写入前对 resolve 后的路径做包含校验。
     """
-    src = Path(src)
-    if not src.is_file():
+    src_resolved = Path(src).resolve()
+    if not src_resolved.is_file():
         raise SourceFileError(f"source file not found: {src}")
-    suffix = src.suffix.lower()
+    suffix = src_resolved.suffix.lower()
     ftype = FILE_TYPE_BY_SUFFIX.get(suffix)
     if ftype is None:
         raise SourceFileError(f"unsupported file type: {suffix}")
 
-    digest = sha256_of(src)
-    size = src.stat().st_size
+    digest = sha256_of(src_resolved)
+    # originals/ 以「sha256 + 后缀」寻址；入库前校验摘要形态，保证副本
+    # 文件名永远是受限的十六进制标识（防哈希函数/格式漂移带坏存储布局）。
+    if not _SHA256_HEX_RE.fullmatch(digest):
+        raise SourceFileError(f"invalid sha256 digest: {digest!r}")
+    size = src_resolved.stat().st_size
 
     originals = Path(project_dir) / "originals"
     originals.mkdir(parents=True, exist_ok=True)
-    stored = originals / f"{digest}{suffix}"
+    originals_root = originals.resolve()
+    # hexdigest 已通过 _SHA256_HEX_RE 校验，pathlib 组合即可，不做字符串插值。
+    stored = originals.joinpath(digest).with_suffix(suffix)
+    if stored.resolve().parent != originals_root:
+        raise SourceFileError(
+            f"副本路径越出 originals 根目录：{stored}（根目录 {originals_root}）"
+        )
 
     row = conn.execute(
         "SELECT id, stored_path FROM source_files WHERE project_id=? AND sha256=?",
@@ -98,7 +116,11 @@ def import_file(
 
     if not stored.exists():  # 不同项目目录或首见文件：复制
         tmp = stored.with_suffix(suffix + ".importing")
-        with open(src, "rb") as fin, open(tmp, "wb") as fout:
+        if tmp.resolve().parent != originals_root:
+            raise SourceFileError(
+                f"中间文件路径越出 originals 根目录：{tmp}（根目录 {originals_root}）"
+            )
+        with src_resolved.open("rb") as fin, tmp.open("wb") as fout:
             while True:
                 block = fin.read(1 << 20)
                 if not block:
@@ -122,16 +144,16 @@ def import_file(
     elif conn.in_transaction:
         # 不提交调用方已经打开的外层事务；导入编排会在同一事务中登记
         # source_files，并在后续物化失败时整体回滚数据库记录。
-        savepoint = "source_file_insert"
-        conn.execute(f"SAVEPOINT {savepoint}")
+        # SAVEPOINT 用常量名与常量语句：登记是单层调用，语句文本不拼接。
+        conn.execute("SAVEPOINT source_file_insert")
         try:
             file_id = _insert()
         except Exception:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.execute("ROLLBACK TO source_file_insert")
+            conn.execute("RELEASE source_file_insert")
             raise
         else:
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.execute("RELEASE source_file_insert")
     else:
         with conn:
             file_id = _insert()

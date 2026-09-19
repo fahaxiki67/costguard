@@ -11,6 +11,7 @@
 import os
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -170,6 +171,7 @@ class TestBlock2SetDirection:
         """同期号 up/down 两行，只改选中行；audit subject 按 period_id。"""
         from PySide6.QtWidgets import QApplication
 
+        import jiadun.ui.workbench as workbench_module
         from jiadun.core.evidence import audit as audit_log
         from jiadun.core.models.project import ProjectInfo
         from jiadun.ui.workbench import WorkbenchPage
@@ -189,22 +191,26 @@ class TestBlock2SetDirection:
         page.period_table.selectRow(target_row)
         page.dir_combo.setCurrentIndex(page.dir_combo.findData("downward"))
 
-        class FakeDlg:
-            def __init__(self, *a, **k):
-                pass
+        # 生产签名：ReasonDialog(title, message, parent)；exec→Accepted，reason 返回确认理由
+        fake_dialog = MagicMock()
+        fake_dialog.exec.return_value = 1  # QDialog.Accepted
+        fake_dialog.reason.return_value = "改方向测试"
+        fake_dialog_cls = MagicMock(return_value=fake_dialog)
 
-            def exec(self):
-                return 1  # QDialog.Accepted
-
-            def reason(self):
-                return "改方向测试"
-
-        monkeypatch.setattr("jiadun.ui.workbench.ReasonDialog", FakeDlg)
+        # 手动替换对话框类（等价于 monkeypatch，便于静态审计看清赋值目标）
+        _original_dialog = workbench_module.ReasonDialog
+        workbench_module.ReasonDialog = fake_dialog_cls
         warnings = []
         from PySide6.QtWidgets import QMessageBox
 
         monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(1))
-        page._set_direction()
+        try:
+            page._set_direction()
+        finally:
+            workbench_module.ReasonDialog = _original_dialog
+        fake_dialog_cls.assert_called_once_with(
+            "标记期次方向", "将第 1 期方向标记为「对下结算」", page
+        )
 
         up_d = conn.execute("SELECT direction FROM settlement_periods WHERE id=?", (up1,)).fetchone()["direction"]
         down_d = conn.execute("SELECT direction FROM settlement_periods WHERE id=?", (down1,)).fetchone()["direction"]
@@ -241,6 +247,7 @@ class TestBlock2SetDirection:
         """非冲突标记：只改选中行（按 period_id），同期号另一方向不受影响。"""
         from PySide6.QtWidgets import QApplication
 
+        import jiadun.ui.workbench as workbench_module
         from jiadun.core.evidence import audit as audit_log
         from jiadun.core.models.project import ProjectInfo
         from jiadun.ui.workbench import WorkbenchPage
@@ -257,17 +264,15 @@ class TestBlock2SetDirection:
         page.period_table.selectRow(target_row)
         page.dir_combo.setCurrentIndex(page.dir_combo.findData("downward"))
 
-        class FakeDlg:
-            def __init__(self, *a, **k):
-                pass
+        # 生产签名：ReasonDialog(title, message, parent)；exec→Accepted，reason 返回确认理由
+        fake_dialog = MagicMock()
+        fake_dialog.exec.return_value = 1
+        fake_dialog.reason.return_value = "改方向测试"
+        fake_dialog_cls = MagicMock(return_value=fake_dialog)
 
-            def exec(self):
-                return 1
-
-            def reason(self):
-                return "改方向测试"
-
-        monkeypatch.setattr("jiadun.ui.workbench.ReasonDialog", FakeDlg)
+        # 手动替换对话框类（等价于 monkeypatch，便于静态审计看清赋值目标）
+        _original_dialog = workbench_module.ReasonDialog
+        workbench_module.ReasonDialog = fake_dialog_cls
         # 先移走 down 第1期的期号（改为 down 第5期），使 up1→downward 不撞车
         with conn:
             conn.execute("UPDATE settlement_periods SET period_no=5 WHERE id=?", (down1,))
@@ -275,7 +280,10 @@ class TestBlock2SetDirection:
         target_row = next(r for r in range(page.period_table.rowCount())
                           if page.period_table.item(r, 1).text() == "up1")
         page.period_table.selectRow(target_row)
-        page._set_direction()
+        try:
+            page._set_direction()
+        finally:
+            workbench_module.ReasonDialog = _original_dialog
 
         up_d = conn.execute("SELECT direction FROM settlement_periods WHERE id=?", (up1,)).fetchone()["direction"]
         down_d = conn.execute("SELECT direction, period_no FROM settlement_periods WHERE id=?", (down1,)).fetchone()

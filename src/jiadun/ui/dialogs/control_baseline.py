@@ -302,6 +302,28 @@ class ControlBaselineDialog(QDialog):
             f"对上结算合计（第 {period['period_no']} 期）：{result['settlement_amount']} 元",
             f"差额：{result['delta'] if result['delta'] is not None else '—'} 元",
             f"说明：{result['reason']}",
-            "（比较结论不构成违规或责任认定；全部依据已写入审计 Evidence）",
         ]
+        try:
+            recorded = cb.record_comparison_finding(
+                self.conn, self.project_id, result,
+                period_no=int(period["period_no"]),
+            )
+        except (ValueError, RuntimeError) as exc:
+            QMessageBox.warning(
+                self, "结论未登记",
+                "比较已完成并留有证据，但结论未能写入审核问题中心：\n"
+                f"{exc}\n请处理后再重新比较。",
+            )
+        except Exception:  # noqa: BLE001 — UI 层兜底
+            _LOG.exception("控制基准比较结论写入问题中心失败")
+            QMessageBox.warning(
+                self, "结论未登记",
+                "比较已完成并留有证据，但结论未能写入审核问题中心，请重试比较。",
+            )
+        else:
+            lines.append(
+                f"已写入审核问题中心：问题 #{recorded['anomaly_id']}"
+                f"（Evidence ID {recorded['evidence_id']}）；可在导出与报告中查阅"
+            )
+        lines.append("（比较结论不构成违规或责任认定；全部依据已写入审计 Evidence）")
         self.result_view.setPlainText("\n".join(lines))

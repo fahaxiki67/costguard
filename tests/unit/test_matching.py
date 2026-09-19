@@ -511,16 +511,25 @@ class TestHumanReview:
         ]
         assert len(ids) >= 2
         first_id, second_id = ids[:2]
-        trigger_name = "mutate_batch_confirmation_candidate"
+        # 触发器 DDL 为常量字面量；运行期目标 id 经 UDF 谓词闭包比较，
+        # 触发体仍是 RAISE(ABORT)（异常类型与消息契约与原实现一致）。
+        def _first_is_target(row_id):
+            return 1 if int(row_id) == first_id else 0
+
+        def _second_is_target(row_id):
+            return 1 if int(row_id) == second_id else 0
+
+        conn.create_function("synthetic_first_match", 1, _first_is_target)
+        conn.create_function("synthetic_second_match", 1, _second_is_target)
         with conn:
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            conn.execute("DROP TRIGGER IF EXISTS mutate_batch_confirmation_candidate")
             conn.execute(
-                f"""CREATE TRIGGER {trigger_name}
+                """CREATE TRIGGER mutate_batch_confirmation_candidate
                     AFTER UPDATE OF status ON matches
-                    WHEN NEW.id={first_id} AND NEW.status='confirmed'
+                    WHEN synthetic_first_match(NEW.id) AND NEW.status='confirmed'
                     BEGIN
                         UPDATE matches SET level='suspected'
-                        WHERE id={second_id};
+                        WHERE synthetic_second_match(id);
                     END"""
             )
         try:
@@ -543,7 +552,7 @@ class TestHumanReview:
                 "SELECT COUNT(*) FROM audit_log WHERE project_id=?", (pid,)
             ).fetchone()[0] == 0
         finally:
-            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            conn.execute("DROP TRIGGER IF EXISTS mutate_batch_confirmation_candidate")
 
     def test_override_match(self, db):
         conn, pid, (p1, p2) = db

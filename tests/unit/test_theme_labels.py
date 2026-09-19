@@ -103,3 +103,20 @@ def test_level_short_zh(level, expected):
 ])
 def test_item_status_zh(status, expected):
     assert labels.ITEM_STATUS_ZH[status] == expected
+
+
+def test_control_baseline_terminology_consistent_across_layers():
+    """控制基准相关业务词在 UI 与导出两层映射中保持一致（防翻译漂移）。
+
+    译文审核回归：control_baseline_cap / contract_risk / control_baseline
+    同时出现在 ui/labels.py（问题中心）与 export/excel_export.py（审核底稿）
+    的映射里，两层必须给出同一中文，避免同一发现两种叫法。
+    """
+    from jiadun.core.export import excel_export
+
+    assert labels.rule_zh("control_baseline_cap") == "对上控制基准上限比较"
+    assert labels.rule_zh("contract_risk") == "合同关键条款风险"
+    assert labels.subject_type_zh("control_baseline") == "控制基准"
+    assert excel_export.RULE_ZH_CN["control_baseline_cap"] == "对上控制基准上限比较"
+    assert excel_export.RULE_ZH_CN["contract_risk"] == "合同关键条款风险"
+    assert excel_export.SUBJECT_ZH["control_baseline"] == "控制基准"

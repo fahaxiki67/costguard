@@ -67,7 +67,7 @@ def runner_env(tmp_path, monkeypatch):
     manifest = base / "manifest.csv"
     import csv
 
-    with open(manifest, "w", encoding="utf-8", newline="") as f:
+    with manifest.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
         w.writeheader()
         w.writerows(rows)
@@ -680,10 +680,19 @@ class TestFormRouting:
                 f"notes 不得暗示写入合同模型: {joined}"
 
             # 结算与合同模型全部零污染（contract_docs/facts 是合同模块专用，
-            # 表单路由不得写入，否则 contract_risks 会产生虚假合同风险）
+            # 表单路由不得写入，否则 contract_risks 会产生虚假合同风险）。
+            # 常量 UNION 查询一次取回五张表计数，表名不进入字符串拼接。
+            row = conn.execute(
+                """SELECT
+                       (SELECT COUNT(*) FROM settlement_periods) AS settlement_periods,
+                       (SELECT COUNT(*) FROM line_items) AS line_items,
+                       (SELECT COUNT(*) FROM period_totals) AS period_totals,
+                       (SELECT COUNT(*) FROM contract_docs) AS contract_docs,
+                       (SELECT COUNT(*) FROM contract_facts) AS contract_facts"""
+            ).fetchone()
             for table in ("settlement_periods", "line_items", "period_totals",
                           "contract_docs", "contract_facts"):
-                c = conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+                c = row[table]
                 assert c == 0, f"{table} 被表单路由污染（{c} 行）"
 
             # 保真层保留原 Sheet
@@ -771,7 +780,7 @@ class TestPureFormProjectHandling:
                 "copy_path": f"corpus/T{i:02d}_sample.xlsx",
                 "sha256": runner.sha256_of(src), "purpose": "脱敏回归",
             })
-        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+        with (base / "manifest.csv").open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
             w.writeheader()
             w.writerows(rows)
@@ -884,7 +893,7 @@ class TestStepsRoleFormSeparation:
             rows.append({"test_id": f"T{i:02d}", "source_path": f"orig/T{i:02d}",
                          "copy_path": f"corpus/T{i:02d}_sample.xlsx",
                          "sha256": runner.sha256_of(p), "purpose": "脱敏回归"})
-        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+        with (base / "manifest.csv").open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
             w.writeheader()
             w.writerows(rows)
@@ -936,7 +945,7 @@ class TestManualSheetDecisions:
                 "copy_path": f"corpus/T{i:02d}_sample.xlsx",
                 "sha256": runner.sha256_of(p), "purpose": "脱敏回归",
             })
-        with open(base / "manifest.csv", "w", encoding="utf-8", newline="") as f:
+        with (base / "manifest.csv").open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(
                 f, fieldnames=["test_id", "source_path", "copy_path", "sha256", "purpose"])
             w.writeheader()

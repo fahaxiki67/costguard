@@ -62,10 +62,13 @@ class TestCandidateByDefault:
     def test_migration_backfills_legacy_as_candidate(self, imported_doc, tmp_path):
         """历史事实无法证明经过人工确认：迁移回填 candidate，不自动升 confirmed。"""
         conn, pid, _, _ = imported_doc
-        # 把库降回 v47 形态：删列 + 回退迁移记录
+        # 把库降回 v47 形态：删列 + 回退迁移记录。
+        # 列名固定，逐条使用字面量 DDL（sqlite 的 ALTER 不支持参数绑定）。
         with conn:
-            for col in ("review_status", "reviewed_at", "reviewed_by", "review_reason"):
-                conn.execute(f"ALTER TABLE contract_facts DROP COLUMN {col}")
+            conn.execute("ALTER TABLE contract_facts DROP COLUMN review_status")
+            conn.execute("ALTER TABLE contract_facts DROP COLUMN reviewed_at")
+            conn.execute("ALTER TABLE contract_facts DROP COLUMN reviewed_by")
+            conn.execute("ALTER TABLE contract_facts DROP COLUMN review_reason")
             conn.execute("DELETE FROM schema_migrations WHERE version>=48")
             conn.execute("UPDATE projects SET schema_version=47")
         conn.close()

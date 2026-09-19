@@ -3,6 +3,7 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -98,23 +99,23 @@ class TestWorkbench:
         )
         wb_page.document_table.selectRow(row_index)
 
-        class FakeCategoryDialog:
-            def __init__(self, *_args, **_kwargs):
-                pass
+        # 生产签名：ImportCategoryDialog(selection_count, parent, category=...)；
+        # setWindowTitle 可调用、exec→Accepted、category 返回重归类类别。
+        fake_dialog = MagicMock()
+        fake_dialog.exec.return_value = QDialog.Accepted
+        fake_dialog.category.return_value = "other_agreement"
+        fake_dialog_cls = MagicMock(return_value=fake_dialog)
 
-            def setWindowTitle(self, _title):
-                pass
-
-            def exec(self):
-                return QDialog.Accepted
-
-            def category(self):
-                return "other_agreement"
-
-        monkeypatch.setattr(workbench, "ImportCategoryDialog", FakeCategoryDialog)
+        # 手动替换对话框类（等价于 monkeypatch，便于静态审计看清赋值目标）
+        selected_category = str(wb_page._selected_source_file()["category"])
+        _original_dialog = workbench.ImportCategoryDialog
+        workbench.ImportCategoryDialog = fake_dialog_cls
         monkeypatch.setattr(QMessageBox, "information", lambda *_args, **_kwargs: None)
-
-        wb_page._reclassify_source_file()
+        try:
+            wb_page._reclassify_source_file()
+        finally:
+            workbench.ImportCategoryDialog = _original_dialog
+        fake_dialog_cls.assert_called_once_with(1, wb_page, category=selected_category)
 
         current = run_contract.get_current_contract(
             wb_page.conn, wb_page.project.project_id
@@ -559,21 +560,23 @@ class TestMainWindow:
             pm.platform_paths, "default_workspace_root", lambda: default_root
         )
 
-        class FakeDialog:
-            def __init__(self, parent=None):
-                pass
+        # 生产签名：NewProjectDialog(parent)；exec→Accepted，values 返回（项目名, 工作区根）
+        fake_dialog = MagicMock()
+        fake_dialog.exec.return_value = QDialog.Accepted
+        fake_dialog.values.return_value = ("重启仍可见", custom_root)
+        fake_dialog_cls = MagicMock(return_value=fake_dialog)
 
-            def exec(self):
-                return QDialog.Accepted
-
-            def values(self):
-                return "重启仍可见", custom_root
-
-        monkeypatch.setattr(main_window, "NewProjectDialog", FakeDialog)
+        # 手动替换对话框类（等价于 monkeypatch，便于静态审计看清赋值目标）
+        _original_dialog = main_window.NewProjectDialog
+        main_window.NewProjectDialog = fake_dialog_cls
         win = main_window.MainWindow()
         monkeypatch.setattr(win, "_open", lambda info: None)
-        win._on_new()
+        try:
+            win._on_new()
+        finally:
+            main_window.NewProjectDialog = _original_dialog
         win.close()
+        fake_dialog_cls.assert_called_once()
 
         # 新窗口模拟应用重启；项目列表应从持久化设置中恢复。
         restarted = main_window.MainWindow()
