@@ -516,7 +516,7 @@ def record_comparison_finding(
             COMPARISON_RULE_ID,
             finding.message,
             steps=[{
-                "step": "控制基准上限比较结论入册",
+                "step": "控制基准上限比较结论写入审核问题中心",
                 "rule_id": COMPARISON_RULE_ID,
                 "finding_id": finding.finding_id,
                 "fingerprint": finding.fingerprint,

@@ -132,7 +132,11 @@ LEVEL_SHORT_ZH = {
     "pending_data": "待补资料",
 }
 
-WORKBENCH_TABS = ["期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出"]
+# 工作台标签页（与 WorkbenchPage 的 addTab 顺序一致；由 UI 回归测试守护）
+WORKBENCH_TABS = [
+    "期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出",
+    "版本与历史资产", "资料中心",
+]
 
 SUBJECT_TYPE_ZH = {
     "line_item": "清单明细",

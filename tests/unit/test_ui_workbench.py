@@ -43,10 +43,14 @@ def wb_page(tmp_path, app):
 
 class TestWorkbench:
     def test_tabs_present(self, wb_page):
+        from jiadun.ui import labels as ui_labels
+
         names = [wb_page.tabs.tabText(i) for i in range(wb_page.tabs.count())]
-        assert names == [
+        # 实际标签页必须与 labels.WORKBENCH_TABS 单一事实来源一致（防文档/常量漂移）
+        assert names == ui_labels.WORKBENCH_TABS
+        # 核心五页顺序保持稳定（与 QUICKSTART 等文档描述一致）
+        assert names[:5] == [
             "期次概览", "清单明细", "审核问题中心", "匹配复核", "成果导出",
-            "版本与历史资产", "资料中心",
         ]
 
     def test_version_history_tab_is_readable_before_assets_exist(self, wb_page):
