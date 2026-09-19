@@ -110,3 +110,47 @@ class TestControlBaselineDialog:
         assert row is not None
         assert row["severity"] == "info"
         assert row["subject_type"] == "control_baseline"
+
+    def test_compare_record_failure_reported_not_faked(
+        self, env_with_contract_and_period, monkeypatch
+    ):
+        """结论写入审核问题中心失败时必须明确提示，不得伪装成功（fail-closed 回归）。
+
+        比较本身已完成并留有证据：五态结论仍完整展示，但不得出现"已写入
+        审核问题中心"的成功话术。
+        """
+        from unittest.mock import MagicMock
+
+        from PySide6.QtWidgets import QMessageBox
+
+        from jiadun.core.engine import control_baseline as cb_module
+
+        conn, pid, _ = env_with_contract_and_period
+        dlg = _open_dialog(env_with_contract_and_period)
+        dlg.tax_combo.setCurrentIndex(1)  # 含税（与对上期次 tax_mode=included 一致）
+        dlg._add_from_fact()
+        dlg.table.selectRow(0)
+        dlg.reason_edit.setText("终审审定表已核对，含税口径一致")
+        dlg._review("confirmed")
+
+        monkeypatch.setattr(
+            cb_module,
+            "record_comparison_finding",
+            MagicMock(side_effect=RuntimeError("模拟写入失败")),
+        )
+        warnings = []
+        monkeypatch.setattr(
+            QMessageBox, "warning", lambda *a, **k: warnings.append((a[1], a[2]))
+        )
+        dlg._compare()
+
+        text = dlg.result_view.toPlainText()
+        assert "已写入审核问题中心" not in text, "写入失败不得伪装成功"
+        assert warnings, "失败必须给出明确提示"
+        title, body = warnings[0]
+        assert title == "结论未登记"
+        assert "未能写入审核问题中心" in body and "模拟写入失败" in body
+        # 比较本身的结论不因入册失败而丢失
+        assert "PASS" in text
+        assert "差额：-86500.00 元" in text
+        assert "不构成违规或责任认定" in text
