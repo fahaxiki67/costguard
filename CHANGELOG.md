@@ -9,9 +9,13 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ## [Unreleased]
 
-后续改动将在这里记录；`v0.1.30` 为预发行/预览候选，不代表正式生产能力。
+后续改动将在这里记录；预发行/预览候选不代表正式生产能力。
+
+## [0.1.31] - 2026-09-20
 
 控制基准比较结论进入统一 Finding 生命周期（ROADMAP v0.1.25 遗留项，任务书任务 E3）：
+
+### Added
 
 - `compare_upward_result` 的五态结论可通过 `record_comparison_finding` 登记为
   `rule_id=control_baseline_cap` 的审核问题（`subject_type=control_baseline`），
@@ -22,6 +26,23 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 - FAIL 结论保持只报告超出金额，不构成违规、责任或最终审定结论；工作台
   「对上控制基准…」对话框比较后自动写入审核问题中心，写入失败时明确提示
   且不伪装成功。
+
+### Security
+
+- OOXML ZIP 部件解析统一走 defusedxml 入口：源工作簿是不可信输入，标准库
+  ElementTree 会展开内部 DTD 实体（billion laughs）造成资源耗尽，现一律拒绝
+  DTD/内部实体（fail-closed）。
+
+### Changed
+
+- 文档第二遍审阅：修正 QUICKSTART 中工作台标签页与 OCR 能力的过期描述、
+  清理 labels 死常量。
+
+### Verification boundary
+
+- 本版为预发行/预览候选，`production_release_ready=false`；真实黄金案例、OCR 质量、
+  Microsoft Excel/WPS 真机、1万/5万/20万行性能、代码签名与公证仍为
+  `PENDING / NOT VERIFIED`。全量 pytest、Ruff 与 Windows/macOS CI 覆盖本版代码。
 
 ## [0.1.30] - 2026-09-18
 

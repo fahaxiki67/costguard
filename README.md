@@ -11,8 +11,13 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.30 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.30
+> **Status: v0.1.31 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.31
+> candidate additionally routes upward control-baseline cap-comparison conclusions into
+> the audit-finding center (snapshot semantics per baseline, automatic entry from the
+> workbench dialog with fail-closed error surfacing, Excel anomaly list / dedicated
+> export sheet / Word top-risk coverage) and hardens OOXML ZIP part parsing with
+> defusedxml (internal DTD/entity refusal, fail-closed). The v0.1.30
 > candidate adds the contract-fact confirmation lifecycle (candidates by default, human
 > confirmation with mandatory reason, rejected facts leave the run contract), per-page
 > human verification of OCR PDF pages against the read-only original, upward control-baseline
