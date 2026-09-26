@@ -6,7 +6,11 @@
   标记 'incomplete'（待补资料），金额累计仍如实累加可得部分，但给出警示；
 - 小计行（flags.subtotal）永不参与累计；
 - item 归组采用"同编码或同名精确匹配"（Phase 4 的模糊归组在此基础上提级，
-  任何归组差异都保留明细行，不做合并改写）。
+  任何归组差异都保留明细行，不做合并改写）；
+- 单位兼容性在累计层独立校验（CG-01）：归组键保持 code/name 口径不变以
+  保住历史映射，但同组出现无法证明兼容的单位（如 1 吨与 1000 千克）时，
+  数量与加权平均单价不可定义，组标记 'incomparable'，金额（货币口径）
+  仍如实累计；没有已确认换算规则时不做任何单位换算。
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
+from jiadun.core.anomalies.rules import _norm_unit
 from jiadun.core.contracts import run_contract
 from jiadun.core.engine.money import (
     Decimal,
@@ -49,6 +54,11 @@ class ItemAggregate:
     amount_source: str = "missing"  # 'raw' | 'calculated' | 'mixed' | 'missing'
     amount_status: str = "missing"  # 'raw' | 'calculated' | 'mixed' | 'missing'
     amount_check_status: str = "not_available"  # 'match' | 'diff' | 'not_available'
+    # 参与数量累计的行的单位（归一化后，含空串）。仅用于向导出/界面披露
+    # 兼容性判定依据，不参与归组键（保持历史 item_key 映射稳定）。
+    units: set[str] = field(default_factory=set)
+    # 组内出现过的非空规格（feature）原文。仅用于提示复核，不改变累计。
+    features: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -158,9 +168,38 @@ def _add_decimal(current: Decimal | None, value: Decimal | None) -> Decimal | No
 
 
 def group_key_of(code: str | None, name: str) -> str:
+    """归组键：code 优先；无 code 用名称。
+
+    刻意不把单位/规格并入键（CG-01）：改变键口径会让 period_totals 等
+    历史映射失联。单位与规格的兼容性由 :func:`units_incompatible` 和
+    规格复核提示在累计层独立把关。
+    """
     if code:
         return f"code:{code}"
     return f"name:{name}"
+
+
+def normalize_unit(unit: str | None) -> str:
+    """单位归一化（与匹配/异常层同口径，别名表见 anomalies.rules）。"""
+    return _norm_unit(unit)
+
+
+def units_incompatible(units: set[str]) -> bool:
+    """判定一组（已归一化）单位是否无法证明兼容（CG-01，fail-closed）。
+
+    - 出现两个及以上不同单位（如 吨 与 千克）：无已确认换算规则，不可比；
+    - 有单位行与未注明单位行混存：无法证明同口径，同样不可比；
+    - 全部未注明单位：沿用历史口径（单位信息整体缺失，由其它校核把关），
+      不在累计层额外制造不可比。
+    """
+    named = {u for u in units if u}
+    if len(named) >= 2:
+        return True
+    return bool(named) and "" in units
+
+
+def _format_units(units: set[str]) -> str:
+    return " / ".join(sorted(units)) if any(units) else "（未注明）"
 
 
 def load_line_items(conn: sqlite3.Connection, project_id: int,
@@ -263,6 +302,9 @@ def aggregate_project(
         quantity_optional = _quantity_is_optional(row, col_maps)
         if not quantity_optional:
             agg.quantity_required = True
+        feature = (row["feature"] or "").strip()
+        if feature:
+            agg.features.add(feature)
         pp = agg.per_period.setdefault(
             int(row["period_id"]),
             {
@@ -277,11 +319,13 @@ def aggregate_project(
                 "amount_source": "missing",
                 "amount_status": "missing",
                 "amount_check_status": "not_available",
+                "units": set(),
             },
         )
         pp["rows"] += 1
         if qty is not None:
             pp["qty"] = qty if pp["qty"] is None else pp["qty"] + qty
+            pp["units"].add(normalize_unit(row["unit"]))
         if amount is not None:
             pp["amount"] = amount if pp["amount"] is None else pp["amount"] + amount
             pp["raw_amount"] = _add_decimal(pp["raw_amount"], amount)
@@ -345,10 +389,19 @@ def aggregate_project(
         amount_source = "missing"
         amount_check_status = "not_available"
         for p in periods:
-            q = agg.per_period[p]["qty"]
+            pp = agg.per_period[p]
+            # CG-01：同一期内单位无法证明兼容 → 该期数量被禁止累计，绝不输出
+            # 跨单位相加值；期内的加权平均单价随之不可定义。
+            if units_incompatible(pp["units"]):
+                pp["qty"] = None
+                agg.status = "incomparable"
+                agg.warnings.append(
+                    f"第{pp['period_no']}期 单位不一致（{_format_units(pp['units'])}）："
+                    "无已确认换算规则，该期数量与加权平均单价不可累计（不可比）"
+                )
+            q = pp["qty"]
             if q is not None:
                 qty_total = q if qty_total is None else qty_total + q
-            pp = agg.per_period[p]
             effective_amt_total = _add_decimal(effective_amt_total, pp["effective_amount"])
             raw_amt_total = _add_decimal(raw_amt_total, pp["raw_amount"])
             calculated_amt_total = _add_decimal(calculated_amt_total, pp["calculated_amount"])
@@ -375,7 +428,30 @@ def aggregate_project(
         agg.amount_source = amount_source
         agg.amount_check_status = amount_check_status
         agg.amount_status = "mixed" if amount_source == "mixed" else amount_source
-        if qty_total is not None and effective_amt_total is not None:
+        if len(agg.features) >= 2:
+            # CG-01 反例面：同组规格不一致（如同名不同规格）不静默当作同一
+            # 清单确认合并；数量金额仍如实累计，但必须降级为待复核。
+            agg.warnings.append(
+                f"同组规格不一致（{_format_units(agg.features)}）：是否同一清单待人工复核"
+            )
+            if agg.status == "ok":
+                agg.status = "incomplete"
+        group_units: set[str] = set()
+        for pp in agg.per_period.values():
+            group_units |= pp["units"]
+        agg.units = group_units
+        if units_incompatible(group_units):
+            # CG-01：跨期单位无法证明兼容（如 1 吨 + 1000 千克）→ 累计数量与
+            # 加权平均单价不可定义，组整体标记不可比；金额（货币口径）保持
+            # 如实累计，等待人工确认换算规则后重算。
+            agg.status = "incomparable"
+            agg.cum_qty = None
+            agg.wavg_price = None
+            agg.warnings.append(
+                f"组内单位不一致（{_format_units(group_units)}）："
+                "无已确认换算规则，累计数量与加权平均单价不可定义（不可比），待人工确认换算"
+            )
+        elif qty_total is not None and effective_amt_total is not None:
             if qty_total == 0:
                 agg.status = "incomparable" if agg.status == "ok" else agg.status
                 agg.warnings.append("累计数量为 0，加权平均单价不可定义（不可比）")
