@@ -36,6 +36,36 @@ class TestToDecimal:
     def test_thousands_separator(self):
         assert to_decimal("1,234,567.89") == D("1234567.89")
 
+    def test_ambiguous_thousands_separators_rejected(self):
+        """CG-02：歧义千分位绝不猜测数值，保留原文转待确认（NotANumberError）。"""
+        for ambiguous in ["1,2,3", "12,34", "1,23,456", ",123", "123,", "1,2345"]:
+            with pytest.raises(NotANumberError, match="ambiguous thousands"):
+                to_decimal(ambiguous)
+            # 错误消息必须保留原文，供调用方转待补资料/待复核
+            with pytest.raises(NotANumberError) as exc_info:
+                to_decimal(ambiguous)
+            assert ambiguous in str(exc_info.value)
+
+    def test_ambiguous_thousands_not_silently_stripped_in_parens_and_percent(self):
+        with pytest.raises(NotANumberError, match="ambiguous thousands"):
+            to_decimal("(1,2,3)")
+        with pytest.raises(NotANumberError, match="ambiguous thousands"):
+            to_percent("1,2,3%")
+
+    def test_valid_thousands_groups_still_accepted(self):
+        assert to_decimal("1,234") == D("1234")
+        assert to_decimal("12,345,678") == D("12345678")
+        assert to_decimal("1,234.56") == D("1234.56")
+        assert to_percent("1,234%") == D("12.34")
+
+    def test_percent_degenerate_forms_raise_not_a_number(self):
+        """CG-02：'.%' 等退化输入抛项目约定的 NotANumberError，不再泄漏
+        裸 decimal.InvalidOperation。"""
+        for bad in [".%", "1..2%", "-%"]:
+            with pytest.raises(NotANumberError):
+                to_percent(bad)
+
+
     def test_currency_symbols(self):
         assert to_decimal("¥12,345.67") == D("12345.67")
         assert to_decimal("￥99.5") == D("99.5")
@@ -69,6 +99,18 @@ class TestToDecimal:
         assert to_percent("6.72%") == D("0.0672")
         assert to_percent_number(13) == D("0.13")
         assert to_percent_number("9") == D("0.09")
+
+    def test_non_number_types_rejected(self):
+        """bool/NaN/Infinity/None 统一 NotANumberError，不补 0。"""
+        for bad in [True, False, float("nan"), float("inf"), float("-inf"), None]:
+            with pytest.raises(NotANumberError):
+                to_decimal(bad)
+
+    def test_fullwidth_digits_supported(self):
+        """受支持全角格式保持兼容（既有行为，防回归）。"""
+        assert to_decimal("１２３") == D("123")
+        assert to_decimal("１２３.４５") == D("123.45")
+        assert to_decimal("１,２３４") == D("1234")
 
 
 class TestMoneyOps:

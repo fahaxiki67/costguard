@@ -8,25 +8,53 @@
 from __future__ import annotations
 
 import re
-from decimal import ROUND_HALF_UP, Decimal, getcontext
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, getcontext
 
 getcontext().prec = 34  # 足够容纳工程金额与中间乘积
 
 ZERO = Decimal("0")
 TWO_PLACES = Decimal("0.01")
 
-_NUM_CLEAN_RE = re.compile(r"[,\s¥￥$€£]|人民币|元(?=$)")
+# 去除空白、货币符号和币种后缀。千分位逗号不在此处删除：必须先通过
+# 严格千分位校验（CG-02），避免 "1,2,3"→123、"12,34"→1234 的歧义静默解析。
+_NUM_CLEAN_RE = re.compile(r"[\s¥￥$€£]|人民币|元(?=$)")
+# 严格千分位：1-3 位开头，其后每组恰好 3 位，小数部分不带逗号。
+_THOUSANDS_RE = re.compile(r"\d{1,3}(?:,\d{3})*(?:\.\d+)?")
 
 
 class NotANumberError(ValueError):
     """输入无法解析为数值（调用方应标记'待补资料/不可比'，禁止补 0）。"""
 
 
+def _strip_validated_thousands(s: str, original: str) -> str:
+    """对含逗号的字符串做严格千分位校验，合法才剥逗号（CG-02）。
+
+    "1,234,567.89" 合法；"1,2,3"、"12,34"、",123"、"123," 属歧义格式，
+    统一抛 NotANumberError 并保留原文，由调用方转待补资料/待复核，
+    绝不猜测数值。
+    """
+    if "," not in s:
+        return s
+    if not _THOUSANDS_RE.fullmatch(s):
+        raise NotANumberError(f"ambiguous thousands separators: {original!r}")
+    return s.replace(",", "")
+
+
+def _decimal_or_nan(s: str, original: str, what: str) -> Decimal:
+    """构造 Decimal；任何底层 InvalidOperation 统一转项目约定的错误。"""
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        raise NotANumberError(f"cannot parse {what}: {original!r}") from None
+
+
 def to_decimal(value) -> Decimal:
     """把 Excel 单元格值安全转为 Decimal。
 
-    支持: int/float/Decimal/str；str 允许千分位、货币符号、全角、
-    括号负数 "(1,234.56)"、百分号 "13%"→0.13(仅当 percent=True)。
+    支持: int/float/Decimal/str；str 允许千分位（严格 3 位分组校验）、
+    货币符号、全角、括号负数 "(1,234.56)"、百分号 "13%"→0.13(仅当
+    percent=True)。歧义千分位（如 "1,2,3"、"12,34"）不猜测，抛
+    NotANumberError 保留原文转待确认。
     """
     if value is None:
         raise NotANumberError("empty value")
@@ -60,9 +88,10 @@ def to_decimal(value) -> Decimal:
             s = s[1:]
         if s.endswith("%"):
             raise NotANumberError("percent string must use to_percent()")
+        s = _strip_validated_thousands(s, value)
         if not re.fullmatch(r"\d*\.?\d*", s) or s in {"", "."}:
             raise NotANumberError(f"cannot parse: {value!r}")
-        d = Decimal(s)
+        d = _decimal_or_nan(s, value, "")
         return -d if negative else d
     raise NotANumberError(f"unsupported type: {type(value)!r}")
 
@@ -71,9 +100,10 @@ def to_percent(value) -> Decimal:
     """'13%' / '0.13' / 13(percent_number=True) → Decimal('0.13')。"""
     if isinstance(value, str) and value.strip().endswith("%"):
         s = _NUM_CLEAN_RE.sub("", value.strip()[:-1])
-        if not re.fullmatch(r"\d*\.?\d*", s) or not s:
+        s = _strip_validated_thousands(s, value)
+        if not re.fullmatch(r"\d*\.?\d*", s) or s in {"", "."}:
             raise NotANumberError(f"cannot parse percent: {value!r}")
-        return Decimal(s) / Decimal("100")
+        return _decimal_or_nan(s, value, "percent") / Decimal("100")
     return to_decimal(value)
 
 
