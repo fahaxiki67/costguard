@@ -4,16 +4,37 @@
 - 金额/数量/单价/税率一律 Decimal，禁止 float 进入金额路径；
 - 舍入统一 ROUND_HALF_UP（工程结算惯例）；
 - 本模块是 core 里唯一允许 Decimal 上下文调整的位置。
+
+上下文确定性（CG-03）：
+- 所有真正的金额运算（乘、加、除、quantize、差）都在 ``MONEY_CONTEXT``
+  的局部副本内执行（``localcontext``），结果只由输入决定，与调用方线程、
+  线程池或调用方临时修改的进程精度无关；
+- ``getcontext().prec = 34`` 只是导入线程的兼容默认值：run_contract 把它
+  作为运行环境记录（历史口径），模块外部的非金额路径 Decimal 运算仍沿用
+  该环境；金额正确性不再依赖这一进程全局状态；
+- 参数复制历史口径：prec=34、上下文舍入 ROUND_HALF_EVEN（round2 仍显式
+  ROUND_HALF_UP）、默认 Emax/Emin 与陷阱（InvalidOperation/DivisionByZero/
+  Overflow 显式拒绝，超范围直接抛错，不产生无限/静默值）。
 """
 from __future__ import annotations
 
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, getcontext
+from decimal import (
+    ROUND_HALF_UP,
+    Context,
+    Decimal,
+    InvalidOperation,
+    getcontext,
+    localcontext,
+)
 
-getcontext().prec = 34  # 足够容纳工程金额与中间乘积
+getcontext().prec = 34  # 兼容默认：仅记录环境口径（见模块 docstring），金额运算不依赖它
 
 ZERO = Decimal("0")
 TWO_PLACES = Decimal("0.01")
+
+# 集中金额上下文（CG-03）：参数保持修复前的主线程有效口径。
+MONEY_CONTEXT = Context(prec=34)
 
 # 去除空白、货币符号和币种后缀。千分位逗号不在此处删除：必须先通过
 # 严格千分位校验（CG-02），避免 "1,2,3"→123、"12,34"→1234 的歧义静默解析。
@@ -103,13 +124,17 @@ def to_percent(value) -> Decimal:
         s = _strip_validated_thousands(s, value)
         if not re.fullmatch(r"\d*\.?\d*", s) or s in {"", "."}:
             raise NotANumberError(f"cannot parse percent: {value!r}")
-        return _decimal_or_nan(s, value, "percent") / Decimal("100")
+        d = _decimal_or_nan(s, value, "percent")
+        with localcontext(MONEY_CONTEXT):
+            return d / Decimal("100")
     return to_decimal(value)
 
 
 def to_percent_number(value) -> Decimal:
     """'13' 或 13 → Decimal('0.13')（Excel 中税率常以数字 13 表示）。"""
-    return to_decimal(value) / Decimal("100")
+    d = to_decimal(value)
+    with localcontext(MONEY_CONTEXT):
+        return d / Decimal("100")
 
 
 def _require_decimal(value: object, field_name: str) -> Decimal:
@@ -128,19 +153,24 @@ def _require_decimal(value: object, field_name: str) -> Decimal:
 
 def money_mul(quantity: Decimal, unit_price: Decimal) -> Decimal:
     """合价 = 数量 × 单价（结果不主动舍入，比较时用 round2 后的值）。"""
-    return _require_decimal(quantity, "quantity") * _require_decimal(unit_price, "unit_price")
+    with localcontext(MONEY_CONTEXT):
+        return _require_decimal(quantity, "quantity") * _require_decimal(
+            unit_price, "unit_price"
+        )
 
 
 def round2(d: Decimal) -> Decimal:
     """结算惯例：保留两位，ROUND_HALF_UP。"""
-    return _require_decimal(d, "amount").quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    with localcontext(MONEY_CONTEXT):
+        return _require_decimal(d, "amount").quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
 
 def money_add(values) -> Decimal:
     total = ZERO
-    for v in values:
-        total += _require_decimal(v, "amount")
-    return total
+    with localcontext(MONEY_CONTEXT):
+        for v in values:
+            total += _require_decimal(v, "amount")
+        return total
 
 
 def weighted_avg_price(total_amount: Decimal, total_quantity: Decimal) -> Decimal:
@@ -152,13 +182,18 @@ def weighted_avg_price(total_amount: Decimal, total_quantity: Decimal) -> Decima
     total_quantity = _require_decimal(total_quantity, "total_quantity")
     if total_quantity == ZERO:
         raise ZeroDivisionError("total quantity is zero: weighted average undefined")
-    return total_amount / total_quantity
+    with localcontext(MONEY_CONTEXT):
+        return total_amount / total_quantity
 
 
 def within_tolerance(a: Decimal, b: Decimal, tol: Decimal) -> bool:
     """差异是否在容差内（仅用于报告分级，禁止用于调平数据）。"""
-    return abs(_require_decimal(a, "left") - _require_decimal(b, "right")) <= _require_decimal(tol, "tolerance")
+    with localcontext(MONEY_CONTEXT):
+        left = _require_decimal(a, "left")
+        right = _require_decimal(b, "right")
+        return abs(left - right) <= _require_decimal(tol, "tolerance")
 
 
 def diff(a: Decimal, b: Decimal) -> Decimal:
-    return _require_decimal(a, "left") - _require_decimal(b, "right")
+    with localcontext(MONEY_CONTEXT):
+        return _require_decimal(a, "left") - _require_decimal(b, "right")

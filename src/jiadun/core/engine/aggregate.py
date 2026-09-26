@@ -18,10 +18,12 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass, field
+from decimal import localcontext
 
 from jiadun.core.anomalies.rules import _norm_unit
 from jiadun.core.contracts import run_contract
 from jiadun.core.engine.money import (
+    MONEY_CONTEXT,
     Decimal,
     NotANumberError,
     money_mul,
@@ -109,7 +111,8 @@ def assess_amount(row: sqlite3.Row) -> tuple[AmountAssessment, bool, bool]:
         status = "missing"
 
     if raw is not None and calculated is not None:
-        difference = raw - calculated
+        with localcontext(MONEY_CONTEXT):  # CG-03：运算在集中金额上下文内
+            difference = raw - calculated
         check_status = "match" if abs(difference) <= AMOUNT_TOL else "diff"
     else:
         difference = None
@@ -162,9 +165,11 @@ def _update_amount_flags(flags: dict, assessment: AmountAssessment) -> dict:
 
 
 def _add_decimal(current: Decimal | None, value: Decimal | None) -> Decimal | None:
+    """累计加法唯一入口；在集中金额上下文内执行（CG-03 确定性）。"""
     if value is None:
         return current
-    return value if current is None else current + value
+    with localcontext(MONEY_CONTEXT):
+        return value if current is None else current + value
 
 
 def group_key_of(code: str | None, name: str) -> str:
@@ -324,10 +329,10 @@ def aggregate_project(
         )
         pp["rows"] += 1
         if qty is not None:
-            pp["qty"] = qty if pp["qty"] is None else pp["qty"] + qty
+            pp["qty"] = _add_decimal(pp["qty"], qty)
             pp["units"].add(normalize_unit(row["unit"]))
         if amount is not None:
-            pp["amount"] = amount if pp["amount"] is None else pp["amount"] + amount
+            pp["amount"] = _add_decimal(pp["amount"], amount)
             pp["raw_amount"] = _add_decimal(pp["raw_amount"], amount)
         if calculated_amount is not None:
             pp["calculated_amount"] = _add_decimal(pp["calculated_amount"], calculated_amount)
@@ -401,7 +406,7 @@ def aggregate_project(
                 )
             q = pp["qty"]
             if q is not None:
-                qty_total = q if qty_total is None else qty_total + q
+                qty_total = _add_decimal(qty_total, q)
             effective_amt_total = _add_decimal(effective_amt_total, pp["effective_amount"])
             raw_amt_total = _add_decimal(raw_amt_total, pp["raw_amount"])
             calculated_amt_total = _add_decimal(calculated_amt_total, pp["calculated_amount"])
