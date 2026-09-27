@@ -11,6 +11,10 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 后续改动将在这里记录；预发行/预览候选不代表正式生产能力。
 
+### Tests
+
+- 将 `pypdf` 纳入开发依赖，确保扫描 PDF 资料导入测试在本机和 CI 中运行；依赖缺失时测试会明确失败，不再静默跳过。
+
 ## [0.1.31] - 2026-09-20
 
 控制基准比较结论进入统一 Finding 生命周期（ROADMAP v0.1.25 遗留项，任务书任务 E3）：

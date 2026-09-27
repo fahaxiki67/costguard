@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pypdf
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -24,7 +25,6 @@ def test_intake_categories_keep_business_direction_user_controlled():
 
 
 def test_scanned_contract_pdf_is_persisted_as_pending_ocr(tmp_path: Path):
-    pypdf = pytest.importorskip("pypdf")
     from jiadun.core import document_intake
     from jiadun.core.contracts import extract
     from jiadun.core.models import project as project_model
@@ -50,13 +50,16 @@ def test_scanned_contract_pdf_is_persisted_as_pending_ocr(tmp_path: Path):
         conn.close()
 
 
-def test_import_worker_returns_for_scanned_pdf_and_keeps_document_visible(tmp_path: Path):
+def test_import_worker_returns_for_scanned_pdf_and_keeps_document_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     pytest.importorskip("PySide6")
-    pypdf = pytest.importorskip("pypdf")
     from jiadun.core import document_intake
     from jiadun.core.models import project as project_model
+    from jiadun.ui import workbench
     from jiadun.ui.workbench import ImportWorker
 
+    monkeypatch.setattr(workbench, "_load_local_ocr_provider", lambda: None)
     info = project_model.create_project("后台扫描件", tmp_path / "workspace")
     info, conn = project_model.open_project(Path(info.workspace_path))
     scanned = tmp_path / "无文本层.pdf"

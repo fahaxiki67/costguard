@@ -25,6 +25,7 @@ dev = [
     "hypothesis>=6",
     "ruff>=0.6",
     "pyinstaller>=6",
+    "pypdf>=5,<7",
 ]
 
 [project.gui-scripts]
