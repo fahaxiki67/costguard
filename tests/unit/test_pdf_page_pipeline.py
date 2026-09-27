@@ -217,6 +217,24 @@ def test_low_confidence_ocr_is_review_only(tmp_path: Path):
     assert raised.value.report.parse_ready is False
 
 
+def test_empty_ocr_result_is_review_only_not_a_success(tmp_path: Path):
+    source = _pdf_copy(tmp_path)
+    provider = FakeOcrProvider({2: _ocr_result("")})
+
+    with pytest.raises(PdfExtractionPending) as raised:
+        extract_pdf_document(
+            source,
+            renderer=FakeRenderer(_mixed_pages()),
+            ocr_provider=provider,
+        )
+
+    page = raised.value.report.pages[1]
+    assert page.status == "needs_review"
+    assert page.text == ""
+    assert "OCR 未返回文本" in page.error
+    assert raised.value.report.parse_ready is False
+
+
 def test_native_text_with_images_is_review_only(tmp_path: Path):
     source = _pdf_copy(tmp_path)
     provider = FakeOcrProvider({1: _ocr_result("不应调用")})

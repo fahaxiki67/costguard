@@ -355,7 +355,7 @@ class ImportWorker(QObject):
                             result["ok"] += 1
                         elif status == "needs_review":
                             result["partial"].append(
-                                f"{path.name}：OCR 已提取，需人工复核；候选条款未进入运行契约"
+                                f"{path.name}：解析结果需人工复核；候选条款未进入运行契约"
                             )
                         elif status == "pending_ocr":
                             result["partial"].append(

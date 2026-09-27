@@ -14,6 +14,7 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 ### Tests
 
 - 将 `pypdf` 纳入开发依赖，确保扫描 PDF 资料导入测试在本机和 CI 中运行；依赖缺失时测试会明确失败，不再静默跳过。
+- 修正扫描版合同的导入提示，OCR 结果为空或需核验时不再误称「OCR 已提取」；补充空 OCR 状态回归。
 
 ## [0.1.31] - 2026-09-20
 

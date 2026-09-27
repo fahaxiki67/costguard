@@ -120,7 +120,9 @@ def test_import_worker_does_not_count_needs_review_contract_as_success(
     worker.run()
 
     assert completed and completed[0]["ok"] == 0
-    assert any("需人工复核" in detail for detail in completed[0]["partial"])
+    assert completed[0]["partial"] == [
+        "候选合同.pdf：解析结果需人工复核；候选条款未进入运行契约"
+    ]
 
 
 def test_import_worker_emits_completion_when_selection_has_no_supported_files(tmp_path: Path):
