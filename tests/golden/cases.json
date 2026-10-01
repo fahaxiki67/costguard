@@ -136,10 +136,10 @@
         "matches": {
           "count": 31,
           "by_level": {
-            "confirmed": 21,
-            "incomparable": 1,
-            "pending_data": 2,
-            "probable": 7
+            "confirmed": 19,
+            "incomparable": 4,
+            "pending_data": 6,
+            "probable": 2
           },
           "group_keys": [
             "downward:code:010101001001",
@@ -185,11 +185,6 @@
               "downward:code:D1-001",
               "downward:name:c25砼垫层",
               "downward:name:劳务队土方用工",
-              "downward:name:合计",
-              "downward:name:小计",
-              "upward:code:010101001001",
-              "upward:code:010101003001",
-              "upward:code:010401001001",
               "upward:code:010402001001",
               "upward:code:010416001001",
               "upward:code:010501002001",
@@ -201,13 +196,18 @@
               "upward:code:011001002001",
               "upward:code:011702002001",
               "upward:code:011703001001",
-              "upward:code:012999001001",
-              "upward:name:合计",
-              "upward:name:小计"
+              "upward:code:012999001001"
             ],
             "non_match_group_keys": [
+              "downward:name:合计",
+              "downward:name:小计",
               "downward:pending:orphan",
+              "upward:code:010101001001",
+              "upward:code:010101003001",
+              "upward:code:010401001001",
               "upward:code:010501001001",
+              "upward:name:合计",
+              "upward:name:小计",
               "upward:pending:blocked_by_duplicate"
             ]
           }

@@ -16,7 +16,9 @@ from typing import Any
 from jiadun.core.contracts import run_contract
 from jiadun.core.engine.aggregate import assess_amount
 from jiadun.core.engine.money import NotANumberError, to_decimal
+from jiadun.core.engine.quantities import normalize_quantities, unit_basis
 from jiadun.core.matching import matching
+from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
 
@@ -78,31 +80,6 @@ def _load_match_rows(conn: sqlite3.Connection, project_id: int, match_row: sqlit
         ids = [int(value) for value in json.loads(match_row["item_ids_json"] or "[]")]
     except (TypeError, ValueError, json.JSONDecodeError):
         ids = []
-    key = matching._unscoped_group_key(match_row["group_key"])
-    if key.startswith("code:"):
-        sql = """SELECT li.*, sp.period_no, sp.direction, sf.id AS file_id,
-                         sf.original_name, rs.sheet_name
-                  FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
-                  LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
-                  LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
-                  LEFT JOIN source_files sf ON sf.id=pb.file_id
-                  WHERE sp.project_id=? AND li.code=?
-                  ORDER BY CASE sp.direction WHEN 'upward' THEN 0 WHEN 'downward' THEN 1 ELSE 2 END,
-                           sp.period_no, li.id"""
-        return conn.execute(sql, (project_id, key[5:])).fetchall()
-    if key.startswith("name:"):
-        rows = conn.execute(
-            """SELECT li.*, sp.period_no, sp.direction, sf.id AS file_id,
-                      sf.original_name, rs.sheet_name
-               FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
-               LEFT JOIN raw_sheets rs ON rs.id=li.sheet_id
-               LEFT JOIN parse_batches pb ON pb.id=rs.batch_id
-               LEFT JOIN source_files sf ON sf.id=pb.file_id
-               WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
-            (project_id,),
-        ).fetchall()
-        wanted = key[5:]
-        return [row for row in rows if matching.normalize_name(row["name"]) == wanted]
     if not ids:
         return []
     placeholders = ",".join("?" for _ in ids)
@@ -120,7 +97,9 @@ def _load_match_rows(conn: sqlite3.Connection, project_id: int, match_row: sqlit
 
 
 def _aggregate_side(rows: list[sqlite3.Row], direction: str) -> dict[str, Any]:
-    side_rows = [row for row in rows if (row["direction"] or "unknown") == direction]
+    side_rows = [row for row in rows if (row["direction"] or "unknown") == direction
+                 and not is_non_detail_flags(row["flags_json"])
+                 and not json.loads(row["flags_json"] or "{}").get("deduction")]
     values: dict[str, list[Any]] = {field: [] for field in MIRROR_FIELDS}
     sources = [_source(row) for row in side_rows]
     for row in side_rows:
@@ -148,7 +127,28 @@ def _aggregate_side(rows: list[sqlite3.Row], direction: str) -> dict[str, Any]:
         else:
             output[field] = values[field][0] if len(values[field]) == 1 else None
             output[f"{field}_values"] = values[field]
-    output["multiple_values"] = any(len(values[field]) > 1 for field in MIRROR_FIELDS)
+    normalized = normalize_quantities(side_rows)
+    output["unit"] = normalized.unit or None
+    output["quantity"] = normalized.quantity
+    output["quantity_status"] = normalized.status
+    output["conversions"] = list(normalized.conversions)
+    if len(values["amount"]) == len(side_rows) and side_rows:
+        output["amount"] = sum(values["amount"], D(0))
+    else:
+        output["amount"] = None
+    if len(side_rows) == 1:
+        basis = unit_basis(side_rows[0]["unit"])
+        price = _dec(side_rows[0]["unit_price"])
+        output["unit_price"] = price / basis[1] if basis and price is not None else None
+    elif output["quantity"] not in (None, D(0)) and output["amount"] is not None:
+        output["unit_price"] = output["amount"] / output["quantity"]
+    else:
+        output["unit_price"] = None
+    output["multiple_values"] = any(len(values[field]) > 1 for field in ("name", "feature"))
+    if normalized.status != "ok":
+        output["unit_price"] = None
+    for source, conversion in zip(sources, normalized.conversions, strict=True):
+        source["quantity_conversion"] = conversion
     return output
 
 
@@ -251,6 +251,9 @@ def build_mirror_comparison(
         left = upward[field]
         right = downward[field]
         difference, status = _compare_value(left, right, field)
+        if field in {"quantity", "unit_price"} and upward["row_count"] and downward["row_count"]:
+            if upward["unit"] != downward["unit"] or _normal_text(upward["feature"]) != _normal_text(downward["feature"]):
+                difference, status = None, "不可比（单位或项目特征冲突）"
         if left is None or right is None:
             status = "待补资料/缺一侧"
         if upward["multiple_values"] or downward["multiple_values"]:

@@ -1,3 +1,14 @@
+# Jiadun 变更记录
+
+## [0.1.34] - 2026-10-01
+
+Preview / prerelease; production gates remain pending.
+
+- 标准数量同量纲换算，单位/特征/缺量冲突阻断；原始金额独立保留。
+- 修复模糊归组重复、连续同名异码丢成员；保存匹配前校验成员唯一和归属。
+- 镜像与界面详情读取显式成员，同侧数量和金额求和，Excel 对比复用共享聚合。
+- 合同独立期次、累计模式与分栋台账仍待下一批完成。
+
 # Changelog — Jiadun（价盾）
 
 All notable changes. Format based on Keep a Changelog; versioning: SemVer.

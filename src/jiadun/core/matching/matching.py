@@ -24,6 +24,7 @@ from rapidfuzz import fuzz
 
 from jiadun.core.anomalies.rules import _norm_unit
 from jiadun.core.contracts import run_contract
+from jiadun.core.engine.quantities import feature_key, unit_basis
 from jiadun.core.evidence import audit as audit_log
 from jiadun.core.evidence import evidence as evidence_api
 from jiadun.core.matching.key_integrity import classify_composite_keys
@@ -131,7 +132,7 @@ def _match_items_for_direction(
 ) -> list[MatchGroup]:
     """只在一个明确方向内做五档归组。"""
     rows = conn.execute(
-        """SELECT li.id, li.period_id, li.code, li.name, li.unit, sp.period_no AS pno,
+        """SELECT li.id, li.period_id, li.code, li.name, li.feature, li.unit, sp.period_no AS pno,
                   COALESCE(sp.direction, 'unknown') AS direction
            FROM line_items li
            JOIN settlement_periods sp ON sp.id = li.period_id
@@ -188,15 +189,22 @@ def _match_items_for_direction(
             if g not in bucket:  # 同组多个名称变体只登记一次
                 bucket.append(g)
     merged_keys: set[str] = set()
+    roots = {g.group_key: g for g in code_groups}
     for gs in by_name.values():
         if len(gs) > 1:
-            base = gs[0]
+            base = roots[gs[0].group_key]
             for other in gs[1:]:
+                other = roots[other.group_key]
+                if other is base:
+                    continue
                 base.item_ids.extend(other.item_ids)
                 base.names |= other.names
                 base.codes |= other.codes
                 base.units |= other.units
                 merged_keys.add(other.group_key)
+                for key, root in roots.items():
+                    if root is other:
+                        roots[key] = base
             base.level = PROBABLE
             base.method = "name_merge"
             base.score = 0.8
@@ -211,10 +219,11 @@ def _match_items_for_direction(
         aliased_key = aliases.get(nm)
         target = None
         if aliased_key and aliased_key in groups:
-            target = groups[aliased_key]
+            target = roots.get(aliased_key, groups[aliased_key])
         else:
             # 并入名称归一化相同的编码组（若唯一）
-            hosts = by_name.get(nm, [])
+            hosts = list({roots[g.group_key].group_key: roots[g.group_key]
+                          for g in by_name.get(nm, [])}.values())
             if len(hosts) == 1:
                 target = hosts[0]
         if target is not None:
@@ -279,9 +288,16 @@ def _match_items_for_direction(
         if len(g.codes) > 1 and key.startswith("code:"):
             g.level = PROBABLE
             g.notes.append("同组出现多个编码")
-        if len(g.units) > 1:
+        unit_dimensions = {basis[0] if (basis := unit_basis(all_rows[i]["unit"])) else None for i in g.item_ids}
+        if len(unit_dimensions - {None}) > 1:
             g.level = INCOMPARABLE
             g.notes.append(f"单位不一致 {sorted(g.units)}：不可比，禁止合并")
+        if len({feature_key(all_rows[i]["feature"]) for i in g.item_ids}) > 1:
+            g.level = INCOMPARABLE
+            g.notes.append("项目特征不一致：不可比，禁止自动接受")
+        if None in unit_dimensions:
+            g.level = PENDING_DATA
+            g.notes.append("单位缺失，待补资料")
         if key != "pending:orphan" and (any(not n for n in g.names) or not g.names):
             g.level = PENDING_DATA
             g.notes.append("缺失名称/编码（待补资料）")
@@ -301,17 +317,25 @@ def _match_items_for_direction(
             if score >= SIM_CONFIRMED:
                 ga.item_ids.extend(gb.item_ids)
                 ga.names |= gb.names
+                ga.units |= gb.units
                 ga.level = PROBABLE
                 ga.method = "fuzzy_name"
                 ga.score = score / 100
                 ga.notes.append(f"名称相似 {score:.0f}%，合并为高概率组，请复核")
                 used.add(gb.group_key)
+                bases = {basis[0] if (basis := unit_basis(all_rows[i]["unit"])) else None for i in ga.item_ids}
+                features = {feature_key(all_rows[i]["feature"]) for i in ga.item_ids}
+                if len(bases) > 1 or len(features) > 1:
+                    ga.level = INCOMPARABLE
+                    ga.notes.append("合并候选的单位或项目特征冲突：不可比")
+                if None in bases:
+                    ga.level = PENDING_DATA
                 break
             if score >= SIM_SUSPECTED and ga.level != PROBABLE:
                 ga.level = SUSPECTED
                 ga.score = score / 100
                 ga.notes.append(f"与「{nb}」相似 {score:.0f}%，疑似匹配待人工确认")
-    return sorted(result, key=lambda g: g.group_key)
+    return sorted((g for g in result if g.group_key not in used), key=lambda g: g.group_key)
 
 
 def match_items(
@@ -352,6 +376,15 @@ def match_items(
 
 
 def save_matches(conn: sqlite3.Connection, project_id: int, groups: list[MatchGroup]) -> int:
+    members = [iid for group in groups for iid in group.item_ids]
+    if any(type(iid) is not int or iid <= 0 for iid in members) or len(members) != len(set(members)):
+        raise ValueError("匹配成员必须为有效行号，每条原始明细只能属于一个候选组")
+    owned = {int(row[0]) for row in conn.execute(
+        "SELECT li.id FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id WHERE sp.project_id=?",
+        (project_id,),
+    )}
+    if not set(members) <= owned:
+        raise ValueError("匹配成员不存在或不属于当前项目")
     availability = run_contract.current_results_available(conn, project_id)
     if not availability["available"] and availability.get("state") is None:
         # 导入/清洗后尚未形成匹配成果时，最新明细可以通过一次新合同

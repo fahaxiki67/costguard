@@ -27,7 +27,7 @@ from jiadun import branding
 from jiadun.core import analysis
 from jiadun.core.contracts import run_contract
 from jiadun.core.diff import radar as diff_radar
-from jiadun.core.engine.aggregate import aggregate_project, assess_amount, group_key_of
+from jiadun.core.engine.aggregate import aggregate_project, assess_amount
 from jiadun.core.engine.money import NotANumberError, round2, to_decimal
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.parsing import import_manifest
@@ -484,7 +484,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     ws.append(header)
     _style_header(ws, 1, len(header))
     for agg in aggs:
-        row = [agg.code, agg.name, ""]
+        row = [agg.code, agg.name, agg.unit]
         for p in periods:
             pp = agg.per_period.get(p["id"])  # period_id 键：防对上/对下同期号串表
             row.append(_num(pp["effective_amount"], money=True) if pp else None)
@@ -1046,29 +1046,12 @@ def export_historical_price_sheet(
 
 def _aggregate_by_direction(conn: sqlite3.Connection, project_id: int, direction: str) -> dict[str, dict]:
     """按方向聚合：item_key -> {qty, amount, names}。缺失值不补 0。"""
-    rows = conn.execute(
-        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
-                  li.flags_json FROM line_items li
-           JOIN settlement_periods sp ON sp.id = li.period_id
-           WHERE sp.project_id=? AND sp.direction=?""",
-        (project_id, direction),
-    ).fetchall()
-    out: dict[str, dict] = {}
-    for r in rows:
-        if is_non_detail_flags(r["flags_json"]):
-            continue  # 小计/合计/层级行不入汇总（B9）
-        key = group_key_of(r["code"], r["name"] or "")
-        agg = out.setdefault(key, {"qty": None, "amount": None, "names": set()})
-        agg["names"].add(r["name"] or "")
-        assessment, _qty_missing, _price_missing = assess_amount(r)
-        for field, val in (("qty", r["quantity"]), ("amount", assessment.effective)):
-            if val is not None:  # "0" 是有效值参与累计；缺失(None)不参与也不补 0
-                try:
-                    d = D(val)
-                except Exception:
-                    continue
-                agg[field] = d if agg[field] is None else agg[field] + d
-    return out
+    return {
+        agg.item_key: {"qty": agg.cum_qty, "amount": agg.cum_amount,
+                       "names": {agg.name}, "unit": agg.unit,
+                       "status": agg.status, "warnings": agg.warnings}
+        for agg in aggregate_project(conn, project_id, direction=direction)
+    }
 
 
 def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Workbook) -> None:
@@ -1107,6 +1090,16 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
             ws.cell(row=r, column=8, value="待补资料（一侧缺失，不做比较）")
         if u and d and set(map(str, u["names"])) != set(map(str, d["names"])):
             ws.cell(row=r, column=8, value="两侧名称不一致，请核实归组")
+        if u and d:
+            notes = []
+            if not u["unit"] or u["unit"] != d["unit"]:
+                notes.append("数量单位缺失或不同，不可比")
+            if u["status"] != "ok" or d["status"] != "ok":
+                notes.append("累计存在待补资料或不可比项")
+            notes.extend(u["warnings"][:1] + d["warnings"][:1])
+            if notes:
+                prior = ws.cell(row=r, column=8).value
+                ws.cell(row=r, column=8, value="；".join(([prior] if prior else []) + notes))
         for c in (3, 4, 5, 6):
             ws.cell(row=r, column=c).number_format = MONEY_FMT
     _autowidth(ws)

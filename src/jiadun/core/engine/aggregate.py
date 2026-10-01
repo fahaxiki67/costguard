@@ -23,6 +23,7 @@ from jiadun.core.engine.money import (
     to_decimal,
     weighted_avg_price,
 )
+from jiadun.core.engine.quantities import normalize_quantities
 from jiadun.core.parsing.extract_items import is_non_detail_flags
 
 D = Decimal
@@ -34,6 +35,8 @@ class ItemAggregate:
     item_key: str  # 归组键：code 优先；无 code 用 'name:<名称>'
     code: str
     name: str
+    unit: str = ""
+    quantity_sources: list[dict] = field(default_factory=list)
     # period_id -> raw/calculated/effective amounts；键用 period_id 防止对上/对下同期号串表。
     # amount/raw_amount 保留原始合价；effective_amount 仅用于可复算累计和持久化。
     per_period: dict[int, dict] = field(default_factory=dict)
@@ -243,6 +246,8 @@ def aggregate_project(
     }
     col_maps = _confirmed_col_maps(conn, project_id)
     aggs: dict[str, ItemAggregate] = {}
+    quantity_rows: dict[str, list] = {}
+    period_quantity_rows: dict[tuple[str, int], list] = {}
     flag_updates: list[tuple[str, int]] = []
     for row in load_line_items(conn, project_id, direction=direction):
         flags = json.loads(row["flags_json"] or "{}")
@@ -253,6 +258,8 @@ def aggregate_project(
         name = row["name"] or f"<第{row['period_no']}期第{row['id']}行无名称>"
         key = group_key_of(row["code"], name)
         agg = aggs.setdefault(key, ItemAggregate(item_key=key, code=row["code"] or "", name=name))
+        quantity_rows.setdefault(key, []).append(row)
+        period_quantity_rows.setdefault((key, int(row["period_id"])), []).append(row)
 
         qty, qty_missing = _dec_or_none(row["quantity"])
         amount_assessment, amount_quantity_missing, _price_missing = assess_amount(row)
@@ -332,9 +339,21 @@ def aggregate_project(
             )
 
     for agg in aggs.values():
+        normalized = normalize_quantities(quantity_rows[agg.item_key])
+        agg.unit = normalized.unit
+        agg.quantity_sources = list(normalized.conversions)
+        for pid, pp in agg.per_period.items():
+            period_quantity = normalize_quantities(period_quantity_rows[(agg.item_key, pid)])
+            pp["qty"] = period_quantity.quantity
+            pp["unit"] = period_quantity.unit
+            pp["quantity_sources"] = list(period_quantity.conversions)
+        if normalized.status != "ok" and agg.quantity_required:
+            agg.status = normalized.status
+            agg.warnings.append("单位、项目特征或数量缺失/冲突，累计数量不可比；原金额独立保留")
         missing_ids = sorted(set(period_meta) - set(agg.per_period))
         for pid in missing_ids:
-            agg.status = "incomplete"
+            if agg.status == "ok":
+                agg.status = "incomplete"
             agg.warnings.append(f"第{period_meta[pid]}期无此清单（疑似漏项），未计入累计，待核实")
         periods = sorted(agg.per_period)
         qty_total: Decimal | None = None
@@ -367,6 +386,7 @@ def aggregate_project(
                 pp["wavg_price"] = weighted_avg_price(pp["effective_amount"], pp["qty"])
             else:
                 pp["wavg_price"] = None
+        qty_total = normalized.quantity
         agg.cum_qty = qty_total
         agg.cum_amount = effective_amt_total
         agg.raw_cum_amount = raw_amt_total
@@ -381,7 +401,7 @@ def aggregate_project(
                 agg.warnings.append("累计数量为 0，加权平均单价不可定义（不可比）")
             else:
                 agg.wavg_price = weighted_avg_price(effective_amt_total, qty_total)
-        elif effective_amt_total is None or agg.quantity_required:
+        elif (effective_amt_total is None or agg.quantity_required) and agg.status == "ok":
             agg.status = "incomplete"
     if flag_updates and persist_derived_flags:
         with conn:

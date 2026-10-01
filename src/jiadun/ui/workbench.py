@@ -2472,45 +2472,16 @@ class WorkbenchPage(QWidget):
         if item_ids:
             placeholders = ",".join("?" for _ in item_ids)
             selected_rows = self.conn.execute(
-                f"""SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
+                f"""SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price,
                            li.amount, sp.period_no, sp.direction
                     FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
                     WHERE li.id IN ({placeholders}) AND sp.project_id=?
                     ORDER BY sp.period_no, li.id""",
                 (*item_ids, self.project.project_id),
             ).fetchall()
-            # 匹配引擎按方向隔离保存候选组；审核详情仍提供真正的“对上 ↔
-            # 对下”对照。以未带方向的编码/归一化名称为桥，重新取两侧行，
-            # 不改变匹配结果或自动合并状态。
-            key = matching._unscoped_group_key(match["group_key"])
-            if key.startswith("code:"):
-                key_kind, key_value = "code", key[5:]
-                comparison_rows = self.conn.execute(
-                    """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
-                              li.amount, sp.period_no, sp.direction
-                       FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
-                       WHERE sp.project_id=? AND li.code=?
-                       ORDER BY CASE sp.direction WHEN 'upward' THEN 0 WHEN 'downward' THEN 1 ELSE 2 END,
-                                sp.period_no, li.id""",
-                    (self.project.project_id, key_value),
-                ).fetchall()
-            elif key.startswith("name:"):
-                key_kind, key_value = "name", key[5:]
-                comparison_rows = [
-                    candidate for candidate in self.conn.execute(
-                        """SELECT li.id, li.code, li.name, li.unit, li.quantity, li.unit_price,
-                                  li.amount, sp.period_no, sp.direction
-                           FROM line_items li JOIN settlement_periods sp ON sp.id=li.period_id
-                           WHERE sp.project_id=?
-                           ORDER BY CASE sp.direction WHEN 'upward' THEN 0 WHEN 'downward' THEN 1 ELSE 2 END,
-                                    sp.period_no, li.id""",
-                        (self.project.project_id,),
-                    ).fetchall()
-                    if matching.normalize_name(candidate["name"]) == key_value
-                ]
-            else:
-                key_kind, key_value = "", ""
-                comparison_rows = selected_rows
+            comparison_rows = selected_rows
+            key_kind, key_value = "", ""
+            lines.append("对照范围：仅保存的匹配成员；跨方向成员未选入时保持待补")
             left_rows = [r for r in comparison_rows if (r["direction"] or "unknown") == "upward"]
             right_rows = [r for r in comparison_rows if (r["direction"] or "unknown") == "downward"]
             if not left_rows and not right_rows:

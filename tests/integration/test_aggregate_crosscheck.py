@@ -75,7 +75,7 @@ def _make_amount_case(tmp_path, raw_amount=None):
         )
         conn.execute(
             """INSERT INTO line_items(period_id, sheet_id, code, name, quantity, unit_price,
-               amount, flags_json) VALUES (?,?,?,?,?,?,?,?)""",
+               amount, flags_json, unit) VALUES (?,?,?,?,?,?,?,?,'m2')""",
             (period_id, sheet_id, "C1", "清单A", "2", "100", raw_amount,
              json.dumps({"row": 2})),
         )

@@ -1,5 +1,6 @@
 """P1-01 清单差异雷达：分类、Decimal 影响和当前运行边界。"""
 
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -187,7 +188,8 @@ def test_mirror_comparison_uses_decimal_differences_and_both_directions(db):
     upward = _period(conn, project_id, 1, "对上第1期", "upward")
     downward = _period(conn, project_id, 1, "对下第1期", "downward")
     _item(conn, upward, "K1", "对上名称", "10", "10", "100", feature="普通")
-    _item(conn, downward, "K1", "对下名称", "12", "12", "140", feature="加强")
+    _item(conn, downward, "K1", "对下名称", "12", "12", "140", feature="普通")
+    members = [r["id"] for r in conn.execute("SELECT id FROM line_items WHERE period_id IN (?,?)", (upward, downward))]
     contract = run_contract.ensure_run_contract(conn, project_id)
     with conn:
         match_id = conn.execute(
@@ -195,7 +197,7 @@ def test_mirror_comparison_uses_decimal_differences_and_both_directions(db):
                    project_id, group_key, item_ids_json, level, method, score,
                    status, run_signature, run_id)
                VALUES (?,?,?,?,?,?, 'pending', ?, ?)""",
-            (project_id, "downward:code:K1", "[]", "probable", "code_exact", 0.8,
+            (project_id, "downward:code:K1", json.dumps(members), "probable", "code_exact", 0.8,
              contract.signature, contract.run_id),
         ).lastrowid
     result = build_mirror_comparison(conn, project_id, int(match_id))
@@ -207,7 +209,7 @@ def test_mirror_comparison_uses_decimal_differences_and_both_directions(db):
     assert result.amount_difference_rate == D("0.4")
     by_field = {field.field: field for field in result.fields}
     assert by_field["name"].status == "名称存在差异"
-    assert by_field["feature"].status == "存在差异"
+    assert by_field["feature"].status == "完全一致"
     assert by_field["unit"].status == "完全一致"
     assert result.upward_sources and result.downward_sources
 
