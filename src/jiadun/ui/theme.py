@@ -144,7 +144,8 @@ QPushButton {{
 QPushButton:hover {{ background: {HOVER_ROW}; border-color: {PRIMARY}; color: {PRIMARY}; }}
 QPushButton:pressed {{ background: {BG}; }}
 QPushButton:disabled {{ color: {TEXT_DISABLED}; border-color: {BORDER}; background: {NEUTRAL_SOFT}; }}
-QPushButton:focus {{ border: 1px solid {PRIMARY}; }}
+QPushButton:focus, QPushButton#btnPrimary:focus, QPushButton#btnTertiary:focus,
+QPushButton#btnDanger:focus, QPushButton[btnLink="true"]:focus {{ border: 1px solid {PRIMARY}; }}
 QDialogButtonBox QPushButton {{ min-width: 72px; }}
 
 QPushButton#btnPrimary {{
