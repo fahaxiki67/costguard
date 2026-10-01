@@ -875,6 +875,7 @@ class WorkbenchPage(QWidget):
         return w
 
     def refresh_periods(self):
+        business_numbers = settlement_io.business_period_numbers(self.conn, self.project.project_id)
         rows = self.conn.execute(
             """SELECT sp.id, sp.period_no, sp.title, sp.direction, sp.contract_party,
                SUM(CASE WHEN li.flags_json NOT LIKE '%"subtotal": true%' THEN 1 ELSE 0 END) AS items,
@@ -887,7 +888,7 @@ class WorkbenchPage(QWidget):
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             direction = DIRECTION_ZH.get(r["direction"], "未标记")
-            t.setItem(i, 0, QTableWidgetItem(str(r["period_no"])))
+            t.setItem(i, 0, QTableWidgetItem(str(business_numbers[int(r["id"])])))
             t.setItem(i, 1, QTableWidgetItem(str(r["title"] or "—")))
             kind = {"upward": "info", "downward": "neutral"}.get(r["direction"], "warning")
             t.setItem(i, 2, badge_item(direction, kind))
@@ -1640,6 +1641,7 @@ class WorkbenchPage(QWidget):
         return w
 
     def _refresh_item_period_options(self):
+        business_numbers = settlement_io.business_period_numbers(self.conn, self.project.project_id)
         current = self.items_period.currentData() if self.items_period.count() else ""
         rows = self.conn.execute(
             """SELECT id, period_no, direction FROM settlement_periods
@@ -1649,7 +1651,8 @@ class WorkbenchPage(QWidget):
         self.items_period.clear()
         self.items_period.addItem("全部期次", "")
         for row in rows:
-            label = f"第 {row['period_no']} 期 · {DIRECTION_ZH.get(row['direction'], '未标记')}"
+            label = (f"第 {business_numbers[int(row['id'])]} 期 · "
+                     f"{DIRECTION_ZH.get(row['direction'], '未标记')} · 记录 #{row['id']}")
             self.items_period.addItem(label, str(row["id"]))
         index = self.items_period.findData(current)
         self.items_period.setCurrentIndex(index if index >= 0 else 0)
@@ -1735,6 +1738,7 @@ class WorkbenchPage(QWidget):
         ).fetchall()
         t = self.items_table
         t.setRowCount(len(rows))
+        business_numbers = settlement_io.business_period_numbers(self.conn, self.project.project_id)
         shown_from = offset + 1 if rows else 0
         shown_to = offset + len(rows)
         self.items_total_label.setText(
@@ -1751,7 +1755,7 @@ class WorkbenchPage(QWidget):
             direction_item = QTableWidgetItem(DIRECTION_ZH.get(r["direction"], "未标记"))
             direction_item.setData(Qt.UserRole, int(r["id"]))
             t.setItem(i, 0, direction_item)
-            t.setItem(i, 1, QTableWidgetItem(str(r["pno"])))
+            t.setItem(i, 1, QTableWidgetItem(str(business_numbers[int(r["period_id"])])))
             t.setItem(i, 2, QTableWidgetItem(str(r["code"] or "—")))
             prefix = "【小计】" if flags.get("subtotal") else ""
             t.setItem(i, 3, QTableWidgetItem(prefix + (r["name"] or "—")))
@@ -1784,7 +1788,7 @@ class WorkbenchPage(QWidget):
         lines = [
             f"清单行 #{record['id']}",
             f"方向：{DIRECTION_ZH.get(record['direction'], '未标记')}",
-            f"期次：第 {record['period_no']} 期",
+            f"期次：第 {settlement_io.business_period_numbers(self.conn, self.project.project_id)[int(record['period_id'])]} 期",
             f"来源文件：{record['original_name'] or '—'}",
             f"Sheet：{record['sheet_name'] or '—'}",
             f"编码：{record['code'] or '—'}　名称：{record['name'] or '—'}",

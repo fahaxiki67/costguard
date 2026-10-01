@@ -729,6 +729,26 @@ def next_period_no(conn: sqlite3.Connection, project_id: int,
     return int(row["m"]) + 1
 
 
+def business_period_numbers(conn: sqlite3.Connection, project_id: int) -> dict[int, int]:
+    """返回来源识别的业务期号；内部期号仅作旧资料兼容值，不能当合同身份。"""
+    numbers = {int(row["id"]): int(row["period_no"]) for row in conn.execute(
+        "SELECT id, period_no FROM settlement_periods WHERE project_id=?", (project_id,)
+    )}
+    batches = conn.execute(
+        """SELECT pb.stats_json FROM parse_batches pb
+           JOIN source_files sf ON sf.id=pb.file_id
+           WHERE sf.project_id=? AND pb.id=(
+               SELECT latest.id FROM parse_batches latest WHERE latest.file_id=pb.file_id
+               ORDER BY latest.parsed_at DESC, latest.id DESC LIMIT 1)""", (project_id,)
+    )
+    for batch in batches:
+        metadata = json.loads(batch["stats_json"] or "{}")
+        for period_id, number in metadata.get("business_period_nos", {}).items():
+            if int(period_id) in numbers:
+                numbers[int(period_id)] = int(number)
+    return numbers
+
+
 def ensure_period(
     conn: sqlite3.Connection,
     project_id: int,

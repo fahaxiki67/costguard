@@ -31,6 +31,9 @@ def test_separate_files_preserve_business_period_and_reimport_identity(tmp_path)
         assert a.period_id != b.period_id
         assert a.business_period_nos == {a.period_id: 1}
         assert b.business_period_nos == {b.period_id: 1}
+        assert settlement_io.business_period_numbers(conn, info.project_id) == {
+            a.period_id: 1, b.period_id: 1,
+        }
         again = settlement_io.import_settlement_file(
             conn, info.project_id, Path(info.workspace_path), tmp_path / 'B第1期.xlsx',
             direction='downward', separate_files=True,
