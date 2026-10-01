@@ -69,7 +69,8 @@ jobs:
           if [ -n "$forbidden_paths" ]; then
             echo "FORBIDDEN SENSITIVE PATHS:"; echo "$forbidden_paths"; exit 1
           fi
-          non_synthetic_business_files=$(git ls-files | grep -Ei '\.(xlsx|xls|csv|docx|doc|pdf|png|jpg|jpeg)$' | grep -Ev '^(synthetic_test_data|examples)/' || true)
+          # 首页双小狗 PNG 是生成的装饰资源；只豁免这一精确路径，业务图片仍受扫描。
+          non_synthetic_business_files=$(git ls-files | grep -Ei '\.(xlsx|xls|csv|docx|doc|pdf|png|jpg|jpeg)$' | grep -Ev '^(synthetic_test_data|examples)/|^src/jiadun/resources/home-puppies\.png$' || true)
           if [ -n "$non_synthetic_business_files" ]; then
             echo "BUSINESS-LIKE FILES OUTSIDE SYNTHETIC/EXAMPLES:"; echo "$non_synthetic_business_files"; exit 1
           fi
