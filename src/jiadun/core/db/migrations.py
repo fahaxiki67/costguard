@@ -2941,6 +2941,64 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE line_items ADD COLUMN tax_amount TEXT",
         ],
     ),
+    # v56：工程量核对上下文（quantity ledger）。settlement_periods.period_no
+    # 继续作为内部序号（按方向自增）；业务身份（合同键/单位/业务期号/
+    # 资料类型 contract|settlement /增量|累计模式/工作口径/楼栋范围/替代
+    # 关系）保存在 quantity_period_context，与期次行 1:1。行级显式上下文
+    # （标准清单键/楼栋/工作口径/有人工依据的跨量纲换算参数）保存在
+    # quantity_line_context，与 line_items 1:1。两者一律以 pending 落库，
+    # 只有显式人工确认（原因必填，写 Evidence/Audit）才可参与有效核量；
+    # 旧资料不自动升级为 confirmed。替代关系由确认动作把旧版标记为
+    # superseded（仅退出有效核量，不删除行或证据）。
+    (
+        56,
+        [
+            """CREATE TABLE IF NOT EXISTS quantity_period_context (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                period_id INTEGER NOT NULL REFERENCES settlement_periods(id),
+                contract_key TEXT NOT NULL DEFAULT '',
+                business_period_no INTEGER NOT NULL,
+                unit_name TEXT NOT NULL DEFAULT '',
+                doc_kind TEXT NOT NULL DEFAULT 'settlement',
+                amount_mode TEXT NOT NULL DEFAULT 'incremental',
+                work_scope TEXT NOT NULL DEFAULT '',
+                building_scope TEXT NOT NULL DEFAULT '',
+                building_status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'pending',
+                supersedes_period_id INTEGER REFERENCES settlement_periods(id),
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                confirmed_at TEXT,
+                confirmed_by TEXT,
+                confirmed_reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER,
+                UNIQUE(project_id, period_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS quantity_line_context (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES projects(id),
+                line_item_id INTEGER NOT NULL REFERENCES line_items(id),
+                standard_key TEXT,
+                building TEXT,
+                work_scope TEXT,
+                convert_factor TEXT,
+                target_unit TEXT,
+                convert_basis TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                confirmed_at TEXT,
+                confirmed_by TEXT,
+                confirmed_reason TEXT NOT NULL DEFAULT '',
+                evidence_id INTEGER,
+                UNIQUE(project_id, line_item_id)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_qpc_project ON quantity_period_context(project_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_qlc_project ON quantity_line_context(project_id, status)",
+            "CREATE INDEX IF NOT EXISTS idx_qpc_contract ON quantity_period_context(project_id, contract_key, business_period_no)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

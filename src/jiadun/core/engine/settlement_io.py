@@ -785,6 +785,58 @@ def ensure_period(
     return _insert()
 
 
+def ensure_period_for_contract(
+    conn: sqlite3.Connection,
+    project_id: int,
+    *,
+    direction: str,
+    contract_key: str,
+    business_period_no: int,
+    unit_name: str = "",
+    doc_kind: str = "settlement",
+    amount_mode: str = "incremental",
+    work_scope: str = "",
+    building_scope: str = "",
+    building_status: str = "pending",
+    title: str | None = None,
+    source_file_id: int | None = None,
+    supersedes_period_id: int | None = None,
+    actor: str = "user",
+    reason: str,
+    commit: bool = True,
+) -> int:
+    """显式合同键创建独立期次入口（工程量核对专用）。
+
+    与旧 ``ensure_period`` 的差异：period_no 仅作内部序号（按方向自增），
+    业务身份（合同键/单位/业务期号/资料类型）保存在数量上下文中；每次
+    调用都创建新的独立期次行——同单位多合同、多文件的各自业务第 1 期
+    互不复用，也不会挤进同一期。上下文一律 pending，需人工确认。
+    返回新期次行 id（内部序号），上下文可通过 quantity_control 读取。
+    """
+    from jiadun.core.engine import quantity_control
+
+    created = quantity_control.create_period_context(
+        conn,
+        project_id,
+        direction=direction,
+        contract_key=contract_key,
+        business_period_no=business_period_no,
+        unit_name=unit_name,
+        doc_kind=doc_kind,
+        amount_mode=amount_mode,
+        work_scope=work_scope,
+        building_scope=building_scope,
+        building_status=building_status,
+        title=title,
+        source_file_id=source_file_id,
+        supersedes_period_id=supersedes_period_id,
+        actor=actor,
+        reason=reason,
+        commit=commit,
+    )
+    return int(created["period_id"])
+
+
 def _route_role_review(conn: sqlite3.Connection, project_id: int, file_id: int,
                        sheet_id: int, sheet_name: str,
                        confidence: float | None, oversized: bool,

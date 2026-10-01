@@ -870,6 +870,10 @@ class WorkbenchPage(QWidget):
         row2.addWidget(QLabel("方向："))
         row2.addWidget(self.dir_combo)
         row2.addWidget(set_dir_btn)
+        quantity_btn = QPushButton("工程量控制台账…")
+        quantity_btn.setToolTip("确认合同、业务期号与计量口径后，核对多个分包的有效结算数量及分楼栋超量。")
+        quantity_btn.clicked.connect(self._open_quantity_control)
+        row2.addWidget(quantity_btn)
         row2.addStretch(1)
         v.addLayout(row2)
         return w
@@ -1030,6 +1034,7 @@ class WorkbenchPage(QWidget):
                     report = settlement_io.import_settlement_file(
                         self.conn, self.project.project_id, self.project_dir, path,
                         document_category="unclassified",
+                        separate_files=True,
                     )
                     pending += sum(
                         1
@@ -1131,6 +1136,13 @@ class WorkbenchPage(QWidget):
         from jiadun.ui.dialogs.control_baseline import ControlBaselineDialog
 
         dlg = ControlBaselineDialog(self.conn, self.project.project_id, self)
+        dlg.exec()
+        self.refresh_all()
+
+    def _open_quantity_control(self) -> None:
+        from jiadun.ui.dialogs.quantity_control import QuantityControlDialog
+
+        dlg = QuantityControlDialog(self.conn, self.project.project_id, self)
         dlg.exec()
         self.refresh_all()
 

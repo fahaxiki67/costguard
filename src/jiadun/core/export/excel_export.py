@@ -84,6 +84,11 @@ DIRECTION_LABELS = {
     "downward": "对下结算",
     "unknown": "未标记",
 }
+QUANTITY_STATUS_ZH = {
+    "PASS": "未超出（限已确认范围）", "FAIL": "超出", "PENDING": "待确认",
+    "INCOMPARABLE": "不可比", "CONTROL_CONFLICT": "身份冲突",
+    "ok": "可用", "pending": "待确认", "incomparable": "不可比",
+}
 RULE_ZH_CN = {
     "qty_price_amount_mismatch": "工程量×单价与合价不一致",
     "rounding_difference": "舍入差异",
@@ -1667,6 +1672,99 @@ def export_management_summary(
     _autowidth(ws)
 
 
+def _quantity_ledger_for_export(conn, project_id, signature):
+    from jiadun.core.engine.quantity_control import build_quantity_ledger
+
+    ledger = build_quantity_ledger(conn, project_id)
+    if ledger["run_signature"] != signature:
+        raise RuntimeError("工程量台账与当前运行签名不同，请重新运行核对后导出")
+    return ledger
+
+
+def export_quantity_control_sheets(ledger: dict, wb: Workbook) -> None:
+    """导出界面同一核量快照；精确数量保留文本，不补零、不依赖公式缓存。"""
+    controls = wb.create_sheet("工程量控制台账")
+    controls.append(["工作计量口径", "标准项身份", "编码", "名称", "核对范围", "标准单位",
+                     "对上合同量", "对上已结算量", "对下已结算合计", "较合同差量",
+                     "合同基准结论", "较对上结算差量", "结算基准结论", "总体状态",
+                     "原因", "排除或待确认明细数", "缺失贡献数", "运行签名"])
+    contributions = wb.create_sheet("分包数量贡献")
+    contributions.append(["工作计量口径", "标准项身份", "核对范围", "标准单位",
+                          "合同标识", "单位名称", "资料类型", "标准数量", "运行签名"])
+    for control in ledger["quantity_controls"]:
+        identity = json.dumps(control["identity"], ensure_ascii=False)
+        building = control["building"] or "全项目"
+        baselines = control["baselines"]
+        controls.append([
+            control["work_scope"], identity, control["code"], control["display_name"],
+            building, control["standard_unit"],
+            baselines["upward_contract"]["quantity"] if baselines["upward_contract"]["status"] == "ok" else None,
+            baselines["upward_settlement"]["quantity"] if baselines["upward_settlement"]["status"] == "ok" else None,
+            control["downstream_quantity"] if control["downstream_status"] == "ok" and not control["excluded_details"] else None,
+            control["delta_vs_contract"], QUANTITY_STATUS_ZH[control["status_vs_contract"]],
+            control["delta_vs_settlement"], QUANTITY_STATUS_ZH[control["status_vs_settlement"]],
+            QUANTITY_STATUS_ZH[control["status"]],
+            control["reason"], len(control["excluded_details"]),
+            len(control.get("missing_contributions", [])),
+            ledger["run_signature"],
+        ])
+        for contribution in control["contributions"]:
+            contributions.append([
+                control["work_scope"], identity, building, control["standard_unit"],
+                contribution["contract_key"], contribution["unit_name"],
+                contribution["doc_kind"], contribution["quantity"], ledger["run_signature"],
+            ])
+    sources = wb.create_sheet("有效数量与来源")
+    sources.append(["方向", "资料类型", "合同标识", "单位名称", "工作计量口径", "标准项身份",
+                    "编码", "名称", "标准单位", "数量口径", "状态", "原因",
+                    "楼栋", "来源文件", "工作表", "行号", "清单行ID", "业务期号",
+                    "原数量", "原单位", "换算系数", "标准行数量", "是否计入", "来源说明", "运行签名"])
+    totals = wb.create_sheet("有效数量分项")
+    totals.append(["方向", "资料类型", "合同标识", "单位名称", "工作计量口径", "标准项身份",
+                   "编码", "名称", "标准单位", "核对范围", "标准数量", "状态", "原因", "运行签名"])
+    for item in ledger["items"]:
+        for building, value in item["buildings"].items():
+            totals.append([
+                {"upward": "对上资料", "downward": "对下资料"}.get(item["direction"], "未标记"), item["doc_kind"],
+                item["contract_key"], item["unit_name"], item["work_scope"],
+                json.dumps(item["identity"], ensure_ascii=False), item["code"], item["display_name"],
+                item["standard_unit"], "全项目" if building == "__all__" else building,
+                value["quantity"] if item["status"] == "ok" and value["status"] == "ok" else None,
+                QUANTITY_STATUS_ZH[item["status"] if item["status"] != "ok" else value["status"]],
+                item["reason"], ledger["run_signature"],
+            ])
+        for source in item["sources"]:
+            sources.append([
+                {"upward": "对上资料", "downward": "对下资料"}.get(item["direction"], "未标记"), item["doc_kind"],
+                item["contract_key"], item["unit_name"], item["work_scope"],
+                json.dumps(item["identity"], ensure_ascii=False), item["code"], item["display_name"],
+                item["standard_unit"], item["mode"], QUANTITY_STATUS_ZH[item["status"]], item["reason"],
+                source.get("building"),
+                source["file"], source["sheet"], source["row"], source["line_item_id"],
+                source["business_period_no"], source["original_quantity"], source["original_unit"],
+                source["factor"], source["standard_quantity"], source["counted"],
+                source.get("problem") or source.get("note"), ledger["run_signature"],
+            ])
+    pending = wb.create_sheet("核量待确认范围")
+    pending.append(["类别", "待确认或冲突详情", "运行签名"])
+    for kind in ("pending_contexts", "unregistered_periods", "identity_conflicts", "superseded_contexts", "notes"):
+        for detail in ledger[kind]:
+            pending.append([kind, json.dumps(detail, ensure_ascii=False), ledger["run_signature"]])
+    for control in ledger["quantity_controls"]:
+        for kind in ("excluded_details", "missing_contributions"):
+            for detail in control.get(kind, []):
+                pending.append([kind, json.dumps({"identity": control["identity"],
+                    "work_scope": control["work_scope"], "building": control["building"],
+                    "detail": detail}, ensure_ascii=False), ledger["run_signature"]])
+    for ws in (controls, contributions, totals, sources, pending):
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
+        _style_header(ws, 1, ws.max_column)
+        _autowidth(ws)
+
+
 def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) -> Path:
     """导出全部报表到一个 xlsx。返回文件路径。"""
     # 仅在项目还没有任何校核/聚合/匹配成果时，允许导出入口先把用户
@@ -1715,7 +1813,11 @@ def export_workbook(conn: sqlite3.Connection, project_id: int, out_dir: Path) ->
     out_dir.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     wb.remove(wb.active)
+    quantity_ledger = _quantity_ledger_for_export(conn, project_id, active_contract.signature)
     export_cover_page(conn, project_id, wb, summary=report_model.project_summary)
+    wb["封面与说明"].append(["工程量核对", "工程量控制台账使用确认后的有效业务期次；旧累计表为原始期次统计，包含全部版本，不作为有效数量结论。"])
+    wb["封面与说明"].append(["工程量台账状态", json.dumps(quantity_ledger["status_counts"], ensure_ascii=False)])
+    export_quantity_control_sheets(quantity_ledger, wb)
     export_management_summary(conn, project_id, wb, summary=report_model.project_summary)
     for direction in _project_directions(conn, project_id):
         export_settlement_summary(conn, project_id, wb, direction=direction)
@@ -1804,6 +1906,7 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
         active_contract = run_contract.ensure_run_contract(conn, project_id)
         report_model = build_report_model(conn, project_id)
     summary = report_model.project_summary
+    quantity_ledger = _quantity_ledger_for_export(conn, project_id, active_contract.signature)
     project = conn.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
     project_name = project["name"] if project else "未命名项目"
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -1913,6 +2016,39 @@ def export_management_summary_docx(conn: sqlite3.Connection, project_id: int, ou
     doc.add_paragraph(f"校核路径说明：{_current_crosscheck_path_notice(conn, project_id)}")
     status_p = doc.add_paragraph(f"成果状态：{result_status}")
     status_p.runs[0].bold = True
+
+    doc.add_heading("工程量核对", level=1)
+    quantity_counts = quantity_ledger["status_counts"]
+    doc.add_paragraph(
+        f"控制组 {quantity_counts['quantity_controls']}；"
+        f"超出 {quantity_counts.get('controls_FAIL', 0)}；"
+        f"待确认 {quantity_counts.get('controls_PENDING', 0)}；"
+        f"不可比 {quantity_counts.get('controls_INCOMPARABLE', 0)}；"
+        f"待确认期次 {len(quantity_ledger['pending_contexts'])}；"
+        f"未登记期次 {len(quantity_ledger['unregistered_periods'])}；"
+        f"身份冲突 {len(quantity_ledger['identity_conflicts'])}。"
+        "工程量控制采用有效业务期次；原始期次累计金额不能证明工程量未超。")
+    if not quantity_ledger["quantity_controls"]:
+        doc.add_paragraph("尚无可核对的有效工程量控制组，须先确认合同身份、业务期号及计量口径。")
+    else:
+        doc.add_paragraph("以下优先列示超出事项，最多 20 个工程量控制组；完整数量、各分包贡献、来源及待确认明细见 Excel 工程量台账。")
+        table = doc.add_table(rows=1, cols=5)
+        table.style = "Table Grid"
+        for cell, label in zip(table.rows[0].cells,
+                               ("对象/范围/单位", "对上合同量", "对上结算量", "对下合计", "结论与原因"), strict=True):
+            cell.text = label
+        controls = sorted(quantity_ledger["quantity_controls"], key=lambda c: c["status"] == "FAIL", reverse=True)
+        for control in controls[:20]:
+            base = control["baselines"]
+            values = [
+                f"{control['display_name'] or control['code']} / {control['building'] or '全项目'} / {control['standard_unit']}",
+                base["upward_contract"]["quantity"] if base["upward_contract"]["status"] == "ok" else None,
+                base["upward_settlement"]["quantity"] if base["upward_settlement"]["status"] == "ok" else None,
+                control["downstream_quantity"] if control["downstream_status"] == "ok" and not control["excluded_details"] else None,
+                f"{QUANTITY_STATUS_ZH[control['status']]}：{control['reason']}",
+            ]
+            for cell, value in zip(table.add_row().cells, values, strict=True):
+                cell.text = "待确认" if value is None else str(value)
 
     metrics = doc.add_table(rows=1, cols=2)
     metrics.style = "Table Grid"

@@ -1719,6 +1719,54 @@ def _human_confirmation_snapshot(
     return [dict(row) for row in rows]
 
 
+def _quantity_context_scope(conn: sqlite3.Connection, project_id: int) -> dict[str, Any]:
+    """工程量上下文快照：期次/明细上下文变化必须使旧运行退出 current。
+
+    快照包含人工确认状态与替代关系，因此确认、替代或行级参数变化都会改变
+    指纹。旧库（schema<v56）缺表是唯一允许的显式兼容分支——此时
+    schema_version 本身已不同，签名必然失效，不需要伪装成空上下文；
+    表存在但查询失败（损坏、外部改写等）必须原样传播并阻断旧运行继续
+    被当作可用结果，不得静默降级为 unavailable。
+    """
+    table_count = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+        " AND name IN ('quantity_period_context','quantity_line_context')"
+    ).fetchone()[0]
+    if table_count < 2:
+        # 缺表只允许出现在旧 schema（<v56 尚未迁移的历史库）；此时
+        # schema_version 本身已不同，签名必然失效，标记 unavailable 即可。
+        if migrations.current_version(conn) >= 56:
+            raise RuntimeError(
+                "schema v56+ 缺少 quantity_period_context/quantity_line_context 表："
+                "数据库结构异常或被外部破坏，拒绝把旧运行当作可用结果（阻断）")
+        return {
+            "available": False,
+            "reason": "schema_missing_quantity_context_tables",
+            "quantity_contexts": [],
+        }
+    periods = conn.execute(
+        """SELECT id, period_id, contract_key, business_period_no, unit_name,
+                  doc_kind, amount_mode, work_scope, building_scope,
+                  building_status, status, supersedes_period_id,
+                  confirmed_at, confirmed_by, confirmed_reason
+           FROM quantity_period_context WHERE project_id=? ORDER BY id""",
+        (project_id,),
+    ).fetchall()
+    lines = conn.execute(
+        """SELECT id, line_item_id, standard_key, building, work_scope,
+                  convert_factor, target_unit, convert_basis, status,
+                  confirmed_at, confirmed_by, confirmed_reason
+           FROM quantity_line_context WHERE project_id=? ORDER BY id""",
+        (project_id,),
+    ).fetchall()
+    return {
+        "available": True,
+        "quantity_contexts": [dict(row) for row in periods] + [
+            {"kind": "line", **dict(row)} for row in lines
+        ],
+    }
+
+
 def build_run_contract_components(
     conn: sqlite3.Connection,
     project_id: int,
@@ -1776,6 +1824,9 @@ def build_run_contract_components(
         # P0-03 要求合同明确绑定权威清单的状态快照；保留旧键供兼容读取，
         # 新键让审阅者无需从组件名称猜测其语义。
         "manifest_state_snapshot": manifest_scope,
+        # 工程量核对上下文（v56）：期次/明细上下文或确认状态变化即视为
+        # 输入漂移，旧运行的工程量台账结果必须重建后才能再次引用。
+        "quantity_context": _quantity_context_scope(conn, project_id),
         "data_fingerprint": _line_item_digest(conn, project_id),
         "rules": _rule_config(conn, project_id),
         "config": config or {},
