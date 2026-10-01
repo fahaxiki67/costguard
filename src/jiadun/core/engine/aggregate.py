@@ -220,8 +220,8 @@ def aggregate_project(
     对上/对下结算结果。
     per_period 以 period_id 为键：对上/对下可存在相同期号，按期号取值会串表。
 
-    漏项检测：某清单未覆盖（同方向）全部期次 → status='incomplete' 并警示，
-    绝不静默当作 0 处理。
+    清单出现范围按已确认合同与计量模式判断；本期无某项不等同于漏项。
+    未确认范围和最新累计快照缺项保留覆盖提示，绝不静默补 0。
     """
     if direction is None and not include_all_directions:
         directions = {
@@ -245,6 +245,17 @@ def aggregate_project(
         ).fetchall()
     }
     col_maps = _confirmed_col_maps(conn, project_id)
+    from jiadun.core.engine.quantity_control import list_period_contexts
+
+    contexts = {c["period_id"]: c for c in list_period_contexts(conn, project_id)}
+    scopes = {pid: (c["direction"], c["contract_key"], c["unit_name"], c["doc_kind"])
+              for pid, c in contexts.items()}
+    latest_cumulative = {}
+    for pid, context in contexts.items():
+        if context["status"] == "confirmed" and context["amount_mode"] == "cumulative":
+            scope = (*scopes[pid], context["work_scope"])
+            latest_cumulative[scope] = max(
+                latest_cumulative.get(scope, 0), context["business_period_no"])
     aggs: dict[str, ItemAggregate] = {}
     quantity_rows: dict[str, list] = {}
     period_quantity_rows: dict[tuple[str, int], list] = {}
@@ -351,10 +362,27 @@ def aggregate_project(
             agg.status = normalized.status
             agg.warnings.append("单位、项目特征或数量缺失/冲突，累计数量不可比；原金额独立保留")
         missing_ids = sorted(set(period_meta) - set(agg.per_period))
+        known_members = all(pid in contexts and contexts[pid]["status"] == "confirmed"
+                            for pid in agg.per_period)
+        member_scopes = {scopes[pid] for pid in agg.per_period if pid in scopes}
         for pid in missing_ids:
+            context = contexts.get(pid)
+            if context and context["status"] == "superseded":
+                continue
+            if context and context["status"] == "confirmed":
+                if context["amount_mode"] == "incremental":
+                    continue  # 本期发生清单无需每期重复，缺行不是已发生量为零的事实。
+                if known_members and scopes[pid] not in member_scopes:
+                    continue  # 不要求另一个合同包含本合同的全部清单。
+                cumulative_scope = (*scopes[pid], context["work_scope"])
+                if context["business_period_no"] < latest_cumulative.get(cumulative_scope, 0):
+                    continue  # 较早累计快照无需包含以后新增的项目。
             if agg.status == "ok":
                 agg.status = "incomplete"
-            agg.warnings.append(f"第{period_meta[pid]}期无此清单（疑似漏项），未计入累计，待核实")
+            period_no = context["business_period_no"] if context else period_meta[pid]
+            agg.warnings.append(
+                f"第{period_no}期未列此清单，覆盖范围待核实；"
+                "需核对合同范围与本期/累计口径，不据此认定漏项或补零")
         periods = sorted(agg.per_period)
         qty_total: Decimal | None = None
         effective_amt_total: Decimal | None = None
