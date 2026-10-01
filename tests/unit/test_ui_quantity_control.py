@@ -129,10 +129,18 @@ class TestQuantityControlDialog:
             " VALUES (?,?,?,?,?)",
             (legacy, "2号楼混凝土", "m3", "50", json.dumps({"row": 7})))
         dlg = _open(env)
-        dlg.lines_table.selectRow(0)
-        assert dlg.lines_table.rowCount() >= 1
-        # 楼栋候选预填（来自明细文本），仅候选不确认
+        dlg.lines_table.selectRow(1)  # 选中"2号楼混凝土"行
+        assert dlg.lines_table.rowCount() >= 2
+        # 楼栋候选按行预填（来自本行文本），仅候选不确认；
+        # 未选中的无楼栋行不应出现别行候选
+        dlg._prefill_building_candidates(1, 0)
+        tokens = [dlg.line_building_combo.itemText(i)
+                  for i in range(dlg.line_building_combo.count())]
         dlg._prefill_building_candidates(0, 0)
+        tokens_row0 = [dlg.line_building_combo.itemText(i)
+                       for i in range(dlg.line_building_combo.count())]
+        assert not any("2号楼" in t for t in tokens_row0)
+        dlg._prefill_building_candidates(1, 0)
         tokens = [dlg.line_building_combo.itemText(i)
                   for i in range(dlg.line_building_combo.count())]
         assert any("2号楼" in t for t in tokens)
@@ -147,8 +155,8 @@ class TestQuantityControlDialog:
         contexts = {c["line_item_id"]: c for c in qc.list_line_contexts(conn, pid)}
         selected_id = dlg._selected_line_ids()[0]
         assert contexts[selected_id]["status"] == "pending"
-        # 显式确认后参与计算
-        dlg.lines_table.selectRow(0)
+        # 显式确认后参与计算（仍选中同一行）
+        dlg.lines_table.selectRow(1)
         dlg.line_reason_edit.setText("与方案核对一致")
         dlg._confirm_line_contexts()
         contexts = {c["line_item_id"]: c for c in qc.list_line_contexts(conn, pid)}

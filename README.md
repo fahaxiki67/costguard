@@ -11,9 +11,10 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.35 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are built in CI; published assets are listed on the release page. The v0.1.35
-> candidate adds effective quantity ledgers by contract and business period, multi-subcontractor
+> **Status: v0.1.36 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are built in CI; published assets are listed on the release page. The v0.1.36
+> candidate adds traceable building recognition and exact-description merging across source codes,
+> effective quantity ledgers by contract and business period, multi-subcontractor
 > and building controls, and explicit human confirmation for scope and conversion. It retains the
 > v0.1.31 implementation, which routes upward control-baseline cap-comparison conclusions into
 > the audit-finding center (snapshot semantics per baseline, automatic entry from the
@@ -36,7 +37,7 @@ Excel import → field standardization → quantity/unit-price/amount checks
 > historical price hints. Real WPS/Excel environment verification, sanitized real-case
 > regression, real scan-PDF OCR quality, per-page OCR candidate review and production
 > signing remain open release gates. See the
-> [release notes](docs/RELEASE_NOTES_v0.1.35.md) and the
+> [release notes](docs/RELEASE_NOTES_v0.1.36.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
 
 ![首页双小狗](examples/screenshots/00-首页.png)

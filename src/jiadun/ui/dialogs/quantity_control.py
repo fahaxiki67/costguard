@@ -334,23 +334,27 @@ class QuantityControlDialog(QDialog):
         ]
 
     def _prefill_building_candidates(self, row: int, _column: int) -> None:
-        """选中行时用楼栋候选预填（仅候选，不代替人工确认）。"""
+        """选中行时按该行提供楼栋候选预填（仅候选，不代替人工确认）。
+
+        候选按 line_item_id 过滤（行名称/特征/编码 + 本行工作表/文件名），
+        选中 2号楼行不会再看到 1号楼行的候选；来源矛盾的行给出冲突提示。
+        """
         self.line_building_combo.clear()
         if not (0 <= row < len(self._line_rows)):
             return
-        period_id = self._line_rows[row]["period_id"]
+        line_item_id = self._line_rows[row]["line_item_id"]
         try:
             candidates = qc.suggest_building_candidates(self.conn, self.project_id)
         except Exception:  # noqa: BLE001 — UI 层兜底
             _LOG.exception("楼栋候选生成失败")
             candidates = []
+        row_candidates = [
+            c for c in candidates if c.get("line_item_id") == line_item_id]
         tokens = sorted({
-            c["building"] for c in candidates
-            if c["period_id"] == period_id and not c["conflict"]
+            c["building"] for c in row_candidates if not c["conflict"]
         })
         conflicts = sorted({
-            c["building"] for c in candidates
-            if c["period_id"] == period_id and c["conflict"]
+            c["building"] for c in row_candidates if c["conflict"]
         })
         if conflicts:
             tokens = [t for t in tokens if t not in conflicts] + [
@@ -798,17 +802,35 @@ class QuantityControlDialog(QDialog):
         self.detail_view.setPlainText(
             f"清单项：{title}\n" + "\n".join(self._format_sources({"sources": sources})))
 
-    @staticmethod
-    def _format_sources(item: dict) -> list[str]:
+    _BUILDING_STATUS_ZH = {
+        "line_confirmed": "人工行级确认",
+        "period_confirmed": "人工期次范围",
+        "rule_accepted": "规则自动",
+        "combined_scope": "组合范围（不摊分）",
+    }
+
+    def _format_sources(self, item: dict) -> list[str]:
         lines = []
         for source in item.get("sources", []):
             counted = "计入" if source.get("counted") else "未计入"
             note = source.get("note") or source.get("problem") or ""
+            building_status = self._BUILDING_STATUS_ZH.get(
+                source.get("building_status") or "", "楼栋待确认")
             lines.append(
                 f"行#{source['line_item_id']}｜业务第{source['business_period_no']}期"
                 f"（内部序号{source['internal_period_no']}）｜"
+                f"楼栋 {source.get('building') or '待确认'}（{building_status}"
+                + (f"：{source.get('building_basis')}"
+                   if source.get("building_status") in ("rule_accepted",
+                                                        "combined_scope")
+                   or (source.get("building_status") is None
+                       and source.get("building_basis"))
+                   else "")
+                + "）｜"
                 f"{source.get('file') or '—'}/Sheet「{source.get('sheet') or '—'}」"
                 f"第{source.get('row') or '—'}行｜"
+                f"原编码 {source.get('original_code') or '—'}｜"
+                f"归并依据 {source.get('identity_basis') or '待确认'}｜"
                 f"原量 {source.get('original_quantity')}{source.get('original_unit') or ''}"
                 f" × {source.get('factor') or '—'} = "
                 f"{source.get('standard_quantity') or '待补'}"

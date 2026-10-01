@@ -70,10 +70,19 @@ ALL_BUILDINGS_KEY = "__all__"
 
 _CN_DIGITS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-_BUILDING_TOKEN_RE = re.compile(
-    r"(\d+|[一二三四五六七八九十]+)\s*#?\s*号?\s*楼")
+# 楼栋 token 三类：并列（1、2号楼）、中文/数字区间（1-3号楼 / 一至三号楼）、
+# 单栋（1号楼 / 1#楼 / 一号楼）。中文序数只支持 1..99；含百/千/零等不支持
+# 位数的段必须整体拒绝（如"一百零一号楼"不得后缀误识为 1号楼）。
+_PARALLEL_TOKEN_RE = re.compile(
+    r"(\d+|[一二三四五六七八九十百千零]+)"
+    r"(?:\s*[、，,和与]\s*(?:\d+|[一二三四五六七八九十百千零]+))+"
+    r"\s*#?\s*号?\s*楼")
 _RANGE_TOKEN_RE = re.compile(
-    r"(\d+)\s*[-—~至]\s*(\d+)\s*#?\s*号?\s*楼")
+    r"(\d+|[一二三四五六七八九十百千零]+)"
+    r"\s*[-—~至]\s*(\d+|[一二三四五六七八九十百千零]+)"
+    r"\s*#?\s*号?\s*楼")
+_BUILDING_TOKEN_RE = re.compile(
+    r"(\d+|[一二三四五六七八九十百千零]+)\s*#?\s*号?\s*楼")
 
 
 def _now() -> str:
@@ -861,26 +870,54 @@ def confirm_line_context(
 # ---------------------------------------------------------------- 楼栋候选
 
 def _cn_token_to_int(token: str) -> int | None:
+    """有限中文序数解析：1..99；含百/千/零或其他未知字符整体拒绝。
+
+    "十一"→11、"二十"→20、"二十一"→21、"十"→10；不支持"一百零一"
+    等百位写法（返回 None，调用方跳过该 token，绝不后缀误识）。
+    """
     if token.isdigit():
         return int(token)
-    if len(token) == 1:
-        return _CN_DIGITS.get(token)
-    total = 0
-    for ch in token:
-        value = _CN_DIGITS.get(ch)
-        if value is None:
-            return None
-        total = total * 10 + value if value < 10 else total + 10
-    return total or None
+    if re.fullmatch(r"[一二三四五六七八九]?十[一二三四五六七八九]?", token):
+        tens, ones = token.split("十")
+        return _CN_DIGITS.get(tens, 1) * 10 + _CN_DIGITS.get(ones, 0)
+    return _CN_DIGITS.get(token)
+
+
+def _parallel_building_tokens(text: str) -> list[str]:
+    """并列楼栋段（1、2号楼 / 一和三号楼）：返回组合 token，任一段无法
+    解析则整段拒绝（完整拒绝，不出部分结果）。"""
+    out: list[str] = []
+    for match in _PARALLEL_TOKEN_RE.finditer(text):
+        segments = re.split(r"\s*[、，,和与]\s*", match.group(0))
+        segments = [
+            re.sub(r"\s*#?\s*号?\s*楼\s*$", "", seg) for seg in segments]
+        numbers = [_cn_token_to_int(seg) for seg in segments]
+        if all(n is not None and n > 0 for n in numbers):
+            out.append("、".join(str(n) for n in numbers) + "号楼")
+    return out
 
 
 def _building_tokens(text: str) -> list[str]:
-    """从文本提取规范化楼栋标记：1号楼 / 一号楼 / 1#楼 / 1-3号楼。"""
+    """从文本提取规范化楼栋标记：1号楼 / 一号楼 / 1#楼 / 1-3号楼 / 1、2号楼。
+
+    中文序数支持 1..99（十一=11、二十=20）；中文区间（一至三号楼）与并列
+    （1、2号楼）一律产出组合 token，不拆单栋；不支持位数的中文段（如
+    "一百零一"）整体拒绝，不产出任何 token。
+    """
     normalized = unicodedata.normalize("NFKC", text or "")
     tokens: list[str] = []
-    for match in _RANGE_TOKEN_RE.finditer(normalized):
-        tokens.append(f"{match.group(1)}-{match.group(2)}号楼")
-    stripped = _RANGE_TOKEN_RE.sub(" ", normalized)
+    stripped = normalized
+    parallel_spans = [m.span() for m in _PARALLEL_TOKEN_RE.finditer(stripped)]
+    for start, end in parallel_spans:
+        tokens.extend(_parallel_building_tokens(normalized[start:end]))
+    for start, end in reversed(parallel_spans):
+        stripped = stripped[:start] + " " + stripped[end:]
+    for match in _RANGE_TOKEN_RE.finditer(stripped):
+        lo = _cn_token_to_int(match.group(1))
+        hi = _cn_token_to_int(match.group(2))
+        if lo is not None and hi is not None and lo > 0 and hi > 0:
+            tokens.append(f"{lo}-{hi}号楼")
+    stripped = _RANGE_TOKEN_RE.sub(" ", stripped)
     for match in _BUILDING_TOKEN_RE.finditer(stripped):
         number = _cn_token_to_int(match.group(1))
         if number is not None and number > 0:
@@ -889,7 +926,14 @@ def _building_tokens(text: str) -> list[str]:
 
 
 def suggest_building_candidates(conn: sqlite3.Connection, project_id: int) -> list[dict]:
-    """从明细文本生成可追溯楼栋候选；冲突（区间与单栋并存）交人工确认。"""
+    """按行生成可追溯楼栋候选（只读，不改原事实）。
+
+    来源字段：行名称/项目特征/清单编码 + 工作表名 + 原文件名，全部复用
+    ``_building_tokens`` 同一 token 规则。候选按 (line_item_id, 楼栋) 组织，
+    便于 UI 按行展示；同一行内不同字段给出不同单栋楼栋时标记
+    ``conflict``（如行写 1号楼、Sheet 写 2号楼）——不同行的不同楼栋不是
+    冲突。组合范围（如 1-3号楼）不生成单栋候选，由台账按组合范围处理。
+    """
     rows = conn.execute(
         """SELECT li.id AS line_item_id, li.period_id, li.code, li.name, li.feature,
                   li.flags_json, rs.id AS sheet_id, rs.sheet_name, sf.id AS file_id,
@@ -903,43 +947,118 @@ def suggest_building_candidates(conn: sqlite3.Connection, project_id: int) -> li
         (int(project_id),),
     ).fetchall()
     candidates: dict[tuple[int, str], dict] = {}
-    range_tokens: dict[int, set[tuple[int, int]]] = {}
-    single_tokens: dict[int, set[int]] = {}
     for row in rows:
         flags = json.loads(row["flags_json"] or "{}")
-        for field in ("name", "feature", "code"):
-            for token in _building_tokens(row[field] or ""):
-                key = (int(row["period_id"]), token)
-                source = {
+        row_source_fields = _row_building_source_fields(
+            row["code"], row["name"], row["feature"],
+            row["sheet_name"], row["original_name"])
+        row_singles = {
+            token for _f, _t, tokens in row_source_fields
+            for token in tokens if _is_single_building_scope(token)
+        }
+        row_conflict = len(row_singles) > 1 or bool(row_singles and any(
+            not _is_single_building_scope(token)
+            for _field, _text, tokens in row_source_fields for token in tokens))
+        for field, text, tokens in row_source_fields:
+            for token in tokens:
+                if not _is_single_building_scope(token):
+                    continue  # 组合范围不作为单栋候选
+                entry = candidates.setdefault((int(row["line_item_id"]), token), {
+                    "period_id": int(row["period_id"]),
+                    "line_item_id": int(row["line_item_id"]),
+                    "building": token,
+                    "sources": [],
+                    "conflict": row_conflict,
+                })
+                entry["sources"].append({
                     "line_item_id": int(row["line_item_id"]),
                     "field": field,
-                    "text": str(row[field] or ""),
+                    "text": text,
                     "row": flags.get("row"),
                     "file": row["original_name"],
                     "sheet": row["sheet_name"],
-                }
-                entry = candidates.setdefault(key, {
-                    "period_id": int(row["period_id"]),
-                    "building": token,
-                    "sources": [],
-                    "conflict": False,
                 })
-                entry["sources"].append(source)
-                if "-" in token:
-                    lo, hi = token.replace("号楼", "").split("-")
-                    range_tokens.setdefault(
-                        int(row["period_id"]), set()).add((int(lo), int(hi)))
-                else:
-                    single_tokens.setdefault(
-                        int(row["period_id"]), set()).add(int(token.replace("号楼", "")))
-    for (period_id, building), entry in candidates.items():
-        if "-" in building:
-            lo, hi = building.replace("号楼", "").split("-")
-            if any(lo <= single <= hi
-                   for single in single_tokens.get(period_id, ())):
-                entry["conflict"] = True
     return sorted(candidates.values(),
-                  key=lambda c: (c["period_id"], c["building"]))
+                  key=lambda c: (c["period_id"], c["line_item_id"], c["building"]))
+
+
+_BUILDING_SOURCE_FIELD_ZH = {
+    "row-name": "行名称",
+    "row-feature": "项目特征",
+    "row-code": "清单编码",
+    "sheet": "工作表",
+    "file": "来源文件名",
+}
+
+
+def _row_building_source_fields(code, name, feature, sheet_name, original_name):
+    """收集一行的楼栋 token 来源：(字段, 原文, tokens)，字段顺序稳定。"""
+    out: list[tuple[str, str, list[str]]] = []
+    for field, text in (
+        ("row-name", name),
+        ("row-feature", feature),
+        ("row-code", code),
+        ("sheet", sheet_name),
+        ("file", original_name),
+    ):
+        text = str(text or "").strip()
+        tokens = _building_tokens(text)
+        if tokens:
+            out.append((field, text, tokens))
+    return out
+
+
+def _derive_rule_building(source_fields):
+    """从行来源推导规则楼栋（只读）：返回 (building, status, basis)。
+
+    - 单栋 token 恰一个且无组合范围 → rule_accepted（明确且一致）；
+    - 单栋 token 多个 → 来源冲突，pending 并解释矛盾字段；
+    - 组合范围（如 1-3号楼）→ 组合值本身作为 building（不摊分），状态
+      combined_scope；组合与单栋并存时保守 pending（范围声明优先）；
+    - 无任何 token → pending（未确认）。
+    """
+    singles: list[str] = []
+    singles_sources: dict[str, tuple[str, str]] = {}
+    combined: list[tuple[str, str, str]] = []
+    for field, text, tokens in source_fields:
+        for token in tokens:
+            if _is_single_building_scope(token):
+                if token not in singles:
+                    singles.append(token)
+                singles_sources.setdefault(token, (field, text))
+            else:
+                combined.append((token, field, text))
+    if combined and singles:
+        token, field, text = combined[0]
+        s_field, s_text = singles_sources[singles[0]]
+        return None, None, (
+            f"来源并存需人工确认：{_BUILDING_SOURCE_FIELD_ZH[s_field]}"
+            f"「{s_text}」识别 {singles[0]}，"
+            f"{_BUILDING_SOURCE_FIELD_ZH[field]}「{text}」为组合范围 {token}，"
+            "不摊分到单栋")
+    if len({token for token, _field, _text in combined}) > 1:
+        return None, None, "组合楼栋来源冲突，待人工确认：" + "；".join(
+            f"{_BUILDING_SOURCE_FIELD_ZH[field]}「{text}」识别 {token}"
+            for token, field, text in combined)
+    if combined:
+        token, field, text = combined[0]
+        return token, "combined_scope", (
+            f"规则自动：{_BUILDING_SOURCE_FIELD_ZH[field]}「{text}」"
+            f"识别组合范围 {token}（不摊分到单栋）")
+    if len(singles) == 1:
+        field, text = singles_sources[singles[0]]
+        return singles[0], "rule_accepted", (
+            f"规则自动：{_BUILDING_SOURCE_FIELD_ZH[field]}「{text}」"
+            f"识别 {singles[0]}")
+    if len(singles) > 1:
+        first_field, first_text = singles_sources[singles[0]]
+        second_field, second_text = singles_sources[singles[1]]
+        return None, None, (
+            f"来源冲突：{_BUILDING_SOURCE_FIELD_ZH[first_field]}"
+            f"「{first_text}」识别 {singles[0]}，"
+            f"{_BUILDING_SOURCE_FIELD_ZH[second_field]}"
+            f"「{second_text}」识别 {singles[1]}，待人工确认")
+    return None, None, "未确认（仅计入全项目）"
 
 
 # ---------------------------------------------------------------- 工程量台账
@@ -957,22 +1076,66 @@ def _sheet_meta_map(conn: sqlite3.Connection, project_id: int) -> dict[int, dict
     return {int(r["sheet_id"]): dict(r) for r in rows}
 
 
+# 已验证标准量纲族首单位（unit_basis 对 kg/cm/mm 等折算到 t/m）。
+_KNOWN_STANDARD_UNITS = frozenset({"t", "m", "m2", "m3"})
+
+
 def _line_identity(code: str, name: str, feature: str,
                    line_ctx: dict | None, base_unit: str) -> tuple:
-    """行级标准身份：显式标准键（已确认）优先，否则自动身份。
+    """行级标准身份（items/同合同比较/跨方向控制共享路径）。
 
-    自动身份必须区分编码/名称命名空间，并包含实际名称、项目特征与标准
-    量纲：同码异名、同名异码、跨特征、跨量纲都不得自动混组——这些对象
-    只能通过人工确认的标准键合并。
+    优先级：人工标准键 > 描述规则身份 > 来源编码身份 > 来源名称身份。
+
+    描述规则（rule_accepted）：完整名称 + 非空明确特征 + 已验证标准量纲
+    完全一致时，跨来源编码（甚至无编码）归同对象——身份为
+    ``("auto:desc", 名称键, 名称键, 特征键, 标准量纲)``，5 元形状与
+    ``auto:code`` 对齐（identity[3]=特征、identity[4]=量纲），保证所有
+    caller 索引一致。同码异名、跨特征、跨量纲、空特征、未知量纲一律
+    保守保留编码/名称命名空间身份，不得混组；人工标准键始终优先。
     """
     if line_ctx and line_ctx.get("standard_key"):
         return ("manual", str(line_ctx["standard_key"]).strip())
     code_text = str(code or "").strip()
     name_key = feature_key(name)
     feature_id = feature_key(feature)
+    if name_key and feature_id and base_unit in _KNOWN_STANDARD_UNITS:
+        return ("auto:desc", name_key, name_key, feature_id, base_unit)
     if code_text:
         return ("auto:code", code_text, name_key, feature_id, base_unit)
     return ("auto:name", name_key, feature_id, base_unit)
+
+
+def _identity_meta(identity: tuple) -> tuple[str, str]:
+    """身份状态与依据（不冒记人工确认）：供来源追溯与导出。"""
+    kind = identity[0]
+    if kind == "manual":
+        return "manual_standard_key", f"人工标准键「{identity[1]}」（人工优先）"
+    if kind == "auto:desc":
+        return "rule_accepted_desc", (
+            f"描述规则自动接受：名称「{identity[1]}」+ 特征「{identity[3]}」"
+            f"+ 标准量纲 {identity[4]} 完整一致")
+    if kind == "auto:code":
+        return "source_code_identity", (
+            f"来源编码「{identity[1]}」身份（完整描述条件不满足，保守不归并）")
+    return "source_name_identity", (
+        "来源名称身份（完整描述条件不满足，保守不归并）")
+
+
+def _project_desc(identity: tuple) -> tuple | None:
+    """把身份投影为描述身份 (名称键, 特征键, 量纲)；条件不完整返回 None。"""
+    identity = tuple(identity)
+    kind = identity[0]
+    if kind == "manual":
+        return None
+    if kind == "auto:desc":
+        name_key, feature_id, base_unit = identity[1], identity[3], identity[4]
+    elif kind == "auto:code":
+        name_key, feature_id, base_unit = identity[2], identity[3], identity[4]
+    else:
+        name_key, feature_id, base_unit = identity[1], identity[2], identity[3]
+    if not name_key or not feature_id or base_unit not in _KNOWN_STANDARD_UNITS:
+        return None
+    return (name_key, feature_id, base_unit)
 
 
 _SINGLE_SCOPE_SEPARATORS = ("-", "—", "~", "、", ",", "，", "/", "／", "+")
@@ -1042,54 +1205,57 @@ def _collect_pending_quantity_rows(
 
 def _identity_may_match(control: tuple, control_code: str, control_name_key: str,
                         entry: dict) -> bool:
-    """保守判定待确认行是否可能属于该控制对象。
+    """保守判定待确认行是否可能属于该控制对象（描述身份共享路径）。
 
-    精确 tuple 相等当然命中；更关键的是不得因待确认行信息不完整
-    （缺单位/缺特征/换了人工键）而漏拦：
     - 双方均为人工标准键：键相同即命中；
-    - 人工键 ↔ 自动身份：待确认行保留了原始编码/名称，与控制成员的
-      编码或归一化名称存在文本关联即命中（人工键可能覆盖同一对象）；
-    - 双方自动身份：命名空间与键一致即候选，特征/量纲仅在双方都明确
-      且不同才排除（任一方缺失都不能排除）；
-    - 跨命名空间（编码↔名称）：键文本与对方键/名称一致即命中。
+    - 任一方为人工键：待确认行保留的原始编码/名称与控制成员编码或
+      归一化名称存在文本关联即命中（人工键可能覆盖同一对象）；
+    - 双方均为自动身份：先投影描述身份——双方都完整（名称+特征+已验证
+      量纲）时相等即同对象、不等即不同对象；任一方缺字段（缺特征/未知
+      量纲/纯名称身份）保守回退文本关联，绝不因信息不完整而漏拦；
+    - 特征/量纲仅在双方都明确且不同时排除。
     """
-    control_kind = control[0]
-    entry_identity = entry["identity"]
-    entry_kind = entry_identity[0]
-    if control_kind == "manual" and entry_kind == "manual":
+    control = tuple(control)
+    entry_identity = tuple(entry["identity"])
+    if control[0] == "manual" and entry_identity[0] == "manual":
         return entry_identity[1] == control[1]
-    if control_kind == "manual" or entry_kind == "manual":
-        other_code = entry["code"]
-        other_name = entry["name_key"]
+    if control[0] == "manual" or entry_identity[0] == "manual":
+        other_code = entry.get("code")
+        other_name = entry.get("name_key")
         if other_code and other_code == control_code:
             return True
         if other_name and other_name == control_name_key:
             return True
         return False
-    # auto ↔ auto：键与命名空间
-    if entry_kind != control_kind:
-        entry_key = entry_identity[1]
-        control_key = control[1] if len(control) > 1 else ""
-        if entry_key and entry_key in {control_key, control_code, control_name_key}:
+    control_desc = _project_desc(control)
+    entry_desc = _project_desc(entry_identity)
+    if control_desc is not None and entry_desc is not None:
+        return control_desc == entry_desc
+    # 任一方描述条件不完整：保守文本关联。
+    other_code = entry.get("code")
+    other_name = entry.get("name_key")
+    control_key = control[1] if len(control) > 1 else ""
+    if other_code and other_code in {control_key, control_code, control_name_key}:
+        return True
+    if other_name and other_name in {control_key, control_code, control_name_key}:
+        return True
+    # 同命名空间键不同时的跨命名空间文本关联（编码↔名称）。
+    if entry_identity[0] == control[0] and entry_identity[1] != control[1]:
+        if entry_identity[0] == "auto:code" and other_name \
+                and other_name == control_name_key:
             return True
-        if entry["name_key"] and entry["name_key"] in {control_key, control_code, control_name_key}:
+        if entry_identity[0] == "auto:name" and other_code \
+                and other_code == control_code:
             return True
         return False
-    if entry_identity[1] != control[1]:
-        # 同命名空间但键不同：编码↔编码不同即不同对象；名称键另查文本关联
-        if entry_kind == "auto:code" and entry["name_key"] and entry["name_key"] == control_name_key:
-            return True
-        if entry_kind == "auto:name" and entry["code"] and entry["code"] == control_code:
-            return True
-        return False
-    control_feature = control[3] if control_kind == "auto:code" and len(control) > 3 else (
-        control[2] if len(control) > 2 else "")
-    if entry["feature"] and control_feature and entry["feature"] != control_feature:
+    control_feature = control[3] if len(control) > 3 else ""
+    if entry.get("feature") and control_feature \
+            and entry["feature"] != control_feature:
         return False
     control_base = control[-1]
-    if entry["base"] and control_base and entry["base"] != control_base:
+    if entry.get("base") and control_base and entry["base"] != control_base:
         return False
-    return True
+    return False
 
 
 def _coverage_hits(
@@ -1098,17 +1264,20 @@ def _coverage_hits(
     identity: tuple,
     code: str = "",
     name_key: str = "",
+    source_codes: list[str] | None = None,
 ) -> list[dict]:
     """待确认明细与该控制对象的保守候选交集（含行来源）。"""
     control_code = code or (identity[1] if len(identity) > 1 else "")
     control_name_key = name_key or (
-        identity[2] if identity[0] == "auto:code" and len(identity) > 2
+        identity[2] if identity[0] in ("auto:code", "auto:desc")
+        and len(identity) > 2
         else identity[1] if identity[0] == "auto:name" else "")
     hits = []
     for entry in coverage:
         if entry["scope"] is not None and entry["scope"] != (work_scope or None):
             continue
-        if _identity_may_match(identity, control_code, control_name_key, entry):
+        if any(_identity_may_match(identity, member_code, control_name_key, entry)
+               for member_code in (source_codes or [control_code])):
             hits.append(entry)
     return hits
 
@@ -1254,13 +1423,32 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             (line_ctx["work_scope"] if line_ctx and line_ctx["work_scope"] else None)
             or row["period_work_scope"] or ""
         )
+        sheet_info = sheet_meta.get(int(row["sheet_id"])) if row["sheet_id"] else None
+        # 楼栋推导（只读）：人工行级 > 人工期次范围 > 规则自动 > 待确认。
+        # 规则自动复用同一 token 规则覆盖行字段与 Sheet/文件名，来源矛盾
+        # 或组合/并存保持待确认；人工确认始终优先覆盖自动候选。
         building: str | None = None
+        building_status: str | None = None
+        building_basis: str | None = None
         if line_ctx and line_ctx["building"]:
             building = str(line_ctx["building"]).strip()
+            building_status = "line_confirmed"
+            building_basis = "行级人工确认"
         elif row["building_status"] == BUILDING_CONFIRMED and row["building_scope"]:
             building = str(row["building_scope"]).strip()
+            building_status = "period_confirmed"
+            building_basis = "期次确认范围"
         else:
-            unconfirmed_building_rows += 1
+            rule_building, rule_status, rule_basis = _derive_rule_building(
+                _row_building_source_fields(
+                    row["code"], row["name"], row["feature"],
+                    sheet_info["sheet_name"] if sheet_info else None,
+                    sheet_info["original_name"] if sheet_info else None))
+            building = rule_building
+            building_status = rule_status
+            building_basis = rule_basis
+            if building is None:
+                unconfirmed_building_rows += 1
         # 数量与换算：确定性 Decimal；缺失/未知不补值。
         problem: str | None = None
         quantity = _try_decimal(row["quantity"])
@@ -1303,16 +1491,6 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             row["direction"], row["doc_kind"], row["contract_key"],
             row["unit_name"], work_scope, identity,
         )
-        sheet_info = sheet_meta.get(int(row["sheet_id"])) if row["sheet_id"] else None
-        if line_ctx and line_ctx["building"]:
-            building_status = "line_confirmed"
-            building_basis = "行级人工确认"
-        elif building and row["building_status"] == BUILDING_CONFIRMED:
-            building_status = "period_confirmed"
-            building_basis = "期次确认范围"
-        else:
-            building_status = None
-            building_basis = "未确认（仅计入全项目）"
         source = {
             "line_item_id": int(row["id"]),
             "file": sheet_info["original_name"] if sheet_info else None,
@@ -1328,6 +1506,11 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             "building_basis": building_basis,
             "original_quantity": row["quantity"],
             "original_unit": row["unit"],
+            "original_code": str(row["code"] or "").strip(),
+            "original_name": str(row["name"] or "").strip(),
+            "original_feature": str(row["feature"] or "").strip(),
+            "identity_status": _identity_meta(identity)[0],
+            "identity_basis": _identity_meta(identity)[1],
             "factor": str(total_factor) if total_factor is not None else None,
             "human_convert_factor": human_factor,
             "standard_quantity": str(standard_quantity) if standard_quantity is not None else None,
@@ -1345,8 +1528,14 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             "feature_keys": set(),
             "display_name": str(row["name"] or "").strip(),
             "code": str(row["code"] or "").strip(),
+            "source_codes": set(),
+            "source_names": set(),
+            "source_features": set(),
             "rows": [],
         })
+        group["source_codes"].add(str(row["code"] or "").strip())
+        group["source_names"].add(str(row["name"] or "").strip())
+        group["source_features"].add(str(row["feature"] or "").strip())
         group["rows"].append({
             "source": source,
             "building": building,
@@ -1464,6 +1653,11 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             "standard_key": group["identity"][1] if group["identity"][0] == "manual" else None,
             "standard_key_source": group["identity"][0],
             "identity": list(group["identity"]),
+            "identity_status": _identity_meta(group["identity"])[0],
+            "identity_basis": _identity_meta(group["identity"])[1],
+            "source_codes": sorted(c for c in group["source_codes"] if c),
+            "source_names": sorted(n for n in group["source_names"] if n),
+            "source_features": sorted(f for f in group["source_features"] if f),
             "code": group["code"] or group["display_name"],
             "feature": (
                 sorted(group["feature_keys"])[0]
@@ -1543,7 +1737,9 @@ def build_quantity_ledger(conn: sqlite3.Connection, project_id: int) -> dict:
             hits = _coverage_hits(
                 coverage, key[3], key[4],
                 code=pair_item["code"] if pair_item else "",
-                name_key=feature_key(pair_item["display_name"]) if pair_item else "")
+                name_key=feature_key(pair_item["display_name"]) if pair_item else "",
+                source_codes=sorted({c for side in sides.values()
+                                     for c in side.get("source_codes", [])}))
             if hits and status == COMPARE_PASS:
                 status = COMPARE_PENDING
                 delta = None
@@ -1620,7 +1816,14 @@ def _build_quantity_controls(
 
     对下侧跨合同（A/B/C）合并到同一控制组，contributions 列出各合同/单位
     的数量；不要求上下游合同键相同——配对只看工作口径 + 标准身份。
+
+    描述归并（rule_accepted 层）：跨来源编码不同（甚至一方无编码）的行，
+    若完整名称、非空特征、标准量纲与工作口径完全一致，按描述身份归入同一
+    控制组（身份标记 ``auto:desc``，``source_codes`` 保留各原编码来源）；
+    同码异名、跨特征、跨量纲、跨口径、空特征、人工标准键一律不归并。
     """
+    # 身份已在 _line_identity 共享路径统一（auto:desc 描述规则），items/
+    # 同合同比较/跨方向控制使用同一 identity，无展示层二次归并。
     controls: dict[tuple, dict[str, list[dict]]] = {}
     for item in items:
         identity = tuple(item["identity"])
@@ -1631,6 +1834,11 @@ def _build_quantity_controls(
     for key in sorted(controls, key=lambda k: (k[0], str(k[1]))):
         work_scope, identity = key
         sides = controls[key]
+        members = [item for group in sides.values() for item in group]
+        source_codes = sorted({
+            code for item in members
+            for code in (item.get("source_codes") or {item.get("code")})
+            if code})
         upward_contract_items = sides.get(("upward", DOC_KIND_CONTRACT), [])
         upward_settlement_items = sides.get(("upward", DOC_KIND_SETTLEMENT), [])
         downward_items = sides.get(("downward", DOC_KIND_SETTLEMENT), [])
@@ -1688,7 +1896,7 @@ def _build_quantity_controls(
             reasons: list[str] = []
             hits = _coverage_hits(
                 coverage, work_scope, identity, code=code,
-                name_key=feature_key(display))
+                name_key=feature_key(display), source_codes=source_codes)
 
             def _guarded(baseline_qty, baseline_status, baseline_missing,
                          baseline_label, baseline_contributors, *,
@@ -1768,6 +1976,8 @@ def _build_quantity_controls(
                 "work_scope": work_scope,
                 "standard_key": identity[1] if identity[0] == "manual" else None,
                 "identity": list(identity),
+                "identity_source": key[1][0],
+                "source_codes": source_codes,
                 "code": code,
                 "display_name": display,
                 "standard_unit": standard_unit,

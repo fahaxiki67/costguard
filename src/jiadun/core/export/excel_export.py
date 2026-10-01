@@ -89,6 +89,14 @@ QUANTITY_STATUS_ZH = {
     "INCOMPARABLE": "不可比", "CONTROL_CONFLICT": "身份冲突",
     "ok": "可用", "pending": "待确认", "incomparable": "不可比",
 }
+QUANTITY_SOURCE_STATUS_ZH = {
+    "rule_accepted": "规则自动接受", "confirmed": "人工已确认",
+    "human_confirmed": "人工已确认", "pending": "待确认",
+    "line_confirmed": "人工行级确认", "period_confirmed": "人工期次确认",
+    "combined_scope": "组合范围（不摊分）",
+    "rule_accepted_desc": "规则自动接受", "manual_standard_key": "人工标准键",
+    "source_code_identity": "来源编码身份", "source_name_identity": "来源名称身份",
+}
 RULE_ZH_CN = {
     "qty_price_amount_mismatch": "工程量×单价与合价不一致",
     "rounding_difference": "舍入差异",
@@ -1718,7 +1726,9 @@ def export_quantity_control_sheets(ledger: dict, wb: Workbook) -> None:
     sources.append(["方向", "资料类型", "合同标识", "单位名称", "工作计量口径", "标准项身份",
                     "编码", "名称", "标准单位", "数量口径", "状态", "原因",
                     "楼栋", "来源文件", "工作表", "行号", "清单行ID", "业务期号",
-                    "原数量", "原单位", "换算系数", "标准行数量", "是否计入", "来源说明", "运行签名"])
+                    "原数量", "原单位", "换算系数", "标准行数量", "是否计入", "来源说明",
+                    "原编码", "原名称", "原项目特征", "归并状态", "归并依据",
+                    "楼栋识别状态", "楼栋识别依据", "运行签名"])
     totals = wb.create_sheet("有效数量分项")
     totals.append(["方向", "资料类型", "合同标识", "单位名称", "工作计量口径", "标准项身份",
                    "编码", "名称", "标准单位", "核对范围", "标准数量", "状态", "原因", "运行签名"])
@@ -1743,7 +1753,13 @@ def export_quantity_control_sheets(ledger: dict, wb: Workbook) -> None:
                 source["file"], source["sheet"], source["row"], source["line_item_id"],
                 source["business_period_no"], source["original_quantity"], source["original_unit"],
                 source["factor"], source["standard_quantity"], source["counted"],
-                source.get("problem") or source.get("note"), ledger["run_signature"],
+                source.get("problem") or source.get("note"),
+                source.get("original_code"), source.get("original_name"),
+                source.get("original_feature"),
+                QUANTITY_SOURCE_STATUS_ZH.get(source.get("identity_status"), "待确认"),
+                source.get("identity_basis"),
+                QUANTITY_SOURCE_STATUS_ZH.get(source.get("building_status"), "待确认"),
+                source.get("building_basis"), ledger["run_signature"],
             ])
     pending = wb.create_sheet("核量待确认范围")
     pending.append(["类别", "待确认或冲突详情", "运行签名"])
