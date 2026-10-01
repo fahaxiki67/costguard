@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "pypdf>=5,<7",
     "pytest>=8",
     "pytest-cov",
     "hypothesis>=6",
