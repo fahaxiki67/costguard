@@ -127,6 +127,7 @@ def test_difference_export_uses_complete_standard_quantities(db):
     assert sheet.cell(4, 5).value is None
     assert sheet.cell(4, 6).value is None
     assert sheet.cell(2, 9).value == 't'
+    assert sheet.cell(2, 5).number_format == 'General'
 
 
 def test_difference_export_breaks_on_feature_change(db):
@@ -140,3 +141,18 @@ def test_difference_export_breaks_on_feature_change(db):
     export_diff_sheets(conn, pid, wb)
     assert wb['工程量差异表'].cell(3, 6).value is None
     assert '不可比' in wb['工程量差异表'].cell(3, 7).value
+
+
+def test_export_keeps_small_standard_quantities_visible(db):
+    from openpyxl import Workbook
+
+    from jiadun.core.export.excel_export import export_settlement_summary, export_updown_comparison
+    conn, pid, ps = db
+    add(conn, ps[0], unit='kg', qty='0.5')
+    wb = Workbook()
+    name = export_settlement_summary(conn, pid, wb, direction='downward')
+    assert wb[name].cell(2, 7).value == D('0.0005')
+    assert wb[name].cell(2, 7).number_format == 'General'
+    export_updown_comparison(conn, pid, wb)
+    assert wb['对上对下对比表'].cell(2, 10).value == 't'
+    assert wb['对上对下对比表'].cell(2, 4).number_format == 'General'

@@ -542,7 +542,7 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     if data_end > 1:
         for r in range(2, data_end + 1):
             for c in range(4, len(header)):
-                ws.cell(row=r, column=c).number_format = MONEY_FMT
+                ws.cell(row=r, column=c).number_format = "General" if c == len(periods) + 4 else MONEY_FMT
     return ws.title
 
 
@@ -727,7 +727,7 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                 prev_features = set(pp["features"]) if isinstance(cur_val, Decimal) else None
                 for c in (5, 6, 7):
                     if isinstance(ws.cell(row=r, column=c).value, Decimal):
-                        ws.cell(row=r, column=c).number_format = MONEY_FMT
+                        ws.cell(row=r, column=c).number_format = "General" if field == "quantity" else MONEY_FMT
         _autowidth(ws)
 
 
@@ -1065,8 +1065,8 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
     """对上对下对比表：同一清单的对上累计 vs 对下累计（差异列为公式）。"""
     ws = wb.create_sheet("对上对下对比表")
     ws.append(["清单编码", "清单名称", "对上累计数量", "对下累计数量", "对上累计金额",
-               "对下累计金额", "金额差异(公式)", "口径说明"])
-    _style_header(ws, 1, 8)
+               "对下累计金额", "金额差异(公式)", "口径说明", "对上标准单位", "对下标准单位"])
+    _style_header(ws, 1, 10)
     up = _aggregate_by_direction(conn, project_id, "upward")
     down = _aggregate_by_direction(conn, project_id, "downward")
     if not up and not down:
@@ -1081,6 +1081,8 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
         names = sorted((u or d or {}).get("names") or {""})
         ws.cell(row=r, column=1, value=code)
         ws.cell(row=r, column=2, value=names[0])
+        ws.cell(row=r, column=9, value=u["unit"] if u else None)
+        ws.cell(row=r, column=10, value=d["unit"] if d else None)
         if u and u["qty"] is not None:
             ws.cell(row=r, column=3, value=_num(u["qty"]))
         if d and d["qty"] is not None:
@@ -1108,7 +1110,7 @@ def export_updown_comparison(conn: sqlite3.Connection, project_id: int, wb: Work
                 prior = ws.cell(row=r, column=8).value
                 ws.cell(row=r, column=8, value="；".join(([prior] if prior else []) + notes))
         for c in (3, 4, 5, 6):
-            ws.cell(row=r, column=c).number_format = MONEY_FMT
+            ws.cell(row=r, column=c).number_format = "General" if c in (3, 4) else MONEY_FMT
     _autowidth(ws)
 
 
