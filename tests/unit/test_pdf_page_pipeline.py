@@ -200,9 +200,10 @@ def test_page_coverage_errors_fail_closed(
     assert raised.value.report.parse_ready is False
 
 
-def test_low_confidence_ocr_is_review_only(tmp_path: Path):
+@pytest.mark.parametrize("text,confidence", [("付款比例为 80%", 0.35), ("", 0.99)])
+def test_low_confidence_or_empty_ocr_is_review_only(tmp_path: Path, text: str, confidence: float):
     source = _pdf_copy(tmp_path)
-    provider = FakeOcrProvider({2: _ocr_result("付款比例为 80%", confidence=0.35)})
+    provider = FakeOcrProvider({2: _ocr_result(text, confidence=confidence)})
 
     with pytest.raises(PdfExtractionPending) as raised:
         extract_pdf_document(
@@ -213,7 +214,7 @@ def test_low_confidence_ocr_is_review_only(tmp_path: Path):
 
     page = raised.value.report.pages[1]
     assert page.status == "needs_review"
-    assert page.text == "付款比例为 80%"
+    assert page.text == text
     assert raised.value.report.parse_ready is False
 
 

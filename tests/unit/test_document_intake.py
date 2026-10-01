@@ -50,13 +50,18 @@ def test_scanned_contract_pdf_is_persisted_as_pending_ocr(tmp_path: Path):
         conn.close()
 
 
-def test_import_worker_returns_for_scanned_pdf_and_keeps_document_visible(tmp_path: Path):
+def test_import_worker_returns_for_scanned_pdf_and_keeps_document_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     pytest.importorskip("PySide6")
     pypdf = pytest.importorskip("pypdf")
     from jiadun.core import document_intake
     from jiadun.core.models import project as project_model
+    from jiadun.ui import workbench
     from jiadun.ui.workbench import ImportWorker
 
+    # 本场景验证未配置 OCR；安装了本地 OCR 的机器应走另一条 needs_review 路径。
+    monkeypatch.setattr(workbench, "_load_local_ocr_provider", lambda: None)
     info = project_model.create_project("后台扫描件", tmp_path / "workspace")
     info, conn = project_model.open_project(Path(info.workspace_path))
     scanned = tmp_path / "无文本层.pdf"
