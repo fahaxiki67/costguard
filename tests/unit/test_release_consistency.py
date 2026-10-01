@@ -178,7 +178,7 @@ def test_packaged_metadata_supports_runtime_version_without_private_install_path
     from jiadun import branding
 
     root = Path(__file__).parents[2]
-    tree = ast.parse((root / 'src/jiadun/platform/packaging' / spec_name).read_text())
+    tree = ast.parse((root / 'src/jiadun/platform/packaging' / spec_name).read_text(encoding='utf-8'))
     analysis = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
                     and isinstance(n.func, ast.Name) and n.func.id == 'Analysis')
     datas = next(k.value for k in analysis.keywords if k.arg == 'datas')
