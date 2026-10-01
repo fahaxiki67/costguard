@@ -103,6 +103,7 @@ a = Analysis(
     datas=[
         (str(DEMO_SRC), "jiadun_resources/demo"),
         (str(ICON_SRC), "jiadun_resources"),
+        (str(REPO / "docs" / "UI_THEME_REFERENCES.md"), "jiadun_resources"),
         *OCR_DATAS,
     ],
     hiddenimports=OCR_HIDDENIMPORTS,

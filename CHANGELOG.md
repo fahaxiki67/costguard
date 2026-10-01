@@ -15,6 +15,10 @@ All notable changes. Format based on Keep a Changelog; versioning: SemVer.
 
 ### Changed
 
+- 参考 PyQtDarkTheme 与 QDarkStyleSheet 的分层配色和控件状态处理，增加总览指标卡片、
+  标签页选中底色、输入禁用态、横向滚动条悬停与按下态；来源见
+  [主题参考记录](docs/UI_THEME_REFERENCES.md)。
+
 - 项目列表、七个工作台标签页、表格、按钮、选中态、输入框、菜单、进度条及弹窗
   统一为暖炭黑与红橙色系；成功、警告与风险徽章保持独立语义。
 - Qt Fusion 与统一 palette 覆盖原生箭头、复选框等控件，清除项目卡片硬编码旧色。

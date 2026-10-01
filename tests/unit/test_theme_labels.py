@@ -49,7 +49,8 @@ def test_dark_theme_text_contrast():
 
     for foreground, background in (
         (theme.TEXT, theme.BG), (theme.TEXT, theme.SURFACE),
-        (theme.TEXT_SECONDARY, theme.SURFACE), (theme.TEXT, theme.SELECTED_ROW),
+        (theme.TEXT_SECONDARY, theme.SURFACE), (theme.TEXT_SECONDARY, theme.PANEL),
+        (theme.PRIMARY, theme.PRIMARY_SOFT), (theme.TEXT, theme.SELECTED_ROW),
         (theme.TEXT, theme.PRIMARY_FILL), (theme.TEXT, theme.PRIMARY_HOVER),
         (theme.TEXT, theme.PRIMARY_PRESSED), (theme.PRIMARY, theme.SURFACE),
         (theme.SUCCESS, theme.SUCCESS_SOFT), (theme.WARNING, theme.WARNING_SOFT),

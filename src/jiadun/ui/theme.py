@@ -17,6 +17,7 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 # ---- 颜色 token ----
 BG = "#1C1412"          # 暖炭黑页面背景
 SURFACE = "#281E1A"     # 内容面板
+PANEL = "#231916"       # 总览与分组的中间层
 TEXT = "#FFF1E6"        # 暖白主文字
 TEXT_SECONDARY = "#CBB4A5"
 TEXT_DISABLED = "#99877B"
@@ -98,8 +99,15 @@ QWidget {{
 
 QWidget:disabled {{ color: {TEXT_DISABLED}; }}
 QWidget#projectOverview {{
+    background: {PANEL};
     border: 1px solid {BORDER};
     border-radius: 8px;
+}}
+
+QWidget#overviewMetric {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
 }}
 
 QToolTip {{
@@ -133,10 +141,11 @@ QPushButton {{
     padding: 5px 14px;
     min-height: 26px;
 }}
-QPushButton:hover {{ border-color: {PRIMARY}; color: {PRIMARY}; }}
+QPushButton:hover {{ background: {HOVER_ROW}; border-color: {PRIMARY}; color: {PRIMARY}; }}
 QPushButton:pressed {{ background: {BG}; }}
 QPushButton:disabled {{ color: {TEXT_DISABLED}; border-color: {BORDER}; background: {NEUTRAL_SOFT}; }}
 QPushButton:focus {{ border: 1px solid {PRIMARY}; }}
+QDialogButtonBox QPushButton {{ min-width: 72px; }}
 
 QPushButton#btnPrimary {{
     background: {PRIMARY_FILL};
@@ -181,6 +190,9 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTextEdit, QPlainText
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus, QDoubleSpinBox:focus, QDateEdit:focus {{
     border: 1px solid {PRIMARY};
 }}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QTextEdit:disabled, QPlainTextEdit:disabled {{
+    background: {NEUTRAL_SOFT}; color: {TEXT_DISABLED};
+}}
 QComboBox QAbstractItemView {{
     background: {SURFACE}; color: {TEXT};
     border: 1px solid {BORDER};
@@ -206,6 +218,7 @@ QTableWidget, QTableView, QTreeView {{
     selection-color: {TEXT};
 }}
 QTableWidget::item {{ padding: 2px 6px; }}
+QTableWidget::item:selected {{ background: {SELECTED_ROW}; color: {TEXT}; }}
 QTableWidget::item:hover {{ background: {HOVER_ROW}; }}
 QHeaderView::section {{
     background: {NEUTRAL_SOFT};
@@ -233,8 +246,12 @@ QTabBar::tab {{
     border-bottom: 2px solid transparent;
     margin-right: 2px;
 }}
-QTabBar::tab:selected {{ color: {PRIMARY}; border-bottom: 2px solid {PRIMARY}; font-weight: 600; }}
-QTabBar::tab:hover:!selected {{ color: {TEXT}; }}
+QTabBar::tab:selected {{
+    background: {PRIMARY_SOFT}; color: {PRIMARY};
+    border-top-left-radius: 6px; border-top-right-radius: 6px;
+    border-bottom: 2px solid {PRIMARY}; font-weight: 600;
+}}
+QTabBar::tab:hover:!selected {{ background: {HOVER_ROW}; color: {TEXT}; }}
 
 /* ---- 列表 ---- */
 QListWidget {{
@@ -250,9 +267,13 @@ QListWidget::item:selected {{ background: {SELECTED_ROW}; color: {TEXT}; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {SCROLL_HANDLE}; border-radius: 5px; min-height: 32px; }}
 QScrollBar::handle:vertical:hover {{ background: {TEXT_DISABLED}; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+/* PyQtDarkTheme 的轨道/滑块状态分离方式，来源见 docs/UI_THEME_REFERENCES.md。 */
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; }}
 QScrollBar::handle:horizontal {{ background: {SCROLL_HANDLE}; border-radius: 5px; min-width: 32px; }}
+QScrollBar::handle:horizontal:hover {{ background: {TEXT_DISABLED}; }}
+QScrollBar::handle:vertical:pressed, QScrollBar::handle:horizontal:pressed {{ background: {PRIMARY}; }}
 
 QSplitter::handle {{ background: {BORDER}; }}
 QGroupBox {{

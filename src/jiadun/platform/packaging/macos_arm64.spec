@@ -52,6 +52,7 @@ a = Analysis(
     datas=[
         (str(DEMO_SRC), f"{branding.RESOURCE_DIR_NAME}/demo"),
         (str(ICON_SRC), branding.RESOURCE_DIR_NAME),
+        (str(REPO / "docs" / "UI_THEME_REFERENCES.md"), branding.RESOURCE_DIR_NAME),
         *OCR_DATAS,
     ],
     hiddenimports=OCR_HIDDENIMPORTS,

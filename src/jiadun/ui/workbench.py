@@ -694,8 +694,9 @@ class WorkbenchPage(QWidget):
             ("historical_prices", "历史单价资产"),
         ):
             card = QWidget()
+            card.setObjectName("overviewMetric")
             cv = QVBoxLayout(card)
-            cv.setContentsMargins(theme.SP_S, theme.SP_XS, theme.SP_S, theme.SP_XS)
+            cv.setContentsMargins(theme.SP_S, theme.SP_S, theme.SP_S, theme.SP_S)
             cv.setSpacing(0)
             caption = QLabel(label)
             caption.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
