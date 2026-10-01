@@ -154,6 +154,9 @@ def main() -> int:
     win.show()
     win.resize(*WINDOW_SIZE)
 
+    # 首次启动首页：仅显示欢迎插图与导入入口，不扫描历史项目。
+    _shot(win, "00-首页.png")
+
     # 项目列表页（演示项目已列出；列表只显示项目名，不泄露路径）
     win.stack.setCurrentIndex(0)
     win.refresh_projects()

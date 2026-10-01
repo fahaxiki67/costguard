@@ -11,9 +11,10 @@ Excel import → field standardization → quantity/unit-price/amount checks
 → anomaly detection → Excel/Word reports
 ```
 
-> **Status: v0.1.32 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
-> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.32
-> candidate adds a unified warm charcoal / red-orange desktop theme. It retains the
+> **Status: v0.1.33 preview/prerelease.** The seven-step core workflow, the macOS GUI and an
+> **unsigned, ad-hoc signed macOS DMG** (Apple Silicon) and **unsigned Windows x64 packages** (per-user setup.exe + portable zip) are available. The v0.1.33
+> candidate adds a two-puppy welcome illustration (Xiaobai and Jimao) to the project
+> home page, retaining the unified warm charcoal / red-orange desktop theme. It retains the
 > v0.1.31 implementation, which routes upward control-baseline cap-comparison conclusions into
 > the audit-finding center (snapshot semantics per baseline, automatic entry from the
 > workbench dialog with fail-closed error surfacing, Excel anomaly list / dedicated
@@ -35,8 +36,10 @@ Excel import → field standardization → quantity/unit-price/amount checks
 > historical price hints. Real WPS/Excel environment verification, sanitized real-case
 > regression, real scan-PDF OCR quality, per-page OCR candidate review and production
 > signing remain open release gates. See the
-> [release notes](docs/RELEASE_NOTES_v0.1.32.md) and the
+> [release notes](docs/RELEASE_NOTES_v0.1.33.md) and the
 > [3-minute quick start (中文)](docs/QUICKSTART_zh-CN.md).
+
+![首页双小狗](examples/screenshots/00-首页.png)
 
 ![期次概览](examples/screenshots/03-期次概览.png)
 

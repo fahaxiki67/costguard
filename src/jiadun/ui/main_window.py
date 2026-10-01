@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QSize, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
 
     # ---- 项目列表页 ----
     def _projects_page(self) -> QWidget:
+        from jiadun.platform.resources import home_mascot_path
         from jiadun.ui import theme
 
         central = QWidget()
@@ -167,8 +168,28 @@ class MainWindow(QMainWindow):
         subtitle = QLabel("工程经营合规智能工作台")
         subtitle.setStyleSheet(
             f"color: {theme.TEXT_SECONDARY}; background: transparent;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        welcome = QHBoxLayout()
+        welcome_copy = QVBoxLayout()
+        welcome_copy.addStretch()
+        welcome_copy.addWidget(title)
+        welcome_copy.addWidget(subtitle)
+        welcome_copy.addStretch()
+        welcome.addLayout(welcome_copy, 1)
+
+        mascot = QLabel()
+        mascot.setObjectName("homeMascot")
+        mascot.setAccessibleName("两只小狗：小白与鸡毛")
+        mascot.setAlignment(Qt.AlignCenter)
+        mascot.setFixedSize(336, 224)
+        pixmap = QPixmap(str(home_mascot_path()))
+        if pixmap.isNull():
+            raise RuntimeError("首页双小狗插图无法读取，请检查安装包资源是否完整")
+        ratio = self.devicePixelRatioF()
+        pixmap = pixmap.scaled(mascot.size() * ratio, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap.setDevicePixelRatio(ratio)
+        mascot.setPixmap(pixmap)
+        welcome.addWidget(mascot)
+        layout.addLayout(welcome)
         layout.addSpacing(theme.SP_L)
         layout.addWidget(section_header("最近项目"))
 

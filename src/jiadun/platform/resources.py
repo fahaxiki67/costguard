@@ -22,6 +22,17 @@ def _bundle_base() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
 
 
+def home_mascot_path() -> Path:
+    """首页双小狗插图：开发模式与安装包使用同一资源。"""
+    if is_frozen():
+        path = _bundle_base() / branding.RESOURCE_DIR_NAME / "home-puppies.png"
+    else:
+        path = Path(__file__).resolve().parents[1] / "resources" / "home-puppies.png"
+    if not path.is_file():
+        raise FileNotFoundError("未找到首页双小狗插图，请检查安装包资源是否完整")
+    return path
+
+
 def bundled_demo_dir() -> Path:
     """安装包内置演示数据目录（与 examples/demo 同构：xlsx/docx + manifest.json）。"""
     if is_frozen():
