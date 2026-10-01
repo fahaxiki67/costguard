@@ -29,6 +29,7 @@ from jiadun.core.contracts import run_contract
 from jiadun.core.diff import radar as diff_radar
 from jiadun.core.engine.aggregate import aggregate_project, assess_amount
 from jiadun.core.engine.money import NotANumberError, round2, to_decimal
+from jiadun.core.engine.quantities import feature_key, normalize_quantities
 from jiadun.core.evidence import finding_lifecycle
 from jiadun.core.parsing import import_manifest
 from jiadun.core.parsing.extract_items import is_non_detail_flags
@@ -545,15 +546,16 @@ def export_settlement_summary(conn: sqlite3.Connection, project_id: int, wb: Wor
     return ws.title
 
 
-def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[dict]:
+def _diff_series(conn: sqlite3.Connection, project_id: int) -> list[dict]:
     """差异表数据序列：按 (direction, period_id, item_key) 取可追溯原始值。
 
-    - 数量/金额：同期同组多行求和（Decimal）；单位不一致时该期标记不可比；
+    - 数量：统一同量纲倍率后求和；单位/特征不一致不可比，任一行缺失则待补；
+    - 金额：沿用可追溯有效金额累计（Decimal）；
     - 单价：同期同组若存在多个不同价 → 标记"多价待复核"，绝不平均；
     - 缺失值不补 0：整期无有效值 → None（待补资料）。
     """
     rows = conn.execute(
-        """SELECT li.code, li.name, li.unit, li.quantity, li.unit_price, li.amount,
+        """SELECT li.id, li.code, li.name, li.feature, li.unit, li.quantity, li.unit_price, li.amount,
                   li.flags_json, sp.period_no AS pno, sp.direction AS dir
            FROM line_items li JOIN settlement_periods sp ON sp.id = li.period_id
            WHERE sp.project_id=? ORDER BY sp.period_no, li.id""",
@@ -571,18 +573,12 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
         series_names.setdefault(key, set()).add(r["name"] or "")
         pp = by_period.setdefault(int(r["pno"]), {
             "qty": None, "amount": None, "effective_amount": None,
-            "amount_source": "missing", "prices": set(), "units": set(), "qty_missing": False,
+            "amount_source": "missing", "prices": set(), "units": set(),
             "period_no": int(r["pno"]), "name": r["name"] or "",
+            "quantity_rows": [], "features": set(),
         })
-        if r["quantity"] is not None:
-            try:
-                q = D(r["quantity"])
-            except Exception:
-                q = None
-            if q is not None:
-                pp["qty"] = q if pp["qty"] is None else pp["qty"] + q
-        else:
-            pp["qty_missing"] = True
+        pp["quantity_rows"].append(r)
+        pp["features"].add(feature_key(r["feature"]))
         assessment, _qty_missing, _price_missing = assess_amount(r)
         if assessment.raw is not None:
             a = assessment.raw
@@ -607,6 +603,11 @@ def _diff_series(conn: sqlite3.Connection, project_id: int, field: str) -> list[
     for key, by_period in series.items():
         direction, key_str = key
         code = key_str[5:] if key_str.startswith("code:") else ""
+        for pp in by_period.values():
+            quantity = normalize_quantities(pp.pop("quantity_rows"))
+            pp["qty"] = quantity.quantity
+            pp["quantity_status"] = quantity.status
+            pp["quantity_unit"] = quantity.unit
         out.append({
             "direction": direction, "code": code,
             "names": series_names[key], "by_period": by_period,
@@ -641,13 +642,12 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
     """
     titles = (("单价差异表", "unit_price"), ("工程量差异表", "quantity"), ("金额差异表", "amount"))
     dir_zh = DIRECTION_LABELS
-    all_series = {f: _diff_series(conn, project_id, f) for _t, f in titles}
+    series = _diff_series(conn, project_id)
 
     for title, field in titles:
         ws = wb.create_sheet(title)
-        ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率"])
-        _style_header(ws, 1, 8)
-        series = all_series[field]
+        ws.append(["方向", "清单编码", "清单名称", "期间", "本期值", "上期值", "差异", "差异率", "单位"])
+        _style_header(ws, 1, 9)
         r = 1
         for item in series:
             ordered = sorted(item["by_period"].items(), key=lambda kv: kv[1]["period_no"])
@@ -655,6 +655,7 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
             first_name = item["by_period"][ordered[0][0]].get("name", "") if ordered else ""
             prev: Decimal | None = None  # 上一可比期数值；不可比/缺失/单位变化即断点
             prev_units: set | None = None
+            prev_features: set | None = None
             for _pid, pp in ordered:
                 r += 1
                 pno = pp["period_no"]
@@ -670,8 +671,8 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                     else:
                         cur_val = _num(next(iter(pp["prices"])), money=True) if pp["prices"] else None
                 elif field == "quantity":
-                    if len(pp["units"]) > 1:
-                        cur_val = "单位不一致（不可比）"
+                    if pp["quantity_status"] == "incomparable":
+                        cur_val = "单位或项目特征不一致（不可比）"
                     else:
                         cur_val = _num(pp["qty"]) if pp["qty"] is not None else None
                 else:
@@ -685,20 +686,25 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                 ws.cell(row=r, column=3, value=name_cell)
                 ws.cell(row=r, column=4, value=f"第{pno}期")
                 ws.cell(row=r, column=5, value=cur_val)
+                units = {pp["quantity_unit"]} if field == "quantity" and pp["quantity_unit"] else pp["units"]
+                ws.cell(row=r, column=9, value=pp["quantity_unit"] if field == "quantity" else "/".join(sorted(units)))
 
                 # 跨期单位变化：与上一可比期单位无交集 → 不可比断点
                 unit_mismatch = (
                     isinstance(cur_val, Decimal)
                     and prev_units is not None
-                    and pp["units"] is not None
                     and prev_units
-                    and not (pp["units"] & prev_units)
+                    and not (units & prev_units)
                 )
-                if isinstance(cur_val, Decimal) and unit_mismatch:
-                    ws.cell(row=r, column=7, value="不可比（与上期单位不一致）")
+                feature_mismatch = field != "amount" and (
+                    len(pp["features"]) > 1
+                    or (prev_features is not None and pp["features"] != prev_features)
+                )
+                if isinstance(cur_val, Decimal) and (unit_mismatch or feature_mismatch):
+                    ws.cell(row=r, column=7, value="不可比（与上期单位或项目特征不一致）")
                     ws.cell(row=r, column=8, value="不可比")
                     prev = None
-                    prev_units = set(pp["units"])
+                    prev_units = set(units)
                 elif isinstance(cur_val, Decimal):
                     if prev is not None:
                         ws.cell(row=r, column=6, value=prev)
@@ -711,13 +717,14 @@ def export_diff_sheets(conn: sqlite3.Connection, project_id: int, wb: Workbook) 
                     else:
                         ws.cell(row=r, column=8, value="首期（无上期可比）")
                     prev = cur_val
-                    prev_units = set(pp["units"]) if pp["units"] else None
+                    prev_units = set(units) if units else None
                 else:
                     # 不可比/缺失期：断点——清空基准，绝不与前后期强行比较
                     ws.cell(row=r, column=7, value="不可比" if isinstance(cur_val, str) else "待补资料")
                     ws.cell(row=r, column=8, value="不可比")
                     prev = None
                     prev_units = None
+                prev_features = set(pp["features"]) if isinstance(cur_val, Decimal) else None
                 for c in (5, 6, 7):
                     if isinstance(ws.cell(row=r, column=c).value, Decimal):
                         ws.cell(row=r, column=c).number_format = MONEY_FMT

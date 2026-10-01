@@ -108,3 +108,35 @@ def test_scaled_units(db, unit, qty, expected):
     agg = aggregate_project(conn, pid, direction='downward')[0]
     assert agg.cum_qty == D(expected)
     assert agg.wavg_price * agg.cum_qty == D(qty)
+
+
+def test_difference_export_uses_complete_standard_quantities(db):
+    from openpyxl import Workbook
+
+    from jiadun.core.export.excel_export import export_diff_sheets
+    conn, pid, ps = db
+    add(conn, ps[0])
+    add(conn, ps[0], unit='kg', qty='500', price='1', amount='500')
+    add(conn, ps[1], qty='2', price='1000', amount='2000')
+    add(conn, ps[2], qty=None)
+    wb = Workbook()
+    export_diff_sheets(conn, pid, wb)
+    sheet = wb['工程量差异表']
+    assert sheet.cell(2, 5).value == D('1.5')
+    assert sheet.cell(3, 6).value == D('1.5')
+    assert sheet.cell(4, 5).value is None
+    assert sheet.cell(4, 6).value is None
+    assert sheet.cell(2, 9).value == 't'
+
+
+def test_difference_export_breaks_on_feature_change(db):
+    from openpyxl import Workbook
+
+    from jiadun.core.export.excel_export import export_diff_sheets
+    conn, pid, ps = db
+    add(conn, ps[0])
+    add(conn, ps[1], feature='Q355')
+    wb = Workbook()
+    export_diff_sheets(conn, pid, wb)
+    assert wb['工程量差异表'].cell(3, 6).value is None
+    assert '不可比' in wb['工程量差异表'].cell(3, 7).value
