@@ -12,8 +12,8 @@ from jiadun.ui import labels, theme
 
 
 def test_theme_tokens_present():
-    assert theme.BG == "#F6F7F9"
-    assert theme.PRIMARY == "#2563EB"
+    assert theme.BG == "#1C1412"
+    assert theme.PRIMARY == "#FF9C7A"
     assert theme.ROW_HEIGHT == 32
     for token in ("SUCCESS", "WARNING", "DANGER", "BORDER", "TEXT_SECONDARY"):
         assert getattr(theme, token).startswith("#")
@@ -34,6 +34,29 @@ def test_apply_theme_smoke(qt_app=None):
     app = QApplication.instance() or QApplication([])
     theme.apply_theme(app)
     assert app.styleSheet(), "应用样式表不应为空"
+    from PySide6.QtGui import QPalette
+
+    assert app.palette().color(QPalette.Base).name().upper() == theme.SURFACE
+    assert app.palette().color(QPalette.WindowText).name().upper() == theme.TEXT
+
+
+def test_dark_theme_text_contrast():
+    """防止深色主题中的正文、按钮与风险徽章失去可读性。"""
+    def luminance(color):
+        channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return sum(c * w for c, w in zip(linear, (0.2126, 0.7152, 0.0722), strict=True))
+
+    for foreground, background in (
+        (theme.TEXT, theme.BG), (theme.TEXT, theme.SURFACE),
+        (theme.TEXT_SECONDARY, theme.SURFACE), (theme.TEXT, theme.SELECTED_ROW),
+        (theme.TEXT, theme.PRIMARY_FILL), (theme.TEXT, theme.PRIMARY_HOVER),
+        (theme.TEXT, theme.PRIMARY_PRESSED), (theme.PRIMARY, theme.SURFACE),
+        (theme.SUCCESS, theme.SUCCESS_SOFT), (theme.WARNING, theme.WARNING_SOFT),
+        (theme.DANGER, theme.DANGER_SOFT),
+    ):
+        light, dark = sorted((luminance(foreground), luminance(background)), reverse=True)
+        assert (light + 0.05) / (dark + 0.05) >= 4.5, (foreground, background)
 
 
 def test_rule_zh_covers_all_rules_in_engine():

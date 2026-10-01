@@ -31,6 +31,7 @@ from jiadun import branding
 from jiadun.core import demo as demo_core
 from jiadun.core.models import project as project_model
 from jiadun.core.reporting import build_project_summary
+from jiadun.ui import theme
 from jiadun.ui.file_selection import (
     FileDropZone,
     preferred_project_name,
@@ -279,7 +280,7 @@ class MainWindow(QMainWindow):
                 f"最近打开：{last_opened}　·　对上结算 {snapshot['upward']} 期　·　"
                 f"对下结算 {snapshot['downward']} 期"
             )
-            period_line.setStyleSheet("color: #667085; background: transparent;")
+            period_line.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
             card_layout.addWidget(period_line)
             status_line = QLabel(
                 f"项目状态：{snapshot['project_status']}　·　"
@@ -287,7 +288,7 @@ class MainWindow(QMainWindow):
                 f"高风险 {snapshot['high']}　·　待确认匹配 {snapshot['matches']}　·　"
                 f"最新校核：{snapshot['latest']}"
             )
-            status_line.setStyleSheet("color: #667085; background: transparent;")
+            status_line.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; background: transparent;")
             card_layout.addWidget(status_line)
             item.setSizeHint(QSize(0, 78))
             self.project_list.setItemWidget(item, card)

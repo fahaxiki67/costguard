@@ -1,9 +1,9 @@
 """统一视觉系统（主题 token + 全局 QSS）。
 
-设计定位：现代 macOS 专业工具 + 企业审计软件。克制、可信、高信息密度。
+设计定位：参考暖红橙与炭黑的统一深色工作台，保持审计数据可读。
 规则：
 - 颜色只在此处定义；页面代码不得散落 setStyleSheet（objectName 语义样式除外）；
-- 风险颜色仅用于语义标签（浅底 Badge），不做装饰、不做整行高饱和；
+- 风险颜色仅用于语义标签（低饱和深底 Badge），不做装饰、不做整行高饱和；
 - 不硬编码字体：macOS/Windows 使用系统字体，中文走系统中文字体
   （PingFang SC / Microsoft YaHei 由系统回退保证）；
 - 间距体系 4/8/12/16/24px；表格行高 32px。
@@ -12,30 +12,33 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 
 # ---- 颜色 token ----
-BG = "#F6F7F9"          # 页面背景
-SURFACE = "#FFFFFF"     # 内容面板背景
-TEXT = "#101828"        # 主文字
-TEXT_SECONDARY = "#667085"  # 次级文字
-TEXT_DISABLED = "#98A2B3"
-BORDER = "#E4E7EC"
-PRIMARY = "#2563EB"     # 主色（专业蓝）
-PRIMARY_HOVER = "#1D4ED8"
-PRIMARY_PRESSED = "#1E40AF"
-PRIMARY_SOFT = "#EFF4FF"  # 自动识别候选/选中底
-SELECTED_ROW = "#EFF4FF"
-HOVER_ROW = "#F8FAFC"
+BG = "#1C1412"          # 暖炭黑页面背景
+SURFACE = "#281E1A"     # 内容面板
+TEXT = "#FFF1E6"        # 暖白主文字
+TEXT_SECONDARY = "#CBB4A5"
+TEXT_DISABLED = "#99877B"
+BORDER = "#594239"
+PRIMARY = "#FF9C7A"     # 珊瑚橙强调文字与焦点
+PRIMARY_FILL = "#A83822"  # 深红橙按钮底，保证暖白文字对比度
+PRIMARY_HOVER = "#BB4329"
+PRIMARY_PRESSED = "#8F2D1B"
+PRIMARY_SOFT = "#4A2A21"
+SELECTED_ROW = PRIMARY_SOFT
+HOVER_ROW = "#352620"
+ALTERNATE_ROW = "#2E231E"
+SCROLL_HANDLE = "#806052"
 
-SUCCESS = "#067647"
-SUCCESS_SOFT = "#ECFDF3"
-WARNING = "#B54708"
-WARNING_SOFT = "#FFFAEB"
-DANGER = "#B42318"
-DANGER_SOFT = "#FEF3F2"
-NEUTRAL_SOFT = "#F2F4F7"
-INFO_SOFT = "#EFF8FF"
+SUCCESS = "#A6D4B5"
+SUCCESS_SOFT = "#243A2D"
+WARNING = "#FFD08A"
+WARNING_SOFT = "#49351F"
+DANGER = "#FFAAA0"
+DANGER_SOFT = "#4B2623"
+NEUTRAL_SOFT = "#352A24"
+INFO_SOFT = PRIMARY_SOFT
 
 # ---- 间距（4/8/12/16/24）----
 SP_XS, SP_S, SP_M, SP_L, SP_XL = 4, 8, 12, 16, 24
@@ -93,17 +96,23 @@ QWidget {{
     font-size: 14px;
 }}
 
+QWidget:disabled {{ color: {TEXT_DISABLED}; }}
+QWidget#projectOverview {{
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+
 QToolTip {{
-    background: {TEXT};
-    color: #FFFFFF;
-    border: none;
+    background: {SURFACE};
+    color: {TEXT};
+    border: 1px solid {BORDER};
     padding: 4px 8px;
 }}
 
 QFrame#fileDropZone {{
     background: {SURFACE};
     color: {TEXT_SECONDARY};
-    border: 1px dashed #B8C4D6;
+    border: 1px dashed {BORDER};
     border-radius: 8px;
 }}
 QFrame#fileDropZone[dragActive="true"] {{
@@ -130,9 +139,9 @@ QPushButton:disabled {{ color: {TEXT_DISABLED}; border-color: {BORDER}; backgrou
 QPushButton:focus {{ border: 1px solid {PRIMARY}; }}
 
 QPushButton#btnPrimary {{
-    background: {PRIMARY};
-    color: #FFFFFF;
-    border: 1px solid {PRIMARY};
+    background: {PRIMARY_FILL};
+    color: {TEXT};
+    border: 1px solid {PRIMARY_FILL};
     font-weight: 600;
 }}
 QPushButton#btnPrimary:hover {{ background: {PRIMARY_HOVER}; border-color: {PRIMARY_HOVER}; }}
@@ -160,7 +169,7 @@ QPushButton[btnLink="true"] {{
 }}
 
 /* ---- 输入控件 ---- */
-QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTextEdit, QPlainTextEdit {{
     background: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: 6px;
@@ -169,15 +178,29 @@ QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {{
     selection-background-color: {PRIMARY_SOFT};
     selection-color: {TEXT};
 }}
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {{
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus, QDoubleSpinBox:focus, QDateEdit:focus {{
     border: 1px solid {PRIMARY};
 }}
 QComboBox::drop-down {{ border: none; width: 18px; }}
+QComboBox QAbstractItemView {{
+    background: {SURFACE}; color: {TEXT};
+    border: 1px solid {BORDER};
+    selection-background-color: {SELECTED_ROW}; selection-color: {TEXT};
+}}
+QMenu {{ background: {SURFACE}; border: 1px solid {BORDER}; padding: 4px; }}
+QMenu::item {{ padding: 6px 20px; }}
+QMenu::item:selected {{ background: {SELECTED_ROW}; color: {TEXT}; }}
+QMenu::separator {{ height: 1px; background: {BORDER}; margin: 4px; }}
+QProgressBar {{
+    background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
+    border-radius: 4px; text-align: center;
+}}
+QProgressBar::chunk {{ background: {PRIMARY_FILL}; border-radius: 3px; }}
 
 /* ---- 表格（本软件的核心控件）---- */
-QTableWidget {{
+QTableWidget, QTableView, QTreeView {{
     background: {SURFACE};
-    alternate-background-color: #FCFCFD;
+    alternate-background-color: {ALTERNATE_ROW};
     gridline-color: {BORDER};
     border: 1px solid {BORDER};
     selection-background-color: {SELECTED_ROW};
@@ -220,17 +243,17 @@ QListWidget {{
     border: 1px solid {BORDER};
     outline: 0;
 }}
-QListWidget::item {{ padding: 6px 8px; border-bottom: 1px solid #F2F4F7; }}
+QListWidget::item {{ padding: 6px 8px; border-bottom: 1px solid {BORDER}; }}
 QListWidget::item:hover {{ background: {HOVER_ROW}; }}
 QListWidget::item:selected {{ background: {SELECTED_ROW}; color: {TEXT}; }}
 
 /* ---- 滚动条：窄、不抢视觉 ---- */
 QScrollBar:vertical {{ background: transparent; width: 10px; }}
-QScrollBar::handle:vertical {{ background: #D0D5DD; border-radius: 5px; min-height: 32px; }}
+QScrollBar::handle:vertical {{ background: {SCROLL_HANDLE}; border-radius: 5px; min-height: 32px; }}
 QScrollBar::handle:vertical:hover {{ background: {TEXT_DISABLED}; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
 QScrollBar:horizontal {{ background: transparent; height: 10px; }}
-QScrollBar::handle:horizontal {{ background: #D0D5DD; border-radius: 5px; min-width: 32px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLL_HANDLE}; border-radius: 5px; min-width: 32px; }}
 
 QSplitter::handle {{ background: {BORDER}; }}
 QGroupBox {{
@@ -246,5 +269,24 @@ QStatusBar {{ background: {SURFACE}; border-top: 1px solid {BORDER}; color: {TEX
 
 def apply_theme(app) -> None:
     """应用全局主题。仅在 QApplication 创建后调用一次。"""
+    # Fusion + palette 让原生箭头、复选框和未被 QSS 覆盖的控件也遵循深色主题。
+    app.setStyle("Fusion")
+    palette = QPalette()
+    for role, color in (
+        (QPalette.Window, BG), (QPalette.WindowText, TEXT),
+        (QPalette.Base, SURFACE), (QPalette.AlternateBase, ALTERNATE_ROW),
+        (QPalette.Text, TEXT), (QPalette.Button, SURFACE),
+        (QPalette.ButtonText, TEXT), (QPalette.Highlight, SELECTED_ROW),
+        (QPalette.HighlightedText, TEXT), (QPalette.Link, PRIMARY),
+        (QPalette.ToolTipBase, SURFACE), (QPalette.ToolTipText, TEXT),
+        (QPalette.PlaceholderText, TEXT_SECONDARY),
+        (QPalette.Light, BORDER), (QPalette.Midlight, NEUTRAL_SOFT),
+        (QPalette.Mid, BORDER), (QPalette.Dark, BG), (QPalette.Shadow, BG),
+        (QPalette.BrightText, TEXT),
+    ):
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        palette.setColor(QPalette.Disabled, role, QColor(TEXT_DISABLED))
+    app.setPalette(palette)
     apply_app_font(app)
     app.setStyleSheet(build_qss())

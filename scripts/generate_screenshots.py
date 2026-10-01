@@ -27,6 +27,9 @@ WINDOW_SIZE = (1440, 900)
 
 
 def _shot(widget, name: str, size: tuple[int, int] | None = WINDOW_SIZE) -> Path:
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.processEvents()
     pix = widget.grab()
     if size is not None and (pix.width(), pix.height()) != size:
         pix = pix.scaled(size[0], size[1])
@@ -68,7 +71,10 @@ def main() -> int:
     from PySide6.QtWidgets import QApplication
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    _ = QApplication.instance() or QApplication([])
+    from jiadun.ui.theme import apply_theme
+
+    app = QApplication.instance() or QApplication([])
+    apply_theme(app)
 
     # 受控工作空间（截图不触碰用户真实 ~/Documents）
     ws_root = Path(tempfile.mkdtemp(prefix="jiadun-screens-")) / "JiadunProjects"
@@ -141,7 +147,7 @@ def main() -> int:
     # 项目列表会扫描"已登记工作空间"（settings.json），因此两层都要隔离：
     # workspace_roots 决定列表扫描范围（不得触到用户真实目录），
     # workspace_root 决定新建项目默认落点。
-    project_model.workspace_roots = lambda: [ws_root]
+    project_model.workspace_roots = lambda **_kwargs: [ws_root]
     project_model.workspace_root = lambda: ws_root
     win = MainWindow()
     win.setAttribute(Qt.WA_DontShowOnScreen, True)
@@ -157,9 +163,12 @@ def main() -> int:
     # 对话框需要显示工作空间，但绝不应把随机临时目录写入跟踪截图；只在
     # 构造期间提供固定展示值，项目实际写入位置仍是上面的受控临时空间。
     workspace_root_resolver = project_model.workspace_root
+    workspace_roots_resolver = project_model.workspace_roots
     project_model.workspace_root = lambda: Path("JiadunProjects")
+    project_model.workspace_roots = lambda **_kwargs: [Path("JiadunProjects")]
     dlg = NewProjectDialog(win)
     project_model.workspace_root = workspace_root_resolver
+    project_model.workspace_roots = workspace_roots_resolver
     dlg.setAttribute(Qt.WA_DontShowOnScreen, True)
     dlg.show()
     _shot(dlg, "02-新建项目.png", size=None)
@@ -182,7 +191,8 @@ def main() -> int:
 
     for idx, name in ((0, "03-期次概览.png"), (1, "04-清单明细.png"),
                       (2, "05-异常检测.png"), (3, "06-匹配复核.png"),
-                      (4, "07-成果导出.png")):
+                      (4, "07-成果导出.png"), (5, "10-版本与历史资产.png"),
+                      (6, "11-资料中心.png")):
         page.tabs.setCurrentIndex(idx)
         _shot(page, name)
 
