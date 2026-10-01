@@ -181,7 +181,6 @@ QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit, QTextEdit, QPlainText
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus, QPlainTextEdit:focus, QDoubleSpinBox:focus, QDateEdit:focus {{
     border: 1px solid {PRIMARY};
 }}
-QComboBox::drop-down {{ border: none; width: 18px; }}
 QComboBox QAbstractItemView {{
     background: {SURFACE}; color: {TEXT};
     border: 1px solid {BORDER};
