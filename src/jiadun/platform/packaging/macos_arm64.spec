@@ -13,7 +13,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -54,6 +54,9 @@ a = Analysis(
         (str(ICON_SRC), branding.RESOURCE_DIR_NAME),
         (str(REPO / "src" / "jiadun" / "resources" / "home-puppies.png"), branding.RESOURCE_DIR_NAME),
         (str(REPO / "docs" / "UI_THEME_REFERENCES.md"), branding.RESOURCE_DIR_NAME),
+        # 运行版本必须可读取；仅复制 METADATA，排除 editable 安装的本机路径。
+        *[(str(Path(source) / "METADATA"), target)
+          for source, target in copy_metadata("jiadun")],
         *OCR_DATAS,
     ],
     hiddenimports=OCR_HIDDENIMPORTS,

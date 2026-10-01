@@ -165,3 +165,33 @@ def test_release_consistency_cli_can_import_golden_runner_from_scripts_directory
     )
     assert allowed_golden["passed"] is True
     assert allowed_golden["status"] == "conditional"
+
+
+@pytest.mark.parametrize('spec_name', ['macos_arm64.spec', 'windows_x64.spec'])
+def test_packaged_metadata_supports_runtime_version_without_private_install_paths(tmp_path, spec_name):
+    import ast
+    import importlib.metadata
+    import shutil
+
+    from PyInstaller.utils.hooks import copy_metadata
+
+    from jiadun import branding
+
+    root = Path(__file__).parents[2]
+    tree = ast.parse((root / 'src/jiadun/platform/packaging' / spec_name).read_text())
+    analysis = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name) and n.func.id == 'Analysis')
+    datas = next(k.value for k in analysis.keywords if k.arg == 'datas')
+    entries = eval(compile(ast.Expression(datas), spec_name, 'eval'), {
+        'Path': Path, 'copy_metadata': copy_metadata, 'branding': branding,
+        'REPO': root, 'DEMO_SRC': root / 'examples/demo', 'ICON_SRC': root / 'icon', 'OCR_DATAS': [],
+    })
+    metadata_entries = [(Path(src), dest) for src, dest in entries
+                        if Path(src).name == 'METADATA' and str(dest).startswith('jiadun-')]
+    assert len(metadata_entries) == 1, 'Application runtime version metadata is missing'
+    source, destination = metadata_entries[0]
+    copied = tmp_path / destination
+    copied.mkdir()
+    shutil.copy2(source, copied / 'METADATA')
+    assert importlib.metadata.Distribution.at(copied).version == _pyproject_version()
+    assert not (copied / 'direct_url.json').exists()
