@@ -322,6 +322,7 @@ class ImportWorker(QObject):
                         report = settlement_io.import_settlement_file(
                             conn, self.project_id, self.project_dir, path,
                             direction=spec.direction, document_category=spec.code,
+                            separate_files=True,
                         )
                         result["pending"] += sum(
                             1 for sheet in report.sheets

@@ -25,6 +25,7 @@ DOCUMENT_CATEGORIES: tuple[DocumentCategory, ...] = (
     DocumentCategory("unclassified", "待人工分类", description="仅登记并保留原件，不自动形成业务结论"),
     DocumentCategory("upward_bid", "对上中标及投标文件", direction="upward", description="招投标/中标资料"),
     DocumentCategory("upward_contract", "对上合同（含补充协议）", direction="upward", parse_strategy="contract", description="优先提取可追溯合同条款"),
+    DocumentCategory("upward_contract_boq", "对上合同清单（Excel/CSV）", direction="upward", parse_strategy="settlement", description="抽取合同清单明细；合同身份、计量口径与有效版本需在工程量核对中确认"),
     DocumentCategory("upward_framework_management", "对上框架/管理性协议", direction="upward", description="协作费率、计取基数、税口径及适用条件的控制规则候选；须人工确认后才参与可复算控制"),
     DocumentCategory("meeting_minutes", "会议纪要/补充约定", description="可能补充、变更或解释合同条款；须人工确认适用范围和优先级"),
     DocumentCategory("other_agreement", "其他关联协议/文件", description="未能归入合同、框架管理协议或纪要的关联资料"),
@@ -34,6 +35,7 @@ DOCUMENT_CATEGORIES: tuple[DocumentCategory, ...] = (
     DocumentCategory("downward_payment_ledger", "对下资金支付台账", direction="downward", description="支付及已结算金额台账"),
     DocumentCategory("downward_material_settlement", "对下物资结算/已完工未结算", direction="downward", parse_strategy="settlement", description="物资结算及已完工未结算清单"),
     DocumentCategory("downward_subcontract_settlement", "对下分包结算", direction="downward", parse_strategy="settlement", description="分包结算清单"),
+    DocumentCategory("downward_contract_boq", "对下合同清单（Excel/CSV）", direction="downward", parse_strategy="settlement", description="抽取对下合同清单明细；与已结算量分别核对，不直接计入已结算累计"),
 )
 
 _CATEGORIES = {item.code: item for item in DOCUMENT_CATEGORIES}

@@ -43,6 +43,7 @@ class ImportReport:
     needs_manual_review: bool = False
     # 任务书 B4：重解析人工决策结转统计（carried/skipped_* 计数）
     carry_forward: dict = field(default_factory=dict)
+    business_period_nos: dict[int, int] = field(default_factory=dict)
 
 
 _PERIOD_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*期")
@@ -1238,7 +1239,7 @@ def _existing_import_report(
     的补充/版本入口处理，而不是静默写入旧期次。
     """
     batches = conn.execute(
-        """SELECT pb.id, pb.status, pb.parsed_at
+        """SELECT pb.id, pb.status, pb.parsed_at, pb.stats_json
              FROM parse_batches pb
             WHERE pb.file_id=? ORDER BY pb.parsed_at DESC, pb.id DESC""",
         (file_id,),
@@ -1265,7 +1266,11 @@ def _existing_import_report(
                 "同一原始文件已按其他方向导入；请使用明确的补充导入/版本入口，"
                 "不要把同一文件静默追加到旧期次"
             )
-        existing_periods = {
+        business_period_nos = {
+            int(key): int(value) for key, value in
+            json.loads(batch["stats_json"] or "{}").get("business_period_nos", {}).items()
+        }
+        existing_periods = set(business_period_nos.values()) or {
             int(row["period_no"]) for row in sheets if row["period_no"] is not None
         }
         if period_no is not None and existing_periods and period_no not in existing_periods:
@@ -1306,6 +1311,7 @@ def _existing_import_report(
             sheets=reports,
             message="same_source_already_imported",
             needs_manual_review=any(row["sheet_status"] != "confirmed" for row in sheets),
+            business_period_nos=business_period_nos,
         )
     return None
 
@@ -1319,6 +1325,8 @@ def import_settlement_file(
     direction: str = "unknown",
     contract_party: str = "",
     document_category: str = "unclassified",
+    *,
+    separate_files: bool = False,
 ) -> ImportReport:
     """以单个外层事务执行文件物化，失败时只保留 failed 批次和 Evidence。"""
     src = Path(src)
@@ -1394,6 +1402,7 @@ def import_settlement_file(
                 direction=direction,
                 contract_party=contract_party,
                 _source_file=sf,
+                separate_files=separate_files,
             )
     except Exception as exc:
         # 任一物化阶段失败均不得把已写入的 raw/period/line_items 当作成功
@@ -1475,6 +1484,7 @@ def _import_settlement_file(
     contract_party: str = "",
     *,
     _source_file: SourceFile | None = None,
+    separate_files: bool = False,
 ) -> ImportReport:
     """导入并解析一个结算文件。
 
@@ -1878,6 +1888,22 @@ def _import_settlement_file(
         else:
             pno = sheet_pno if sheet_pno is not None else next_period_no(conn, project_id, direction)
         title = f"{src.stem}/{sheet.sheet_name}"
+        business_pno = pno
+        if separate_files:
+            internal_by_business = {value: key for key, value in report.business_period_nos.items()}
+            if business_pno in internal_by_business:
+                pno = conn.execute(
+                    "SELECT period_no FROM settlement_periods WHERE id=?",
+                    (internal_by_business[business_pno],),
+                ).fetchone()["period_no"]
+            else:
+                collision = conn.execute(
+                    "SELECT source_file_id FROM settlement_periods WHERE project_id=? AND direction=? AND period_no=?",
+                    (project_id, direction, pno),
+                ).fetchone()
+                if collision is not None and collision["source_file_id"] != sf.file_id:
+                    pno = next_period_no(conn, project_id, direction)
+            notes.append(f"识别业务第{business_pno}期；文件独立内部序号{pno}，合同身份及业务口径待确认")
         period_id = ensure_period(
             conn,
             project_id,
@@ -1951,6 +1977,8 @@ def _import_settlement_file(
                 commit=False,
             )
         period_ids.add(period_id)
+        if separate_files:
+            report.business_period_nos[period_id] = business_pno
 
         extract_items.persist_line_items(
             conn, period_id, sheet_id, items, commit=False
@@ -1977,6 +2005,10 @@ def _import_settlement_file(
             )
         )
     report.period_id = next(iter(period_ids), -1)
+    if separate_files:
+        stats = json.loads(conn.execute("SELECT stats_json FROM parse_batches WHERE id=?", (batch_id,)).fetchone()["stats_json"] or "{}")
+        stats["business_period_nos"] = report.business_period_nos
+        conn.execute("UPDATE parse_batches SET stats_json=? WHERE id=?", (json.dumps(stats, ensure_ascii=False), batch_id))
     report.period_no = min(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
          for pid in period_ids), default=0,
