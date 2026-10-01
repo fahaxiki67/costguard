@@ -862,7 +862,7 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
                   rs.hidden_rows_json, rs.hidden_cols_json,
                   rs.filter_state, rs.filter_conditions_json, rs.table_ranges_json,
                   rs.formula_metadata_json, rs.auto_filter_ref,
-                  rs.merged_ranges_json
+                  rs.merged_ranges_json, pb.id AS batch_id, pb.stats_json
            FROM raw_sheets rs JOIN parse_batches pb ON pb.id=rs.batch_id
            JOIN source_files sf ON sf.id=pb.file_id
            WHERE rs.id=? AND sf.project_id=?""",
@@ -871,6 +871,7 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
     if not meta:
         raise ValueError(f"sheet {sheet_id} 不属于 project {project_id}")
     sheet_name = meta["sheet_name"]
+    batch_stats = json.loads(meta["stats_json"] or "{}")
     det = detect_header(0, cells, merged, n_rows, n_cols)
     if det is None:
         if confirmed_col_map is None or confirmed_header_range is None:
@@ -983,6 +984,20 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             pno = period_no if period_no is not None else next_period_no(conn, project_id, direction)
             if not isinstance(pno, int) or pno < 1:
                 raise ValueError("确认期次必须为正整数")
+            business_pno = pno
+            if batch_stats.get("separate_files"):
+                mapped = next((int(pid) for pid, number in
+                               batch_stats.get("business_period_nos", {}).items()
+                               if int(number) == business_pno), None)
+                if mapped is not None:
+                    pno = conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (mapped,)).fetchone()["period_no"]
+                else:
+                    collision = conn.execute(
+                        "SELECT source_file_id FROM settlement_periods WHERE project_id=? AND direction=? AND period_no=?",
+                        (project_id, direction, pno),
+                    ).fetchone()
+                    if collision is not None and collision["source_file_id"] != int(meta["file_id"]):
+                        pno = next_period_no(conn, project_id, direction)
             # B8：期次是项目级 (period_no, direction)，不同分包合同的同名期号
             # （各自的"第3期"）写入同一期次会混算。已有期次属于其它文件时
             # fail-closed 阻断，要求人工改期号或明确确认合并。
@@ -1002,6 +1017,10 @@ def confirm_sheet_role_and_extract(conn: sqlite3.Connection, project_id: int,
             period_id = ensure_period(
                 conn, project_id, pno, f"{meta['original_name']}/{sheet_name}", meta["file_id"],
                 direction=direction, commit=False)
+            if batch_stats.get("separate_files"):
+                batch_stats.setdefault("business_period_nos", {})[str(period_id)] = business_pno
+                conn.execute("UPDATE parse_batches SET stats_json=? WHERE id=?",
+                             (json.dumps(batch_stats, ensure_ascii=False), meta["batch_id"]))
         if existing_period_id is not None and period_id == existing_period_id:
             conn.execute(
                 "DELETE FROM line_items WHERE period_id=? AND sheet_id=?",
@@ -1910,6 +1929,8 @@ def _import_settlement_file(
         title = f"{src.stem}/{sheet.sheet_name}"
         business_pno = pno
         if separate_files:
+            business_pno = file_period or sheet_pno or pno
+            pno = business_pno
             internal_by_business = {value: key for key, value in report.business_period_nos.items()}
             if business_pno in internal_by_business:
                 pno = conn.execute(
@@ -2028,6 +2049,7 @@ def _import_settlement_file(
     if separate_files:
         stats = json.loads(conn.execute("SELECT stats_json FROM parse_batches WHERE id=?", (batch_id,)).fetchone()["stats_json"] or "{}")
         stats["business_period_nos"] = report.business_period_nos
+        stats["separate_files"] = True
         conn.execute("UPDATE parse_batches SET stats_json=? WHERE id=?", (json.dumps(stats, ensure_ascii=False), batch_id))
     report.period_no = min(
         (conn.execute("SELECT period_no FROM settlement_periods WHERE id=?", (pid,)).fetchone()["period_no"]
